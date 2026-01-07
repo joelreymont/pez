@@ -1,0 +1,22 @@
+# Zig build artifacts
+zig-out/
+.zig-cache/
+
+# Reference implementations (separate git repos)
+refs/
+
+# Editor
+*.swp
+*~
+.vscode/
+.idea/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Temporary files
+/tmp/
+
+# Dot tool state
+.beads/
