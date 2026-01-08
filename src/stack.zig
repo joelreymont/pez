@@ -353,6 +353,79 @@ pub const SimContext = struct {
                 }
             },
 
+            .MAKE_FUNCTION => {
+                // MAKE_FUNCTION creates a function from a code object on the stack.
+                // In Python 3.12+, the code object is on top of stack.
+                // The function name comes from the code object's co_qualname.
+                //
+                // Stack: code_obj -> function
+                //
+                // For now, we create a placeholder Name expression for the function.
+                // Full function decompilation requires recursively processing the code object.
+                const code_val = self.stack.pop() orelse return error.StackUnderflow;
+
+                // Try to get the function name from the code object
+                // TODO: Extract name from code object's co_qualname when available
+                const func_name: []const u8 = "<function>";
+
+                // Create a placeholder Name expression for the function
+                const expr = try ast.makeName(self.allocator, func_name, .load);
+                try self.stack.push(.{ .expr = expr });
+
+                // Clean up the code value if needed
+                if (code_val == .expr) {
+                    code_val.expr.deinit(self.allocator);
+                    self.allocator.destroy(code_val.expr);
+                }
+            },
+
+            .SET_FUNCTION_ATTRIBUTE => {
+                // SET_FUNCTION_ATTRIBUTE flag - sets closure, defaults, annotations, etc.
+                // Stack: func, value -> func
+                // The flag in inst.arg determines which attribute to set:
+                //   1: defaults
+                //   2: kwdefaults
+                //   4: annotations
+                //   8: closure
+                //
+                // For now, we just pop the attribute value and keep the function
+                if (self.stack.pop()) |attr_val| {
+                    var val = attr_val;
+                    val.deinit(self.allocator);
+                }
+                // Function stays on stack (already there from MAKE_FUNCTION)
+            },
+
+            .COPY_FREE_VARS => {
+                // COPY_FREE_VARS n - copies n free variables for a closure
+                // This is a setup instruction, doesn't affect the stack
+            },
+
+            .MAKE_CELL => {
+                // MAKE_CELL i - creates a cell for a closure variable
+                // This is a setup instruction, doesn't affect the stack
+            },
+
+            .LOAD_CLOSURE => {
+                // LOAD_CLOSURE i - loads a cell/freevar onto the stack
+                // For now, push unknown since we don't track cells
+                try self.stack.push(.unknown);
+            },
+
+            .LOAD_DEREF => {
+                // LOAD_DEREF i - loads value from a cell
+                // For now, push unknown since we don't track cells
+                try self.stack.push(.unknown);
+            },
+
+            .STORE_DEREF => {
+                // STORE_DEREF i - stores value to a cell
+                if (self.stack.pop()) |v| {
+                    var val = v;
+                    val.deinit(self.allocator);
+                }
+            },
+
             else => {
                 // Unhandled opcode - push unknown for each value it would produce
                 // For now, just push unknown
