@@ -294,6 +294,167 @@ pub fn buildCFG(allocator: Allocator, bytecode: []const u8, version: Version) !C
     };
 }
 
+// ============================================================================
+// Exception Table Parsing (Python 3.11+)
+// ============================================================================
+
+/// An exception table entry.
+pub const ExceptionEntry = struct {
+    /// Inclusive start offset of the protected range.
+    start: u32,
+    /// Exclusive end offset of the protected range.
+    end: u32,
+    /// Bytecode offset of the exception handler.
+    target: u32,
+    /// Stack depth at handler entry.
+    depth: u16,
+    /// Whether to push the instruction offset (lasti) before the exception.
+    push_lasti: bool,
+};
+
+/// Parse the exception table (3.11+ format).
+pub fn parseExceptionTable(table: []const u8, allocator: Allocator) ![]ExceptionEntry {
+    if (table.len == 0) return &.{};
+
+    var entries: std.ArrayList(ExceptionEntry) = .{};
+    errdefer entries.deinit(allocator);
+
+    var pos: usize = 0;
+    while (pos < table.len) {
+        // First byte must have S bit (bit 7) set
+        if ((table[pos] & 0x80) == 0) break;
+
+        // Read start offset
+        const start_result = readVarint7(table, pos);
+        pos = start_result.new_pos;
+        const start = start_result.value;
+
+        // Read size (end - start)
+        const size_result = readVarint7(table, pos);
+        pos = size_result.new_pos;
+        const size = size_result.value;
+
+        // Read target handler offset
+        const target_result = readVarint7(table, pos);
+        pos = target_result.new_pos;
+        const target = target_result.value;
+
+        // Read combined depth_lasti value
+        const depth_lasti_result = readVarint7(table, pos);
+        pos = depth_lasti_result.new_pos;
+        const depth_lasti = depth_lasti_result.value;
+
+        try entries.append(allocator, .{
+            .start = start,
+            .end = start + size,
+            .target = target,
+            .depth = @intCast(depth_lasti >> 1),
+            .push_lasti = (depth_lasti & 1) != 0,
+        });
+    }
+
+    return entries.toOwnedSlice(allocator);
+}
+
+/// Read a 7-bit varint from the exception table.
+/// Format: SXdddddd where S=start marker, X=extend, d=data bits.
+fn readVarint7(data: []const u8, start_pos: usize) struct { value: u32, new_pos: usize } {
+    var result: u32 = 0;
+    var shift: u5 = 0;
+    var pos = start_pos;
+
+    while (pos < data.len) {
+        const byte = data[pos];
+        pos += 1;
+
+        // 6 data bits per byte
+        result |= @as(u32, byte & 0x3F) << shift;
+
+        // X bit (bit 6) not set = last byte of this value
+        if ((byte & 0x40) == 0) break;
+
+        shift +|= 6;
+        if (shift > 30) break;
+    }
+
+    return .{ .value = result, .new_pos = pos };
+}
+
+/// Build CFG with exception handling information.
+pub fn buildCFGWithExceptions(
+    allocator: Allocator,
+    bytecode: []const u8,
+    exception_table: []const u8,
+    version: Version,
+) !CFG {
+    // First build the basic CFG
+    var cfg = try buildCFG(allocator, bytecode, version);
+    errdefer cfg.deinit();
+
+    // Parse exception table (only for 3.11+)
+    if (!version.gte(3, 11) or exception_table.len == 0) {
+        return cfg;
+    }
+
+    const entries = try parseExceptionTable(exception_table, allocator);
+    defer allocator.free(entries);
+
+    // Add exception edges and mark handler blocks
+    for (entries) |entry| {
+        // Find the handler block
+        const handler_block_id = cfg.blockAtOffset(entry.target);
+        if (handler_block_id) |hid| {
+            cfg.blocks[hid].is_exception_handler = true;
+        }
+
+        // Add exception edges from all blocks in the protected range
+        for (cfg.blocks, 0..) |*block, block_idx| {
+            // Check if this block overlaps with the protected range
+            if (block.start_offset < entry.end and block.end_offset > entry.start) {
+                // Add exception edge if handler exists
+                if (handler_block_id) |hid| {
+                    // Check if edge already exists
+                    var has_edge = false;
+                    for (block.successors) |edge| {
+                        if (edge.target == hid and edge.edge_type == .exception) {
+                            has_edge = true;
+                            break;
+                        }
+                    }
+
+                    if (!has_edge) {
+                        // Reallocate successors to add exception edge
+                        const new_succs = try allocator.alloc(Edge, block.successors.len + 1);
+                        @memcpy(new_succs[0..block.successors.len], block.successors);
+                        new_succs[block.successors.len] = .{
+                            .target = hid,
+                            .edge_type = .exception,
+                        };
+
+                        if (block.successors.len > 0) {
+                            allocator.free(block.successors);
+                        }
+                        cfg.blocks[block_idx].successors = new_succs;
+
+                        // Update handler's predecessors
+                        var handler = &cfg.blocks[hid];
+                        const new_preds = try allocator.alloc(u32, handler.predecessors.len + 1);
+                        @memcpy(new_preds[0..handler.predecessors.len], handler.predecessors);
+                        new_preds[handler.predecessors.len] = block.id;
+
+                        if (handler.predecessors.len > 0) {
+                            allocator.free(handler.predecessors);
+                        }
+                        handler.predecessors = new_preds;
+                    }
+                }
+            }
+        }
+    }
+
+    return cfg;
+}
+
 /// Print CFG in a debug format.
 pub fn debugPrint(cfg: *const CFG, writer: anytype) !void {
     try writer.print("CFG with {d} blocks:\n", .{cfg.blocks.len});
@@ -385,4 +546,50 @@ test "cfg with conditional" {
 
     // Block 0 should have two successors (true -> block 2, false -> block 1)
     try testing.expectEqual(@as(usize, 2), cfg.blocks[0].successors.len);
+}
+
+test "exception table parsing" {
+    const testing = std.testing;
+    const allocator = testing.allocator;
+
+    // Simple exception table with one entry:
+    // start=0, size=10, target=20, depth=1, lasti=0
+    // depth_lasti = (1 << 1) | 0 = 2
+    //
+    // Encoding (all values fit in single bytes, so no extend bits):
+    // start: 0x80 | 0 = 0x80 (S=1, X=0, d=0)
+    // size: 10 = 0x0A
+    // target: 20 = 0x14
+    // depth_lasti: 2 = 0x02
+    const table = [_]u8{ 0x80, 0x0A, 0x14, 0x02 };
+
+    const entries = try parseExceptionTable(&table, allocator);
+    defer allocator.free(entries);
+
+    try testing.expectEqual(@as(usize, 1), entries.len);
+    try testing.expectEqual(@as(u32, 0), entries[0].start);
+    try testing.expectEqual(@as(u32, 10), entries[0].end);
+    try testing.expectEqual(@as(u32, 20), entries[0].target);
+    try testing.expectEqual(@as(u16, 1), entries[0].depth);
+    try testing.expectEqual(false, entries[0].push_lasti);
+}
+
+test "exception table varint" {
+    const testing = std.testing;
+
+    // Test varint with extend bit
+    // Value 100 (0x64) needs two bytes in 6-bit encoding:
+    // 100 = 0b1100100 = 0b100 (6 bits) + 0b1 (1 bit)
+    // First byte: S=1, X=1, d=100 & 0x3F = 36 -> 0x80 | 0x40 | 36 = 0xE4
+    // Second byte: S=0, X=0, d=100 >> 6 = 1 -> 0x01
+    // Hmm, let me recalculate. 100 in binary is 1100100.
+    // We take 6 bits at a time LSB first: bits 0-5 = 100100 = 36, bits 6+ = 1
+    // First byte: S=1, X=1 (more data), d=36 -> 1 1 100100 = 0xE4
+    // Second byte: S=0, X=0 (no more), d=1 -> 0 0 000001 = 0x01
+
+    // Actually for 100:
+    // 100 in 6-bit chunks: 100 & 0x3F = 36, 100 >> 6 = 1
+    const result = readVarint7(&[_]u8{ 0xE4, 0x01 }, 0);
+    try testing.expectEqual(@as(u32, 100), result.value);
+    try testing.expectEqual(@as(usize, 2), result.new_pos);
 }

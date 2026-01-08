@@ -462,13 +462,50 @@ Multiple EXTENDED_ARG can chain for larger values.
 4. Each block runs from start to next boundary
 
 ### Exception Table (3.11+)
-Format: Variable-length entries
+
+The exception table maps bytecode ranges to exception handlers. Format uses 7-bit varint encoding.
+
+**Entry Fields:**
+- start: inclusive start offset
+- size: end - start (exclusive end is start + size)
+- target: handler bytecode offset
+- depth_lasti: combined value of (depth << 1) | lasti
+
+**Byte Format:** `SXdddddd`
+- S (bit 7): Start of entry marker (1 = new entry)
+- X (bit 6): Extend flag (1 = next byte continues this value)
+- d (bits 0-5): 6 bits of data
+
+**Decoding:**
 ```
-start:  varint (relative offset)
-end:    varint (relative offset)
-target: varint (handler offset)
-depth:  varint (stack depth + lasti flag)
+pos = 0
+while pos < len(exceptiontable):
+    # Start byte must have S=1
+    start, pos = read_varint7(exceptiontable, pos)
+    size, pos = read_varint7(exceptiontable, pos)
+    target, pos = read_varint7(exceptiontable, pos)
+    depth_lasti, pos = read_varint7(exceptiontable, pos)
+
+    end = start + size
+    lasti = depth_lasti & 1
+    depth = depth_lasti >> 1
+    yield (start, end, target, depth, lasti)
+
+def read_varint7(data, pos):
+    result = 0
+    shift = 0
+    while pos < len(data):
+        byte = data[pos]
+        pos += 1
+        result |= (byte & 0x3F) << shift  # 6 data bits
+        if not (byte & 0x40):  # X bit not set = last byte
+            break
+        shift += 6
+    return result, pos
 ```
+
+**Sources:**
+- [CPython InternalDocs/exception_handling.md](https://github.com/python/cpython/blob/main/InternalDocs/exception_handling.md)
 
 ---
 
