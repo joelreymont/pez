@@ -426,6 +426,216 @@ pub const SimContext = struct {
                 }
             },
 
+            // Stack manipulation opcodes
+            .DUP_TOP => {
+                // DUP_TOP - duplicate top of stack
+                const top = self.stack.peek() orelse return error.StackUnderflow;
+                if (top == .expr) {
+                    // Create a copy of the expression name (for Name exprs) or push unknown
+                    // For simplicity, push a reference to the same expression
+                    try self.stack.push(top);
+                } else {
+                    try self.stack.push(top);
+                }
+            },
+
+            .SWAP => {
+                // SWAP i - swap TOS with stack item at position i
+                if (inst.arg < 2) return error.InvalidSwapArg;
+                const pos = inst.arg - 1;
+                if (pos >= self.stack.items.items.len) return error.StackUnderflow;
+                const top_idx = self.stack.items.items.len - 1;
+                const swap_idx = self.stack.items.items.len - 1 - pos;
+                const tmp = self.stack.items.items[top_idx];
+                self.stack.items.items[top_idx] = self.stack.items.items[swap_idx];
+                self.stack.items.items[swap_idx] = tmp;
+            },
+
+            .COPY => {
+                // COPY i - copy stack item at position i to TOS
+                const pos = inst.arg;
+                if (pos < 1 or pos > self.stack.items.items.len) return error.StackUnderflow;
+                const copy_idx = self.stack.items.items.len - pos;
+                const val = self.stack.items.items[copy_idx];
+                try self.stack.push(val);
+            },
+
+            // Unary operators
+            .UNARY_NEGATIVE => {
+                const operand = self.stack.popExpr() orelse return error.StackUnderflow;
+                const expr = try ast.makeUnaryOp(self.allocator, .usub, operand);
+                try self.stack.push(.{ .expr = expr });
+            },
+
+            .UNARY_NOT => {
+                const operand = self.stack.popExpr() orelse return error.StackUnderflow;
+                const expr = try ast.makeUnaryOp(self.allocator, .not_, operand);
+                try self.stack.push(.{ .expr = expr });
+            },
+
+            .UNARY_INVERT => {
+                const operand = self.stack.popExpr() orelse return error.StackUnderflow;
+                const expr = try ast.makeUnaryOp(self.allocator, .invert, operand);
+                try self.stack.push(.{ .expr = expr });
+            },
+
+            // Iterator opcodes
+            .GET_ITER => {
+                // GET_ITER - get an iterator from TOS, leave iterator on stack
+                // The expression stays on the stack conceptually as an iterator
+                // In decompilation, we track what's being iterated over
+            },
+
+            .FOR_ITER => {
+                // FOR_ITER delta - get next value from iterator
+                // On exhaustion, jumps forward by delta
+                // For now, just push unknown for the iteration value
+                try self.stack.push(.unknown);
+            },
+
+            // Import opcodes
+            .IMPORT_NAME => {
+                // IMPORT_NAME namei - imports module names[namei]
+                // Stack: fromlist, level -> module
+                _ = self.stack.pop(); // level
+                _ = self.stack.pop(); // fromlist
+                if (self.getName(inst.arg)) |name| {
+                    const expr = try ast.makeName(self.allocator, name, .load);
+                    try self.stack.push(.{ .expr = expr });
+                } else {
+                    try self.stack.push(.unknown);
+                }
+            },
+
+            .IMPORT_FROM => {
+                // IMPORT_FROM namei - load attribute names[namei] from module on TOS
+                // Stack: module -> module, attr
+                // Module stays on stack, attr is pushed
+                if (self.getName(inst.arg)) |name| {
+                    const expr = try ast.makeName(self.allocator, name, .load);
+                    try self.stack.push(.{ .expr = expr });
+                } else {
+                    try self.stack.push(.unknown);
+                }
+            },
+
+            // Attribute access
+            .LOAD_ATTR => {
+                // LOAD_ATTR namei - replace TOS with TOS.names[namei]
+                const obj = self.stack.popExpr() orelse return error.StackUnderflow;
+                if (self.getName(inst.arg >> 1)) |attr_name| {
+                    const attr = try ast.makeAttribute(self.allocator, obj, attr_name, .load);
+                    try self.stack.push(.{ .expr = attr });
+                } else {
+                    obj.deinit(self.allocator);
+                    self.allocator.destroy(obj);
+                    try self.stack.push(.unknown);
+                }
+            },
+
+            .STORE_ATTR => {
+                // STORE_ATTR namei - TOS.names[namei] = TOS1
+                // Stack: obj, value -> (empty)
+                if (self.stack.pop()) |v| {
+                    var val = v;
+                    val.deinit(self.allocator);
+                }
+                if (self.stack.pop()) |v| {
+                    var val = v;
+                    val.deinit(self.allocator);
+                }
+            },
+
+            // Subscript operations
+            .BINARY_SUBSCR => {
+                // BINARY_SUBSCR - TOS = TOS1[TOS]
+                const index = self.stack.popExpr() orelse return error.StackUnderflow;
+                const container = self.stack.popExpr() orelse {
+                    index.deinit(self.allocator);
+                    self.allocator.destroy(index);
+                    return error.StackUnderflow;
+                };
+                const expr = try ast.makeSubscript(self.allocator, container, index, .load);
+                try self.stack.push(.{ .expr = expr });
+            },
+
+            .STORE_SUBSCR => {
+                // STORE_SUBSCR - TOS1[TOS] = TOS2
+                // Stack: key, container, value -> (empty)
+                if (self.stack.pop()) |v| {
+                    var val = v;
+                    val.deinit(self.allocator);
+                }
+                if (self.stack.pop()) |v| {
+                    var val = v;
+                    val.deinit(self.allocator);
+                }
+                if (self.stack.pop()) |v| {
+                    var val = v;
+                    val.deinit(self.allocator);
+                }
+            },
+
+            // Dict operations
+            .BUILD_MAP => {
+                // BUILD_MAP count - create a dict from count key/value pairs
+                const count = inst.arg;
+                const expr = try self.allocator.create(Expr);
+
+                if (count == 0) {
+                    expr.* = .{ .dict = .{ .keys = &.{}, .values = &.{} } };
+                } else {
+                    const keys = try self.allocator.alloc(?*Expr, count);
+                    const values = try self.allocator.alloc(*Expr, count);
+
+                    var i: usize = 0;
+                    while (i < count) : (i += 1) {
+                        const val = self.stack.popExpr() orelse {
+                            // Clean up already allocated
+                            var j: usize = 0;
+                            while (j < i) : (j += 1) {
+                                if (keys[j]) |k| {
+                                    k.deinit(self.allocator);
+                                    self.allocator.destroy(k);
+                                }
+                                values[j].deinit(self.allocator);
+                                self.allocator.destroy(values[j]);
+                            }
+                            self.allocator.free(keys);
+                            self.allocator.free(values);
+                            self.allocator.destroy(expr);
+                            return error.StackUnderflow;
+                        };
+                        const key = self.stack.popExpr();
+                        keys[count - 1 - i] = key;
+                        values[count - 1 - i] = val;
+                    }
+                    expr.* = .{ .dict = .{ .keys = keys, .values = values } };
+                }
+                try self.stack.push(.{ .expr = expr });
+            },
+
+            // Slice operations
+            .BUILD_SLICE => {
+                // BUILD_SLICE argc - build slice from argc elements
+                // argc=2: TOS1:TOS, argc=3: TOS2:TOS1:TOS
+                const argc = inst.arg;
+                var step: ?*Expr = null;
+                if (argc == 3) {
+                    step = self.stack.popExpr();
+                }
+                const stop = self.stack.popExpr();
+                const start = self.stack.popExpr();
+
+                const expr = try self.allocator.create(Expr);
+                expr.* = .{ .slice = .{
+                    .lower = start,
+                    .upper = stop,
+                    .step = step,
+                } };
+                try self.stack.push(.{ .expr = expr });
+            },
+
             else => {
                 // Unhandled opcode - push unknown for each value it would produce
                 // For now, just push unknown

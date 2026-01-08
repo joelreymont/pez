@@ -680,6 +680,13 @@ pub fn makeSubscript(allocator: Allocator, value: *Expr, slice_expr: *Expr, ctx:
     return expr;
 }
 
+/// Create a unary operation expression.
+pub fn makeUnaryOp(allocator: Allocator, op: UnaryOp, operand: *Expr) !*Expr {
+    const expr = try allocator.create(Expr);
+    expr.* = .{ .unary_op = .{ .op = op, .operand = operand } };
+    return expr;
+}
+
 test "ast create name" {
     const testing = std.testing;
     const allocator = testing.allocator;
