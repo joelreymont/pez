@@ -757,6 +757,106 @@ pub const SimContext = struct {
                 try self.stack.push(.unknown);
             },
 
+            // Comprehension opcodes
+            .LIST_APPEND => {
+                // LIST_APPEND i - append TOS to list at stack[i]
+                // Used in list comprehensions
+                // Stack: ..., list, ..., item -> ..., list, ...
+                if (self.stack.pop()) |v| {
+                    var val = v;
+                    val.deinit(self.allocator);
+                }
+            },
+
+            .SET_ADD => {
+                // SET_ADD i - add TOS to set at stack[i]
+                // Used in set comprehensions
+                if (self.stack.pop()) |v| {
+                    var val = v;
+                    val.deinit(self.allocator);
+                }
+            },
+
+            .MAP_ADD => {
+                // MAP_ADD i - add TOS1:TOS to dict at stack[i]
+                // Used in dict comprehensions
+                // Stack: ..., dict, ..., key, value -> ..., dict, ...
+                if (self.stack.pop()) |v| {
+                    var val = v;
+                    val.deinit(self.allocator);
+                }
+                if (self.stack.pop()) |v| {
+                    var val = v;
+                    val.deinit(self.allocator);
+                }
+            },
+
+            .LIST_EXTEND => {
+                // LIST_EXTEND i - extend list at stack[i] with TOS
+                // Used for [*items] unpacking
+                if (self.stack.pop()) |v| {
+                    var val = v;
+                    val.deinit(self.allocator);
+                }
+            },
+
+            .SET_UPDATE => {
+                // SET_UPDATE i - update set at stack[i] with TOS
+                if (self.stack.pop()) |v| {
+                    var val = v;
+                    val.deinit(self.allocator);
+                }
+            },
+
+            .DICT_UPDATE => {
+                // DICT_UPDATE i - update dict at stack[i] with TOS
+                if (self.stack.pop()) |v| {
+                    var val = v;
+                    val.deinit(self.allocator);
+                }
+            },
+
+            .DICT_MERGE => {
+                // DICT_MERGE i - merge TOS into dict at stack[i]
+                if (self.stack.pop()) |v| {
+                    var val = v;
+                    val.deinit(self.allocator);
+                }
+            },
+
+            // Await expression
+            .GET_AWAITABLE => {
+                // GET_AWAITABLE - get awaitable from TOS
+                // Leaves awaitable on stack
+            },
+
+            .END_ASYNC_FOR => {
+                // END_ASYNC_FOR - cleanup after async for loop
+            },
+
+            // Unpacking
+            .UNPACK_SEQUENCE => {
+                // UNPACK_SEQUENCE count - unpack TOS into count values
+                const count = inst.arg;
+                _ = self.stack.pop();
+                var i: u32 = 0;
+                while (i < count) : (i += 1) {
+                    try self.stack.push(.unknown);
+                }
+            },
+
+            .UNPACK_EX => {
+                // UNPACK_EX - unpack with *rest
+                // Low byte: before star, high byte: after star
+                const before = inst.arg & 0xFF;
+                const after = (inst.arg >> 8) & 0xFF;
+                _ = self.stack.pop();
+                var i: u32 = 0;
+                while (i < before + 1 + after) : (i += 1) {
+                    try self.stack.push(.unknown);
+                }
+            },
+
             else => {
                 // Unhandled opcode - push unknown for each value it would produce
                 // For now, just push unknown
