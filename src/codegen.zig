@@ -670,3 +670,417 @@ test "codegen string escaping" {
 
     try testing.expectEqualStrings("\"hello\\nworld\"", output);
 }
+
+// ============================================================================
+// AST Debug Pretty Printer
+// ============================================================================
+
+/// Debug printer that shows AST structure with indentation.
+pub const DebugPrinter = struct {
+    indent_level: u32 = 0,
+    indent_str: []const u8 = "  ",
+
+    /// Print an expression tree to a writer.
+    pub fn printExpr(self: *DebugPrinter, w: anytype, expr: *const Expr) !void {
+        try self.writeIndent(w);
+        switch (expr.*) {
+            .constant => |c| {
+                try w.writeAll("Constant(");
+                try self.printConstant(w, c);
+                try w.writeAll(")\n");
+            },
+            .name => |n| {
+                try w.print("Name(\"{s}\", {s})\n", .{ n.id, @tagName(n.ctx) });
+            },
+            .bin_op => |b| {
+                try w.print("BinOp({s})\n", .{b.op.symbol()});
+                self.indent_level += 1;
+                try self.printExpr(w, b.left);
+                try self.printExpr(w, b.right);
+                self.indent_level -= 1;
+            },
+            .unary_op => |u| {
+                try w.print("UnaryOp({s})\n", .{@tagName(u.op)});
+                self.indent_level += 1;
+                try self.printExpr(w, u.operand);
+                self.indent_level -= 1;
+            },
+            .compare => |c| {
+                try w.writeAll("Compare(");
+                for (c.ops, 0..) |op, i| {
+                    if (i > 0) try w.writeAll(", ");
+                    try w.writeAll(op.symbol());
+                }
+                try w.writeAll(")\n");
+                self.indent_level += 1;
+                try self.printExpr(w, c.left);
+                for (c.comparators) |cmp| {
+                    try self.printExpr(w, cmp);
+                }
+                self.indent_level -= 1;
+            },
+            .bool_op => |b| {
+                try w.print("BoolOp({s})\n", .{b.op.symbol()});
+                self.indent_level += 1;
+                for (b.values) |v| {
+                    try self.printExpr(w, v);
+                }
+                self.indent_level -= 1;
+            },
+            .call => |c| {
+                try w.print("Call(argc={d})\n", .{c.args.len});
+                self.indent_level += 1;
+                try self.writeIndent(w);
+                try w.writeAll("func:\n");
+                self.indent_level += 1;
+                try self.printExpr(w, c.func);
+                self.indent_level -= 1;
+                if (c.args.len > 0) {
+                    try self.writeIndent(w);
+                    try w.writeAll("args:\n");
+                    self.indent_level += 1;
+                    for (c.args) |arg| {
+                        try self.printExpr(w, arg);
+                    }
+                    self.indent_level -= 1;
+                }
+                self.indent_level -= 1;
+            },
+            .attribute => |a| {
+                try w.print("Attribute(\"{s}\", {s})\n", .{ a.attr, @tagName(a.ctx) });
+                self.indent_level += 1;
+                try self.printExpr(w, a.value);
+                self.indent_level -= 1;
+            },
+            .subscript => |s| {
+                try w.print("Subscript({s})\n", .{@tagName(s.ctx)});
+                self.indent_level += 1;
+                try self.writeIndent(w);
+                try w.writeAll("value:\n");
+                self.indent_level += 1;
+                try self.printExpr(w, s.value);
+                self.indent_level -= 1;
+                try self.writeIndent(w);
+                try w.writeAll("slice:\n");
+                self.indent_level += 1;
+                try self.printExpr(w, s.slice);
+                self.indent_level -= 1;
+                self.indent_level -= 1;
+            },
+            .list => |l| {
+                try w.print("List(len={d})\n", .{l.elts.len});
+                self.indent_level += 1;
+                for (l.elts) |e| {
+                    try self.printExpr(w, e);
+                }
+                self.indent_level -= 1;
+            },
+            .tuple => |t| {
+                try w.print("Tuple(len={d})\n", .{t.elts.len});
+                self.indent_level += 1;
+                for (t.elts) |e| {
+                    try self.printExpr(w, e);
+                }
+                self.indent_level -= 1;
+            },
+            .set => |s| {
+                try w.print("Set(len={d})\n", .{s.elts.len});
+                self.indent_level += 1;
+                for (s.elts) |e| {
+                    try self.printExpr(w, e);
+                }
+                self.indent_level -= 1;
+            },
+            .dict => |d| {
+                try w.print("Dict(len={d})\n", .{d.keys.len});
+                self.indent_level += 1;
+                for (d.keys, d.values) |k, v| {
+                    try self.writeIndent(w);
+                    if (k) |key| {
+                        try w.writeAll("key:\n");
+                        self.indent_level += 1;
+                        try self.printExpr(w, key);
+                        self.indent_level -= 1;
+                    } else {
+                        try w.writeAll("**spread\n");
+                    }
+                    try self.writeIndent(w);
+                    try w.writeAll("value:\n");
+                    self.indent_level += 1;
+                    try self.printExpr(w, v);
+                    self.indent_level -= 1;
+                }
+                self.indent_level -= 1;
+            },
+            .if_exp => |i| {
+                try w.writeAll("IfExp\n");
+                self.indent_level += 1;
+                try self.writeIndent(w);
+                try w.writeAll("condition:\n");
+                self.indent_level += 1;
+                try self.printExpr(w, i.condition);
+                self.indent_level -= 1;
+                try self.writeIndent(w);
+                try w.writeAll("body:\n");
+                self.indent_level += 1;
+                try self.printExpr(w, i.body);
+                self.indent_level -= 1;
+                try self.writeIndent(w);
+                try w.writeAll("else:\n");
+                self.indent_level += 1;
+                try self.printExpr(w, i.else_body);
+                self.indent_level -= 1;
+                self.indent_level -= 1;
+            },
+            .slice => |s| {
+                try w.writeAll("Slice\n");
+                self.indent_level += 1;
+                if (s.lower) |l| {
+                    try self.writeIndent(w);
+                    try w.writeAll("lower:\n");
+                    self.indent_level += 1;
+                    try self.printExpr(w, l);
+                    self.indent_level -= 1;
+                }
+                if (s.upper) |u| {
+                    try self.writeIndent(w);
+                    try w.writeAll("upper:\n");
+                    self.indent_level += 1;
+                    try self.printExpr(w, u);
+                    self.indent_level -= 1;
+                }
+                if (s.step) |step| {
+                    try self.writeIndent(w);
+                    try w.writeAll("step:\n");
+                    self.indent_level += 1;
+                    try self.printExpr(w, step);
+                    self.indent_level -= 1;
+                }
+                self.indent_level -= 1;
+            },
+            .lambda => |l| {
+                try w.writeAll("Lambda\n");
+                self.indent_level += 1;
+                try self.writeIndent(w);
+                try w.writeAll("body:\n");
+                self.indent_level += 1;
+                try self.printExpr(w, l.body);
+                self.indent_level -= 1;
+                self.indent_level -= 1;
+            },
+            .await_expr => |a| {
+                try w.writeAll("Await\n");
+                self.indent_level += 1;
+                try self.printExpr(w, a.value);
+                self.indent_level -= 1;
+            },
+            .yield_expr => |y| {
+                try w.writeAll("Yield\n");
+                if (y.value) |v| {
+                    self.indent_level += 1;
+                    try self.printExpr(w, v);
+                    self.indent_level -= 1;
+                }
+            },
+            .yield_from => |y| {
+                try w.writeAll("YieldFrom\n");
+                self.indent_level += 1;
+                try self.printExpr(w, y.value);
+                self.indent_level -= 1;
+            },
+            .starred => |s| {
+                try w.writeAll("Starred\n");
+                self.indent_level += 1;
+                try self.printExpr(w, s.value);
+                self.indent_level -= 1;
+            },
+            else => {
+                try w.print("<{s}>\n", .{@tagName(expr.*)});
+            },
+        }
+    }
+
+    fn printConstant(self: *DebugPrinter, w: anytype, c: Constant) !void {
+        _ = self;
+        switch (c) {
+            .none => try w.writeAll("None"),
+            .true_ => try w.writeAll("True"),
+            .false_ => try w.writeAll("False"),
+            .ellipsis => try w.writeAll("..."),
+            .int => |v| try w.print("{d}", .{v}),
+            .float => |v| try w.print("{d}", .{v}),
+            .complex => |v| try w.print("{d}+{d}j", .{ v.real, v.imag }),
+            .string => |s| try w.print("\"{s}\"", .{s}),
+            .bytes => |b| try w.print("b\"{s}\"", .{b}),
+        }
+    }
+
+    fn writeIndent(self: *DebugPrinter, w: anytype) !void {
+        var i: u32 = 0;
+        while (i < self.indent_level) : (i += 1) {
+            try w.writeAll(self.indent_str);
+        }
+    }
+
+    /// Print a statement tree to a writer.
+    pub fn printStmt(self: *DebugPrinter, w: anytype, stmt: *const Stmt) !void {
+        try self.writeIndent(w);
+        switch (stmt.*) {
+            .expr_stmt => |e| {
+                try w.writeAll("ExprStmt\n");
+                self.indent_level += 1;
+                try self.printExpr(w, e.value);
+                self.indent_level -= 1;
+            },
+            .return_stmt => |r| {
+                try w.writeAll("Return\n");
+                if (r.value) |v| {
+                    self.indent_level += 1;
+                    try self.printExpr(w, v);
+                    self.indent_level -= 1;
+                }
+            },
+            .assign => |a| {
+                try w.print("Assign(targets={d})\n", .{a.targets.len});
+                self.indent_level += 1;
+                for (a.targets) |t| {
+                    try self.printExpr(w, t);
+                }
+                try self.writeIndent(w);
+                try w.writeAll("value:\n");
+                self.indent_level += 1;
+                try self.printExpr(w, a.value);
+                self.indent_level -= 1;
+                self.indent_level -= 1;
+            },
+            .if_stmt => |i| {
+                try w.writeAll("If\n");
+                self.indent_level += 1;
+                try self.writeIndent(w);
+                try w.writeAll("condition:\n");
+                self.indent_level += 1;
+                try self.printExpr(w, i.condition);
+                self.indent_level -= 1;
+                try self.writeIndent(w);
+                try w.print("body({d}):\n", .{i.body.len});
+                self.indent_level += 1;
+                for (i.body) |s| {
+                    try self.printStmt(w, s);
+                }
+                self.indent_level -= 1;
+                if (i.else_body.len > 0) {
+                    try self.writeIndent(w);
+                    try w.print("else({d}):\n", .{i.else_body.len});
+                    self.indent_level += 1;
+                    for (i.else_body) |s| {
+                        try self.printStmt(w, s);
+                    }
+                    self.indent_level -= 1;
+                }
+                self.indent_level -= 1;
+            },
+            .while_stmt => |ws| {
+                try w.writeAll("While\n");
+                self.indent_level += 1;
+                try self.writeIndent(w);
+                try w.writeAll("condition:\n");
+                self.indent_level += 1;
+                try self.printExpr(w, ws.condition);
+                self.indent_level -= 1;
+                try self.writeIndent(w);
+                try w.print("body({d}):\n", .{ws.body.len});
+                self.indent_level += 1;
+                for (ws.body) |s| {
+                    try self.printStmt(w, s);
+                }
+                self.indent_level -= 1;
+                self.indent_level -= 1;
+            },
+            .for_stmt => |f| {
+                if (f.is_async) {
+                    try w.writeAll("AsyncFor\n");
+                } else {
+                    try w.writeAll("For\n");
+                }
+                self.indent_level += 1;
+                try self.writeIndent(w);
+                try w.writeAll("target:\n");
+                self.indent_level += 1;
+                try self.printExpr(w, f.target);
+                self.indent_level -= 1;
+                try self.writeIndent(w);
+                try w.writeAll("iter:\n");
+                self.indent_level += 1;
+                try self.printExpr(w, f.iter);
+                self.indent_level -= 1;
+                try self.writeIndent(w);
+                try w.print("body({d}):\n", .{f.body.len});
+                self.indent_level += 1;
+                for (f.body) |s| {
+                    try self.printStmt(w, s);
+                }
+                self.indent_level -= 1;
+                self.indent_level -= 1;
+            },
+            .function_def => |f| {
+                if (f.is_async) {
+                    try w.print("AsyncFunctionDef(\"{s}\")\n", .{f.name});
+                } else {
+                    try w.print("FunctionDef(\"{s}\")\n", .{f.name});
+                }
+                self.indent_level += 1;
+                try self.writeIndent(w);
+                try w.print("body({d}):\n", .{f.body.len});
+                self.indent_level += 1;
+                for (f.body) |s| {
+                    try self.printStmt(w, s);
+                }
+                self.indent_level -= 1;
+                self.indent_level -= 1;
+            },
+            .class_def => |c| {
+                try w.print("ClassDef(\"{s}\")\n", .{c.name});
+                self.indent_level += 1;
+                try self.writeIndent(w);
+                try w.print("body({d}):\n", .{c.body.len});
+                self.indent_level += 1;
+                for (c.body) |s| {
+                    try self.printStmt(w, s);
+                }
+                self.indent_level -= 1;
+                self.indent_level -= 1;
+            },
+            .pass => try w.writeAll("Pass\n"),
+            .break_stmt => try w.writeAll("Break\n"),
+            .continue_stmt => try w.writeAll("Continue\n"),
+            else => try w.print("<{s}>\n", .{@tagName(stmt.*)}),
+        }
+    }
+};
+
+test "debug printer expr" {
+    const testing = std.testing;
+    const allocator = testing.allocator;
+
+    var buf: std.ArrayList(u8) = .{};
+    defer buf.deinit(allocator);
+
+    const left = try ast.makeConstant(allocator, .{ .int = 1 });
+    const right = try ast.makeConstant(allocator, .{ .int = 2 });
+    const binop = try ast.makeBinOp(allocator, left, .add, right);
+    defer {
+        @constCast(binop).deinit(allocator);
+        allocator.destroy(binop);
+    }
+
+    var printer = DebugPrinter{};
+    try printer.printExpr(buf.writer(allocator), binop);
+
+    const expected =
+        \\BinOp(+)
+        \\  Constant(1)
+        \\  Constant(2)
+        \\
+    ;
+    try testing.expectEqualStrings(expected, buf.items);
+}
