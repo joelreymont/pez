@@ -6,6 +6,7 @@
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 const ast = @import("ast.zig");
+const codegen = @import("codegen.zig");
 const decoder = @import("decoder.zig");
 const opcodes = @import("opcodes.zig");
 const pyc = @import("pyc.zig");
@@ -15,14 +16,150 @@ pub const Instruction = decoder.Instruction;
 pub const Opcode = opcodes.Opcode;
 pub const Version = opcodes.Version;
 
+pub const SimError = Allocator.Error || error{
+    StackUnderflow,
+    NotAnExpression,
+    InvalidSwapArg,
+    InvalidDupArg,
+    InvalidComprehension,
+    InvalidConstant,
+    InvalidLambdaBody,
+    InvalidStackDepth,
+    UnsupportedConstant,
+};
+
+pub const FunctionValue = struct {
+    code: *const pyc.Code,
+    decorators: std.ArrayList(*Expr),
+
+    pub fn deinit(self: *FunctionValue, allocator: Allocator) void {
+        for (self.decorators.items) |decorator| {
+            decorator.deinit(allocator);
+            allocator.destroy(decorator);
+        }
+        self.decorators.deinit(allocator);
+        allocator.destroy(self);
+    }
+};
+
+pub const ClassValue = struct {
+    code: *const pyc.Code,
+    name: []const u8,
+    bases: []const *Expr,
+    decorators: std.ArrayList(*Expr),
+
+    pub fn deinit(self: *ClassValue, allocator: Allocator) void {
+        if (self.name.len > 0) allocator.free(self.name);
+        for (self.bases) |base| {
+            @constCast(base).deinit(allocator);
+            allocator.destroy(base);
+        }
+        if (self.bases.len > 0) allocator.free(self.bases);
+        for (self.decorators.items) |decorator| {
+            decorator.deinit(allocator);
+            allocator.destroy(decorator);
+        }
+        self.decorators.deinit(allocator);
+        allocator.destroy(self);
+    }
+};
+
+const CompKind = enum {
+    list,
+    set,
+    dict,
+    genexpr,
+};
+
+const CompObject = struct {
+    code: *const pyc.Code,
+    kind: CompKind,
+};
+
+const PendingComp = struct {
+    target: ?*Expr,
+    iter: ?*Expr,
+    ifs: std.ArrayList(*Expr),
+    is_async: bool,
+
+    fn deinit(self: *PendingComp, allocator: Allocator) void {
+        if (self.target) |target| {
+            target.deinit(allocator);
+            allocator.destroy(target);
+        }
+        if (self.iter) |iter_expr| {
+            iter_expr.deinit(allocator);
+            allocator.destroy(iter_expr);
+        }
+        for (self.ifs.items) |cond| {
+            cond.deinit(allocator);
+            allocator.destroy(cond);
+        }
+        self.ifs.deinit(allocator);
+    }
+};
+
+const CompBuilder = struct {
+    kind: CompKind,
+    generators: std.ArrayList(PendingComp),
+    loop_stack: std.ArrayList(usize),
+    elt: ?*Expr,
+    key: ?*Expr,
+    value: ?*Expr,
+    seen_append: bool,
+
+    fn init(kind: CompKind) CompBuilder {
+        return .{
+            .kind = kind,
+            .generators = .{},
+            .loop_stack = .{},
+            .elt = null,
+            .key = null,
+            .value = null,
+            .seen_append = false,
+        };
+    }
+
+    fn deinit(self: *CompBuilder, allocator: Allocator) void {
+        for (self.generators.items) |*gen| {
+            gen.deinit(allocator);
+        }
+        self.generators.deinit(allocator);
+        self.loop_stack.deinit(allocator);
+        if (self.elt) |elt| {
+            elt.deinit(allocator);
+            allocator.destroy(elt);
+        }
+        if (self.key) |key| {
+            key.deinit(allocator);
+            allocator.destroy(key);
+        }
+        if (self.value) |value| {
+            value.deinit(allocator);
+            allocator.destroy(value);
+        }
+        allocator.destroy(self);
+    }
+};
+
 /// A value on the simulated stack.
 pub const StackValue = union(enum) {
     /// An AST expression.
     expr: *Expr,
+    /// A function object with code and decorators.
+    function_obj: *FunctionValue,
+    /// A class object with code, bases, and decorators.
+    class_obj: *ClassValue,
+    /// A comprehension builder for inline comprehensions.
+    comp_builder: *CompBuilder,
+    /// A comprehension code object (list/set/dict/genexpr).
+    comp_obj: CompObject,
     /// A code object constant (non-owning).
     code_obj: *const pyc.Code,
     /// A NULL marker (for PUSH_NULL).
     null_marker,
+    /// A saved local (for LOAD_FAST_AND_CLEAR).
+    saved_local: []const u8,
     /// Unknown/untracked value.
     unknown,
 
@@ -32,6 +169,9 @@ pub const StackValue = union(enum) {
                 e.deinit(allocator);
                 allocator.destroy(e);
             },
+            .function_obj => |f| f.deinit(allocator),
+            .class_obj => |c| c.deinit(allocator),
+            .comp_builder => |b| b.deinit(allocator),
             else => {},
         }
     }
@@ -64,11 +204,15 @@ pub const Stack = struct {
         return self.items.pop();
     }
 
-    pub fn popExpr(self: *Stack) ?*Expr {
-        const val = self.pop() orelse return null;
+    pub fn popExpr(self: *Stack) !*Expr {
+        const val = self.pop() orelse return error.StackUnderflow;
         return switch (val) {
             .expr => |e| e,
-            else => null,
+            else => {
+                var tmp = val;
+                tmp.deinit(self.allocator);
+                return error.NotAnExpression;
+            },
         };
     }
 
@@ -95,33 +239,48 @@ pub const Stack = struct {
     /// Pop n expressions in reverse order.
     pub fn popNExprs(self: *Stack, n: usize) ![]const *Expr {
         const values = try self.popN(n);
-        defer self.allocator.free(values);
+        return self.valuesToExprs(values);
+    }
 
-        const exprs = try self.allocator.alloc(*Expr, n);
+    pub fn valuesToExprs(self: *Stack, values: []StackValue) ![]const *Expr {
+        const exprs = try self.allocator.alloc(*Expr, values.len);
+        errdefer {
+            for (values) |*val| {
+                val.deinit(self.allocator);
+            }
+            if (values.len > 0) self.allocator.free(values);
+            self.allocator.free(exprs);
+        }
+
         for (values, 0..) |v, i| {
             exprs[i] = switch (v) {
                 .expr => |e| e,
-                else => {
-                    for (values) |*val| {
-                        val.deinit(self.allocator);
-                    }
-                    self.allocator.free(exprs);
-                    return error.NotAnExpression;
-                },
+                else => return error.NotAnExpression,
             };
         }
+
+        self.allocator.free(values);
         return exprs;
     }
 };
 
 /// Context for stack simulation.
 pub const SimContext = struct {
+    pub const IterOverride = struct {
+        index: u32,
+        expr: ?*Expr,
+    };
+
     allocator: Allocator,
     version: Version,
     /// Code object being simulated.
     code: *const pyc.Code,
     /// Current stack state.
     stack: Stack,
+    /// Override for iterator locals (used for genexpr/listcomp code objects).
+    iter_override: ?IterOverride = null,
+    /// Optional comprehension builder not stored on the stack.
+    comp_builder: ?*CompBuilder = null,
 
     pub fn init(allocator: Allocator, code: *const pyc.Code, version: Version) SimContext {
         return .{
@@ -129,11 +288,19 @@ pub const SimContext = struct {
             .version = version,
             .code = code,
             .stack = Stack.init(allocator),
+            .iter_override = null,
+            .comp_builder = null,
         };
     }
 
     pub fn deinit(self: *SimContext) void {
         self.stack.deinit();
+        if (self.iter_override) |ov| {
+            if (ov.expr) |expr| {
+                expr.deinit(self.allocator);
+                self.allocator.destroy(expr);
+            }
+        }
     }
 
     /// Get a name from the code object's names tuple.
@@ -285,20 +452,433 @@ pub const SimContext = struct {
         return qualname;
     }
 
+    fn isBuildClass(self: *SimContext, callee: *const Expr) bool {
+        _ = self;
+        return switch (callee.*) {
+            .name => |n| std.mem.eql(u8, n.id, "__build_class__"),
+            else => false,
+        };
+    }
+
+    fn buildClassValue(self: *SimContext, callee_expr: *Expr, args_vals: []StackValue) !bool {
+        if (args_vals.len < 2) return false;
+
+        const func = switch (args_vals[0]) {
+            .function_obj => |f| f,
+            else => return false,
+        };
+
+        const name_expr = switch (args_vals[1]) {
+            .expr => |e| e,
+            else => return false,
+        };
+
+        const name_value = if (name_expr.* == .constant) name_expr.constant else return false;
+        const name = switch (name_value) {
+            .string => |s| s,
+            else => return false,
+        };
+
+        for (args_vals[2..]) |val| {
+            if (val != .expr) return false;
+        }
+
+        var bases: []const *Expr = &.{};
+        if (args_vals.len > 2) {
+            var bases_mut = try self.allocator.alloc(*Expr, args_vals.len - 2);
+            errdefer if (bases_mut.len > 0) self.allocator.free(bases_mut);
+            for (args_vals[2..], 0..) |val, idx| {
+                bases_mut[idx] = val.expr;
+            }
+            bases = bases_mut;
+        }
+
+        const name_copy = try self.allocator.dupe(u8, name);
+        errdefer self.allocator.free(name_copy);
+
+        const cls = try self.allocator.create(ClassValue);
+        cls.* = .{
+            .code = func.code,
+            .name = name_copy,
+            .bases = bases,
+            .decorators = .{},
+        };
+
+        func.deinit(self.allocator);
+        name_expr.deinit(self.allocator);
+        self.allocator.destroy(name_expr);
+        callee_expr.deinit(self.allocator);
+        self.allocator.destroy(callee_expr);
+        self.allocator.free(args_vals);
+
+        try self.stack.push(.{ .class_obj = cls });
+        return true;
+    }
+
     fn cloneStackValue(self: *SimContext, value: StackValue) !StackValue {
         return switch (value) {
             .expr => |e| .{ .expr = try ast.cloneExpr(self.allocator, e) },
+            .function_obj => |func| .{ .function_obj = try self.cloneFunctionValue(func) },
+            .class_obj => |cls| .{ .class_obj = try self.cloneClassValue(cls) },
+            .comp_builder => |builder| .{ .comp_builder = try self.cloneCompBuilder(builder) },
+            .comp_obj => |comp| .{ .comp_obj = comp },
             .code_obj => |code| .{ .code_obj = code },
             .null_marker => .null_marker,
+            .saved_local => |name| .{ .saved_local = name },
             .unknown => .unknown,
         };
     }
 
+    fn cloneFunctionValue(self: *SimContext, func: *const FunctionValue) !*FunctionValue {
+        const copy = try self.allocator.create(FunctionValue);
+        errdefer self.allocator.destroy(copy);
+
+        copy.* = .{
+            .code = func.code,
+            .decorators = .{},
+        };
+
+        if (func.decorators.items.len > 0) {
+            try copy.decorators.ensureTotalCapacity(self.allocator, func.decorators.items.len);
+            for (func.decorators.items) |decorator| {
+                try copy.decorators.append(self.allocator, try ast.cloneExpr(self.allocator, decorator));
+            }
+        }
+
+        return copy;
+    }
+
+    fn cloneClassValue(self: *SimContext, cls: *const ClassValue) !*ClassValue {
+        const copy = try self.allocator.create(ClassValue);
+        errdefer self.allocator.destroy(copy);
+
+        var bases: []const *Expr = &.{};
+        if (cls.bases.len > 0) {
+            var bases_mut = try self.allocator.alloc(*Expr, cls.bases.len);
+            var count: usize = 0;
+            errdefer {
+                var i: usize = 0;
+                while (i < count) : (i += 1) {
+                    bases_mut[i].deinit(self.allocator);
+                    self.allocator.destroy(bases_mut[i]);
+                }
+                self.allocator.free(bases_mut);
+            }
+
+            for (cls.bases, 0..) |base, idx| {
+                bases_mut[idx] = try ast.cloneExpr(self.allocator, base);
+                count += 1;
+            }
+            bases = bases_mut;
+        }
+
+        copy.* = .{
+            .code = cls.code,
+            .name = if (cls.name.len > 0) try self.allocator.dupe(u8, cls.name) else &.{},
+            .bases = bases,
+            .decorators = .{},
+        };
+
+        if (cls.decorators.items.len > 0) {
+            try copy.decorators.ensureTotalCapacity(self.allocator, cls.decorators.items.len);
+            for (cls.decorators.items) |decorator| {
+                try copy.decorators.append(self.allocator, try ast.cloneExpr(self.allocator, decorator));
+            }
+        }
+
+        return copy;
+    }
+
+    fn cloneCompBuilder(self: *SimContext, builder: *const CompBuilder) !*CompBuilder {
+        const copy = try self.allocator.create(CompBuilder);
+        errdefer copy.deinit(self.allocator);
+
+        copy.* = CompBuilder.init(builder.kind);
+        copy.seen_append = builder.seen_append;
+
+        if (builder.elt) |elt| {
+            copy.elt = try ast.cloneExpr(self.allocator, elt);
+        }
+        if (builder.key) |key| {
+            copy.key = try ast.cloneExpr(self.allocator, key);
+        }
+        if (builder.value) |value| {
+            copy.value = try ast.cloneExpr(self.allocator, value);
+        }
+
+        if (builder.generators.items.len > 0) {
+            try copy.generators.ensureTotalCapacity(self.allocator, builder.generators.items.len);
+            for (builder.generators.items) |gen| {
+                const iter_expr = gen.iter orelse return error.InvalidComprehension;
+                var gen_copy = PendingComp{
+                    .target = if (gen.target) |target| try ast.cloneExpr(self.allocator, target) else null,
+                    .iter = try ast.cloneExpr(self.allocator, iter_expr),
+                    .ifs = .{},
+                    .is_async = gen.is_async,
+                };
+                var appended = false;
+                errdefer if (!appended) gen_copy.deinit(self.allocator);
+
+                if (gen.ifs.items.len > 0) {
+                    try gen_copy.ifs.ensureTotalCapacity(self.allocator, gen.ifs.items.len);
+                    for (gen.ifs.items) |cond| {
+                        try gen_copy.ifs.append(self.allocator, try ast.cloneExpr(self.allocator, cond));
+                    }
+                }
+
+                try copy.generators.append(self.allocator, gen_copy);
+                appended = true;
+            }
+        }
+
+        if (builder.loop_stack.items.len > 0) {
+            try copy.loop_stack.ensureTotalCapacity(self.allocator, builder.loop_stack.items.len);
+            for (builder.loop_stack.items) |idx| {
+                try copy.loop_stack.append(self.allocator, idx);
+            }
+        }
+
+        return copy;
+    }
+
+    fn stackIndexFromDepth(self: *const SimContext, depth: u32) !usize {
+        const len = self.stack.items.items.len;
+        if (depth == 0) return error.InvalidStackDepth;
+        if (depth > len) return error.StackUnderflow;
+        return len - @as(usize, depth);
+    }
+
+    fn findCompContainer(self: *SimContext) ?struct { idx: usize, kind: CompKind } {
+        var i = self.stack.items.items.len;
+        while (i > 0) : (i -= 1) {
+            const idx = i - 1;
+            switch (self.stack.items.items[idx]) {
+                .comp_builder => |builder| return .{ .idx = idx, .kind = builder.kind },
+                .expr => |expr| switch (expr.*) {
+                    .list => |v| if (v.elts.len == 0) return .{ .idx = idx, .kind = .list },
+                    .set => |v| if (v.elts.len == 0) return .{ .idx = idx, .kind = .set },
+                    .dict => |v| if (v.keys.len == 0 and v.values.len == 0) return .{ .idx = idx, .kind = .dict },
+                    else => {},
+                },
+                else => {},
+            }
+        }
+        return null;
+    }
+
+    fn isBuilderOnStack(self: *SimContext, builder: *const CompBuilder) bool {
+        for (self.stack.items.items) |item| {
+            if (item == .comp_builder and item.comp_builder == builder) return true;
+        }
+        return false;
+    }
+
+    fn findActiveCompBuilder(self: *SimContext) ?*CompBuilder {
+        if (self.comp_builder) |builder| return builder;
+        const container = self.findCompContainer() orelse return null;
+        return switch (self.stack.items.items[container.idx]) {
+            .comp_builder => |builder| builder,
+            else => null,
+        };
+    }
+
+    fn ensureCompBuilderAt(self: *SimContext, idx: usize, kind: CompKind) !*CompBuilder {
+        switch (self.stack.items.items[idx]) {
+            .comp_builder => |builder| return builder,
+            .expr => |expr| {
+                const matches = switch (expr.*) {
+                    .list => |v| kind == .list and v.elts.len == 0,
+                    .set => |v| kind == .set and v.elts.len == 0,
+                    .dict => |v| kind == .dict and v.keys.len == 0 and v.values.len == 0,
+                    else => false,
+                };
+                if (!matches) return error.InvalidComprehension;
+
+                const builder = try self.allocator.create(CompBuilder);
+                builder.* = CompBuilder.init(kind);
+                expr.deinit(self.allocator);
+                self.allocator.destroy(expr);
+                self.stack.items.items[idx] = .{ .comp_builder = builder };
+                return builder;
+            },
+            else => return error.InvalidComprehension,
+        }
+    }
+
+    fn getBuilderAtDepth(self: *SimContext, depth: u32, kind: CompKind) !*CompBuilder {
+        const idx = try self.stackIndexFromDepth(depth);
+        return self.ensureCompBuilderAt(idx, kind);
+    }
+
+    fn addCompGenerator(self: *SimContext, builder: *CompBuilder, iter_expr: *Expr) !void {
+        var pending = PendingComp{
+            .target = null,
+            .iter = iter_expr,
+            .ifs = .{},
+            .is_async = false,
+        };
+        errdefer pending.deinit(self.allocator);
+
+        const gen_idx = builder.generators.items.len;
+        try builder.loop_stack.append(self.allocator, gen_idx);
+        errdefer builder.loop_stack.items.len -= 1;
+
+        try builder.generators.append(self.allocator, pending);
+    }
+
+    fn addCompTarget(self: *SimContext, builder: *CompBuilder, target: *Expr) !void {
+        if (builder.loop_stack.items.len == 0) return error.InvalidComprehension;
+        const idx = builder.loop_stack.items[builder.loop_stack.items.len - 1];
+        var slot = &builder.generators.items[idx];
+        if (slot.target) |old| {
+            old.deinit(self.allocator);
+            self.allocator.destroy(old);
+        }
+        slot.target = target;
+    }
+
+    fn addCompIf(self: *SimContext, builder: *CompBuilder, cond: *Expr) !void {
+        if (builder.loop_stack.items.len == 0) return error.InvalidComprehension;
+        const idx = builder.loop_stack.items[builder.loop_stack.items.len - 1];
+        try builder.generators.items[idx].ifs.append(self.allocator, cond);
+    }
+
+    fn makeIsNoneCompare(self: *SimContext, value: *Expr, is_not: bool) !*Expr {
+        const none_expr = try ast.makeConstant(self.allocator, .none);
+        errdefer {
+            none_expr.deinit(self.allocator);
+            self.allocator.destroy(none_expr);
+        }
+
+        const comparators = try self.allocator.alloc(*Expr, 1);
+        errdefer self.allocator.free(comparators);
+        comparators[0] = none_expr;
+
+        const ops = try self.allocator.alloc(ast.CmpOp, 1);
+        errdefer self.allocator.free(ops);
+        ops[0] = if (is_not) .is_not else .is;
+
+        const expr = try self.allocator.create(Expr);
+        errdefer self.allocator.destroy(expr);
+        expr.* = .{ .compare = .{
+            .left = value,
+            .ops = ops,
+            .comparators = comparators,
+        } };
+        return expr;
+    }
+
+    fn buildCompExpr(self: *SimContext, builder: *CompBuilder) SimError!*Expr {
+        if (builder.generators.items.len == 0) return error.InvalidComprehension;
+
+        const gens = try self.allocator.alloc(ast.Comprehension, builder.generators.items.len);
+        var built: usize = 0;
+        errdefer {
+            var i: usize = 0;
+            while (i < built) : (i += 1) {
+                gens[i].target.deinit(self.allocator);
+                self.allocator.destroy(gens[i].target);
+                gens[i].iter.deinit(self.allocator);
+                self.allocator.destroy(gens[i].iter);
+                for (gens[i].ifs) |cond| {
+                    cond.deinit(self.allocator);
+                    self.allocator.destroy(cond);
+                }
+                if (gens[i].ifs.len > 0) self.allocator.free(gens[i].ifs);
+            }
+            self.allocator.free(gens);
+        }
+
+        for (builder.generators.items, 0..) |*gen, idx| {
+            const target = gen.target orelse return error.InvalidComprehension;
+            const iter_expr = gen.iter orelse return error.InvalidComprehension;
+            const ifs = try gen.ifs.toOwnedSlice(self.allocator);
+
+            gens[idx] = .{
+                .target = target,
+                .iter = iter_expr,
+                .ifs = ifs,
+                .is_async = gen.is_async,
+            };
+            built += 1;
+
+            gen.target = null;
+            gen.iter = null;
+        }
+
+        builder.generators.items.len = 0;
+        builder.loop_stack.items.len = 0;
+
+        const expr = try self.allocator.create(Expr);
+        errdefer self.allocator.destroy(expr);
+
+        switch (builder.kind) {
+            .list => {
+                const elt = builder.elt orelse return error.InvalidComprehension;
+                builder.elt = null;
+                expr.* = .{ .list_comp = .{ .elt = elt, .generators = gens } };
+            },
+            .set => {
+                const elt = builder.elt orelse return error.InvalidComprehension;
+                builder.elt = null;
+                expr.* = .{ .set_comp = .{ .elt = elt, .generators = gens } };
+            },
+            .dict => {
+                const key = builder.key orelse return error.InvalidComprehension;
+                const value = builder.value orelse return error.InvalidComprehension;
+                builder.key = null;
+                builder.value = null;
+                expr.* = .{ .dict_comp = .{
+                    .key = key,
+                    .value = value,
+                    .generators = gens,
+                } };
+            },
+            .genexpr => {
+                const elt = builder.elt orelse return error.InvalidComprehension;
+                builder.elt = null;
+                expr.* = .{ .generator_exp = .{ .elt = elt, .generators = gens } };
+            },
+        }
+
+        return expr;
+    }
+
+    fn buildComprehensionFromCode(self: *SimContext, comp: CompObject, iter_expr: *Expr) SimError!*Expr {
+        var nested = SimContext.init(self.allocator, comp.code, self.version);
+        defer nested.deinit();
+
+        const builder = try self.allocator.create(CompBuilder);
+        builder.* = CompBuilder.init(comp.kind);
+        errdefer builder.deinit(self.allocator);
+
+        nested.comp_builder = builder;
+        nested.iter_override = .{ .index = 0, .expr = iter_expr };
+
+        var iter = decoder.InstructionIterator.init(comp.code.code, self.version);
+        while (iter.next()) |inst| {
+            switch (inst.opcode) {
+                .RETURN_VALUE, .RETURN_CONST => break,
+                else => try nested.simulate(inst),
+            }
+        }
+
+        if (!builder.seen_append) return error.InvalidComprehension;
+        const expr = try nested.buildCompExpr(builder);
+        builder.deinit(self.allocator);
+        return expr;
+    }
+
     /// Simulate a single instruction.
-    pub fn simulate(self: *SimContext, inst: Instruction) !void {
+    pub fn simulate(self: *SimContext, inst: Instruction) SimError!void {
         switch (inst.opcode) {
             .NOP, .RESUME, .CACHE, .EXTENDED_ARG => {
                 // No stack effect
+            },
+
+            .RETURN_GENERATOR => {
+                // Push a placeholder generator value (popped by POP_TOP in genexpr prologue)
+                try self.stack.push(.unknown);
             },
 
             .POP_TOP => {
@@ -319,10 +899,7 @@ pub const SimContext = struct {
                             try self.stack.push(.{ .code_obj = code });
                         },
                         else => {
-                            const expr = self.objToExpr(obj) catch {
-                                try self.stack.push(.unknown);
-                                return;
-                            };
+                            const expr = try self.objToExpr(obj);
                             try self.stack.push(.{ .expr = expr });
                         },
                     }
@@ -347,9 +924,27 @@ pub const SimContext = struct {
             },
 
             .LOAD_FAST, .LOAD_FAST_CHECK, .LOAD_FAST_BORROW => {
+                if (self.iter_override) |*ov| {
+                    if (inst.arg == ov.index) {
+                        if (ov.expr) |expr| {
+                            ov.expr = null;
+                            try self.stack.push(.{ .expr = expr });
+                            return;
+                        }
+                    }
+                }
+
                 if (self.getLocal(inst.arg)) |name| {
                     const expr = try ast.makeName(self.allocator, name, .load);
                     try self.stack.push(.{ .expr = expr });
+                } else {
+                    try self.stack.push(.unknown);
+                }
+            },
+
+            .LOAD_FAST_AND_CLEAR => {
+                if (self.getLocal(inst.arg)) |name| {
+                    try self.stack.push(.{ .saved_local = name });
                 } else {
                     try self.stack.push(.unknown);
                 }
@@ -396,14 +991,46 @@ pub const SimContext = struct {
                 }
             },
 
+            .STORE_FAST_LOAD_FAST => {
+                // STORE_FAST_LOAD_FAST - store TOS into local and then push it back
+                // arg packs store and load indices in 4-bit nibbles (hi, lo)
+                if (self.stack.pop()) |v| {
+                    var val = v;
+                    val.deinit(self.allocator);
+                } else {
+                    return error.StackUnderflow;
+                }
+
+                const store_idx = (inst.arg >> 4) & 0xF;
+                const load_idx = inst.arg & 0xF;
+
+                if (self.getLocal(load_idx)) |name| {
+                    const expr = try ast.makeName(self.allocator, name, .load);
+                    try self.stack.push(.{ .expr = expr });
+                } else {
+                    try self.stack.push(.unknown);
+                }
+
+                if (self.getLocal(store_idx)) |store_name| {
+                    if (self.findActiveCompBuilder()) |builder| {
+                        const target = try ast.makeName(self.allocator, store_name, .store);
+                        try self.addCompTarget(builder, target);
+                    }
+                }
+            },
+
             .BINARY_OP => {
                 // Pop two operands, create BinOp expression
-                const right = self.stack.popExpr() orelse return error.StackUnderflow;
-                const left = self.stack.popExpr() orelse {
+                const right = try self.stack.popExpr();
+                errdefer {
                     right.deinit(self.allocator);
                     self.allocator.destroy(right);
-                    return error.StackUnderflow;
-                };
+                }
+                const left = try self.stack.popExpr();
+                errdefer {
+                    left.deinit(self.allocator);
+                    self.allocator.destroy(left);
+                }
 
                 const op = binOpFromArg(inst.arg);
                 const expr = try ast.makeBinOp(self.allocator, left, op, right);
@@ -412,20 +1039,27 @@ pub const SimContext = struct {
 
             .COMPARE_OP => {
                 // Pop two operands, create Compare expression
-                const right = self.stack.popExpr() orelse return error.StackUnderflow;
-                const left = self.stack.popExpr() orelse {
+                const right = try self.stack.popExpr();
+                errdefer {
                     right.deinit(self.allocator);
                     self.allocator.destroy(right);
-                    return error.StackUnderflow;
-                };
+                }
+                const left = try self.stack.popExpr();
+                errdefer {
+                    left.deinit(self.allocator);
+                    self.allocator.destroy(left);
+                }
 
                 // Create a compare expression
                 const comparators = try self.allocator.alloc(*Expr, 1);
+                errdefer self.allocator.free(comparators);
                 comparators[0] = right;
                 const ops = try self.allocator.alloc(ast.CmpOp, 1);
+                errdefer self.allocator.free(ops);
                 ops[0] = cmpOpFromArg(inst.arg, self.version);
 
                 const expr = try self.allocator.create(Expr);
+                errdefer self.allocator.destroy(expr);
                 expr.* = .{ .compare = .{
                     .left = left,
                     .ops = ops,
@@ -471,35 +1105,119 @@ pub const SimContext = struct {
                 // Stack: callable, NULL, arg0, ..., argN -> result
                 // Pop argc args, then NULL marker (if present), then callable
                 const argc = inst.arg;
-                const args = try self.stack.popNExprs(argc);
-                errdefer {
-                    for (args) |arg| {
-                        arg.deinit(self.allocator);
-                        self.allocator.destroy(arg);
+                const args_vals = try self.stack.popN(argc);
+                var cleanup_args = true;
+                defer {
+                    if (cleanup_args) {
+                        for (args_vals) |*val| {
+                            val.deinit(self.allocator);
+                        }
+                        self.allocator.free(args_vals);
                     }
-                    self.allocator.free(args);
                 }
 
                 // Check for NULL marker (PUSH_NULL before function)
                 const maybe_null = self.stack.pop() orelse return error.StackUnderflow;
-                var func_val: StackValue = undefined;
+                var callable = maybe_null;
+                var iter_expr_from_stack: ?*Expr = null;
                 if (maybe_null == .null_marker) {
-                    // Pop the actual function
-                    func_val = self.stack.pop() orelse return error.StackUnderflow;
-                } else {
-                    // Not a NULL marker, this is the function
-                    func_val = maybe_null;
+                    callable = self.stack.pop() orelse return error.StackUnderflow;
+                } else if (argc == 0 and maybe_null == .expr) {
+                    if (self.stack.peek()) |peek| {
+                        if (peek == .comp_obj) {
+                            iter_expr_from_stack = maybe_null.expr;
+                            callable = self.stack.pop().?;
+                        }
+                    }
                 }
 
-                const func = switch (func_val) {
-                    .expr => |e| e,
+                switch (callable) {
+                    .comp_obj => |comp| {
+                        var iter_expr: *Expr = undefined;
+                        if (iter_expr_from_stack) |iter_expr_value| {
+                            if (args_vals.len != 0) {
+                                iter_expr_value.deinit(self.allocator);
+                                self.allocator.destroy(iter_expr_value);
+                                return error.InvalidComprehension;
+                            }
+                            iter_expr = iter_expr_value;
+                            cleanup_args = false;
+                            self.allocator.free(args_vals);
+                        } else {
+                            if (args_vals.len != 1) return error.InvalidComprehension;
+                            switch (args_vals[0]) {
+                                .expr => |expr| {
+                                    iter_expr = expr;
+                                    cleanup_args = false;
+                                    self.allocator.free(args_vals);
+                                },
+                                else => return error.NotAnExpression,
+                            }
+                        }
+
+                        const comp_expr = try self.buildComprehensionFromCode(comp, iter_expr);
+                        try self.stack.push(.{ .expr = comp_expr });
+                        return;
+                    },
+                    .expr => |callee_expr| {
+                        var cleanup_callee = true;
+                        errdefer if (cleanup_callee) {
+                            callee_expr.deinit(self.allocator);
+                            self.allocator.destroy(callee_expr);
+                        };
+
+                        if (args_vals.len == 1) {
+                            switch (args_vals[0]) {
+                                .function_obj => |func| {
+                                    try func.decorators.append(self.allocator, callee_expr);
+                                    cleanup_callee = false;
+                                    cleanup_args = false;
+                                    self.allocator.free(args_vals);
+                                    try self.stack.push(.{ .function_obj = func });
+                                    return;
+                                },
+                                .class_obj => |cls| {
+                                    try cls.decorators.append(self.allocator, callee_expr);
+                                    cleanup_callee = false;
+                                    cleanup_args = false;
+                                    self.allocator.free(args_vals);
+                                    try self.stack.push(.{ .class_obj = cls });
+                                    return;
+                                },
+                                else => {},
+                            }
+                        }
+
+                        if (self.isBuildClass(callee_expr)) {
+                            if (try self.buildClassValue(callee_expr, args_vals)) {
+                                cleanup_args = false;
+                                cleanup_callee = false;
+                                return;
+                            }
+                        }
+
+                        const args = self.stack.valuesToExprs(args_vals) catch |err| {
+                            cleanup_args = false;
+                            return err;
+                        };
+                        cleanup_args = false;
+                        errdefer {
+                            for (args) |arg| {
+                                arg.deinit(self.allocator);
+                                self.allocator.destroy(arg);
+                            }
+                            if (args.len > 0) self.allocator.free(args);
+                        }
+                        const expr = try ast.makeCall(self.allocator, callee_expr, args);
+                        cleanup_callee = false;
+                        try self.stack.push(.{ .expr = expr });
+                    },
                     else => {
+                        var val = callable;
+                        val.deinit(self.allocator);
                         return error.NotAnExpression;
                     },
-                };
-
-                const expr = try ast.makeCall(self.allocator, func, args);
-                try self.stack.push(.{ .expr = expr });
+                }
             },
 
             .RETURN_VALUE => {
@@ -532,24 +1250,39 @@ pub const SimContext = struct {
                 // Full function decompilation requires recursively processing the code object.
                 const code_val = self.stack.pop() orelse return error.StackUnderflow;
 
-                // Try to get the function name from the code object
-                const func_name: []const u8 = switch (code_val) {
-                    .code_obj => |code| blk: {
-                        if (code.qualname.len > 0) break :blk self.qualnameLeaf(code.qualname);
-                        if (code.name.len > 0) break :blk code.name;
-                        break :blk "<function>";
+                switch (code_val) {
+                    .code_obj => |code| {
+                        if (compKindFromName(code.name)) |kind| {
+                            try self.stack.push(.{ .comp_obj = .{ .code = code, .kind = kind } });
+                            return;
+                        }
+                        if (std.mem.eql(u8, code.name, "<lambda>")) {
+                            const expr = try buildLambdaExpr(self.allocator, code, self.version);
+                            try self.stack.push(.{ .expr = expr });
+                            return;
+                        }
+
+                        const func = try self.allocator.create(FunctionValue);
+                        func.* = .{
+                            .code = code,
+                            .decorators = .{},
+                        };
+                        try self.stack.push(.{ .function_obj = func });
                     },
-                    else => "<function>",
-                };
+                    else => {
+                        // Try to get the function name from the code object
+                        const func_name: []const u8 = switch (code_val) {
+                            .expr => |e| blk: {
+                                e.deinit(self.allocator);
+                                self.allocator.destroy(e);
+                                break :blk "<function>";
+                            },
+                            else => "<function>",
+                        };
 
-                // Create a placeholder Name expression for the function
-                const expr = try ast.makeName(self.allocator, func_name, .load);
-                try self.stack.push(.{ .expr = expr });
-
-                // Clean up the code value if needed
-                if (code_val == .expr) {
-                    code_val.expr.deinit(self.allocator);
-                    self.allocator.destroy(code_val.expr);
+                        const expr = try ast.makeName(self.allocator, func_name, .load);
+                        try self.stack.push(.{ .expr = expr });
+                    },
                 }
             },
 
@@ -699,19 +1432,31 @@ pub const SimContext = struct {
 
             // Unary operators
             .UNARY_NEGATIVE => {
-                const operand = self.stack.popExpr() orelse return error.StackUnderflow;
+                const operand = try self.stack.popExpr();
+                errdefer {
+                    operand.deinit(self.allocator);
+                    self.allocator.destroy(operand);
+                }
                 const expr = try ast.makeUnaryOp(self.allocator, .usub, operand);
                 try self.stack.push(.{ .expr = expr });
             },
 
             .UNARY_NOT => {
-                const operand = self.stack.popExpr() orelse return error.StackUnderflow;
+                const operand = try self.stack.popExpr();
+                errdefer {
+                    operand.deinit(self.allocator);
+                    self.allocator.destroy(operand);
+                }
                 const expr = try ast.makeUnaryOp(self.allocator, .not_, operand);
                 try self.stack.push(.{ .expr = expr });
             },
 
             .UNARY_INVERT => {
-                const operand = self.stack.popExpr() orelse return error.StackUnderflow;
+                const operand = try self.stack.popExpr();
+                errdefer {
+                    operand.deinit(self.allocator);
+                    self.allocator.destroy(operand);
+                }
                 const expr = try ast.makeUnaryOp(self.allocator, .invert, operand);
                 try self.stack.push(.{ .expr = expr });
             },
@@ -726,7 +1471,30 @@ pub const SimContext = struct {
             .FOR_ITER => {
                 // FOR_ITER delta - get next value from iterator
                 // On exhaustion, jumps forward by delta
-                // For now, just push unknown for the iteration value
+                if (self.comp_builder) |builder| {
+                    const top = self.stack.peek() orelse return error.StackUnderflow;
+                    switch (top) {
+                        .expr => |iter_expr| {
+                            const top_idx = self.stack.items.items.len - 1;
+                            self.stack.items.items[top_idx] = .unknown;
+                            try self.addCompGenerator(builder, iter_expr);
+                        },
+                        else => return error.NotAnExpression,
+                    }
+                } else if (self.findCompContainer()) |container| {
+                    const builder = try self.ensureCompBuilderAt(container.idx, container.kind);
+                    const top = self.stack.peek() orelse return error.StackUnderflow;
+                    switch (top) {
+                        .expr => |iter_expr| {
+                            const top_idx = self.stack.items.items.len - 1;
+                            self.stack.items.items[top_idx] = .unknown;
+                            try self.addCompGenerator(builder, iter_expr);
+                        },
+                        else => return error.NotAnExpression,
+                    }
+                }
+
+                // Push the iteration value placeholder
                 try self.stack.push(.unknown);
             },
 
@@ -769,7 +1537,11 @@ pub const SimContext = struct {
             // Attribute access
             .LOAD_ATTR => {
                 // LOAD_ATTR namei - replace TOS with TOS.names[namei]
-                const obj = self.stack.popExpr() orelse return error.StackUnderflow;
+                const obj = try self.stack.popExpr();
+                errdefer {
+                    obj.deinit(self.allocator);
+                    self.allocator.destroy(obj);
+                }
                 if (self.getName(inst.arg >> 1)) |attr_name| {
                     const attr = try ast.makeAttribute(self.allocator, obj, attr_name, .load);
                     try self.stack.push(.{ .expr = attr });
@@ -796,12 +1568,16 @@ pub const SimContext = struct {
             // Subscript operations
             .BINARY_SUBSCR => {
                 // BINARY_SUBSCR - TOS = TOS1[TOS]
-                const index = self.stack.popExpr() orelse return error.StackUnderflow;
-                const container = self.stack.popExpr() orelse {
+                const index = try self.stack.popExpr();
+                errdefer {
                     index.deinit(self.allocator);
                     self.allocator.destroy(index);
-                    return error.StackUnderflow;
-                };
+                }
+                const container = try self.stack.popExpr();
+                errdefer {
+                    container.deinit(self.allocator);
+                    self.allocator.destroy(container);
+                }
                 const expr = try ast.makeSubscript(self.allocator, container, index, .load);
                 try self.stack.push(.{ .expr = expr });
             },
@@ -828,34 +1604,40 @@ pub const SimContext = struct {
                 // BUILD_MAP count - create a dict from count key/value pairs
                 const count = inst.arg;
                 const expr = try self.allocator.create(Expr);
+                errdefer self.allocator.destroy(expr);
 
                 if (count == 0) {
                     expr.* = .{ .dict = .{ .keys = &.{}, .values = &.{} } };
                 } else {
                     const keys = try self.allocator.alloc(?*Expr, count);
                     const values = try self.allocator.alloc(*Expr, count);
+                    var filled: usize = 0;
+                    errdefer {
+                        var j: usize = 0;
+                        while (j < filled) : (j += 1) {
+                            const idx = count - 1 - j;
+                            if (keys[idx]) |k| {
+                                k.deinit(self.allocator);
+                                self.allocator.destroy(k);
+                            }
+                            values[idx].deinit(self.allocator);
+                            self.allocator.destroy(values[idx]);
+                        }
+                        self.allocator.free(keys);
+                        self.allocator.free(values);
+                    }
 
                     var i: usize = 0;
                     while (i < count) : (i += 1) {
-                        const val = self.stack.popExpr() orelse {
-                            // Clean up already allocated
-                            var j: usize = 0;
-                            while (j < i) : (j += 1) {
-                                if (keys[j]) |k| {
-                                    k.deinit(self.allocator);
-                                    self.allocator.destroy(k);
-                                }
-                                values[j].deinit(self.allocator);
-                                self.allocator.destroy(values[j]);
-                            }
-                            self.allocator.free(keys);
-                            self.allocator.free(values);
-                            self.allocator.destroy(expr);
-                            return error.StackUnderflow;
+                        const val = try self.stack.popExpr();
+                        const key = self.stack.popExpr() catch |err| {
+                            val.deinit(self.allocator);
+                            self.allocator.destroy(val);
+                            return err;
                         };
-                        const key = self.stack.popExpr();
                         keys[count - 1 - i] = key;
                         values[count - 1 - i] = val;
+                        filled += 1;
                     }
                     expr.* = .{ .dict = .{ .keys = keys, .values = values } };
                 }
@@ -869,10 +1651,22 @@ pub const SimContext = struct {
                 const argc = inst.arg;
                 var step: ?*Expr = null;
                 if (argc == 3) {
-                    step = self.stack.popExpr();
+                    step = try self.stack.popExpr();
                 }
-                const stop = self.stack.popExpr();
-                const start = self.stack.popExpr();
+                errdefer if (step) |s| {
+                    s.deinit(self.allocator);
+                    self.allocator.destroy(s);
+                };
+                const stop = try self.stack.popExpr();
+                errdefer {
+                    stop.deinit(self.allocator);
+                    self.allocator.destroy(stop);
+                }
+                const start = try self.stack.popExpr();
+                errdefer {
+                    start.deinit(self.allocator);
+                    self.allocator.destroy(start);
+                }
 
                 const expr = try self.allocator.create(Expr);
                 expr.* = .{ .slice = .{
@@ -944,16 +1738,18 @@ pub const SimContext = struct {
                 const has_spec = (inst.arg & 0x04) != 0;
                 var format_spec: ?*Expr = null;
                 if (has_spec) {
-                    format_spec = self.stack.popExpr();
+                    format_spec = try self.stack.popExpr();
                 }
-
-                const value = self.stack.popExpr() orelse {
-                    if (format_spec) |spec| {
-                        spec.deinit(self.allocator);
-                        self.allocator.destroy(spec);
-                    }
-                    return error.StackUnderflow;
+                errdefer if (format_spec) |spec| {
+                    spec.deinit(self.allocator);
+                    self.allocator.destroy(spec);
                 };
+
+                const value = try self.stack.popExpr();
+                errdefer {
+                    value.deinit(self.allocator);
+                    self.allocator.destroy(value);
+                }
 
                 const conversion: ?u8 = switch (inst.arg & 0x03) {
                     1 => 's', // str
@@ -987,6 +1783,31 @@ pub const SimContext = struct {
                 // For simulation, we leave the value on stack (the expr stays)
             },
 
+            .TO_BOOL => {
+                // Preserve the existing expression for decompilation.
+            },
+
+            .POP_JUMP_IF_TRUE, .POP_JUMP_IF_FALSE, .POP_JUMP_IF_NONE, .POP_JUMP_IF_NOT_NONE => {
+                const cond = try self.stack.popExpr();
+                if (self.findActiveCompBuilder()) |builder| {
+                    const final_cond = switch (inst.opcode) {
+                        .POP_JUMP_IF_FALSE => try ast.makeUnaryOp(self.allocator, .not_, cond),
+                        .POP_JUMP_IF_NONE => try self.makeIsNoneCompare(cond, false),
+                        .POP_JUMP_IF_NOT_NONE => try self.makeIsNoneCompare(cond, true),
+                        else => cond,
+                    };
+                    errdefer {
+                        final_cond.deinit(self.allocator);
+                        self.allocator.destroy(final_cond);
+                    }
+                    try self.addCompIf(builder, final_cond);
+                    return;
+                }
+
+                cond.deinit(self.allocator);
+                self.allocator.destroy(cond);
+            },
+
             // Yield opcodes
             .GET_YIELD_FROM_ITER => {
                 // GET_YIELD_FROM_ITER - prepare iterator for yield from
@@ -995,7 +1816,24 @@ pub const SimContext = struct {
 
             .YIELD_VALUE => {
                 // YIELD_VALUE - yield TOS
-                const value = self.stack.popExpr();
+                const value = try self.stack.popExpr();
+                if (self.comp_builder) |builder| {
+                    if (builder.kind == .genexpr) {
+                        if (builder.elt) |old| {
+                            old.deinit(self.allocator);
+                            self.allocator.destroy(old);
+                        }
+                        builder.elt = value;
+                        builder.seen_append = true;
+                        try self.stack.push(.unknown);
+                        return;
+                    }
+                }
+
+                errdefer {
+                    value.deinit(self.allocator);
+                    self.allocator.destroy(value);
+                }
                 const expr = try self.allocator.create(Expr);
                 expr.* = .{ .yield_expr = .{ .value = value } };
                 try self.stack.push(.{ .expr = expr });
@@ -1019,33 +1857,60 @@ pub const SimContext = struct {
                 // LIST_APPEND i - append TOS to list at stack[i]
                 // Used in list comprehensions
                 // Stack: ..., list, ..., item -> ..., list, ...
-                if (self.stack.pop()) |v| {
-                    var val = v;
-                    val.deinit(self.allocator);
+                const item = try self.stack.popExpr();
+                const builder = if (self.comp_builder) |b| blk: {
+                    if (b.kind != .list) return error.InvalidComprehension;
+                    break :blk b;
+                } else try self.getBuilderAtDepth(inst.arg, .list);
+                if (builder.elt) |old| {
+                    old.deinit(self.allocator);
+                    self.allocator.destroy(old);
                 }
+                builder.elt = item;
+                builder.seen_append = true;
             },
 
             .SET_ADD => {
                 // SET_ADD i - add TOS to set at stack[i]
                 // Used in set comprehensions
-                if (self.stack.pop()) |v| {
-                    var val = v;
-                    val.deinit(self.allocator);
+                const item = try self.stack.popExpr();
+                const builder = if (self.comp_builder) |b| blk: {
+                    if (b.kind != .set) return error.InvalidComprehension;
+                    break :blk b;
+                } else try self.getBuilderAtDepth(inst.arg, .set);
+                if (builder.elt) |old| {
+                    old.deinit(self.allocator);
+                    self.allocator.destroy(old);
                 }
+                builder.elt = item;
+                builder.seen_append = true;
             },
 
             .MAP_ADD => {
                 // MAP_ADD i - add TOS1:TOS to dict at stack[i]
                 // Used in dict comprehensions
                 // Stack: ..., dict, ..., key, value -> ..., dict, ...
-                if (self.stack.pop()) |v| {
-                    var val = v;
-                    val.deinit(self.allocator);
+                const value = try self.stack.popExpr();
+                errdefer {
+                    value.deinit(self.allocator);
+                    self.allocator.destroy(value);
                 }
-                if (self.stack.pop()) |v| {
-                    var val = v;
-                    val.deinit(self.allocator);
+                const key = try self.stack.popExpr();
+                const builder = if (self.comp_builder) |b| blk: {
+                    if (b.kind != .dict) return error.InvalidComprehension;
+                    break :blk b;
+                } else try self.getBuilderAtDepth(inst.arg, .dict);
+                if (builder.key) |old_key| {
+                    old_key.deinit(self.allocator);
+                    self.allocator.destroy(old_key);
                 }
+                if (builder.value) |old_value| {
+                    old_value.deinit(self.allocator);
+                    self.allocator.destroy(old_value);
+                }
+                builder.key = key;
+                builder.value = value;
+                builder.seen_append = true;
             },
 
             .LIST_EXTEND => {
@@ -1091,6 +1956,35 @@ pub const SimContext = struct {
                 // END_ASYNC_FOR - cleanup after async for loop
             },
 
+            .END_FOR => {
+                if (self.findActiveCompBuilder()) |builder| {
+                    if (builder.loop_stack.items.len > 0) {
+                        _ = builder.loop_stack.pop();
+                    }
+                    if (builder.loop_stack.items.len == 0 and builder.seen_append) {
+                        if (self.isBuilderOnStack(builder)) {
+                            const expr = try self.buildCompExpr(builder);
+                            for (self.stack.items.items, 0..) |item, idx| {
+                                if (item == .comp_builder and item.comp_builder == builder) {
+                                    self.stack.items.items[idx] = .{ .expr = expr };
+                                    break;
+                                }
+                            }
+                            builder.deinit(self.allocator);
+                        }
+                    }
+                }
+            },
+
+            .POP_ITER => {
+                if (self.stack.pop()) |v| {
+                    var val = v;
+                    val.deinit(self.allocator);
+                } else {
+                    return error.StackUnderflow;
+                }
+            },
+
             // Unpacking
             .UNPACK_SEQUENCE => {
                 // UNPACK_SEQUENCE count - unpack TOS into count values
@@ -1132,6 +2026,57 @@ pub const SimContext = struct {
         }
     }
 };
+
+fn compKindFromName(name: []const u8) ?CompKind {
+    if (std.mem.eql(u8, name, "<listcomp>")) return .list;
+    if (std.mem.eql(u8, name, "<setcomp>")) return .set;
+    if (std.mem.eql(u8, name, "<dictcomp>")) return .dict;
+    if (std.mem.eql(u8, name, "<genexpr>")) return .genexpr;
+    return null;
+}
+
+pub fn buildLambdaExpr(allocator: Allocator, code: *const pyc.Code, version: Version) SimError!*Expr {
+    var ctx = SimContext.init(allocator, code, version);
+    defer ctx.deinit();
+
+    var body_expr: ?*Expr = null;
+
+    var iter = decoder.InstructionIterator.init(code.code, version);
+    while (iter.next()) |inst| {
+        switch (inst.opcode) {
+            .RETURN_VALUE => {
+                body_expr = try ctx.stack.popExpr();
+                break;
+            },
+            .RETURN_CONST => {
+                if (ctx.getConst(inst.arg)) |obj| {
+                    body_expr = try ctx.objToExpr(obj);
+                } else {
+                    return error.InvalidConstant;
+                }
+                break;
+            },
+            else => try ctx.simulate(inst),
+        }
+    }
+
+    const body = body_expr orelse return error.InvalidLambdaBody;
+    errdefer {
+        body.deinit(allocator);
+        allocator.destroy(body);
+    }
+
+    const args = try codegen.extractFunctionSignature(allocator, code);
+    errdefer {
+        args.deinit(allocator);
+        allocator.destroy(args);
+    }
+
+    const expr = try allocator.create(Expr);
+    errdefer allocator.destroy(expr);
+    expr.* = .{ .lambda = .{ .args = args, .body = body } };
+    return expr;
+}
 
 /// Convert BINARY_OP arg to BinOp enum.
 fn binOpFromArg(arg: u32) ast.BinOp {
@@ -1272,7 +2217,6 @@ test "stack simulation dup top clones expr" {
 test "stack simulation composite load const" {
     const testing = std.testing;
     const allocator = testing.allocator;
-    const codegen = @import("codegen.zig");
 
     const DictEntry = @typeInfo(@FieldType(pyc.Object, "dict")).pointer.child;
 

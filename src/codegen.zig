@@ -234,6 +234,32 @@ pub const Writer = struct {
                 }
                 try self.writeByte(allocator, '}');
             },
+            .list_comp => |c| {
+                try self.writeByte(allocator, '[');
+                try self.writeExpr(allocator, c.elt);
+                try self.writeComprehensionClauses(allocator, c.generators);
+                try self.writeByte(allocator, ']');
+            },
+            .set_comp => |c| {
+                try self.writeByte(allocator, '{');
+                try self.writeExpr(allocator, c.elt);
+                try self.writeComprehensionClauses(allocator, c.generators);
+                try self.writeByte(allocator, '}');
+            },
+            .dict_comp => |c| {
+                try self.writeByte(allocator, '{');
+                try self.writeExpr(allocator, c.key);
+                try self.write(allocator, ": ");
+                try self.writeExpr(allocator, c.value);
+                try self.writeComprehensionClauses(allocator, c.generators);
+                try self.writeByte(allocator, '}');
+            },
+            .generator_exp => |c| {
+                try self.writeByte(allocator, '(');
+                try self.writeExpr(allocator, c.elt);
+                try self.writeComprehensionClauses(allocator, c.generators);
+                try self.writeByte(allocator, ')');
+            },
             .starred => |s| {
                 try self.writeByte(allocator, '*');
                 try self.writeExpr(allocator, s.value);
@@ -282,6 +308,9 @@ pub const Writer = struct {
             },
             .lambda => |l| {
                 try self.write(allocator, "lambda");
+                const has_args = l.args.posonlyargs.len > 0 or l.args.args.len > 0 or l.args.kwonlyargs.len > 0 or
+                    l.args.vararg != null or l.args.kwarg != null;
+                if (has_args) try self.writeByte(allocator, ' ');
                 try self.writeArguments(allocator, l.args);
                 try self.write(allocator, ": ");
                 try self.writeExpr(allocator, l.body);
@@ -389,6 +418,19 @@ pub const Writer = struct {
             if (!first) try self.write(allocator, ", ");
             try self.write(allocator, "**");
             try self.write(allocator, kw.arg);
+        }
+    }
+
+    fn writeComprehensionClauses(self: *Writer, allocator: std.mem.Allocator, generators: []const ast.Comprehension) !void {
+        for (generators) |gen| {
+            try self.write(allocator, " for ");
+            try self.writeExpr(allocator, gen.target);
+            try self.write(allocator, " in ");
+            try self.writeExpr(allocator, gen.iter);
+            for (gen.ifs) |cond| {
+                try self.write(allocator, " if ");
+                try self.writeExpr(allocator, cond);
+            }
         }
     }
 
@@ -1036,6 +1078,151 @@ pub const DebugPrinter = struct {
                     try w.writeAll("value:\n");
                     self.indent_level += 1;
                     try self.printExpr(w, v);
+                    self.indent_level -= 1;
+                }
+                self.indent_level -= 1;
+            },
+            .list_comp => |c| {
+                try w.writeAll("ListComp\n");
+                self.indent_level += 1;
+                try self.writeIndent(w);
+                try w.writeAll("elt:\n");
+                self.indent_level += 1;
+                try self.printExpr(w, c.elt);
+                self.indent_level -= 1;
+                for (c.generators, 0..) |gen, idx| {
+                    try self.writeIndent(w);
+                    try w.print("gen[{d}]\n", .{idx});
+                    self.indent_level += 1;
+                    try self.writeIndent(w);
+                    try w.writeAll("target:\n");
+                    self.indent_level += 1;
+                    try self.printExpr(w, gen.target);
+                    self.indent_level -= 1;
+                    try self.writeIndent(w);
+                    try w.writeAll("iter:\n");
+                    self.indent_level += 1;
+                    try self.printExpr(w, gen.iter);
+                    self.indent_level -= 1;
+                    if (gen.ifs.len > 0) {
+                        try self.writeIndent(w);
+                        try w.writeAll("ifs:\n");
+                        self.indent_level += 1;
+                        for (gen.ifs) |cond| {
+                            try self.printExpr(w, cond);
+                        }
+                        self.indent_level -= 1;
+                    }
+                    self.indent_level -= 1;
+                }
+                self.indent_level -= 1;
+            },
+            .set_comp => |c| {
+                try w.writeAll("SetComp\n");
+                self.indent_level += 1;
+                try self.writeIndent(w);
+                try w.writeAll("elt:\n");
+                self.indent_level += 1;
+                try self.printExpr(w, c.elt);
+                self.indent_level -= 1;
+                for (c.generators, 0..) |gen, idx| {
+                    try self.writeIndent(w);
+                    try w.print("gen[{d}]\n", .{idx});
+                    self.indent_level += 1;
+                    try self.writeIndent(w);
+                    try w.writeAll("target:\n");
+                    self.indent_level += 1;
+                    try self.printExpr(w, gen.target);
+                    self.indent_level -= 1;
+                    try self.writeIndent(w);
+                    try w.writeAll("iter:\n");
+                    self.indent_level += 1;
+                    try self.printExpr(w, gen.iter);
+                    self.indent_level -= 1;
+                    if (gen.ifs.len > 0) {
+                        try self.writeIndent(w);
+                        try w.writeAll("ifs:\n");
+                        self.indent_level += 1;
+                        for (gen.ifs) |cond| {
+                            try self.printExpr(w, cond);
+                        }
+                        self.indent_level -= 1;
+                    }
+                    self.indent_level -= 1;
+                }
+                self.indent_level -= 1;
+            },
+            .dict_comp => |c| {
+                try w.writeAll("DictComp\n");
+                self.indent_level += 1;
+                try self.writeIndent(w);
+                try w.writeAll("key:\n");
+                self.indent_level += 1;
+                try self.printExpr(w, c.key);
+                self.indent_level -= 1;
+                try self.writeIndent(w);
+                try w.writeAll("value:\n");
+                self.indent_level += 1;
+                try self.printExpr(w, c.value);
+                self.indent_level -= 1;
+                for (c.generators, 0..) |gen, idx| {
+                    try self.writeIndent(w);
+                    try w.print("gen[{d}]\n", .{idx});
+                    self.indent_level += 1;
+                    try self.writeIndent(w);
+                    try w.writeAll("target:\n");
+                    self.indent_level += 1;
+                    try self.printExpr(w, gen.target);
+                    self.indent_level -= 1;
+                    try self.writeIndent(w);
+                    try w.writeAll("iter:\n");
+                    self.indent_level += 1;
+                    try self.printExpr(w, gen.iter);
+                    self.indent_level -= 1;
+                    if (gen.ifs.len > 0) {
+                        try self.writeIndent(w);
+                        try w.writeAll("ifs:\n");
+                        self.indent_level += 1;
+                        for (gen.ifs) |cond| {
+                            try self.printExpr(w, cond);
+                        }
+                        self.indent_level -= 1;
+                    }
+                    self.indent_level -= 1;
+                }
+                self.indent_level -= 1;
+            },
+            .generator_exp => |c| {
+                try w.writeAll("GeneratorExp\n");
+                self.indent_level += 1;
+                try self.writeIndent(w);
+                try w.writeAll("elt:\n");
+                self.indent_level += 1;
+                try self.printExpr(w, c.elt);
+                self.indent_level -= 1;
+                for (c.generators, 0..) |gen, idx| {
+                    try self.writeIndent(w);
+                    try w.print("gen[{d}]\n", .{idx});
+                    self.indent_level += 1;
+                    try self.writeIndent(w);
+                    try w.writeAll("target:\n");
+                    self.indent_level += 1;
+                    try self.printExpr(w, gen.target);
+                    self.indent_level -= 1;
+                    try self.writeIndent(w);
+                    try w.writeAll("iter:\n");
+                    self.indent_level += 1;
+                    try self.printExpr(w, gen.iter);
+                    self.indent_level -= 1;
+                    if (gen.ifs.len > 0) {
+                        try self.writeIndent(w);
+                        try w.writeAll("ifs:\n");
+                        self.indent_level += 1;
+                        for (gen.ifs) |cond| {
+                            try self.printExpr(w, cond);
+                        }
+                        self.indent_level -= 1;
+                    }
                     self.indent_level -= 1;
                 }
                 self.indent_level -= 1;

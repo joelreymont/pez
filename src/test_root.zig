@@ -15,6 +15,7 @@ pub const ast = @import("ast.zig");
 pub const stack = @import("stack.zig");
 pub const codegen = @import("codegen.zig");
 pub const decompile = @import("decompile.zig");
+pub const snapshot_tests = @import("snapshot_tests.zig");
 
 // Property testing
 pub const zcheck = @import("zcheck");
@@ -35,6 +36,7 @@ comptime {
     _ = codegen;
     _ = decompile;
     _ = property_tests;
+    _ = snapshot_tests;
 }
 
 test "pez test root" {

@@ -68,13 +68,14 @@ pub const Decompiler = struct {
         self.cfg.deinit();
         self.allocator.destroy(self.cfg);
         for (self.statements.items) |stmt| {
+            stmt.deinit(self.allocator);
             self.allocator.destroy(stmt);
         }
         self.statements.deinit(self.allocator);
     }
 
     /// Find the last block that's part of an if-elif-else chain.
-    fn findIfChainEnd(self: *Decompiler, pattern: ctrl.IfPattern) u32 {
+    fn findIfChainEnd(self: *Decompiler, pattern: ctrl.IfPattern) !u32 {
         var max_block = pattern.then_block;
 
         if (pattern.else_block) |else_id| {
@@ -82,9 +83,9 @@ pub const Decompiler = struct {
 
             // If this is an elif, recursively find its end
             if (pattern.is_elif) {
-                const else_pattern = self.analyzer.detectPattern(else_id);
+                const else_pattern = try self.analyzer.detectPattern(else_id);
                 if (else_pattern == .if_stmt) {
-                    max_block = @max(max_block, self.findIfChainEnd(else_pattern.if_stmt));
+                    max_block = @max(max_block, try self.findIfChainEnd(else_pattern.if_stmt));
                 }
             }
         }
@@ -106,7 +107,7 @@ pub const Decompiler = struct {
         // Process blocks in order, using control flow patterns
         var block_idx: u32 = 0;
         while (block_idx < self.cfg.blocks.len) {
-            const pattern = self.analyzer.detectPattern(block_idx);
+            const pattern = try self.analyzer.detectPattern(block_idx);
 
             switch (pattern) {
                 .if_stmt => |p| {
@@ -115,7 +116,7 @@ pub const Decompiler = struct {
                         try self.statements.append(self.allocator, s);
                     }
                     // Skip all processed blocks
-                    block_idx = self.findIfChainEnd(p);
+                    block_idx = try self.findIfChainEnd(p);
                 },
                 .while_loop => |p| {
                     const stmt = try self.decompileWhile(p);
@@ -168,24 +169,20 @@ pub const Decompiler = struct {
             // Check for statement-producing instructions
             switch (inst.opcode) {
                 .STORE_NAME, .STORE_FAST, .STORE_GLOBAL => {
-                    // This is an assignment
-                    if (sim.stack.popExpr()) |value| {
-                        const name = switch (inst.opcode) {
-                            .STORE_NAME, .STORE_GLOBAL => sim.getName(inst.arg) orelse "<unknown>",
-                            .STORE_FAST => sim.getLocal(inst.arg) orelse "<unknown>",
-                            else => "<unknown>",
-                        };
-
-                        const target = try ast.makeName(self.allocator, name, .store);
-                        const stmt = try self.makeAssign(target, value);
+                    const name = switch (inst.opcode) {
+                        .STORE_NAME, .STORE_GLOBAL => sim.getName(inst.arg) orelse "<unknown>",
+                        .STORE_FAST => sim.getLocal(inst.arg) orelse "<unknown>",
+                        else => "<unknown>",
+                    };
+                    const value = sim.stack.pop() orelse return error.StackUnderflow;
+                    if (try self.handleStoreValue(name, value)) |stmt| {
                         try self.statements.append(self.allocator, stmt);
                     }
                 },
                 .RETURN_VALUE => {
-                    if (sim.stack.popExpr()) |value| {
-                        const stmt = try self.makeReturn(value);
-                        try self.statements.append(self.allocator, stmt);
-                    }
+                    const value = try sim.stack.popExpr();
+                    const stmt = try self.makeReturn(value);
+                    try self.statements.append(self.allocator, stmt);
                 },
                 .RETURN_CONST => {
                     if (sim.getConst(inst.arg)) |obj| {
@@ -196,14 +193,13 @@ pub const Decompiler = struct {
                 },
                 .POP_TOP => {
                     // Expression statement (result discarded)
-                    if (sim.stack.popExpr()) |value| {
-                        const stmt = try self.makeExprStmt(value);
-                        try self.statements.append(self.allocator, stmt);
-                    }
+                    const value = try sim.stack.popExpr();
+                    const stmt = try self.makeExprStmt(value);
+                    try self.statements.append(self.allocator, stmt);
                 },
                 else => {
                     // Simulate the instruction to build up expressions
-                    sim.simulate(inst) catch {};
+                    try sim.simulate(inst);
                 },
             }
         }
@@ -238,22 +234,20 @@ pub const Decompiler = struct {
         for (block.instructions) |inst| {
             switch (inst.opcode) {
                 .STORE_NAME, .STORE_FAST, .STORE_GLOBAL => {
-                    if (sim.stack.popExpr()) |value| {
-                        const name = switch (inst.opcode) {
-                            .STORE_NAME, .STORE_GLOBAL => sim.getName(inst.arg) orelse "<unknown>",
-                            .STORE_FAST => sim.getLocal(inst.arg) orelse "<unknown>",
-                            else => "<unknown>",
-                        };
-                        const target = try ast.makeName(self.allocator, name, .store);
-                        const stmt = try self.makeAssign(target, value);
+                    const name = switch (inst.opcode) {
+                        .STORE_NAME, .STORE_GLOBAL => sim.getName(inst.arg) orelse "<unknown>",
+                        .STORE_FAST => sim.getLocal(inst.arg) orelse "<unknown>",
+                        else => "<unknown>",
+                    };
+                    const value = sim.stack.pop() orelse return error.StackUnderflow;
+                    if (try self.handleStoreValue(name, value)) |stmt| {
                         try stmts.append(self.allocator, stmt);
                     }
                 },
                 .RETURN_VALUE => {
-                    if (sim.stack.popExpr()) |value| {
-                        const stmt = try self.makeReturn(value);
-                        try stmts.append(self.allocator, stmt);
-                    }
+                    const value = try sim.stack.popExpr();
+                    const stmt = try self.makeReturn(value);
+                    try stmts.append(self.allocator, stmt);
                 },
                 .RETURN_CONST => {
                     if (sim.getConst(inst.arg)) |obj| {
@@ -263,13 +257,12 @@ pub const Decompiler = struct {
                     }
                 },
                 .POP_TOP => {
-                    if (sim.stack.popExpr()) |value| {
-                        const stmt = try self.makeExprStmt(value);
-                        try stmts.append(self.allocator, stmt);
-                    }
+                    const value = try sim.stack.popExpr();
+                    const stmt = try self.makeExprStmt(value);
+                    try stmts.append(self.allocator, stmt);
                 },
                 else => {
-                    sim.simulate(inst) catch {};
+                    try sim.simulate(inst);
                 },
             }
         }
@@ -286,12 +279,10 @@ pub const Decompiler = struct {
         // Simulate up to but not including the conditional jump
         for (cond_block.instructions) |inst| {
             if (ctrl.Analyzer.isConditionalJump(undefined, inst.opcode)) break;
-            sim.simulate(inst) catch {};
+            try sim.simulate(inst);
         }
 
-        const condition = sim.stack.popExpr() orelse {
-            return null;
-        };
+        const condition = try sim.stack.popExpr();
 
         // Decompile the then body
         const then_end = pattern.else_block orelse pattern.merge_block;
@@ -302,7 +293,7 @@ pub const Decompiler = struct {
             // Check if else is an elif
             if (pattern.is_elif) {
                 // The else block is another if statement - recurse
-                const else_pattern = self.analyzer.detectPattern(else_id);
+                const else_pattern = try self.analyzer.detectPattern(else_id);
                 if (else_pattern == .if_stmt) {
                     const elif_stmt = try self.decompileIf(else_pattern.if_stmt);
                     if (elif_stmt) |s| {
@@ -337,13 +328,10 @@ pub const Decompiler = struct {
 
         for (header.instructions) |inst| {
             if (ctrl.Analyzer.isConditionalJump(undefined, inst.opcode)) break;
-            sim.simulate(inst) catch {};
+            try sim.simulate(inst);
         }
 
-        const condition = sim.stack.popExpr() orelse {
-            // Use True as fallback
-            return null;
-        };
+        const condition = try sim.stack.popExpr();
 
         var visited = try std.DynamicBitSet.initEmpty(self.allocator, self.cfg.blocks.len);
         defer visited.deinit();
@@ -575,7 +563,7 @@ pub const Decompiler = struct {
                 continue;
             }
             if (!after_before_with) {
-                sim.simulate(inst) catch {};
+                try sim.simulate(inst);
                 continue;
             }
 
@@ -596,10 +584,7 @@ pub const Decompiler = struct {
             }
         }
 
-        const context_expr = sim.stack.popExpr() orelse return .{
-            .stmt = null,
-            .next_block = pattern.exit_block,
-        };
+        const context_expr = try sim.stack.popExpr();
 
         const item = try self.allocator.alloc(ast.WithItem, 1);
         item[0] = .{
@@ -630,7 +615,7 @@ pub const Decompiler = struct {
         const limit = @min(end, @as(u32, @intCast(self.cfg.blocks.len)));
 
         while (block_idx < limit) {
-            const pattern = self.analyzer.detectPattern(block_idx);
+            const pattern = try self.analyzer.detectPattern(block_idx);
 
             switch (pattern) {
                 .if_stmt => |p| {
@@ -638,7 +623,7 @@ pub const Decompiler = struct {
                     if (stmt) |s| {
                         try stmts.append(self.allocator, s);
                     }
-                    block_idx = self.findIfChainEnd(p);
+                    block_idx = try self.findIfChainEnd(p);
                 },
                 .while_loop => |p| {
                     const stmt = try self.decompileWhile(p);
@@ -692,10 +677,10 @@ pub const Decompiler = struct {
         var exc_type: ?*Expr = null;
         for (block.instructions) |inst| {
             if (inst.opcode == .CHECK_EXC_MATCH) {
-                exc_type = sim.stack.popExpr();
+                exc_type = try sim.stack.popExpr();
                 break;
             }
-            sim.simulate(inst) catch {};
+            try sim.simulate(inst);
         }
 
         var name: ?[]const u8 = null;
@@ -801,11 +786,10 @@ pub const Decompiler = struct {
 
         for (setup.instructions) |inst| {
             if (inst.opcode == .GET_ITER) break;
-            iter_sim.simulate(inst) catch {};
+            try iter_sim.simulate(inst);
         }
 
-        const iter_expr = iter_sim.stack.popExpr() orelse
-            try ast.makeName(self.allocator, "iter", .load);
+        const iter_expr = try iter_sim.stack.popExpr();
 
         // Get the loop target from the body block's first STORE_FAST
         const body = &self.cfg.blocks[pattern.body_block];
@@ -862,7 +846,7 @@ pub const Decompiler = struct {
             visited.set(block_idx);
 
             // Check for nested control flow patterns
-            const pattern = self.analyzer.detectPattern(block_idx);
+            const pattern = try self.analyzer.detectPattern(block_idx);
 
             switch (pattern) {
                 .if_stmt => |p| {
@@ -928,18 +912,16 @@ pub const Decompiler = struct {
                         skip_first_store.* = false;
                         continue;
                     }
-                    if (sim.stack.popExpr()) |value| {
-                        const name = sim.getLocal(inst.arg) orelse "<unknown>";
-                        const target = try ast.makeName(self.allocator, name, .store);
-                        const stmt = try self.makeAssign(target, value);
+                    const name = sim.getLocal(inst.arg) orelse "<unknown>";
+                    const value = sim.stack.pop() orelse return error.StackUnderflow;
+                    if (try self.handleStoreValue(name, value)) |stmt| {
                         try stmts.append(self.allocator, stmt);
                     }
                 },
                 .STORE_NAME, .STORE_GLOBAL => {
-                    if (sim.stack.popExpr()) |value| {
-                        const name = sim.getName(inst.arg) orelse "<unknown>";
-                        const target = try ast.makeName(self.allocator, name, .store);
-                        const stmt = try self.makeAssign(target, value);
+                    const name = sim.getName(inst.arg) orelse "<unknown>";
+                    const value = sim.stack.pop() orelse return error.StackUnderflow;
+                    if (try self.handleStoreValue(name, value)) |stmt| {
                         try stmts.append(self.allocator, stmt);
                     }
                 },
@@ -963,10 +945,9 @@ pub const Decompiler = struct {
                     if (stop_at_jump) return;
                 },
                 .RETURN_VALUE => {
-                    if (sim.stack.popExpr()) |value| {
-                        const stmt = try self.makeReturn(value);
-                        try stmts.append(self.allocator, stmt);
-                    }
+                    const value = try sim.stack.popExpr();
+                    const stmt = try self.makeReturn(value);
+                    try stmts.append(self.allocator, stmt);
                 },
                 .RETURN_CONST => {
                     if (sim.getConst(inst.arg)) |obj| {
@@ -976,13 +957,12 @@ pub const Decompiler = struct {
                     }
                 },
                 .POP_TOP => {
-                    if (sim.stack.popExpr()) |value| {
-                        const stmt = try self.makeExprStmt(value);
-                        try stmts.append(self.allocator, stmt);
-                    }
+                    const value = try sim.stack.popExpr();
+                    const stmt = try self.makeExprStmt(value);
+                    try stmts.append(self.allocator, stmt);
                 },
                 else => {
-                    sim.simulate(inst) catch {};
+                    try sim.simulate(inst);
                 },
             }
         }
@@ -1004,15 +984,14 @@ pub const Decompiler = struct {
                         skip_first_store.* = false;
                         continue;
                     }
-                    if (sim.stack.popExpr()) |value| {
-                        const name = sim.getLocal(inst.arg) orelse "<unknown>";
-                        const target = try ast.makeName(self.allocator, name, .store);
-                        const stmt = try self.makeAssign(target, value);
+                    const name = sim.getLocal(inst.arg) orelse "<unknown>";
+                    const value = sim.stack.pop() orelse return error.StackUnderflow;
+                    if (try self.handleStoreValue(name, value)) |stmt| {
                         try stmts.append(self.allocator, stmt);
                     }
                 },
                 else => {
-                    sim.simulate(inst) catch {};
+                    try sim.simulate(inst);
                 },
             }
         }
@@ -1028,10 +1007,10 @@ pub const Decompiler = struct {
 
         for (cond_block.instructions) |inst| {
             if (ctrl.Analyzer.isConditionalJump(undefined, inst.opcode)) break;
-            sim.simulate(inst) catch {};
+            try sim.simulate(inst);
         }
 
-        const condition = sim.stack.popExpr() orelse return null;
+        const condition = try sim.stack.popExpr();
 
         const then_in_loop = self.dom.isInLoop(pattern.then_block, loop_header);
         const else_in_loop = if (pattern.else_block) |else_id|
@@ -1058,7 +1037,7 @@ pub const Decompiler = struct {
         const else_body = if (pattern.else_block) |else_id| blk: {
             if (else_is_continuation) break :blk &[_]*Stmt{};
             if (pattern.is_elif) {
-                const else_pattern = self.analyzer.detectPattern(else_id);
+                const else_pattern = try self.analyzer.detectPattern(else_id);
                 if (else_pattern == .if_stmt) {
                     const elif_stmt = try self.decompileLoopIf(else_pattern.if_stmt, loop_header, visited);
                     if (elif_stmt) |s| {
@@ -1113,7 +1092,7 @@ pub const Decompiler = struct {
 
             const block = &self.cfg.blocks[block_idx];
             const has_back_edge = self.hasLoopBackEdge(block, loop_header);
-            const pattern = self.analyzer.detectPattern(block_idx);
+            const pattern = try self.analyzer.detectPattern(block_idx);
 
             switch (pattern) {
                 .if_stmt => |p| {
@@ -1171,6 +1150,137 @@ pub const Decompiler = struct {
         }
 
         return stmts.toOwnedSlice(self.allocator);
+    }
+
+    fn deinitExprSlice(self: *Decompiler, items: []const *Expr) void {
+        for (items) |expr| {
+            expr.deinit(self.allocator);
+            self.allocator.destroy(expr);
+        }
+        if (items.len > 0) self.allocator.free(items);
+    }
+
+    fn deinitStmtSlice(self: *Decompiler, items: []const *Stmt) void {
+        for (items) |stmt| {
+            stmt.deinit(self.allocator);
+            self.allocator.destroy(stmt);
+        }
+        if (items.len > 0) self.allocator.free(items);
+    }
+
+    fn takeDecorators(self: *Decompiler, decorators: *std.ArrayList(*Expr)) ![]const *Expr {
+        if (decorators.items.len == 0) return &.{};
+        const count = decorators.items.len;
+        const out = try self.allocator.alloc(*Expr, count);
+        var i: usize = 0;
+        while (i < count) : (i += 1) {
+            out[i] = decorators.items[count - 1 - i];
+        }
+        decorators.deinit(self.allocator);
+        decorators.* = .{};
+        return out;
+    }
+
+    fn decompileNestedBody(self: *Decompiler, code: *const pyc.Code) ![]const *Stmt {
+        var nested = try Decompiler.init(self.allocator, code, self.version);
+        defer nested.deinit();
+        _ = try nested.decompile();
+        const body = try self.allocator.dupe(*Stmt, nested.statements.items);
+        nested.statements.items.len = 0;
+        return body;
+    }
+
+    fn makeFunctionDef(self: *Decompiler, name: []const u8, func: *stack_mod.FunctionValue) !*Stmt {
+        var cleanup_func = true;
+        errdefer if (cleanup_func) func.deinit(self.allocator);
+
+        const body = try self.decompileNestedBody(func.code);
+        errdefer self.deinitStmtSlice(body);
+
+        const args = try codegen.extractFunctionSignature(self.allocator, func.code);
+        errdefer args.deinit(self.allocator);
+
+        const decorator_list = try self.takeDecorators(&func.decorators);
+        errdefer self.deinitExprSlice(decorator_list);
+
+        cleanup_func = false;
+        errdefer self.allocator.destroy(func);
+
+        const name_copy = try self.allocator.dupe(u8, name);
+        errdefer self.allocator.free(name_copy);
+
+        const stmt = try self.allocator.create(Stmt);
+        errdefer self.allocator.destroy(stmt);
+
+        stmt.* = .{ .function_def = .{
+            .name = name_copy,
+            .args = args,
+            .body = body,
+            .decorator_list = decorator_list,
+            .returns = null,
+            .type_comment = null,
+            .is_async = codegen.isCoroutine(func.code) or codegen.isAsyncGenerator(func.code),
+        } };
+
+        self.allocator.destroy(func);
+        return stmt;
+    }
+
+    fn makeClassDef(self: *Decompiler, name: []const u8, cls: *stack_mod.ClassValue) !*Stmt {
+        var cleanup_cls = true;
+        errdefer if (cleanup_cls) cls.deinit(self.allocator);
+
+        const body = try self.decompileNestedBody(cls.code);
+        errdefer self.deinitStmtSlice(body);
+
+        const decorator_list = try self.takeDecorators(&cls.decorators);
+        errdefer self.deinitExprSlice(decorator_list);
+
+        const bases = cls.bases;
+        cls.bases = &.{};
+        errdefer self.deinitExprSlice(bases);
+
+        var class_name = name;
+        if (cls.name.len > 0) {
+            class_name = cls.name;
+            cls.name = &.{};
+        } else {
+            class_name = try self.allocator.dupe(u8, name);
+        }
+        errdefer if (class_name.len > 0) self.allocator.free(class_name);
+
+        cleanup_cls = false;
+        errdefer self.allocator.destroy(cls);
+
+        const stmt = try self.allocator.create(Stmt);
+        errdefer self.allocator.destroy(stmt);
+        stmt.* = .{ .class_def = .{
+            .name = class_name,
+            .bases = bases,
+            .keywords = &.{},
+            .body = body,
+            .decorator_list = decorator_list,
+        } };
+
+        self.allocator.destroy(cls);
+        return stmt;
+    }
+
+    fn handleStoreValue(self: *Decompiler, name: []const u8, value: stack_mod.StackValue) !?*Stmt {
+        return switch (value) {
+            .expr => |expr| blk: {
+                const target = try ast.makeName(self.allocator, name, .store);
+                break :blk try self.makeAssign(target, expr);
+            },
+            .function_obj => |func| try self.makeFunctionDef(name, func),
+            .class_obj => |cls| try self.makeClassDef(name, cls),
+            .saved_local => null,
+            else => blk: {
+                var tmp = value;
+                tmp.deinit(self.allocator);
+                break :blk error.NotAnExpression;
+            },
+        };
     }
 
     /// Create an assignment statement.
@@ -1260,7 +1370,19 @@ fn decompileFunctionToSource(allocator: Allocator, code: *const pyc.Code, versio
 
     // Check for lambda
     if (codegen.isLambda(code)) {
-        try writer.writeAll("# lambda\n");
+        const lambda_expr = try stack_mod.buildLambdaExpr(allocator, code, version);
+        defer {
+            lambda_expr.deinit(allocator);
+            allocator.destroy(lambda_expr);
+        }
+
+        var cg = codegen.Writer.init(allocator);
+        defer cg.deinit(allocator);
+        try cg.writeExpr(allocator, lambda_expr);
+        const output = try cg.getOutput(allocator);
+        defer allocator.free(output);
+        try writer.writeAll(output);
+        try writer.writeByte('\n');
         return;
     }
 
