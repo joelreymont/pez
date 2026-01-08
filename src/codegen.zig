@@ -299,6 +299,10 @@ pub const Writer = struct {
             .false_ => try self.write(allocator, "False"),
             .ellipsis => try self.write(allocator, "..."),
             .int => |v| try self.writeFmt(allocator, "{d}", .{v}),
+            .big_int => |v| {
+                const out = self.output.writer(allocator);
+                try v.format("", .{}, out);
+            },
             .float => |v| try self.writeFmt(allocator, "{d}", .{v}),
             .complex => |v| {
                 if (v.real != 0) {
@@ -747,6 +751,34 @@ test "codegen binop" {
     try testing.expectEqualStrings("1 + 2", output);
 }
 
+test "codegen big int constant" {
+    const testing = std.testing;
+    const allocator = testing.allocator;
+
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    const arena_alloc = arena.allocator();
+
+    const digits = try arena_alloc.alloc(u16, 5);
+    digits[0] = 0;
+    digits[1] = 0;
+    digits[2] = 0;
+    digits[3] = 0;
+    digits[4] = 1024;
+    const big = pyc.BigInt{ .digits = digits, .negative = false };
+
+    const expr = try ast.makeConstant(arena_alloc, .{ .big_int = big });
+
+    var writer = Writer.init(allocator);
+    defer writer.deinit(allocator);
+
+    try writer.writeExpr(allocator, expr);
+    const output = try writer.getOutput(allocator);
+    defer allocator.free(output);
+
+    try testing.expectEqualStrings("1180591620717411303424", output);
+}
+
 test "codegen string escaping" {
     const testing = std.testing;
     const allocator = testing.allocator;
@@ -1104,6 +1136,7 @@ pub const DebugPrinter = struct {
             .false_ => try w.writeAll("False"),
             .ellipsis => try w.writeAll("..."),
             .int => |v| try w.print("{d}", .{v}),
+            .big_int => |v| try v.format("", .{}, w),
             .float => |v| try w.print("{d}", .{v}),
             .complex => |v| try w.print("{d}+{d}j", .{ v.real, v.imag }),
             .string => |s| try w.print("\"{s}\"", .{s}),

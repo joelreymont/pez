@@ -154,7 +154,6 @@ pub const SimContext = struct {
 
     /// Convert a pyc.Object constant to an AST Constant.
     pub fn objToConstant(self: *SimContext, obj: pyc.Object) !ast.Constant {
-        _ = self;
         return switch (obj) {
             .none => .none,
             .true_val => .true_,
@@ -162,7 +161,7 @@ pub const SimContext = struct {
             .ellipsis => .ellipsis,
             .int => |v| switch (v) {
                 .small => |s| .{ .int = s },
-                .big => .{ .int = 0 }, // TODO: handle big ints
+                .big => |b| .{ .big_int = try b.clone(self.allocator) },
             },
             .float => |v| .{ .float = v },
             .complex => |v| .{ .complex = .{ .real = v.real, .imag = v.imag } },

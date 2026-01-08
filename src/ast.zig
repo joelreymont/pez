@@ -4,7 +4,9 @@
 //! Designed to match Python's own AST module structure.
 
 const std = @import("std");
+const pyc = @import("pyc.zig");
 const Allocator = std.mem.Allocator;
+const BigInt = pyc.BigInt;
 
 /// Source location information.
 pub const Location = struct {
@@ -413,6 +415,7 @@ pub const Constant = union(enum) {
     false_,
     ellipsis,
     int: i64,
+    big_int: BigInt,
     float: f64,
     complex: struct { real: f64, imag: f64 },
     string: []const u8,
@@ -422,6 +425,10 @@ pub const Constant = union(enum) {
         switch (self) {
             .string => |s| allocator.free(s),
             .bytes => |b| allocator.free(b),
+            .big_int => |b| {
+                var tmp = b;
+                tmp.deinit(allocator);
+            },
             else => {},
         }
     }
