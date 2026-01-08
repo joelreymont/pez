@@ -11,6 +11,7 @@ pub const decoder = @import("decoder.zig");
 pub const cfg = @import("cfg.zig");
 pub const ast = @import("ast.zig");
 pub const stack = @import("stack.zig");
+pub const codegen = @import("codegen.zig");
 
 // Utilities
 pub const quickcheck = @import("util/quickcheck.zig");
@@ -23,6 +24,7 @@ comptime {
     _ = cfg;
     _ = ast;
     _ = stack;
+    _ = codegen;
     _ = quickcheck;
 }
 
