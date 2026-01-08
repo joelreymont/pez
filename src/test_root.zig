@@ -7,6 +7,8 @@ const std = @import("std");
 // Core modules
 pub const pyc = @import("pyc.zig");
 pub const opcodes = @import("opcodes.zig");
+pub const decoder = @import("decoder.zig");
+pub const cfg = @import("cfg.zig");
 
 // Utilities
 pub const quickcheck = @import("util/quickcheck.zig");
@@ -15,6 +17,8 @@ pub const quickcheck = @import("util/quickcheck.zig");
 comptime {
     _ = pyc;
     _ = opcodes;
+    _ = decoder;
+    _ = cfg;
     _ = quickcheck;
 }
 

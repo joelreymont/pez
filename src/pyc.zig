@@ -491,7 +491,13 @@ pub const Object = union(enum) {
             .stop_iteration => try writer.writeAll("StopIteration"),
             .int => |v| try v.format("", .{}, writer),
             .float => |v| try writer.print("{d}", .{v}),
-            .complex => |v| try writer.print("({d}+{d}j)", .{ v.real, v.imag }),
+            .complex => |v| {
+                if (v.imag >= 0) {
+                    try writer.print("({d}+{d}j)", .{ v.real, v.imag });
+                } else {
+                    try writer.print("({d}{d}j)", .{ v.real, v.imag });
+                }
+            },
             .string => |s| try writer.print("'{s}'", .{s}),
             .bytes => |b| try writer.print("b'{s}'", .{b}),
             .tuple => |items| {
@@ -775,6 +781,7 @@ pub const Module = struct {
 
         // Read code object fields (order varies by version)
         if (ver.gte(3, 11)) {
+            // Python 3.11+ removed nlocals from marshal format
             code.argcount = try reader.readU32();
             code.posonlyargcount = try reader.readU32();
             code.kwonlyargcount = try reader.readU32();
@@ -810,7 +817,11 @@ pub const Module = struct {
         code.names = try self.readTupleStrings(reader);
 
         if (ver.gte(3, 11)) {
-            code.varnames = try self.readTupleStrings(reader);
+            // Python 3.11+ uses localsplusnames and localspluskinds
+            // instead of varnames, freevars, cellvars
+            code.varnames = try self.readTupleStrings(reader); // localsplusnames
+            const localspluskinds = try self.readBytesAlloc(reader);
+            if (localspluskinds.len > 0) allocator.free(localspluskinds); // discard for now
             code.freevars = &.{};
             code.cellvars = &.{};
         } else {
@@ -1041,6 +1052,29 @@ pub const Module = struct {
                 break :blk .{ .int = Int.fromBigInt(big, self.allocator) };
             },
             .TYPE_BINARY_FLOAT => .{ .float = @bitCast(try reader.readU64()) },
+            .TYPE_FLOAT => blk: {
+                // Text-based float: 1-byte length followed by ASCII decimal representation
+                const len = try reader.readByte();
+                const slice = try reader.readSlice(len);
+                const value = std.fmt.parseFloat(f64, slice) catch 0.0;
+                break :blk .{ .float = value };
+            },
+            .TYPE_COMPLEX => blk: {
+                // Text-based complex: two text floats (real and imaginary)
+                const real_len = try reader.readByte();
+                const real_slice = try reader.readSlice(real_len);
+                const real = std.fmt.parseFloat(f64, real_slice) catch 0.0;
+                const imag_len = try reader.readByte();
+                const imag_slice = try reader.readSlice(imag_len);
+                const imag = std.fmt.parseFloat(f64, imag_slice) catch 0.0;
+                break :blk .{ .complex = .{ .real = real, .imag = imag } };
+            },
+            .TYPE_BINARY_COMPLEX => blk: {
+                // Binary complex: two 64-bit IEEE floats
+                const real: f64 = @bitCast(try reader.readU64());
+                const imag: f64 = @bitCast(try reader.readU64());
+                break :blk .{ .complex = .{ .real = real, .imag = imag } };
+            },
             .TYPE_STRING, .TYPE_ASCII => blk: {
                 const len = try reader.readU32();
                 const slice = try reader.readSlice(len);
@@ -1092,6 +1126,74 @@ pub const Module = struct {
 
                 break :blk .{ .tuple = items };
             },
+            .TYPE_LIST => blk: {
+                const count = try reader.readU32();
+
+                const items = try self.allocator.alloc(Object, count);
+                var items_initialized: usize = 0;
+                errdefer {
+                    for (items[0..items_initialized]) |*item| item.deinit(self.allocator);
+                    self.allocator.free(items);
+                }
+
+                for (items) |*item| {
+                    item.* = try self.readAnyObject(reader);
+                    items_initialized += 1;
+                }
+
+                break :blk .{ .list = items };
+            },
+            .TYPE_SET, .TYPE_FROZENSET => blk: {
+                const count = try reader.readU32();
+
+                const items = try self.allocator.alloc(Object, count);
+                var items_initialized: usize = 0;
+                errdefer {
+                    for (items[0..items_initialized]) |*item| item.deinit(self.allocator);
+                    self.allocator.free(items);
+                }
+
+                for (items) |*item| {
+                    item.* = try self.readAnyObject(reader);
+                    items_initialized += 1;
+                }
+
+                break :blk if (obj_type == .TYPE_SET) .{ .set = items } else .{ .frozenset = items };
+            },
+            .TYPE_DICT => blk: {
+                // Dict entries are key-value pairs until TYPE_NULL sentinel
+                const DictEntry = @typeInfo(@FieldType(Object, "dict")).pointer.child;
+                var entries: std.ArrayList(DictEntry) = .{};
+                errdefer {
+                    for (entries.items) |*e| {
+                        e.key.deinit(self.allocator);
+                        e.value.deinit(self.allocator);
+                    }
+                    entries.deinit(self.allocator);
+                }
+
+                while (true) {
+                    // Peek at type byte to check for TYPE_NULL sentinel
+                    const type_byte_peek = try reader.readByte();
+                    const peek_type = ObjectType.fromByte(type_byte_peek);
+                    if (peek_type == .TYPE_NULL) {
+                        // TYPE_NULL ('0') signals end of dict
+                        break;
+                    }
+                    // Put the byte back by rewinding
+                    reader.pos -= 1;
+
+                    const key = try self.readAnyObject(reader);
+                    errdefer {
+                        var k = key;
+                        k.deinit(self.allocator);
+                    }
+                    const value = try self.readAnyObject(reader);
+                    try entries.append(self.allocator, .{ .key = key, .value = value });
+                }
+
+                break :blk .{ .dict = try entries.toOwnedSlice(self.allocator) };
+            },
             .TYPE_CODE => blk: {
                 const code = try self.readCode(reader);
                 break :blk .{ .code = code };
@@ -1119,7 +1221,7 @@ pub const Module = struct {
     /// Disassemble the module's code to the writer
     pub fn disassemble(self: *const Module, writer: anytype) !void {
         if (self.code) |code| {
-            try self.disassembleCode(code, writer, 0);
+            try self.disassembleCodeWithNested(code, writer, 0);
         }
     }
 
@@ -1143,75 +1245,103 @@ pub const Module = struct {
         const ver = self.version();
         const bytecode = code.code;
         var i: usize = 0;
-        var offset: usize = 0;
+
+        // In Python 3.6+, bytecode is word-based: each instruction is 2 bytes
+        // (opcode byte + argument byte). Even no-arg opcodes have an arg byte (0).
+        const word_based = ver.gte(3, 6);
 
         while (i < bytecode.len) {
             const op_byte = bytecode[i];
             const opcode = opcodes.byteToOpcode(ver, op_byte) orelse .INVALID;
 
             try writeIndent(writer, indent);
-            try writer.print("{d:>4}  {s:<24}", .{ offset, opcode.name() });
+            try writer.print("{d:>4}  {s:<24}", .{ i, opcode.name() });
 
             i += 1;
-            offset += 1;
 
             // Handle argument
-            if (opcode.hasArg() and i < bytecode.len) {
-                var arg: u32 = 0;
+            if (word_based) {
+                // In Python 3.6+, all instructions have an arg byte
+                if (i < bytecode.len) {
+                    const arg: u32 = bytecode[i];
+                    i += 1;
 
-                if (ver.gte(3, 6)) {
-                    if (i < bytecode.len) {
-                        arg = bytecode[i];
-                        i += 1;
-                        offset += 1;
-                    }
-                } else {
-                    if (i + 1 < bytecode.len) {
-                        arg = @as(u32, bytecode[i]) | (@as(u32, bytecode[i + 1]) << 8);
-                        i += 2;
-                        offset += 2;
+                    // Only display arg for opcodes that use it
+                    if (opcode.hasArg(ver)) {
+                        try writer.print(" {d}", .{arg});
+                        try self.writeOpcodeAnnotation(writer, opcode, arg, code, ver);
                     }
                 }
 
-                try writer.print(" {d}", .{arg});
-
-                // Add human-readable annotation
-                switch (opcode) {
-                    .LOAD_CONST => {
-                        if (arg < code.consts.len) {
-                            try writer.writeAll("  # ");
-                            try code.consts[arg].format("", .{}, writer);
-                        }
-                    },
-                    .LOAD_NAME, .STORE_NAME, .DELETE_NAME, .LOAD_ATTR, .STORE_ATTR, .DELETE_ATTR, .LOAD_GLOBAL, .STORE_GLOBAL, .DELETE_GLOBAL, .IMPORT_NAME, .IMPORT_FROM => {
-                        if (arg < code.names.len) {
-                            try writer.print("  # {s}", .{code.names[arg]});
-                        }
-                    },
-                    .LOAD_FAST, .STORE_FAST, .DELETE_FAST => {
-                        if (arg < code.varnames.len) {
-                            try writer.print("  # {s}", .{code.varnames[arg]});
-                        }
-                    },
-                    .COMPARE_OP => {
-                        if (arg < 6) {
-                            const cmp: opcodes.CompareOp = @enumFromInt(arg);
-                            try writer.print("  # {s}", .{cmp.symbol()});
-                        }
-                    },
-                    else => {},
+                // Skip inline cache entries (Python 3.11+)
+                // Each cache entry is a 2-byte word
+                const cache_count = opcodes.cacheEntries(opcode, ver);
+                i += @as(usize, cache_count) * 2;
+            } else {
+                // Pre-3.6: variable-size instructions
+                if (opcode.hasArg(ver) and i + 1 < bytecode.len) {
+                    const arg: u32 = @as(u32, bytecode[i]) | (@as(u32, bytecode[i + 1]) << 8);
+                    i += 2;
+                    try writer.print(" {d}", .{arg});
+                    try self.writeOpcodeAnnotation(writer, opcode, arg, code, ver);
                 }
             }
 
             try writer.writeByte('\n');
         }
+    }
+
+    fn writeOpcodeAnnotation(self: *const Module, writer: anytype, opcode: opcodes.Opcode, arg: u32, code: *const Code, ver: Version) !void {
+        _ = self;
+        switch (opcode) {
+            .LOAD_CONST => {
+                if (arg < code.consts.len) {
+                    try writer.writeAll("  # ");
+                    try code.consts[arg].format("", .{}, writer);
+                }
+            },
+            .LOAD_NAME, .STORE_NAME, .DELETE_NAME, .LOAD_ATTR, .STORE_ATTR, .DELETE_ATTR, .LOAD_GLOBAL, .STORE_GLOBAL, .DELETE_GLOBAL, .IMPORT_NAME, .IMPORT_FROM => {
+                if (arg < code.names.len) {
+                    try writer.print("  # {s}", .{code.names[arg]});
+                }
+            },
+            .LOAD_FAST, .STORE_FAST, .DELETE_FAST, .LOAD_FAST_BORROW, .LOAD_FAST_CHECK, .LOAD_FAST_AND_CLEAR => {
+                if (arg < code.varnames.len) {
+                    try writer.print("  # {s}", .{code.varnames[arg]});
+                }
+            },
+            .COMPARE_OP => {
+                // In Python 3.12+, COMPARE_OP arg encodes both operation and invert flag
+                if (ver.gte(3, 12)) {
+                    const cmp_op = arg >> 4;
+                    if (cmp_op < 6) {
+                        const cmp: opcodes.CompareOp = @enumFromInt(cmp_op);
+                        try writer.print("  # {s}", .{cmp.symbol()});
+                    }
+                } else if (arg < 6) {
+                    const cmp: opcodes.CompareOp = @enumFromInt(arg);
+                    try writer.print("  # {s}", .{cmp.symbol()});
+                }
+            },
+            .BINARY_OP => {
+                if (arg < 26) {
+                    const bin_op: opcodes.BinaryOp = @enumFromInt(arg);
+                    try writer.print("  # {s}", .{bin_op.symbol()});
+                }
+            },
+            else => {},
+        }
+    }
+
+    fn disassembleCodeWithNested(self: *const Module, code: *const Code, writer: anytype, indent: usize) !void {
+        try self.disassembleCode(code, writer, indent);
 
         // Recursively disassemble nested code objects
         for (code.consts) |const_obj| {
             switch (const_obj) {
                 .code, .code_ref => |c| {
                     try writer.writeByte('\n');
-                    try self.disassembleCode(c, writer, indent + 2);
+                    try self.disassembleCodeWithNested(c, writer, indent + 2);
                 },
                 else => {},
             }
