@@ -604,3 +604,107 @@ Opcode values are NOT stable across versions. Each version requires its own mapp
 ### Argument Encoding
 - Pre-3.6: 16-bit little-endian arguments
 - 3.6+: 8-bit arguments with EXTENDED_ARG chaining
+
+---
+
+## Line Number Tables
+
+Python bytecode maps bytecode offsets to source line numbers. The format evolved significantly.
+
+### co_lnotab (Pre-3.10)
+
+The `co_lnotab` field stores pairs of unsigned bytes: `(bytecode_delta, line_delta)`.
+
+```
+┌─────────────────┬─────────────────┐
+│ bytecode_delta  │ line_delta      │
+└─────────────────┴─────────────────┘
+       u8               u8 (signed in 3.8+)
+```
+
+**Algorithm to decode:**
+```
+addr = 0
+line = co_firstlineno
+for i in range(0, len(co_lnotab), 2):
+    addr_incr = co_lnotab[i]
+    line_incr = co_lnotab[i+1]
+    # Python 3.8+: interpret line_incr as signed
+    if version >= 3.8 and line_incr >= 128:
+        line_incr = line_incr - 256
+    addr += addr_incr
+    line += line_incr
+    yield (addr, line)
+```
+
+**Handling large deltas:**
+- If `bytecode_delta > 255`: multiple pairs with `line_delta = 0` until remaining < 256
+- If `line_delta > 127` (3.8+): multiple pairs to stay in signed range
+
+### co_linetable (Python 3.10)
+
+Python 3.10 uses a similar format but with signed line deltas:
+
+```
+┌─────────────────┬─────────────────┐
+│ start_delta     │ line_delta      │
+└─────────────────┴─────────────────┘
+       u8           i8 (-127 to 127)
+```
+
+- **Line delta = -128**: No line number for this range
+- Start offset of first entry is always zero
+- End of one entry equals start of next
+
+### co_linetable (Python 3.11+)
+
+Python 3.11 uses a complex location table with line AND column information.
+
+**Entry Structure:**
+```
+┌────────────────────────────────────────┐
+│ Header byte (bit 7 always set)         │
+├───────┬───────────────┬────────────────┤
+│ Bit 7 │ Bits 3-6 (code) │ Bits 0-2 (len-1) │
+└───────┴───────────────┴────────────────┘
+```
+
+**Location Info Kinds (codes 0-15):**
+
+| Code | Type | Format |
+|------|------|--------|
+| 0-9 | Short form | 2 bytes total; start_col = code*8 + ((byte2>>4)&7); end_col = start_col + (byte2&15) |
+| 10-12 | One line form | line_delta = code - 10; start_col and end_col as u8 bytes |
+| 13 | No column | line_delta as svarint; no column data |
+| 14 | Long form | All fields as varints: line_delta(svarint), end_line_delta(varint), start_col(varint), end_col(varint) |
+| 15 | No location | No source location |
+
+**Variable-length integer encoding:**
+- Unsigned (varint): 6-bit chunks, LSB first. Bit 6 set on all but last chunk.
+- Signed (svarint): Zigzag encode first: `(-s << 1) | 1` for negative, `s << 1` for non-negative.
+
+**Decoding pseudocode:**
+```
+def read_varint(data, pos):
+    result = 0
+    shift = 0
+    while True:
+        byte = data[pos]
+        pos += 1
+        result |= (byte & 0x3F) << shift
+        if not (byte & 0x40):  # bit 6 not set = last chunk
+            break
+        shift += 6
+    return result, pos
+
+def decode_svarint(val):
+    if val & 1:
+        return -(val >> 1)
+    return val >> 1
+```
+
+**Sources:**
+- [CPython Objects/lnotab_notes.txt](https://github.com/python/cpython/blob/main/Objects/lnotab_notes.txt)
+- [PEP 626](https://peps.python.org/pep-0626/)
+- [CPython InternalDocs/code_objects.md](https://github.com/python/cpython/blob/main/InternalDocs/code_objects.md)
+- [CPython Objects/locations.md](https://chromium.googlesource.com/external/github.com/python/cpython/+/refs/tags/v3.11.7/Objects/locations.md)

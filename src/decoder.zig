@@ -296,3 +296,335 @@ test "extended arg" {
 
     try testing.expect(iter.next() == null);
 }
+
+// ============================================================================
+// Line Number Table Parsing
+// ============================================================================
+
+/// A single entry in the line table mapping bytecode offset range to line number.
+pub const LineEntry = struct {
+    start_offset: u32,
+    end_offset: u32,
+    line: ?u32, // null = no line number for this range
+};
+
+/// Parsed line table for efficient bytecode offset to line number lookup.
+pub const LineTable = struct {
+    entries: []const LineEntry,
+    allocator: std.mem.Allocator,
+
+    pub fn deinit(self: *LineTable) void {
+        self.allocator.free(self.entries);
+    }
+
+    /// Look up the line number for a given bytecode offset.
+    /// Returns null if the offset has no associated line or is out of range.
+    pub fn getLine(self: LineTable, offset: u32) ?u32 {
+        // Binary search for the entry containing this offset
+        var lo: usize = 0;
+        var hi: usize = self.entries.len;
+
+        while (lo < hi) {
+            const mid = lo + (hi - lo) / 2;
+            const entry = self.entries[mid];
+
+            if (offset < entry.start_offset) {
+                hi = mid;
+            } else if (offset >= entry.end_offset) {
+                lo = mid + 1;
+            } else {
+                return entry.line;
+            }
+        }
+        return null;
+    }
+};
+
+/// Parse a line number table from a code object.
+/// Handles lnotab (pre-3.10), linetable (3.10), and locations table (3.11+).
+pub fn parseLineTable(
+    linetable: []const u8,
+    firstlineno: u32,
+    version: Version,
+    allocator: std.mem.Allocator,
+) !LineTable {
+    var entries: std.ArrayList(LineEntry) = .{};
+    errdefer entries.deinit(allocator);
+
+    if (version.gte(3, 11)) {
+        try parseLocationsTable(linetable, firstlineno, &entries, allocator);
+    } else if (version.gte(3, 10)) {
+        try parseLineTable310(linetable, firstlineno, &entries, allocator);
+    } else {
+        try parseLnotab(linetable, firstlineno, version, &entries, allocator);
+    }
+
+    return .{
+        .entries = try entries.toOwnedSlice(allocator),
+        .allocator = allocator,
+    };
+}
+
+/// Parse pre-3.10 lnotab format.
+fn parseLnotab(
+    lnotab: []const u8,
+    firstlineno: u32,
+    version: Version,
+    entries: *std.ArrayList(LineEntry),
+    allocator: std.mem.Allocator,
+) !void {
+    if (lnotab.len == 0) return;
+    if (lnotab.len % 2 != 0) return; // Invalid: must be pairs
+
+    var addr: u32 = 0;
+    var line: i32 = @intCast(firstlineno);
+    var prev_addr: u32 = 0;
+    var prev_line: i32 = line;
+
+    var i: usize = 0;
+    while (i + 1 < lnotab.len) : (i += 2) {
+        const addr_incr = lnotab[i];
+        const line_incr_byte = lnotab[i + 1];
+
+        // Python 3.8+: line increment is signed
+        const line_incr: i32 = if (version.gte(3, 8) and line_incr_byte >= 128)
+            @as(i32, line_incr_byte) - 256
+        else
+            line_incr_byte;
+
+        addr += addr_incr;
+
+        // Only emit entry when line actually changes
+        if (line_incr != 0) {
+            if (addr > prev_addr) {
+                try entries.append(allocator, .{
+                    .start_offset = prev_addr,
+                    .end_offset = addr,
+                    .line = if (prev_line >= 0) @intCast(prev_line) else null,
+                });
+            }
+            prev_addr = addr;
+            prev_line = line + line_incr;
+        }
+
+        line += line_incr;
+    }
+
+    // Emit final entry (covers rest of bytecode)
+    if (prev_line >= 0) {
+        try entries.append(allocator, .{
+            .start_offset = prev_addr,
+            .end_offset = std.math.maxInt(u32),
+            .line = @intCast(prev_line),
+        });
+    }
+}
+
+/// Parse Python 3.10 linetable format (signed line deltas).
+fn parseLineTable310(
+    linetable: []const u8,
+    firstlineno: u32,
+    entries: *std.ArrayList(LineEntry),
+    allocator: std.mem.Allocator,
+) !void {
+    if (linetable.len == 0) return;
+    if (linetable.len % 2 != 0) return;
+
+    var addr: u32 = 0;
+    var line: i32 = @intCast(firstlineno);
+
+    var i: usize = 0;
+    while (i + 1 < linetable.len) : (i += 2) {
+        const start_delta = linetable[i];
+        const line_delta_byte: i8 = @bitCast(linetable[i + 1]);
+
+        const end_addr = addr + start_delta;
+
+        // -128 means no line number for this range
+        const entry_line: ?u32 = if (line_delta_byte == -128)
+            null
+        else blk: {
+            line += line_delta_byte;
+            break :blk if (line >= 0) @intCast(line) else null;
+        };
+
+        if (start_delta > 0) {
+            try entries.append(allocator, .{
+                .start_offset = addr,
+                .end_offset = end_addr,
+                .line = entry_line,
+            });
+        }
+
+        addr = end_addr;
+    }
+}
+
+/// Parse Python 3.11+ locations table format (includes column info, though we ignore columns).
+fn parseLocationsTable(
+    linetable: []const u8,
+    firstlineno: u32,
+    entries: *std.ArrayList(LineEntry),
+    allocator: std.mem.Allocator,
+) !void {
+    if (linetable.len == 0) return;
+
+    var pos: usize = 0;
+    var addr: u32 = 0;
+    var line: i32 = @intCast(firstlineno);
+
+    while (pos < linetable.len) {
+        const header = linetable[pos];
+        pos += 1;
+
+        // Header byte must have bit 7 set
+        if ((header & 0x80) == 0) break;
+
+        const code: u4 = @intCast((header >> 3) & 0x0F);
+        const length: u32 = @as(u32, header & 0x07) + 1; // Length in code units
+
+        // Each code unit is 2 bytes (word-aligned bytecode)
+        const byte_length = length * 2;
+        const end_addr = addr + byte_length;
+
+        var entry_line: ?u32 = null;
+
+        switch (code) {
+            0...9 => {
+                // Short form: 2 bytes total, same line
+                if (pos < linetable.len) {
+                    pos += 1; // Skip column byte
+                }
+                entry_line = if (line >= 0) @intCast(line) else null;
+            },
+            10, 11, 12 => {
+                // One line form: line_delta = code - 10
+                const line_delta: i32 = @as(i32, code) - 10;
+                line += line_delta;
+                // Skip start_col and end_col bytes
+                if (pos + 1 < linetable.len) {
+                    pos += 2;
+                }
+                entry_line = if (line >= 0) @intCast(line) else null;
+            },
+            13 => {
+                // No column info: line_delta as svarint
+                const varint_result = readVarint(linetable, pos);
+                pos = varint_result.new_pos;
+                const line_delta = decodeSvarint(varint_result.value);
+                line += line_delta;
+                entry_line = if (line >= 0) @intCast(line) else null;
+            },
+            14 => {
+                // Long form: all fields as varints
+                const line_delta_result = readVarint(linetable, pos);
+                pos = line_delta_result.new_pos;
+                const line_delta = decodeSvarint(line_delta_result.value);
+                line += line_delta;
+
+                // Skip end_line_delta, start_col, end_col
+                const end_line_result = readVarint(linetable, pos);
+                pos = end_line_result.new_pos;
+                const start_col_result = readVarint(linetable, pos);
+                pos = start_col_result.new_pos;
+                const end_col_result = readVarint(linetable, pos);
+                pos = end_col_result.new_pos;
+
+                entry_line = if (line >= 0) @intCast(line) else null;
+            },
+            15 => {
+                // No location: entry_line stays null
+            },
+        }
+
+        if (byte_length > 0) {
+            try entries.append(allocator, .{
+                .start_offset = addr,
+                .end_offset = end_addr,
+                .line = entry_line,
+            });
+        }
+
+        addr = end_addr;
+    }
+}
+
+/// Read a variable-length unsigned integer (6-bit chunks, LSB first).
+fn readVarint(data: []const u8, start_pos: usize) struct { value: u32, new_pos: usize } {
+    var result: u32 = 0;
+    var shift: u5 = 0;
+    var pos = start_pos;
+
+    while (pos < data.len) {
+        const byte = data[pos];
+        pos += 1;
+
+        result |= @as(u32, byte & 0x3F) << shift;
+
+        // Bit 6 not set = last chunk
+        if ((byte & 0x40) == 0) break;
+
+        shift +|= 6;
+        if (shift > 30) break; // Overflow protection
+    }
+
+    return .{ .value = result, .new_pos = pos };
+}
+
+/// Decode a zigzag-encoded signed integer.
+fn decodeSvarint(val: u32) i32 {
+    if ((val & 1) != 0) {
+        return -@as(i32, @intCast(val >> 1));
+    }
+    return @intCast(val >> 1);
+}
+
+test "lnotab parsing basic" {
+    const testing = std.testing;
+
+    // Simple lnotab: offset 0-6 = line 1, offset 6-50 = line 2
+    // Encoded as: (6, 1), (44, 1)
+    const lnotab = [_]u8{ 6, 1, 44, 1 };
+    const v37 = Version.init(3, 7);
+
+    var table = try parseLineTable(&lnotab, 1, v37, testing.allocator);
+    defer table.deinit();
+
+    try testing.expectEqual(@as(?u32, 1), table.getLine(0));
+    try testing.expectEqual(@as(?u32, 1), table.getLine(5));
+    try testing.expectEqual(@as(?u32, 2), table.getLine(6));
+    try testing.expectEqual(@as(?u32, 2), table.getLine(49));
+    try testing.expectEqual(@as(?u32, 3), table.getLine(50));
+}
+
+test "lnotab parsing with signed deltas" {
+    const testing = std.testing;
+
+    // Python 3.8+: line can go backwards
+    // Line 10, then back to line 8
+    // (10, 0) to advance addr, then (10, -2) for line 8
+    // -2 as u8 = 254
+    const lnotab = [_]u8{ 10, 0, 10, 254 };
+    const v38 = Version.init(3, 8);
+
+    var table = try parseLineTable(&lnotab, 10, v38, testing.allocator);
+    defer table.deinit();
+
+    try testing.expectEqual(@as(?u32, 10), table.getLine(0));
+    try testing.expectEqual(@as(?u32, 8), table.getLine(20));
+}
+
+test "locations table parsing code 15" {
+    const testing = std.testing;
+
+    // Code 15 (no location) for 2 code units (4 bytes)
+    // Header: 0x80 | (15 << 3) | (2-1) = 0x80 | 0x78 | 0x01 = 0xF9
+    const locations = [_]u8{0xF9};
+    const v311 = Version.init(3, 11);
+
+    var table = try parseLineTable(&locations, 1, v311, testing.allocator);
+    defer table.deinit();
+
+    try testing.expectEqual(@as(usize, 1), table.entries.len);
+    try testing.expectEqual(@as(?u32, null), table.getLine(0));
+}
