@@ -200,6 +200,12 @@ pub const SimContext = struct {
                 }
             },
 
+            .LOAD_SMALL_INT => {
+                // LOAD_SMALL_INT n - push small integer directly from arg
+                const expr = try ast.makeConstant(self.allocator, .{ .int = @intCast(inst.arg) });
+                try self.stack.push(.{ .expr = expr });
+            },
+
             .LOAD_NAME, .LOAD_GLOBAL => {
                 if (self.getName(if (inst.opcode == .LOAD_GLOBAL) inst.arg >> 1 else inst.arg)) |name| {
                     const expr = try ast.makeName(self.allocator, name, .load);
