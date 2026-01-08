@@ -136,6 +136,18 @@ pub const LoopExit = union(enum) {
     none,
 };
 
+/// Pattern for ternary expressions (a if cond else b).
+pub const TernaryPattern = struct {
+    /// Block containing the condition test.
+    condition_block: u32,
+    /// Block containing the true value.
+    true_block: u32,
+    /// Block containing the false value.
+    false_block: u32,
+    /// Block where both branches merge.
+    merge_block: u32,
+};
+
 /// Control flow analyzer.
 pub const Analyzer = struct {
     cfg: *const CFG,
@@ -218,6 +230,77 @@ pub const Analyzer = struct {
             if (inst.opcode == .BEFORE_WITH) return true;
         }
         return false;
+    }
+
+    /// Detect ternary expression pattern.
+    /// A ternary has the form: value_if_true if condition else value_if_false
+    /// In bytecode: condition, POP_JUMP_IF_FALSE, true_expr, JUMP_FORWARD, false_expr
+    pub fn detectTernary(self: *const Analyzer, block_id: u32) ?TernaryPattern {
+        if (block_id >= self.cfg.blocks.len) return null;
+        const block = &self.cfg.blocks[block_id];
+        const term = block.terminator() orelse return null;
+
+        // Must end with conditional jump
+        if (!self.isConditionalJump(term.opcode)) return null;
+        if (block.successors.len != 2) return null;
+
+        var true_block: ?u32 = null;
+        var false_block: ?u32 = null;
+
+        for (block.successors) |edge| {
+            if (edge.edge_type == .conditional_true or edge.edge_type == .normal) {
+                true_block = edge.target;
+            } else if (edge.edge_type == .conditional_false) {
+                false_block = edge.target;
+            }
+        }
+
+        const true_id = true_block orelse return null;
+        const false_id = false_block orelse return null;
+
+        // Both blocks should be small (1-2 instructions typically for ternary)
+        // and should merge immediately
+        const true_blk = &self.cfg.blocks[true_id];
+        const false_blk = &self.cfg.blocks[false_id];
+
+        // Check if both blocks merge to the same successor
+        var true_merge: ?u32 = null;
+        var false_merge: ?u32 = null;
+
+        for (true_blk.successors) |edge| {
+            if (edge.edge_type == .normal) {
+                true_merge = edge.target;
+                break;
+            }
+        }
+
+        for (false_blk.successors) |edge| {
+            if (edge.edge_type == .normal) {
+                false_merge = edge.target;
+                break;
+            }
+        }
+
+        // For a ternary, the true block jumps past the false block
+        // So true_merge should equal false_id + 1 or be the same as false_merge
+        if (true_merge == null or false_merge == null) return null;
+
+        // Check if they merge at the same point
+        // true_merge might equal false_id (true jumps to end of false block)
+        // or they might both go to the same place
+        const merge = if (true_merge == false_id)
+            false_merge.?
+        else if (true_merge == false_merge)
+            true_merge.?
+        else
+            return null;
+
+        return TernaryPattern{
+            .condition_block = block_id,
+            .true_block = true_id,
+            .false_block = false_id,
+            .merge_block = merge,
+        };
     }
 
     /// Check if an opcode is a conditional jump.
