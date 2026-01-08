@@ -36,14 +36,18 @@ Output includes:
 
 ```
 src/
-├── main.zig        # CLI entry point
-├── pyc.zig         # .pyc format parsing & disassembly
-├── opcodes.zig     # Opcode definitions by Python version
-└── util/           # Testing utilities (quickcheck)
+├── main.zig          # CLI entry point
+├── pyc.zig           # .pyc format parsing & disassembly
+├── opcodes.zig       # Opcode definitions by Python version
+├── decoder.zig       # Instruction decoding & line table parsing
+├── cfg.zig           # Control flow graph construction
+├── ast.zig           # AST node definitions
+├── stack.zig         # Stack simulation for expression reconstruction
+├── codegen.zig       # Python source code generation
+└── property_tests.zig # Property-based tests (zcheck)
 docs/
 ├── python-bytecode.md   # Technical reference
 └── zig-0.15-io-api.md   # Zig API patterns
-test/               # Test .pyc files
 ```
 
 ## Status
@@ -52,7 +56,9 @@ test/               # Test .pyc files
 - [x] Marshal format parsing
 - [x] Code object extraction
 - [x] Bytecode disassembly
-- [ ] Control flow graph construction
+- [x] Control flow graph construction
+- [x] Exception table parsing (3.11+)
+- [x] Line number table parsing (all versions)
 - [ ] AST reconstruction
 - [ ] Source code generation
 

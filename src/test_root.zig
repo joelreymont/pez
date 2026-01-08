@@ -13,8 +13,11 @@ pub const ast = @import("ast.zig");
 pub const stack = @import("stack.zig");
 pub const codegen = @import("codegen.zig");
 
-// Utilities
-pub const quickcheck = @import("util/quickcheck.zig");
+// Property testing
+pub const zcheck = @import("zcheck");
+
+// Property tests
+pub const property_tests = @import("property_tests.zig");
 
 // Run all tests from imported modules
 comptime {
@@ -25,7 +28,7 @@ comptime {
     _ = ast;
     _ = stack;
     _ = codegen;
-    _ = quickcheck;
+    _ = property_tests;
 }
 
 test "pez test root" {

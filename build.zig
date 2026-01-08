@@ -53,6 +53,14 @@ pub fn build(b: *std.Build) void {
         unit_tests.root_module.addImport("ohsnap", ohsnap_dep.module("ohsnap"));
     }
 
+    // zcheck property testing
+    if (b.lazyDependency("zcheck", .{
+        .target = target,
+        .optimize = optimize,
+    })) |zcheck_dep| {
+        unit_tests.root_module.addImport("zcheck", zcheck_dep.module("zcheck"));
+    }
+
     const run_unit_tests = b.addRunArtifact(unit_tests);
 
     const test_step = b.step("test", "Run unit tests");

@@ -509,6 +509,41 @@ def read_varint7(data, pos):
 
 ---
 
+## Testing
+
+### Property-Based Testing with zcheck
+
+We use [zcheck](https://github.com/joelreymont/zcheck) for property-based testing.
+
+**Key Features:**
+- Typed generators for primitives, enums, tagged unions, structs
+- `BoundedSlice(T, N)` for generating bounded collections
+- `String`, `Id`, `FilePath` for bounded string types
+- Automatic shrinking to minimal counterexamples
+- `checkResult()` returns failure details for debugging
+
+**Usage Pattern:**
+```zig
+const zc = @import("zcheck");
+
+test "property name" {
+    try zc.check(struct {
+        fn prop(args: struct { field: u8 }) bool {
+            // Return true if property holds
+            return someInvariant(args.field);
+        }
+    }.prop, .{ .iterations = 100 });
+}
+```
+
+**Configuration:**
+- `.iterations` - test case count (default: 100)
+- `.seed` - reproducibility (default: timestamp)
+- `.max_shrinks` - shrink attempts (default: 100)
+- `.expect_failure` - for testing shrinking behavior
+
+---
+
 ## AST Reconstruction
 
 ### Stack Simulation

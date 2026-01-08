@@ -96,7 +96,7 @@ pub const Instruction = struct {
 
         return switch (self.opcode) {
             .JUMP_FORWARD => next_offset + self.arg * multiplier,
-            .JUMP_BACKWARD, .JUMP_BACKWARD_NO_INTERRUPT => next_offset - self.arg * multiplier,
+            .JUMP_BACKWARD, .JUMP_BACKWARD_NO_INTERRUPT => next_offset -| (self.arg *| multiplier),
             .FOR_ITER, .SEND => next_offset + self.arg * multiplier, // Jump on exhaustion/end
             .POP_JUMP_IF_TRUE,
             .POP_JUMP_IF_FALSE,

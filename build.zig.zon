@@ -7,6 +7,9 @@
         .ohsnap = .{
             .path = "deps/ohsnap",
         },
+        .zcheck = .{
+            .path = "../zcheck",
+        },
     },
     .paths = .{
         "build.zig",

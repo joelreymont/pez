@@ -1098,7 +1098,7 @@ const opcode_table_2_7 = [_]?Opcode{
 };
 
 /// Get the opcode table for a Python version.
-fn getOpcodeTable(ver: Version) []const ?Opcode {
+pub fn getOpcodeTable(ver: Version) []const ?Opcode {
     if (ver.gte(3, 14)) return &opcode_table_3_14;
     if (ver.gte(3, 13)) return &opcode_table_3_13;
     if (ver.gte(3, 12)) return &opcode_table_3_12;
