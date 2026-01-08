@@ -103,8 +103,15 @@ pub const Instruction = struct {
             .POP_JUMP_IF_NONE,
             .POP_JUMP_IF_NOT_NONE,
             => blk: {
-                // In Python 3.12+ and 3.14+, these use relative offsets from next instruction
-                // (in word units for 3.10+)
+                // Python 3.14+: relative offsets from next instruction
+                // Python 3.12-3.13: absolute offsets in word units
+                // Python 3.11: split into forward/backward variants (handled by opcode)
+                if (ver.gte(3, 14)) {
+                    break :blk next_offset + self.arg * multiplier;
+                } else if (ver.gte(3, 12)) {
+                    break :blk self.arg * multiplier;
+                }
+                // For 3.11 and earlier, use relative (forward assumed)
                 break :blk next_offset + self.arg * multiplier;
             },
             else => null,
