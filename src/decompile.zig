@@ -39,7 +39,10 @@ pub const Decompiler = struct {
         const cfg = try allocator.create(CFG);
         errdefer allocator.destroy(cfg);
 
-        cfg.* = try cfg_mod.buildCFG(allocator, code.code, version);
+        cfg.* = if (version.gte(3, 11) and code.exceptiontable.len > 0)
+            try cfg_mod.buildCFGWithExceptions(allocator, code.code, code.exceptiontable, version)
+        else
+            try cfg_mod.buildCFG(allocator, code.code, version);
         errdefer cfg.deinit();
 
         var analyzer = try Analyzer.init(allocator, cfg);
@@ -127,6 +130,20 @@ pub const Decompiler = struct {
                         try self.statements.append(self.allocator, s);
                     }
                     block_idx = p.exit_block;
+                },
+                .try_stmt => |p| {
+                    const result = try self.decompileTry(p);
+                    if (result.stmt) |s| {
+                        try self.statements.append(self.allocator, s);
+                    }
+                    block_idx = result.next_block;
+                },
+                .with_stmt => |p| {
+                    const result = try self.decompileWith(p);
+                    if (result.stmt) |s| {
+                        try self.statements.append(self.allocator, s);
+                    }
+                    block_idx = result.next_block;
                 },
                 else => {
                     // Process block as sequential statements
@@ -352,6 +369,426 @@ pub const Decompiler = struct {
         };
 
         return stmt;
+    }
+
+    const PatternResult = struct {
+        stmt: ?*Stmt,
+        next_block: u32,
+    };
+
+    fn decompileTry(self: *Decompiler, pattern: ctrl.TryPattern) !PatternResult {
+        var handler_blocks = std.ArrayList(u32).init(self.allocator);
+        defer handler_blocks.deinit(self.allocator);
+
+        for (pattern.handlers) |handler| {
+            try handler_blocks.append(self.allocator, handler.handler_block);
+        }
+        if (handler_blocks.items.len == 0) {
+            return .{ .stmt = null, .next_block = pattern.try_block + 1 };
+        }
+
+        std.mem.sort(u32, handler_blocks.items, {}, std.sort.asc(u32));
+
+        var handler_set = try std.DynamicBitSet.initEmpty(self.allocator, self.cfg.blocks.len);
+        defer handler_set.deinit();
+        for (handler_blocks.items) |hid| {
+            handler_set.set(hid);
+        }
+
+        var protected_set = try std.DynamicBitSet.initEmpty(self.allocator, self.cfg.blocks.len);
+        defer protected_set.deinit();
+        for (self.cfg.blocks, 0..) |block, i| {
+            for (block.successors) |edge| {
+                if (edge.edge_type == .exception and handler_set.isSet(edge.target)) {
+                    protected_set.set(i);
+                    break;
+                }
+            }
+        }
+
+        var post_try_entry: ?u32 = null;
+        for (self.cfg.blocks, 0..) |block, i| {
+            if (!protected_set.isSet(i)) continue;
+            for (block.successors) |edge| {
+                if (edge.edge_type == .exception) continue;
+                if (edge.target >= self.cfg.blocks.len) continue;
+                if (protected_set.isSet(edge.target)) continue;
+                if (handler_set.isSet(edge.target)) continue;
+                post_try_entry = if (post_try_entry) |prev|
+                    @min(prev, edge.target)
+                else
+                    edge.target;
+            }
+        }
+
+        var handler_reach = try std.DynamicBitSet.initEmpty(self.allocator, self.cfg.blocks.len);
+        defer handler_reach.deinit();
+        for (handler_blocks.items) |hid| {
+            var reach = try self.collectReachableNoException(hid, &handler_set);
+            defer reach.deinit();
+            handler_reach.setUnion(reach);
+        }
+
+        var join_block: ?u32 = null;
+        if (post_try_entry) |entry| {
+            var normal_reach = try self.collectReachableNoException(entry, &handler_set);
+            defer normal_reach.deinit();
+            var it = normal_reach.iterator(.{});
+            while (it.next()) |bit| {
+                if (handler_reach.isSet(bit)) {
+                    join_block = @intCast(bit);
+                    break;
+                }
+            }
+        }
+
+        var has_finally = false;
+        for (handler_blocks.items) |hid| {
+            if (self.isFinallyHandler(hid)) {
+                has_finally = true;
+                break;
+            }
+        }
+
+        var else_start: ?u32 = null;
+        if (post_try_entry) |entry| {
+            if (!handler_reach.isSet(entry)) {
+                if (join_block == null or entry != join_block.?) {
+                    else_start = entry;
+                }
+            }
+        }
+
+        var finally_start: ?u32 = null;
+        if (has_finally) {
+            finally_start = join_block orelse post_try_entry;
+        }
+
+        const handler_start = handler_blocks.items[0];
+        var try_end: u32 = handler_start;
+        if (else_start) |start| {
+            if (start < try_end) try_end = start;
+        }
+        if (finally_start) |start| {
+            if (start < try_end) try_end = start;
+        }
+
+        const try_body = if (pattern.try_block < try_end)
+            try self.decompileStructuredRange(pattern.try_block, try_end)
+        else
+            &[_]*Stmt{};
+
+        var else_end: u32 = handler_start;
+        if (else_start) |start| {
+            if (finally_start) |final_start| {
+                if (final_start > start and final_start < else_end) else_end = final_start;
+            }
+            if (join_block) |join| {
+                if (join > start and join < else_end) else_end = join;
+            }
+        }
+
+        const else_body = if (else_start) |start| blk: {
+            if (start >= else_end) break :blk &[_]*Stmt{};
+            break :blk try self.decompileStructuredRange(start, else_end);
+        } else &[_]*Stmt{};
+
+        var final_end: u32 = pattern.exit_block orelse @as(u32, @intCast(self.cfg.blocks.len));
+        if (finally_start) |final_start| {
+            if (handler_start > final_start and handler_start < final_end) {
+                final_end = handler_start;
+            }
+        }
+
+        const final_body = if (finally_start) |start| blk: {
+            if (start >= final_end) break :blk &[_]*Stmt{};
+            break :blk try self.decompileStructuredRange(start, final_end);
+        } else &[_]*Stmt{};
+
+        var handler_nodes = try self.allocator.alloc(ast.ExceptHandler, handler_blocks.items.len);
+        errdefer {
+            for (handler_nodes) |*h| {
+                if (h.type) |t| {
+                    t.deinit(self.allocator);
+                    self.allocator.destroy(t);
+                }
+                if (h.body.len > 0) self.allocator.free(h.body);
+            }
+            self.allocator.free(handler_nodes);
+        }
+
+        for (handler_blocks.items, 0..) |hid, idx| {
+            const handler_end = blk: {
+                const next_handler = if (idx + 1 < handler_blocks.items.len)
+                    handler_blocks.items[idx + 1]
+                else
+                    (pattern.exit_block orelse @as(u32, @intCast(self.cfg.blocks.len)));
+                if (finally_start) |start| {
+                    if (start > hid and start < next_handler) break :blk start;
+                }
+                break :blk next_handler;
+            };
+
+            const info = try self.extractHandlerHeader(hid);
+            const body = try self.decompileHandlerBody(hid, handler_end, info.skip_first_store);
+            handler_nodes[idx] = .{
+                .type = info.exc_type,
+                .name = info.name,
+                .body = body,
+            };
+        }
+
+        const stmt = try self.allocator.create(Stmt);
+        stmt.* = .{
+            .try_stmt = .{
+                .body = try_body,
+                .handlers = handler_nodes,
+                .else_body = else_body,
+                .finalbody = final_body,
+            },
+        };
+
+        var next_block: u32 = final_end;
+        if (next_block < try_end) next_block = try_end;
+        if (else_start) |start| {
+            if (start > next_block) next_block = start;
+        }
+        if (pattern.exit_block) |exit| {
+            if (exit > next_block) next_block = exit;
+        }
+        return .{ .stmt = stmt, .next_block = next_block };
+    }
+
+    fn decompileWith(self: *Decompiler, pattern: ctrl.WithPattern) !PatternResult {
+        const setup = &self.cfg.blocks[pattern.setup_block];
+        var sim = SimContext.init(self.allocator, self.code, self.version);
+        defer sim.deinit();
+
+        var after_before_with = false;
+        var is_async = false;
+        var optional_vars: ?*Expr = null;
+
+        for (setup.instructions) |inst| {
+            if (inst.opcode == .BEFORE_WITH or inst.opcode == .BEFORE_ASYNC_WITH) {
+                after_before_with = true;
+                if (inst.opcode == .BEFORE_ASYNC_WITH) {
+                    is_async = true;
+                }
+                continue;
+            }
+            if (!after_before_with) {
+                sim.simulate(inst) catch {};
+                continue;
+            }
+
+            switch (inst.opcode) {
+                .STORE_FAST => {
+                    if (sim.getLocal(inst.arg)) |name| {
+                        optional_vars = try ast.makeName(self.allocator, name, .store);
+                    }
+                    break;
+                },
+                .STORE_NAME, .STORE_GLOBAL => {
+                    if (sim.getName(inst.arg)) |name| {
+                        optional_vars = try ast.makeName(self.allocator, name, .store);
+                    }
+                    break;
+                },
+                else => {},
+            }
+        }
+
+        const context_expr = sim.stack.popExpr() orelse return .{
+            .stmt = null,
+            .next_block = pattern.exit_block,
+        };
+
+        const item = try self.allocator.alloc(ast.WithItem, 1);
+        item[0] = .{
+            .context_expr = context_expr,
+            .optional_vars = optional_vars,
+        };
+
+        const body = try self.decompileStructuredRange(pattern.body_block, pattern.cleanup_block);
+
+        const stmt = try self.allocator.create(Stmt);
+        stmt.* = .{
+            .with_stmt = .{
+                .items = item,
+                .body = body,
+                .type_comment = null,
+                .is_async = is_async,
+            },
+        };
+
+        return .{ .stmt = stmt, .next_block = pattern.exit_block };
+    }
+
+    fn decompileStructuredRange(self: *Decompiler, start: u32, end: u32) ![]const *Stmt {
+        var stmts: std.ArrayList(*Stmt) = .{};
+        errdefer stmts.deinit(self.allocator);
+
+        var block_idx = start;
+        const limit = @min(end, @as(u32, @intCast(self.cfg.blocks.len)));
+
+        while (block_idx < limit) {
+            const pattern = self.analyzer.detectPattern(block_idx);
+
+            switch (pattern) {
+                .if_stmt => |p| {
+                    const stmt = try self.decompileIf(p);
+                    if (stmt) |s| {
+                        try stmts.append(self.allocator, s);
+                    }
+                    block_idx = self.findIfChainEnd(p);
+                },
+                .while_loop => |p| {
+                    const stmt = try self.decompileWhile(p);
+                    if (stmt) |s| {
+                        try stmts.append(self.allocator, s);
+                    }
+                    block_idx = p.exit_block;
+                },
+                .for_loop => |p| {
+                    const stmt = try self.decompileFor(p);
+                    if (stmt) |s| {
+                        try stmts.append(self.allocator, s);
+                    }
+                    block_idx = p.exit_block;
+                },
+                .try_stmt => |p| {
+                    const result = try self.decompileTry(p);
+                    if (result.stmt) |s| {
+                        try stmts.append(self.allocator, s);
+                    }
+                    block_idx = result.next_block;
+                },
+                .with_stmt => |p| {
+                    const result = try self.decompileWith(p);
+                    if (result.stmt) |s| {
+                        try stmts.append(self.allocator, s);
+                    }
+                    block_idx = result.next_block;
+                },
+                else => {
+                    try self.decompileBlockInto(block_idx, &stmts);
+                    block_idx += 1;
+                },
+            }
+        }
+
+        return stmts.toOwnedSlice(self.allocator);
+    }
+
+    const HandlerHeader = struct {
+        exc_type: ?*Expr,
+        name: ?[]const u8,
+        skip_first_store: bool,
+    };
+
+    fn extractHandlerHeader(self: *Decompiler, handler_block: u32) !HandlerHeader {
+        const block = &self.cfg.blocks[handler_block];
+        var sim = SimContext.init(self.allocator, self.code, self.version);
+        defer sim.deinit();
+
+        var exc_type: ?*Expr = null;
+        for (block.instructions) |inst| {
+            if (inst.opcode == .CHECK_EXC_MATCH) {
+                exc_type = sim.stack.popExpr();
+                break;
+            }
+            sim.simulate(inst) catch {};
+        }
+
+        var name: ?[]const u8 = null;
+        for (block.instructions) |inst| {
+            switch (inst.opcode) {
+                .STORE_FAST => {
+                    name = sim.getLocal(inst.arg);
+                    break;
+                },
+                .STORE_NAME, .STORE_GLOBAL => {
+                    name = sim.getName(inst.arg);
+                    break;
+                },
+                else => {},
+            }
+        }
+
+        return .{
+            .exc_type = exc_type,
+            .name = name,
+            .skip_first_store = name != null,
+        };
+    }
+
+    fn decompileHandlerBody(self: *Decompiler, start: u32, end: u32, skip_first_store: bool) ![]const *Stmt {
+        var stmts: std.ArrayList(*Stmt) = .{};
+        errdefer stmts.deinit(self.allocator);
+
+        if (start >= end or start >= self.cfg.blocks.len) {
+            return &[_]*Stmt{};
+        }
+
+        var skip_store = skip_first_store;
+        try self.processBlockStatements(
+            start,
+            &self.cfg.blocks[start],
+            &stmts,
+            &skip_store,
+            false,
+            null,
+        );
+
+        if (start + 1 < end) {
+            const rest = try self.decompileStructuredRange(start + 1, end);
+            try stmts.appendSlice(self.allocator, rest);
+        }
+
+        return stmts.toOwnedSlice(self.allocator);
+    }
+
+    fn collectReachableNoException(
+        self: *Decompiler,
+        start: u32,
+        handler_set: *const std.DynamicBitSet,
+    ) !std.DynamicBitSet {
+        var visited = try std.DynamicBitSet.initEmpty(self.allocator, self.cfg.blocks.len);
+        var queue: std.ArrayList(u32) = .{};
+        defer queue.deinit(self.allocator);
+
+        if (start >= self.cfg.blocks.len) return visited;
+        if (handler_set.isSet(start)) return visited;
+
+        visited.set(start);
+        try queue.append(self.allocator, start);
+
+        while (queue.items.len > 0) {
+            const node = queue.pop().?;
+            const block = &self.cfg.blocks[node];
+            for (block.successors) |edge| {
+                if (edge.edge_type == .exception) continue;
+                if (edge.target >= self.cfg.blocks.len) continue;
+                if (handler_set.isSet(edge.target)) continue;
+                if (!visited.isSet(edge.target)) {
+                    visited.set(edge.target);
+                    try queue.append(self.allocator, edge.target);
+                }
+            }
+        }
+
+        return visited;
+    }
+
+    fn isFinallyHandler(self: *Decompiler, handler_block: u32) bool {
+        const block = &self.cfg.blocks[handler_block];
+        for (block.instructions) |inst| {
+            if (inst.opcode == .CHECK_EXC_MATCH) return false;
+        }
+        for (block.instructions) |inst| {
+            if (inst.opcode == .RERAISE) return true;
+        }
+        return false;
     }
 
     /// Decompile a for loop pattern.

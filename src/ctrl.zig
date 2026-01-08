@@ -197,17 +197,17 @@ pub const Analyzer = struct {
             }
         }
 
-        // Check for try/except pattern (block with exception edge)
-        if (self.hasExceptionEdge(block)) {
-            if (self.detectTryPattern(block_id)) |pattern| {
-                return .{ .try_stmt = pattern };
-            }
-        }
-
         // Check for with statement (BEFORE_WITH opcode)
         if (self.hasWithSetup(block)) {
             if (self.detectWithPattern(block_id)) |pattern| {
                 return .{ .with_stmt = pattern };
+            }
+        }
+
+        // Check for try/except pattern (block with exception edge)
+        if (self.hasExceptionEdge(block)) {
+            if (self.detectTryPattern(block_id)) |pattern| {
+                return .{ .try_stmt = pattern };
             }
         }
 
@@ -227,7 +227,7 @@ pub const Analyzer = struct {
     fn hasWithSetup(self: *const Analyzer, block: *const BasicBlock) bool {
         _ = self;
         for (block.instructions) |inst| {
-            if (inst.opcode == .BEFORE_WITH) return true;
+            if (inst.opcode == .BEFORE_WITH or inst.opcode == .BEFORE_ASYNC_WITH) return true;
         }
         return false;
     }
@@ -454,22 +454,51 @@ pub const Analyzer = struct {
 
     /// Detect try/except/finally pattern.
     fn detectTryPattern(self: *Analyzer, block_id: u32) ?TryPattern {
+        if (block_id >= self.cfg.blocks.len) return null;
         const block = &self.cfg.blocks[block_id];
+        if (block.is_exception_handler) return null;
+
+        var handler_targets: std.ArrayList(u32) = .{};
+        defer handler_targets.deinit(self.allocator);
+
+        self.collectExceptionTargets(block_id, &handler_targets) catch return null;
+        if (handler_targets.items.len == 0) return null;
+
+        var pred_targets: std.ArrayList(u32) = .{};
+        defer pred_targets.deinit(self.allocator);
+
+        for (block.predecessors) |pred_id| {
+            if (pred_id >= self.cfg.blocks.len) continue;
+            const pred = &self.cfg.blocks[pred_id];
+            if (pred.is_exception_handler) continue;
+            const edge_type = self.edgeTypeTo(pred_id, block_id) orelse continue;
+            if (edge_type == .exception or edge_type == .loop_back) continue;
+
+            self.collectExceptionTargets(pred_id, &pred_targets) catch continue;
+            if (pred_targets.items.len != handler_targets.items.len) continue;
+
+            var same = true;
+            for (pred_targets.items, 0..) |hid, idx| {
+                if (handler_targets.items[idx] != hid) {
+                    same = false;
+                    break;
+                }
+            }
+            if (same) return null;
+        }
 
         // Collect all exception handlers reachable from this block
         var handler_list: std.ArrayList(HandlerInfo) = .{};
         defer handler_list.deinit(self.allocator);
 
-        for (block.successors) |edge| {
-            if (edge.edge_type == .exception) {
-                const handler_block = &self.cfg.blocks[edge.target];
-                // Check if this is a bare except (no type check)
-                const is_bare = !self.hasExceptionTypeCheck(handler_block);
-                handler_list.append(self.allocator, .{
-                    .handler_block = edge.target,
-                    .is_bare = is_bare,
-                }) catch continue;
-            }
+        for (handler_targets.items) |hid| {
+            if (hid >= self.cfg.blocks.len) continue;
+            const handler_block = &self.cfg.blocks[hid];
+            const is_bare = !self.hasExceptionTypeCheck(handler_block);
+            handler_list.append(self.allocator, .{
+                .handler_block = hid,
+                .is_bare = is_bare,
+            }) catch continue;
         }
 
         if (handler_list.items.len == 0) return null;
@@ -498,6 +527,41 @@ pub const Analyzer = struct {
         };
     }
 
+    fn edgeTypeTo(self: *Analyzer, pred_id: u32, target_id: u32) ?EdgeType {
+        if (pred_id >= self.cfg.blocks.len) return null;
+        const pred = &self.cfg.blocks[pred_id];
+        for (pred.successors) |edge| {
+            if (edge.target == target_id) return edge.edge_type;
+        }
+        return null;
+    }
+
+    fn collectExceptionTargets(
+        self: *Analyzer,
+        block_id: u32,
+        targets: *std.ArrayList(u32),
+    ) !void {
+        targets.clearRetainingCapacity();
+        if (block_id >= self.cfg.blocks.len) return;
+        const block = &self.cfg.blocks[block_id];
+
+        for (block.successors) |edge| {
+            if (edge.edge_type != .exception) continue;
+            var seen = false;
+            for (targets.items) |existing| {
+                if (existing == edge.target) {
+                    seen = true;
+                    break;
+                }
+            }
+            if (!seen) {
+                try targets.append(self.allocator, edge.target);
+            }
+        }
+
+        std.mem.sort(u32, targets.items, {}, std.sort.asc(u32));
+    }
+
     /// Check if handler block has exception type check (CHECK_EXC_MATCH).
     fn hasExceptionTypeCheck(self: *const Analyzer, block: *const BasicBlock) bool {
         _ = self;
@@ -511,10 +575,10 @@ pub const Analyzer = struct {
     fn detectWithPattern(self: *Analyzer, block_id: u32) ?WithPattern {
         const block = &self.cfg.blocks[block_id];
 
-        // Find BEFORE_WITH instruction
+        // Find BEFORE_WITH/BEFORE_ASYNC_WITH instruction
         var has_before_with = false;
         for (block.instructions) |inst| {
-            if (inst.opcode == .BEFORE_WITH) {
+            if (inst.opcode == .BEFORE_WITH or inst.opcode == .BEFORE_ASYNC_WITH) {
                 has_before_with = true;
                 break;
             }

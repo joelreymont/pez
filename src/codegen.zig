@@ -466,6 +466,29 @@ pub const Writer = struct {
                     self.indent_level -= 1;
                 }
             },
+            .with_stmt => |w| {
+                if (w.is_async) try self.write(allocator, "async ");
+                try self.write(allocator, "with ");
+                for (w.items, 0..) |item, idx| {
+                    if (idx > 0) try self.write(allocator, ", ");
+                    try self.writeExpr(allocator, item.context_expr);
+                    if (item.optional_vars) |vars| {
+                        try self.write(allocator, " as ");
+                        try self.writeExpr(allocator, vars);
+                    }
+                }
+                try self.write(allocator, ":\n");
+                self.indent_level += 1;
+                if (w.body.len == 0) {
+                    try self.writeIndent(allocator);
+                    try self.write(allocator, "pass\n");
+                } else {
+                    for (w.body) |s| {
+                        try self.writeStmt(allocator, s);
+                    }
+                }
+                self.indent_level -= 1;
+            },
             .pass => {
                 try self.write(allocator, "pass\n");
             },
@@ -585,6 +608,63 @@ pub const Writer = struct {
                 }
                 try self.writeByte(allocator, '\n');
             },
+            .try_stmt => |t| {
+                try self.write(allocator, "try:\n");
+                self.indent_level += 1;
+                if (t.body.len == 0) {
+                    try self.writeIndent(allocator);
+                    try self.write(allocator, "pass\n");
+                } else {
+                    for (t.body) |s| {
+                        try self.writeStmt(allocator, s);
+                    }
+                }
+                self.indent_level -= 1;
+
+                for (t.handlers) |h| {
+                    try self.writeIndent(allocator);
+                    try self.write(allocator, "except");
+                    if (h.type) |exc| {
+                        try self.writeByte(allocator, ' ');
+                        try self.writeExpr(allocator, exc);
+                        if (h.name) |name| {
+                            try self.write(allocator, " as ");
+                            try self.write(allocator, name);
+                        }
+                    }
+                    try self.write(allocator, ":\n");
+                    self.indent_level += 1;
+                    if (h.body.len == 0) {
+                        try self.writeIndent(allocator);
+                        try self.write(allocator, "pass\n");
+                    } else {
+                        for (h.body) |s| {
+                            try self.writeStmt(allocator, s);
+                        }
+                    }
+                    self.indent_level -= 1;
+                }
+
+                if (t.else_body.len > 0) {
+                    try self.writeIndent(allocator);
+                    try self.write(allocator, "else:\n");
+                    self.indent_level += 1;
+                    for (t.else_body) |s| {
+                        try self.writeStmt(allocator, s);
+                    }
+                    self.indent_level -= 1;
+                }
+
+                if (t.finalbody.len > 0) {
+                    try self.writeIndent(allocator);
+                    try self.write(allocator, "finally:\n");
+                    self.indent_level += 1;
+                    for (t.finalbody) |s| {
+                        try self.writeStmt(allocator, s);
+                    }
+                    self.indent_level -= 1;
+                }
+            },
             .global_stmt => |g| {
                 try self.write(allocator, "global ");
                 for (g.names, 0..) |n, i| {
@@ -682,6 +762,109 @@ test "codegen string escaping" {
     defer allocator.free(output);
 
     try testing.expectEqualStrings("\"hello\\nworld\"", output);
+}
+
+test "codegen with statement" {
+    const testing = std.testing;
+    const allocator = testing.allocator;
+
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    const arena_alloc = arena.allocator();
+
+    const context_expr = try ast.makeName(arena_alloc, "cm", .load);
+    const optional_vars = try ast.makeName(arena_alloc, "v", .store);
+    const items = try arena_alloc.alloc(ast.WithItem, 1);
+    items[0] = .{
+        .context_expr = context_expr,
+        .optional_vars = optional_vars,
+    };
+
+    const body_stmt = try arena_alloc.create(Stmt);
+    body_stmt.* = .pass;
+    const body = try arena_alloc.alloc(*Stmt, 1);
+    body[0] = body_stmt;
+
+    const with_stmt = try arena_alloc.create(Stmt);
+    with_stmt.* = .{
+        .with_stmt = .{
+            .items = items,
+            .body = body,
+            .type_comment = null,
+            .is_async = false,
+        },
+    };
+
+    var writer = Writer.init(allocator);
+    defer writer.deinit(allocator);
+
+    try writer.writeStmt(allocator, with_stmt);
+    const output = try writer.getOutput(allocator);
+    defer allocator.free(output);
+
+    try testing.expectEqualStrings(
+        "with cm as v:\n    pass\n",
+        output,
+    );
+}
+
+test "codegen try statement" {
+    const testing = std.testing;
+    const allocator = testing.allocator;
+
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    const arena_alloc = arena.allocator();
+
+    const try_body_stmt = try arena_alloc.create(Stmt);
+    try_body_stmt.* = .pass;
+    const try_body = try arena_alloc.alloc(*Stmt, 1);
+    try_body[0] = try_body_stmt;
+
+    const handler_body_stmt = try arena_alloc.create(Stmt);
+    handler_body_stmt.* = .pass;
+    const handler_body = try arena_alloc.alloc(*Stmt, 1);
+    handler_body[0] = handler_body_stmt;
+
+    const exc_type = try ast.makeName(arena_alloc, "Exception", .load);
+    const handlers = try arena_alloc.alloc(ast.ExceptHandler, 1);
+    handlers[0] = .{
+        .type = exc_type,
+        .name = "e",
+        .body = handler_body,
+    };
+
+    const else_stmt = try arena_alloc.create(Stmt);
+    else_stmt.* = .pass;
+    const else_body = try arena_alloc.alloc(*Stmt, 1);
+    else_body[0] = else_stmt;
+
+    const finally_stmt = try arena_alloc.create(Stmt);
+    finally_stmt.* = .pass;
+    const final_body = try arena_alloc.alloc(*Stmt, 1);
+    final_body[0] = finally_stmt;
+
+    const try_stmt = try arena_alloc.create(Stmt);
+    try_stmt.* = .{
+        .try_stmt = .{
+            .body = try_body,
+            .handlers = handlers,
+            .else_body = else_body,
+            .finalbody = final_body,
+        },
+    };
+
+    var writer = Writer.init(allocator);
+    defer writer.deinit(allocator);
+
+    try writer.writeStmt(allocator, try_stmt);
+    const output = try writer.getOutput(allocator);
+    defer allocator.free(output);
+
+    try testing.expectEqualStrings(
+        "try:\n    pass\nexcept Exception as e:\n    pass\nelse:\n    pass\nfinally:\n    pass\n",
+        output,
+    );
 }
 
 // ============================================================================
@@ -1035,6 +1218,44 @@ pub const DebugPrinter = struct {
                 self.indent_level -= 1;
                 self.indent_level -= 1;
             },
+            .with_stmt => |w_stmt| {
+                if (w_stmt.is_async) {
+                    try w.writeAll("AsyncWith\n");
+                } else {
+                    try w.writeAll("With\n");
+                }
+                self.indent_level += 1;
+                try self.writeIndent(w);
+                try w.print("items({d}):\n", .{w_stmt.items.len});
+                self.indent_level += 1;
+                for (w_stmt.items) |item| {
+                    try self.writeIndent(w);
+                    try w.writeAll("item:\n");
+                    self.indent_level += 1;
+                    try self.writeIndent(w);
+                    try w.writeAll("context:\n");
+                    self.indent_level += 1;
+                    try self.printExpr(w, item.context_expr);
+                    self.indent_level -= 1;
+                    if (item.optional_vars) |vars| {
+                        try self.writeIndent(w);
+                        try w.writeAll("as:\n");
+                        self.indent_level += 1;
+                        try self.printExpr(w, vars);
+                        self.indent_level -= 1;
+                    }
+                    self.indent_level -= 1;
+                }
+                self.indent_level -= 1;
+                try self.writeIndent(w);
+                try w.print("body({d}):\n", .{w_stmt.body.len});
+                self.indent_level += 1;
+                for (w_stmt.body) |s| {
+                    try self.printStmt(w, s);
+                }
+                self.indent_level -= 1;
+                self.indent_level -= 1;
+            },
             .function_def => |f| {
                 if (f.is_async) {
                     try w.print("AsyncFunctionDef(\"{s}\")\n", .{f.name});
@@ -1061,6 +1282,64 @@ pub const DebugPrinter = struct {
                     try self.printStmt(w, s);
                 }
                 self.indent_level -= 1;
+                self.indent_level -= 1;
+            },
+            .try_stmt => |t| {
+                try w.writeAll("Try\n");
+                self.indent_level += 1;
+                try self.writeIndent(w);
+                try w.print("body({d}):\n", .{t.body.len});
+                self.indent_level += 1;
+                for (t.body) |s| {
+                    try self.printStmt(w, s);
+                }
+                self.indent_level -= 1;
+                try self.writeIndent(w);
+                try w.print("handlers({d}):\n", .{t.handlers.len});
+                self.indent_level += 1;
+                for (t.handlers) |h| {
+                    try self.writeIndent(w);
+                    try w.writeAll("handler:\n");
+                    self.indent_level += 1;
+                    if (h.type) |exc| {
+                        try self.writeIndent(w);
+                        try w.writeAll("type:\n");
+                        self.indent_level += 1;
+                        try self.printExpr(w, exc);
+                        self.indent_level -= 1;
+                    }
+                    if (h.name) |name| {
+                        try self.writeIndent(w);
+                        try w.print("name: {s}\n", .{name});
+                    }
+                    try self.writeIndent(w);
+                    try w.print("body({d}):\n", .{h.body.len});
+                    self.indent_level += 1;
+                    for (h.body) |s| {
+                        try self.printStmt(w, s);
+                    }
+                    self.indent_level -= 1;
+                    self.indent_level -= 1;
+                }
+                self.indent_level -= 1;
+                if (t.else_body.len > 0) {
+                    try self.writeIndent(w);
+                    try w.print("else({d}):\n", .{t.else_body.len});
+                    self.indent_level += 1;
+                    for (t.else_body) |s| {
+                        try self.printStmt(w, s);
+                    }
+                    self.indent_level -= 1;
+                }
+                if (t.finalbody.len > 0) {
+                    try self.writeIndent(w);
+                    try w.print("finally({d}):\n", .{t.finalbody.len});
+                    self.indent_level += 1;
+                    for (t.finalbody) |s| {
+                        try self.printStmt(w, s);
+                    }
+                    self.indent_level -= 1;
+                }
                 self.indent_level -= 1;
             },
             .pass => try w.writeAll("Pass\n"),
