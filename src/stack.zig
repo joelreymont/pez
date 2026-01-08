@@ -226,10 +226,10 @@ pub const SimContext = struct {
 
             .LOAD_FAST_BORROW_LOAD_FAST_BORROW => {
                 // Combined instruction that loads two fast variables
-                // arg encodes two indices: first in high byte, second in low byte
-                // (because we push first, then second onto the stack)
-                const second_idx = inst.arg & 0xFF;
-                const first_idx = (inst.arg >> 8) & 0xFF;
+                // arg encodes two 4-bit indices: first in high nibble, second in low nibble
+                // For arg=0x12: first_idx=1, second_idx=2
+                const first_idx = (inst.arg >> 4) & 0xF;
+                const second_idx = inst.arg & 0xF;
 
                 // Push first variable
                 if (self.getLocal(first_idx)) |name| {
