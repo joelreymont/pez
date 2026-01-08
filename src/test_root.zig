@@ -9,6 +9,7 @@ pub const pyc = @import("pyc.zig");
 pub const opcodes = @import("opcodes.zig");
 pub const decoder = @import("decoder.zig");
 pub const cfg = @import("cfg.zig");
+pub const ctrl = @import("ctrl.zig");
 pub const ast = @import("ast.zig");
 pub const stack = @import("stack.zig");
 pub const codegen = @import("codegen.zig");
@@ -25,6 +26,7 @@ comptime {
     _ = opcodes;
     _ = decoder;
     _ = cfg;
+    _ = ctrl;
     _ = ast;
     _ = stack;
     _ = codegen;
