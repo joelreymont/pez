@@ -625,7 +625,7 @@ pub const Analyzer = struct {
         const term = block.terminator() orelse return .none;
 
         // Only unconditional jumps can be break/continue
-        if (term.opcode != .JUMP_FORWARD and term.opcode != .JUMP_BACKWARD and term.opcode != .JUMP_BACKWARD_NO_INTERRUPT) {
+        if (term.opcode != .JUMP_FORWARD and term.opcode != .JUMP_BACKWARD and term.opcode != .JUMP_BACKWARD_NO_INTERRUPT and term.opcode != .JUMP_ABSOLUTE) {
             return .none;
         }
 

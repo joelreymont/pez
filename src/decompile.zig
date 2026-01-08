@@ -330,11 +330,23 @@ pub const Decompiler = struct {
             return null;
         };
 
+        var visited = try std.DynamicBitSet.initEmpty(self.allocator, self.cfg.blocks.len);
+        defer visited.deinit();
+
+        var skip_first = false;
+        const body = try self.decompileLoopBody(
+            pattern.body_block,
+            pattern.header_block,
+            &skip_first,
+            &visited,
+            null,
+        );
+
         const stmt = try self.allocator.create(Stmt);
         stmt.* = .{
             .while_stmt = .{
                 .condition = condition,
-                .body = &.{}, // TODO: decompile body
+                .body = body,
                 .else_body = &.{},
             },
         };
@@ -433,7 +445,14 @@ pub const Decompiler = struct {
                 else => {
                     // Process block statements, stop at loop-back jump
                     const has_back_edge = self.hasLoopBackEdge(block, header_block_id);
-                    try self.processBlockStatements(block, &stmts, &skip_first_store, has_back_edge);
+                    try self.processBlockStatements(
+                        block_idx,
+                        block,
+                        &stmts,
+                        &skip_first_store,
+                        has_back_edge,
+                        header_block_id,
+                    );
                     if (has_back_edge) break;
                     block_idx += 1;
                 },
@@ -455,7 +474,15 @@ pub const Decompiler = struct {
     }
 
     /// Process statements in a block, stopping before control flow jumps.
-    fn processBlockStatements(self: *Decompiler, block: *const cfg_mod.BasicBlock, stmts: *std.ArrayList(*Stmt), skip_first_store: *bool, stop_at_jump: bool) !void {
+    fn processBlockStatements(
+        self: *Decompiler,
+        block_id: u32,
+        block: *const cfg_mod.BasicBlock,
+        stmts: *std.ArrayList(*Stmt),
+        skip_first_store: *bool,
+        stop_at_jump: bool,
+        loop_header: ?u32,
+    ) !void {
         var sim = SimContext.init(self.allocator, self.code, self.version);
         defer sim.deinit();
 
@@ -481,7 +508,23 @@ pub const Decompiler = struct {
                         try stmts.append(self.allocator, stmt);
                     }
                 },
-                .JUMP_BACKWARD, .JUMP_BACKWARD_NO_INTERRUPT => {
+                .JUMP_FORWARD, .JUMP_BACKWARD, .JUMP_BACKWARD_NO_INTERRUPT, .JUMP_ABSOLUTE => {
+                    if (loop_header) |header_id| {
+                        const exit = self.analyzer.detectLoopExit(block_id, &[_]u32{header_id});
+                        switch (exit) {
+                            .break_stmt => {
+                                const stmt = try self.makeBreak();
+                                try stmts.append(self.allocator, stmt);
+                                return;
+                            },
+                            .continue_stmt => {
+                                const stmt = try self.makeContinue();
+                                try stmts.append(self.allocator, stmt);
+                                return;
+                            },
+                            else => {},
+                        }
+                    }
                     if (stop_at_jump) return;
                 },
                 .RETURN_VALUE => {
@@ -660,7 +703,14 @@ pub const Decompiler = struct {
                 },
                 else => {
                     // Process statements, stopping at back edge
-                    try self.processBlockStatements(block, &stmts, skip_first_store, has_back_edge);
+                    try self.processBlockStatements(
+                        block_idx,
+                        block,
+                        &stmts,
+                        skip_first_store,
+                        has_back_edge,
+                        loop_header,
+                    );
                     if (has_back_edge) break;
 
                     // Move to next block
@@ -700,6 +750,20 @@ pub const Decompiler = struct {
             .value = value,
             .type_comment = null,
         } };
+        return stmt;
+    }
+
+    /// Create a break statement.
+    fn makeBreak(self: *Decompiler) !*Stmt {
+        const stmt = try self.allocator.create(Stmt);
+        stmt.* = .break_stmt;
+        return stmt;
+    }
+
+    /// Create a continue statement.
+    fn makeContinue(self: *Decompiler) !*Stmt {
+        const stmt = try self.allocator.create(Stmt);
+        stmt.* = .continue_stmt;
         return stmt;
     }
 
