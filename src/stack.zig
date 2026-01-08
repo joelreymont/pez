@@ -173,8 +173,8 @@ pub const SimContext = struct {
             },
             .float => |v| .{ .float = v },
             .complex => |v| .{ .complex = .{ .real = v.real, .imag = v.imag } },
-            .string => |s| .{ .string = s },
-            .bytes => |b| .{ .bytes = b },
+            .string => |s| .{ .string = try self.allocator.dupe(u8, s) },
+            .bytes => |b| .{ .bytes = try self.allocator.dupe(u8, b) },
             else => .none, // TODO: handle tuples, code objects, etc.
         };
     }
