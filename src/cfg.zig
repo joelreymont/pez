@@ -219,9 +219,15 @@ pub fn buildCFG(allocator: Allocator, bytecode: []const u8, version: Version) !C
         if (term) |t| {
             if (t.jumpTarget(version)) |target| {
                 if (offset_to_block.get(target)) |target_block| {
-                    const edge_type: EdgeType = if (t.isConditionalJump())
-                        .conditional_true
-                    else if (t.opcode == .JUMP_BACKWARD or t.opcode == .JUMP_BACKWARD_NO_INTERRUPT)
+                    const edge_type: EdgeType = if (t.isConditionalJump()) blk: {
+                        // For POP_JUMP_IF_FALSE/NONE, jump target is the FALSE branch
+                        // For POP_JUMP_IF_TRUE/NOT_NONE, jump target is the TRUE branch
+                        break :blk switch (t.opcode) {
+                            .POP_JUMP_IF_FALSE, .POP_JUMP_IF_NONE => .conditional_false,
+                            .POP_JUMP_IF_TRUE, .POP_JUMP_IF_NOT_NONE => .conditional_true,
+                            else => .conditional_true,
+                        };
+                    } else if (t.opcode == .JUMP_BACKWARD or t.opcode == .JUMP_BACKWARD_NO_INTERRUPT)
                         .loop_back
                     else
                         .normal;
@@ -233,10 +239,17 @@ pub fn buildCFG(allocator: Allocator, bytecode: []const u8, version: Version) !C
         // Check for fallthrough edge
         if (block.fallsThrough()) {
             if (block_idx + 1 < blocks.len) {
-                const edge_type: EdgeType = if (term != null and term.?.isConditionalJump())
-                    .conditional_false
-                else
-                    .normal;
+                const edge_type: EdgeType = if (term) |t| blk: {
+                    if (t.isConditionalJump()) {
+                        // Fallthrough is the opposite of jump target
+                        break :blk switch (t.opcode) {
+                            .POP_JUMP_IF_FALSE, .POP_JUMP_IF_NONE => .conditional_true,
+                            .POP_JUMP_IF_TRUE, .POP_JUMP_IF_NOT_NONE => .conditional_false,
+                            else => .conditional_false,
+                        };
+                    }
+                    break :blk .normal;
+                } else .normal;
                 try succ_list.append(allocator, .{ .target = @intCast(block_idx + 1), .edge_type = edge_type });
             }
         }

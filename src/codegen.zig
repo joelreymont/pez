@@ -51,6 +51,41 @@ pub const Writer = struct {
         }
     }
 
+    /// Write an if statement, with special handling for elif chains.
+    fn writeIfStmt(self: *Writer, allocator: std.mem.Allocator, i: anytype, is_elif: bool) WriteError!void {
+        // Write the keyword
+        if (is_elif) {
+            try self.write(allocator, "elif ");
+        } else {
+            try self.write(allocator, "if ");
+        }
+        try self.writeExpr(allocator, i.condition);
+        try self.write(allocator, ":\n");
+
+        // Write body
+        self.indent_level += 1;
+        for (i.body) |s| {
+            try self.writeStmt(allocator, s);
+        }
+        self.indent_level -= 1;
+
+        // Write else/elif
+        if (i.else_body.len > 0) {
+            try self.writeIndent(allocator);
+            // Check if else body is a single if statement (elif)
+            if (i.else_body.len == 1 and i.else_body[0].* == .if_stmt) {
+                try self.writeIfStmt(allocator, i.else_body[0].if_stmt, true);
+            } else {
+                try self.write(allocator, "else:\n");
+                self.indent_level += 1;
+                for (i.else_body) |s| {
+                    try self.writeStmt(allocator, s);
+                }
+                self.indent_level -= 1;
+            }
+        }
+    }
+
     fn writeFmt(self: *Writer, allocator: std.mem.Allocator, comptime fmt: []const u8, args: anytype) !void {
         var buf: [1024]u8 = undefined;
         const result = std.fmt.bufPrint(&buf, fmt, args) catch {
@@ -388,30 +423,7 @@ pub const Writer = struct {
                 try self.writeByte(allocator, '\n');
             },
             .if_stmt => |i| {
-                try self.write(allocator, "if ");
-                try self.writeExpr(allocator, i.condition);
-                try self.write(allocator, ":\n");
-                self.indent_level += 1;
-                for (i.body) |s| {
-                    try self.writeStmt(allocator, s);
-                }
-                self.indent_level -= 1;
-                if (i.else_body.len > 0) {
-                    try self.writeIndent(allocator);
-                    // Check if else body is a single if statement (elif)
-                    if (i.else_body.len == 1 and i.else_body[0].* == .if_stmt) {
-                        try self.write(allocator, "el");
-                        // Remove indent for elif
-                        try self.writeStmt(allocator, i.else_body[0]);
-                    } else {
-                        try self.write(allocator, "else:\n");
-                        self.indent_level += 1;
-                        for (i.else_body) |s| {
-                            try self.writeStmt(allocator, s);
-                        }
-                        self.indent_level -= 1;
-                    }
-                }
+                try self.writeIfStmt(allocator, i, false);
             },
             .while_stmt => |w| {
                 try self.write(allocator, "while ");

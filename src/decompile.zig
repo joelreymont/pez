@@ -63,6 +63,30 @@ pub const Decompiler = struct {
         self.statements.deinit(self.allocator);
     }
 
+    /// Find the last block that's part of an if-elif-else chain.
+    fn findIfChainEnd(self: *Decompiler, pattern: ctrl.IfPattern) u32 {
+        var max_block = pattern.then_block;
+
+        if (pattern.else_block) |else_id| {
+            max_block = @max(max_block, else_id);
+
+            // If this is an elif, recursively find its end
+            if (pattern.is_elif) {
+                const else_pattern = self.analyzer.detectPattern(else_id);
+                if (else_pattern == .if_stmt) {
+                    max_block = @max(max_block, self.findIfChainEnd(else_pattern.if_stmt));
+                }
+            }
+        }
+
+        if (pattern.merge_block) |merge| {
+            return merge;
+        }
+
+        // No merge point - return past the last block in the chain
+        return max_block + 1;
+    }
+
     /// Decompile the code object into a list of statements.
     pub fn decompile(self: *Decompiler) ![]const *Stmt {
         if (self.cfg.blocks.len == 0) {
@@ -80,12 +104,8 @@ pub const Decompiler = struct {
                     if (stmt) |s| {
                         try self.statements.append(self.allocator, s);
                     }
-                    // Skip processed blocks
-                    if (p.merge_block) |merge| {
-                        block_idx = merge;
-                    } else {
-                        block_idx += 1;
-                    }
+                    // Skip all processed blocks
+                    block_idx = self.findIfChainEnd(p);
                 },
                 .while_loop => |p| {
                     const stmt = try self.decompileWhile(p);
@@ -166,6 +186,73 @@ pub const Decompiler = struct {
         }
     }
 
+    /// Decompile a range of blocks into a statement list.
+    /// Returns statements from start_block up to (but not including) end_block.
+    fn decompileBlockRange(self: *Decompiler, start_block: u32, end_block: ?u32) ![]const *Stmt {
+        var stmts: std.ArrayList(*Stmt) = .{};
+        errdefer stmts.deinit(self.allocator);
+
+        var block_idx = start_block;
+        const limit = end_block orelse @as(u32, @intCast(self.cfg.blocks.len));
+
+        while (block_idx < limit) {
+            // Process this block's statements
+            try self.decompileBlockInto(block_idx, &stmts);
+            block_idx += 1;
+        }
+
+        return stmts.toOwnedSlice(self.allocator);
+    }
+
+    /// Decompile a single block's statements into the provided list.
+    fn decompileBlockInto(self: *Decompiler, block_id: u32, stmts: *std.ArrayList(*Stmt)) !void {
+        if (block_id >= self.cfg.blocks.len) return;
+        const block = &self.cfg.blocks[block_id];
+
+        var sim = SimContext.init(self.allocator, self.code, self.version);
+        defer sim.deinit();
+
+        for (block.instructions) |inst| {
+            switch (inst.opcode) {
+                .STORE_NAME, .STORE_FAST, .STORE_GLOBAL => {
+                    if (sim.stack.popExpr()) |value| {
+                        const name = switch (inst.opcode) {
+                            .STORE_NAME, .STORE_GLOBAL => sim.getName(inst.arg) orelse "<unknown>",
+                            .STORE_FAST => sim.getLocal(inst.arg) orelse "<unknown>",
+                            else => "<unknown>",
+                        };
+                        const target = try ast.makeName(self.allocator, name, .store);
+                        const stmt = try self.makeAssign(target, value);
+                        try stmts.append(self.allocator, stmt);
+                    }
+                },
+                .RETURN_VALUE => {
+                    if (sim.stack.popExpr()) |value| {
+                        const stmt = try self.makeReturn(value);
+                        try stmts.append(self.allocator, stmt);
+                    }
+                },
+                .RETURN_CONST => {
+                    if (sim.getConst(inst.arg)) |obj| {
+                        const constant = try sim.objToConstant(obj);
+                        const value = try ast.makeConstant(self.allocator, constant);
+                        const stmt = try self.makeReturn(value);
+                        try stmts.append(self.allocator, stmt);
+                    }
+                },
+                .POP_TOP => {
+                    if (sim.stack.popExpr()) |value| {
+                        const stmt = try self.makeExprStmt(value);
+                        try stmts.append(self.allocator, stmt);
+                    }
+                },
+                else => {
+                    sim.simulate(inst) catch {};
+                },
+            }
+        }
+    }
+
     /// Decompile an if statement pattern.
     fn decompileIf(self: *Decompiler, pattern: ctrl.IfPattern) !?*Stmt {
         const cond_block = &self.cfg.blocks[pattern.condition_block];
@@ -184,12 +271,35 @@ pub const Decompiler = struct {
             return null;
         };
 
+        // Decompile the then body
+        const then_end = pattern.else_block orelse pattern.merge_block;
+        const then_body = try self.decompileBlockRange(pattern.then_block, then_end);
+
+        // Decompile the else body
+        const else_body = if (pattern.else_block) |else_id| blk: {
+            // Check if else is an elif
+            if (pattern.is_elif) {
+                // The else block is another if statement - recurse
+                const else_pattern = self.analyzer.detectPattern(else_id);
+                if (else_pattern == .if_stmt) {
+                    const elif_stmt = try self.decompileIf(else_pattern.if_stmt);
+                    if (elif_stmt) |s| {
+                        const body = try self.allocator.alloc(*Stmt, 1);
+                        body[0] = s;
+                        break :blk body;
+                    }
+                }
+            }
+            // Regular else
+            break :blk try self.decompileBlockRange(else_id, pattern.merge_block);
+        } else &[_]*Stmt{};
+
         // Create if statement
         const stmt = try self.allocator.create(Stmt);
         stmt.* = .{ .if_stmt = .{
             .condition = condition,
-            .body = &.{}, // TODO: decompile then block
-            .else_body = &.{}, // TODO: decompile else block
+            .body = then_body,
+            .else_body = else_body,
         } };
 
         return stmt;
