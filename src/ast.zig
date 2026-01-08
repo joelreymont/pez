@@ -344,11 +344,13 @@ pub const Expr = union(enum) {
         // Recursively free child nodes
         switch (self.*) {
             .bool_op => |v| {
-                for (v.values) |val| {
-                    val.deinit(allocator);
-                    allocator.destroy(val);
-                }
-                allocator.free(v.values);
+                deinitExprSlice(allocator, v.values);
+            },
+            .named_expr => |v| {
+                v.target.deinit(allocator);
+                allocator.destroy(v.target);
+                v.value.deinit(allocator);
+                allocator.destroy(v.value);
             },
             .bin_op => |v| {
                 v.left.deinit(allocator);
@@ -360,36 +362,39 @@ pub const Expr = union(enum) {
                 v.operand.deinit(allocator);
                 allocator.destroy(v.operand);
             },
+            .lambda => |v| {
+                deinitArguments(allocator, v.args);
+                v.body.deinit(allocator);
+                allocator.destroy(v.body);
+            },
+            .if_exp => |v| {
+                v.condition.deinit(allocator);
+                allocator.destroy(v.condition);
+                v.body.deinit(allocator);
+                allocator.destroy(v.body);
+                v.else_body.deinit(allocator);
+                allocator.destroy(v.else_body);
+            },
             .call => |v| {
                 v.func.deinit(allocator);
                 allocator.destroy(v.func);
-                for (v.args) |arg| {
-                    @constCast(arg).deinit(allocator);
-                    allocator.destroy(arg);
-                }
-                allocator.free(v.args);
-                allocator.free(v.keywords);
+                deinitExprSlice(allocator, v.args);
+                deinitKeywords(allocator, v.keywords);
+            },
+            .compare => |v| {
+                v.left.deinit(allocator);
+                allocator.destroy(v.left);
+                deinitExprSlice(allocator, v.comparators);
+                allocator.free(v.ops);
             },
             .list => |v| {
-                for (v.elts) |e| {
-                    @constCast(e).deinit(allocator);
-                    allocator.destroy(e);
-                }
-                allocator.free(v.elts);
+                deinitExprSlice(allocator, v.elts);
             },
             .tuple => |v| {
-                for (v.elts) |e| {
-                    @constCast(e).deinit(allocator);
-                    allocator.destroy(e);
-                }
-                allocator.free(v.elts);
+                deinitExprSlice(allocator, v.elts);
             },
             .set => |v| {
-                for (v.elts) |e| {
-                    @constCast(e).deinit(allocator);
-                    allocator.destroy(e);
-                }
-                allocator.free(v.elts);
+                deinitExprSlice(allocator, v.elts);
             },
             .dict => |v| {
                 for (v.keys, v.values) |maybe_key, value| {
@@ -403,6 +408,53 @@ pub const Expr = union(enum) {
                 allocator.free(v.keys);
                 allocator.free(v.values);
             },
+            .list_comp => |v| {
+                v.elt.deinit(allocator);
+                allocator.destroy(v.elt);
+                deinitComprehensions(allocator, v.generators);
+            },
+            .set_comp => |v| {
+                v.elt.deinit(allocator);
+                allocator.destroy(v.elt);
+                deinitComprehensions(allocator, v.generators);
+            },
+            .dict_comp => |v| {
+                v.key.deinit(allocator);
+                allocator.destroy(v.key);
+                v.value.deinit(allocator);
+                allocator.destroy(v.value);
+                deinitComprehensions(allocator, v.generators);
+            },
+            .generator_exp => |v| {
+                v.elt.deinit(allocator);
+                allocator.destroy(v.elt);
+                deinitComprehensions(allocator, v.generators);
+            },
+            .await_expr => |v| {
+                v.value.deinit(allocator);
+                allocator.destroy(v.value);
+            },
+            .yield_expr => |v| {
+                if (v.value) |value| {
+                    value.deinit(allocator);
+                    allocator.destroy(value);
+                }
+            },
+            .yield_from => |v| {
+                v.value.deinit(allocator);
+                allocator.destroy(v.value);
+            },
+            .formatted_value => |v| {
+                v.value.deinit(allocator);
+                allocator.destroy(v.value);
+                if (v.format_spec) |spec| {
+                    spec.deinit(allocator);
+                    allocator.destroy(spec);
+                }
+            },
+            .joined_str => |v| {
+                deinitExprSlice(allocator, v.values);
+            },
             .attribute => |v| {
                 v.value.deinit(allocator);
                 allocator.destroy(v.value);
@@ -413,9 +465,26 @@ pub const Expr = union(enum) {
                 v.slice.deinit(allocator);
                 allocator.destroy(v.slice);
             },
+            .slice => |v| {
+                if (v.lower) |lower| {
+                    lower.deinit(allocator);
+                    allocator.destroy(lower);
+                }
+                if (v.upper) |upper| {
+                    upper.deinit(allocator);
+                    allocator.destroy(upper);
+                }
+                if (v.step) |step| {
+                    step.deinit(allocator);
+                    allocator.destroy(step);
+                }
+            },
+            .starred => |v| {
+                v.value.deinit(allocator);
+                allocator.destroy(v.value);
+            },
             .constant => |c| c.deinit(allocator),
             .name => {}, // String owned elsewhere
-            else => {},
         }
     }
 };
@@ -477,6 +546,456 @@ pub const Arg = struct {
     annotation: ?*Expr,
     type_comment: ?[]const u8,
 };
+
+fn deinitExprSlice(allocator: Allocator, items: []const *Expr) void {
+    for (items) |item| {
+        @constCast(item).deinit(allocator);
+        allocator.destroy(item);
+    }
+    if (items.len > 0) allocator.free(items);
+}
+
+fn deinitOptionalExprSlice(allocator: Allocator, items: []const ?*Expr) void {
+    for (items) |item| {
+        if (item) |expr| {
+            @constCast(expr).deinit(allocator);
+            allocator.destroy(expr);
+        }
+    }
+    if (items.len > 0) allocator.free(items);
+}
+
+fn deinitKeywords(allocator: Allocator, keywords: []const Keyword) void {
+    for (keywords) |kw| {
+        kw.value.deinit(allocator);
+        allocator.destroy(kw.value);
+    }
+    if (keywords.len > 0) allocator.free(keywords);
+}
+
+fn deinitComprehensions(allocator: Allocator, generators: []const Comprehension) void {
+    for (generators) |gen| {
+        gen.target.deinit(allocator);
+        allocator.destroy(gen.target);
+        gen.iter.deinit(allocator);
+        allocator.destroy(gen.iter);
+        deinitExprSlice(allocator, gen.ifs);
+    }
+    if (generators.len > 0) allocator.free(generators);
+}
+
+fn deinitArguments(allocator: Allocator, args: *Arguments) void {
+    for (args.posonlyargs) |arg| {
+        if (arg.annotation) |ann| {
+            ann.deinit(allocator);
+            allocator.destroy(ann);
+        }
+    }
+    if (args.posonlyargs.len > 0) allocator.free(args.posonlyargs);
+
+    for (args.args) |arg| {
+        if (arg.annotation) |ann| {
+            ann.deinit(allocator);
+            allocator.destroy(ann);
+        }
+    }
+    if (args.args.len > 0) allocator.free(args.args);
+
+    if (args.vararg) |arg| {
+        if (arg.annotation) |ann| {
+            ann.deinit(allocator);
+            allocator.destroy(ann);
+        }
+    }
+
+    for (args.kwonlyargs) |arg| {
+        if (arg.annotation) |ann| {
+            ann.deinit(allocator);
+            allocator.destroy(ann);
+        }
+    }
+    if (args.kwonlyargs.len > 0) allocator.free(args.kwonlyargs);
+
+    deinitOptionalExprSlice(allocator, args.kw_defaults);
+
+    if (args.kwarg) |arg| {
+        if (arg.annotation) |ann| {
+            ann.deinit(allocator);
+            allocator.destroy(ann);
+        }
+    }
+
+    deinitExprSlice(allocator, args.defaults);
+    allocator.destroy(args);
+}
+
+const CloneError = Allocator.Error;
+
+pub fn cloneConstant(allocator: Allocator, value: Constant) CloneError!Constant {
+    return switch (value) {
+        .none => .none,
+        .true_ => .true_,
+        .false_ => .false_,
+        .ellipsis => .ellipsis,
+        .int => |v| .{ .int = v },
+        .big_int => |v| .{ .big_int = try v.clone(allocator) },
+        .float => |v| .{ .float = v },
+        .complex => |v| .{ .complex = .{ .real = v.real, .imag = v.imag } },
+        .string => |s| .{ .string = try allocator.dupe(u8, s) },
+        .bytes => |b| .{ .bytes = try allocator.dupe(u8, b) },
+    };
+}
+
+fn cloneExprSlice(allocator: Allocator, items: []const *Expr) CloneError![]const *Expr {
+    if (items.len == 0) return &.{};
+    const out = try allocator.alloc(*Expr, items.len);
+    var count: usize = 0;
+    errdefer {
+        deinitExprSlice(allocator, out[0..count]);
+    }
+
+    for (items, 0..) |item, idx| {
+        out[idx] = try cloneExpr(allocator, item);
+        count += 1;
+    }
+
+    return out;
+}
+
+fn cloneOptionalExprSlice(allocator: Allocator, items: []const ?*Expr) CloneError![]const ?*Expr {
+    if (items.len == 0) return &.{};
+    const out = try allocator.alloc(?*Expr, items.len);
+    var count: usize = 0;
+    errdefer {
+        deinitOptionalExprSlice(allocator, out[0..count]);
+    }
+
+    for (items, 0..) |item, idx| {
+        out[idx] = if (item) |expr| try cloneExpr(allocator, expr) else null;
+        count += 1;
+    }
+
+    return out;
+}
+
+fn cloneArg(allocator: Allocator, arg: Arg) CloneError!Arg {
+    return .{
+        .arg = arg.arg,
+        .annotation = if (arg.annotation) |ann| try cloneExpr(allocator, ann) else null,
+        .type_comment = arg.type_comment,
+    };
+}
+
+fn cloneArgSlice(allocator: Allocator, args: []const Arg) CloneError![]const Arg {
+    if (args.len == 0) return &.{};
+    const out = try allocator.alloc(Arg, args.len);
+    var count: usize = 0;
+    errdefer {
+        var i: usize = 0;
+        while (i < count) : (i += 1) {
+            if (out[i].annotation) |ann| {
+                ann.deinit(allocator);
+                allocator.destroy(ann);
+            }
+        }
+        allocator.free(out);
+    }
+
+    for (args, 0..) |arg, idx| {
+        out[idx] = try cloneArg(allocator, arg);
+        count += 1;
+    }
+
+    return out;
+}
+
+fn cloneKeywords(allocator: Allocator, keywords: []const Keyword) CloneError![]const Keyword {
+    if (keywords.len == 0) return &.{};
+    const out = try allocator.alloc(Keyword, keywords.len);
+    var count: usize = 0;
+    errdefer {
+        var i: usize = 0;
+        while (i < count) : (i += 1) {
+            out[i].value.deinit(allocator);
+            allocator.destroy(out[i].value);
+        }
+        allocator.free(out);
+    }
+
+    for (keywords, 0..) |kw, idx| {
+        out[idx] = .{
+            .arg = kw.arg,
+            .value = try cloneExpr(allocator, kw.value),
+        };
+        count += 1;
+    }
+
+    return out;
+}
+
+fn cloneComprehensions(allocator: Allocator, generators: []const Comprehension) CloneError![]const Comprehension {
+    if (generators.len == 0) return &.{};
+    const out = try allocator.alloc(Comprehension, generators.len);
+    var count: usize = 0;
+    errdefer {
+        deinitComprehensions(allocator, out[0..count]);
+    }
+
+    for (generators, 0..) |gen, idx| {
+        out[idx] = .{
+            .target = try cloneExpr(allocator, gen.target),
+            .iter = try cloneExpr(allocator, gen.iter),
+            .ifs = try cloneExprSlice(allocator, gen.ifs),
+            .is_async = gen.is_async,
+        };
+        count += 1;
+    }
+
+    return out;
+}
+
+fn cloneArguments(allocator: Allocator, args: *const Arguments) CloneError!*Arguments {
+    const out = try allocator.create(Arguments);
+    out.* = .{
+        .posonlyargs = &.{},
+        .args = &.{},
+        .vararg = null,
+        .kwonlyargs = &.{},
+        .kw_defaults = &.{},
+        .kwarg = null,
+        .defaults = &.{},
+    };
+    errdefer deinitArguments(allocator, out);
+
+    out.posonlyargs = try cloneArgSlice(allocator, args.posonlyargs);
+    out.args = try cloneArgSlice(allocator, args.args);
+    if (args.vararg) |va| out.vararg = try cloneArg(allocator, va);
+    out.kwonlyargs = try cloneArgSlice(allocator, args.kwonlyargs);
+    out.kw_defaults = try cloneOptionalExprSlice(allocator, args.kw_defaults);
+    if (args.kwarg) |ka| out.kwarg = try cloneArg(allocator, ka);
+    out.defaults = try cloneExprSlice(allocator, args.defaults);
+
+    return out;
+}
+
+pub fn cloneExpr(allocator: Allocator, expr: *const Expr) CloneError!*Expr {
+    const out = try allocator.create(Expr);
+    errdefer allocator.destroy(out);
+
+    out.* = switch (expr.*) {
+        .bool_op => |v| .{ .bool_op = .{
+            .op = v.op,
+            .values = try cloneExprSlice(allocator, v.values),
+        } },
+        .named_expr => |v| blk: {
+            const target = try cloneExpr(allocator, v.target);
+            errdefer {
+                target.deinit(allocator);
+                allocator.destroy(target);
+            }
+            const value = try cloneExpr(allocator, v.value);
+            break :blk .{ .named_expr = .{
+                .target = target,
+                .value = value,
+            } };
+        },
+        .bin_op => |v| blk: {
+            const left = try cloneExpr(allocator, v.left);
+            errdefer {
+                left.deinit(allocator);
+                allocator.destroy(left);
+            }
+            const right = try cloneExpr(allocator, v.right);
+            break :blk .{ .bin_op = .{
+                .left = left,
+                .op = v.op,
+                .right = right,
+            } };
+        },
+        .unary_op => |v| blk: {
+            const operand = try cloneExpr(allocator, v.operand);
+            break :blk .{ .unary_op = .{ .op = v.op, .operand = operand } };
+        },
+        .lambda => |v| blk: {
+            const args = try cloneArguments(allocator, v.args);
+            errdefer deinitArguments(allocator, args);
+            const body = try cloneExpr(allocator, v.body);
+            break :blk .{ .lambda = .{
+                .args = args,
+                .body = body,
+            } };
+        },
+        .if_exp => |v| blk: {
+            const condition = try cloneExpr(allocator, v.condition);
+            errdefer {
+                condition.deinit(allocator);
+                allocator.destroy(condition);
+            }
+            const body = try cloneExpr(allocator, v.body);
+            errdefer {
+                body.deinit(allocator);
+                allocator.destroy(body);
+            }
+            const else_body = try cloneExpr(allocator, v.else_body);
+            break :blk .{ .if_exp = .{
+                .condition = condition,
+                .body = body,
+                .else_body = else_body,
+            } };
+        },
+        .dict => |v| blk: {
+            const keys = try cloneOptionalExprSlice(allocator, v.keys);
+            errdefer deinitOptionalExprSlice(allocator, keys);
+            const values = try cloneExprSlice(allocator, v.values);
+            break :blk .{ .dict = .{ .keys = keys, .values = values } };
+        },
+        .set => |v| .{ .set = .{ .elts = try cloneExprSlice(allocator, v.elts) } },
+        .list_comp => |v| blk: {
+            const elt = try cloneExpr(allocator, v.elt);
+            errdefer {
+                elt.deinit(allocator);
+                allocator.destroy(elt);
+            }
+            const generators = try cloneComprehensions(allocator, v.generators);
+            break :blk .{ .list_comp = .{ .elt = elt, .generators = generators } };
+        },
+        .set_comp => |v| blk: {
+            const elt = try cloneExpr(allocator, v.elt);
+            errdefer {
+                elt.deinit(allocator);
+                allocator.destroy(elt);
+            }
+            const generators = try cloneComprehensions(allocator, v.generators);
+            break :blk .{ .set_comp = .{ .elt = elt, .generators = generators } };
+        },
+        .dict_comp => |v| blk: {
+            const key = try cloneExpr(allocator, v.key);
+            errdefer {
+                key.deinit(allocator);
+                allocator.destroy(key);
+            }
+            const value = try cloneExpr(allocator, v.value);
+            errdefer {
+                value.deinit(allocator);
+                allocator.destroy(value);
+            }
+            const generators = try cloneComprehensions(allocator, v.generators);
+            break :blk .{ .dict_comp = .{
+                .key = key,
+                .value = value,
+                .generators = generators,
+            } };
+        },
+        .generator_exp => |v| blk: {
+            const elt = try cloneExpr(allocator, v.elt);
+            errdefer {
+                elt.deinit(allocator);
+                allocator.destroy(elt);
+            }
+            const generators = try cloneComprehensions(allocator, v.generators);
+            break :blk .{ .generator_exp = .{ .elt = elt, .generators = generators } };
+        },
+        .await_expr => |v| .{ .await_expr = .{ .value = try cloneExpr(allocator, v.value) } },
+        .yield_expr => |v| .{ .yield_expr = .{ .value = if (v.value) |val| try cloneExpr(allocator, val) else null } },
+        .yield_from => |v| .{ .yield_from = .{ .value = try cloneExpr(allocator, v.value) } },
+        .compare => |v| blk: {
+            const left = try cloneExpr(allocator, v.left);
+            errdefer {
+                left.deinit(allocator);
+                allocator.destroy(left);
+            }
+            const ops = try allocator.dupe(CmpOp, v.ops);
+            errdefer allocator.free(ops);
+            const comparators = try cloneExprSlice(allocator, v.comparators);
+            break :blk .{ .compare = .{
+                .left = left,
+                .ops = ops,
+                .comparators = comparators,
+            } };
+        },
+        .call => |v| blk: {
+            const func = try cloneExpr(allocator, v.func);
+            errdefer {
+                func.deinit(allocator);
+                allocator.destroy(func);
+            }
+            const args = try cloneExprSlice(allocator, v.args);
+            errdefer deinitExprSlice(allocator, args);
+            const keywords = try cloneKeywords(allocator, v.keywords);
+            break :blk .{ .call = .{
+                .func = func,
+                .args = args,
+                .keywords = keywords,
+            } };
+        },
+        .formatted_value => |v| blk: {
+            const value = try cloneExpr(allocator, v.value);
+            errdefer {
+                value.deinit(allocator);
+                allocator.destroy(value);
+            }
+            const format_spec = if (v.format_spec) |spec| try cloneExpr(allocator, spec) else null;
+            break :blk .{ .formatted_value = .{
+                .value = value,
+                .conversion = v.conversion,
+                .format_spec = format_spec,
+            } };
+        },
+        .joined_str => |v| .{ .joined_str = .{ .values = try cloneExprSlice(allocator, v.values) } },
+        .constant => |v| .{ .constant = try cloneConstant(allocator, v) },
+        .attribute => |v| .{ .attribute = .{
+            .value = try cloneExpr(allocator, v.value),
+            .attr = v.attr,
+            .ctx = v.ctx,
+        } },
+        .subscript => |v| blk: {
+            const value = try cloneExpr(allocator, v.value);
+            errdefer {
+                value.deinit(allocator);
+                allocator.destroy(value);
+            }
+            const slice = try cloneExpr(allocator, v.slice);
+            break :blk .{ .subscript = .{
+                .value = value,
+                .slice = slice,
+                .ctx = v.ctx,
+            } };
+        },
+        .starred => |v| .{ .starred = .{
+            .value = try cloneExpr(allocator, v.value),
+            .ctx = v.ctx,
+        } },
+        .name => |v| .{ .name = .{ .id = v.id, .ctx = v.ctx } },
+        .list => |v| .{ .list = .{
+            .elts = try cloneExprSlice(allocator, v.elts),
+            .ctx = v.ctx,
+        } },
+        .tuple => |v| .{ .tuple = .{
+            .elts = try cloneExprSlice(allocator, v.elts),
+            .ctx = v.ctx,
+        } },
+        .slice => |v| blk: {
+            const lower = if (v.lower) |l| try cloneExpr(allocator, l) else null;
+            errdefer if (lower) |lower_expr| {
+                lower_expr.deinit(allocator);
+                allocator.destroy(lower_expr);
+            };
+            const upper = if (v.upper) |u| try cloneExpr(allocator, u) else null;
+            errdefer if (upper) |upper_expr| {
+                upper_expr.deinit(allocator);
+                allocator.destroy(upper_expr);
+            };
+            const step = if (v.step) |s| try cloneExpr(allocator, s) else null;
+            break :blk .{ .slice = .{
+                .lower = lower,
+                .upper = upper,
+                .step = step,
+            } };
+        },
+    };
+
+    return out;
+}
 
 /// Statement node types.
 pub const Stmt = union(enum) {

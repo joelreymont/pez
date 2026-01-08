@@ -101,7 +101,13 @@ pub const Stack = struct {
         for (values, 0..) |v, i| {
             exprs[i] = switch (v) {
                 .expr => |e| e,
-                else => return error.NotAnExpression,
+                else => {
+                    for (values) |*val| {
+                        val.deinit(self.allocator);
+                    }
+                    self.allocator.free(exprs);
+                    return error.NotAnExpression;
+                },
             };
         }
         return exprs;
@@ -277,6 +283,15 @@ pub const SimContext = struct {
             }
         }
         return qualname;
+    }
+
+    fn cloneStackValue(self: *SimContext, value: StackValue) !StackValue {
+        return switch (value) {
+            .expr => |e| .{ .expr = try ast.cloneExpr(self.allocator, e) },
+            .code_obj => |code| .{ .code_obj = code },
+            .null_marker => .null_marker,
+            .unknown => .unknown,
+        };
     }
 
     /// Simulate a single instruction.
@@ -582,13 +597,76 @@ pub const SimContext = struct {
             .DUP_TOP => {
                 // DUP_TOP - duplicate top of stack
                 const top = self.stack.peek() orelse return error.StackUnderflow;
-                if (top == .expr) {
-                    // Create a copy of the expression name (for Name exprs) or push unknown
-                    // For simplicity, push a reference to the same expression
-                    try self.stack.push(top);
-                } else {
-                    try self.stack.push(top);
+                try self.stack.push(try self.cloneStackValue(top));
+            },
+
+            .DUP_TOP_TWO => {
+                const len = self.stack.items.items.len;
+                if (len < 2) return error.StackUnderflow;
+                try self.stack.items.ensureUnusedCapacity(self.allocator, 2);
+                const second = self.stack.items.items[len - 2];
+                const top = self.stack.items.items[len - 1];
+                try self.stack.push(try self.cloneStackValue(second));
+                try self.stack.push(try self.cloneStackValue(top));
+            },
+
+            .DUP_TOPX => {
+                const count: usize = @intCast(inst.arg);
+                if (count == 0) return error.InvalidDupArg;
+                if (count > self.stack.items.items.len) return error.StackUnderflow;
+                try self.stack.items.ensureUnusedCapacity(self.allocator, count);
+
+                const start = self.stack.items.items.len - count;
+                const items = self.stack.items.items;
+
+                var clones = try self.allocator.alloc(StackValue, count);
+                defer self.allocator.free(clones);
+                var cloned_count: usize = 0;
+                errdefer {
+                    for (clones[0..cloned_count]) |*val| val.deinit(self.allocator);
                 }
+
+                var i: usize = 0;
+                while (i < count) : (i += 1) {
+                    clones[i] = try self.cloneStackValue(items[start + i]);
+                    cloned_count += 1;
+                }
+
+                for (clones) |val| {
+                    try self.stack.push(val);
+                }
+            },
+
+            .ROT_TWO => {
+                if (self.stack.items.items.len < 2) return error.StackUnderflow;
+                const len = self.stack.items.items.len;
+                const tmp = self.stack.items.items[len - 1];
+                self.stack.items.items[len - 1] = self.stack.items.items[len - 2];
+                self.stack.items.items[len - 2] = tmp;
+            },
+
+            .ROT_THREE => {
+                if (self.stack.items.items.len < 3) return error.StackUnderflow;
+                const len = self.stack.items.items.len;
+                const top = self.stack.items.items[len - 1];
+                const second = self.stack.items.items[len - 2];
+                const third = self.stack.items.items[len - 3];
+                self.stack.items.items[len - 1] = second;
+                self.stack.items.items[len - 2] = third;
+                self.stack.items.items[len - 3] = top;
+            },
+
+            .ROT_FOUR => {
+                if (self.stack.items.items.len < 4) return error.StackUnderflow;
+                const len = self.stack.items.items.len;
+                const top = self.stack.items.items[len - 1];
+                const second = self.stack.items.items[len - 2];
+                const third = self.stack.items.items[len - 3];
+                const fourth = self.stack.items.items[len - 4];
+                self.stack.items.items[len - 1] = second;
+                self.stack.items.items[len - 2] = third;
+                self.stack.items.items[len - 3] = fourth;
+                self.stack.items.items[len - 4] = top;
             },
 
             .SWAP => {
@@ -609,7 +687,7 @@ pub const SimContext = struct {
                 if (pos < 1 or pos > self.stack.items.items.len) return error.StackUnderflow;
                 const copy_idx = self.stack.items.items.len - pos;
                 const val = self.stack.items.items[copy_idx];
-                try self.stack.push(val);
+                try self.stack.push(try self.cloneStackValue(val));
             },
 
             // Unary operators
@@ -1107,6 +1185,51 @@ test "stack simulation load const" {
     try testing.expect(val == .expr);
     try testing.expect(val.expr.constant == .int);
     try testing.expectEqual(@as(i64, 42), val.expr.constant.int);
+}
+
+test "stack simulation dup top clones expr" {
+    const testing = std.testing;
+    const allocator = testing.allocator;
+
+    var consts = [_]pyc.Object{
+        .{ .int = pyc.Int.fromI64(7) },
+    };
+    var code = pyc.Code{
+        .allocator = allocator,
+        .consts = &consts,
+    };
+    const version = Version.init(3, 12);
+
+    var ctx = SimContext.init(allocator, &code, version);
+    defer ctx.deinit();
+
+    const load_inst = Instruction{
+        .opcode = .LOAD_CONST,
+        .arg = 0,
+        .offset = 0,
+        .size = 2,
+        .cache_entries = 0,
+    };
+    try ctx.simulate(load_inst);
+
+    const dup_inst = Instruction{
+        .opcode = .DUP_TOP,
+        .arg = 0,
+        .offset = 2,
+        .size = 2,
+        .cache_entries = 0,
+    };
+    try ctx.simulate(dup_inst);
+
+    try testing.expectEqual(@as(usize, 2), ctx.stack.len());
+    const first = ctx.stack.pop().?;
+    const second = ctx.stack.pop().?;
+    defer first.deinit(allocator);
+    defer second.deinit(allocator);
+
+    try testing.expect(first == .expr);
+    try testing.expect(second == .expr);
+    try testing.expect(first.expr != second.expr);
 }
 
 test "stack simulation composite load const" {
