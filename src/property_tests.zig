@@ -22,11 +22,20 @@ test "decoder handles arbitrary bytecode without crashing" {
     // Property: For any random bytecode, the decoder either produces valid
     // instructions or returns an error - it never crashes or hangs.
     try zc.check(struct {
-        fn prop(args: struct { bytecode: [32]u8, major: u8, minor: u8 }) bool {
-            // Constrain version to reasonable Python versions
-            const major = 2 + (args.major % 2); // 2 or 3
-            const minor = args.minor % 15; // 0-14
-            const version = Version.init(major, minor);
+        fn prop(args: struct { bytecode: [32]u8, version_idx: u8 }) bool {
+            const versions = [_]Version{
+                Version.init(2, 7),
+                Version.init(3, 6),
+                Version.init(3, 7),
+                Version.init(3, 8),
+                Version.init(3, 9),
+                Version.init(3, 10),
+                Version.init(3, 11),
+                Version.init(3, 12),
+                Version.init(3, 13),
+                Version.init(3, 14),
+            };
+            const version = versions[args.version_idx % versions.len];
 
             var iter = decoder.InstructionIterator.init(&args.bytecode, version);
 

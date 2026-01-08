@@ -513,3 +513,143 @@ test "snapshot lambda expression" {
         \\"
     ).expectEqual(output);
 }
+
+test "snapshot list unpack" {
+    const allocator = testing.allocator;
+    const version = Version.init(3, 10);
+
+    const names = try dupeStrings(allocator, &[_][]const u8{ "a", "b" });
+    defer {
+        for (names) |v| allocator.free(v);
+        allocator.free(names);
+    }
+
+    const name = try allocator.dupe(u8, "list_unpack");
+    defer allocator.free(name);
+
+    var code = pyc.Code{
+        .allocator = allocator,
+        .names = names,
+        .name = name,
+    };
+
+    const insts = [_]Instruction{
+        inst(.LOAD_NAME, 0),
+        inst(.LOAD_NAME, 1),
+        inst(.BUILD_LIST_UNPACK, 2),
+    };
+
+    const expr = try simulateExpr(allocator, &code, version, &insts);
+    defer {
+        expr.deinit(allocator);
+        allocator.destroy(expr);
+    }
+
+    const output = try renderExprWithNewline(allocator, expr);
+    defer allocator.free(output);
+
+    const oh = OhSnap{};
+    try oh.snap(@src(),
+        \\[]const u8
+        \\  "[*a, *b]
+        \\"
+    ).expectEqual(output);
+}
+
+test "snapshot call with keywords" {
+    const allocator = testing.allocator;
+    const version = Version.init(3, 10);
+
+    const names = try dupeStrings(allocator, &[_][]const u8{"f"});
+    defer {
+        for (names) |v| allocator.free(v);
+        allocator.free(names);
+    }
+
+    const name = try allocator.dupe(u8, "call_kw");
+    defer allocator.free(name);
+
+    var kw_items = [_]pyc.Object{
+        .{ .string = "a" },
+        .{ .string = "b" },
+    };
+
+    var consts = [_]pyc.Object{
+        .{ .int = pyc.Int.fromI64(1) },
+        .{ .int = pyc.Int.fromI64(2) },
+        .{ .tuple = kw_items[0..] },
+    };
+
+    var code = pyc.Code{
+        .allocator = allocator,
+        .names = names,
+        .consts = &consts,
+        .name = name,
+    };
+
+    const insts = [_]Instruction{
+        inst(.LOAD_NAME, 0),
+        inst(.LOAD_CONST, 0),
+        inst(.LOAD_CONST, 1),
+        inst(.LOAD_CONST, 2),
+        inst(.CALL_FUNCTION_KW, 2),
+    };
+
+    const expr = try simulateExpr(allocator, &code, version, &insts);
+    defer {
+        expr.deinit(allocator);
+        allocator.destroy(expr);
+    }
+
+    const output = try renderExprWithNewline(allocator, expr);
+    defer allocator.free(output);
+
+    const oh = OhSnap{};
+    try oh.snap(@src(),
+        \\[]const u8
+        \\  "f(a=1, b=2)
+        \\"
+    ).expectEqual(output);
+}
+
+test "snapshot call method" {
+    const allocator = testing.allocator;
+    const version = Version.init(3, 10);
+
+    const names = try dupeStrings(allocator, &[_][]const u8{ "obj", "m" });
+    defer {
+        for (names) |v| allocator.free(v);
+        allocator.free(names);
+    }
+
+    const name = try allocator.dupe(u8, "call_method");
+    defer allocator.free(name);
+
+    var code = pyc.Code{
+        .allocator = allocator,
+        .names = names,
+        .name = name,
+    };
+
+    const insts = [_]Instruction{
+        inst(.LOAD_NAME, 0),
+        inst(.LOAD_METHOD, 1),
+        inst(.CALL_METHOD, 0),
+    };
+
+    const expr = try simulateExpr(allocator, &code, version, &insts);
+    defer {
+        expr.deinit(allocator);
+        allocator.destroy(expr);
+    }
+
+    const output = try renderExprWithNewline(allocator, expr);
+    defer allocator.free(output);
+
+    const oh = OhSnap{};
+    try oh.snap(@src(),
+        \\[]const u8
+        \\  "obj.m()
+        \\"
+    ).expectEqual(output);
+}

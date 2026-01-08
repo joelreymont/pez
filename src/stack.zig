@@ -24,6 +24,7 @@ pub const SimError = Allocator.Error || error{
     InvalidComprehension,
     InvalidConstant,
     InvalidLambdaBody,
+    InvalidKeywordNames,
     InvalidStackDepth,
     UnsupportedConstant,
 };
@@ -515,6 +516,259 @@ pub const SimContext = struct {
         return true;
     }
 
+    fn deinitStackValues(self: *SimContext, values: []StackValue) void {
+        for (values) |val| {
+            val.deinit(self.allocator);
+        }
+        if (values.len > 0) self.allocator.free(values);
+    }
+
+    fn deinitExprSlice(allocator: Allocator, items: []const *Expr) void {
+        for (items) |item| {
+            @constCast(item).deinit(allocator);
+            allocator.destroy(item);
+        }
+        if (items.len > 0) allocator.free(items);
+    }
+
+    fn deinitKeywordsOwned(allocator: Allocator, keywords: []const ast.Keyword) void {
+        for (keywords) |kw| {
+            if (kw.arg) |arg| allocator.free(arg);
+            kw.value.deinit(allocator);
+            allocator.destroy(kw.value);
+        }
+        if (keywords.len > 0) allocator.free(keywords);
+    }
+
+    fn keywordNamesFromValue(self: *SimContext, value: StackValue) SimError![]const []const u8 {
+        var owned = value;
+        defer owned.deinit(self.allocator);
+
+        const expr = switch (owned) {
+            .expr => |e| e,
+            else => return error.InvalidKeywordNames,
+        };
+
+        if (expr.* != .tuple) return error.InvalidKeywordNames;
+        const elts = expr.tuple.elts;
+
+        const names = try self.allocator.alloc([]const u8, elts.len);
+        var count: usize = 0;
+        errdefer {
+            for (names[0..count]) |name| self.allocator.free(name);
+            self.allocator.free(names);
+        }
+
+        for (elts, 0..) |elt, idx| {
+            if (elt.* != .constant or elt.constant != .string) {
+                return error.InvalidKeywordNames;
+            }
+            names[idx] = try self.allocator.dupe(u8, elt.constant.string);
+            count += 1;
+        }
+
+        return names;
+    }
+
+    const UnpackedSeqKind = enum { list, tuple, set };
+
+    fn buildStarredSequence(self: *SimContext, kind: UnpackedSeqKind, count: u32) SimError!void {
+        const len: usize = @intCast(count);
+        if (len == 0) {
+            const expr = switch (kind) {
+                .list => try ast.makeList(self.allocator, &.{}, .load),
+                .tuple => try ast.makeTuple(self.allocator, &.{}, .load),
+                .set => blk: {
+                    const empty_set = try self.allocator.create(Expr);
+                    empty_set.* = .{ .set = .{ .elts = &.{} } };
+                    break :blk empty_set;
+                },
+            };
+            try self.stack.push(.{ .expr = expr });
+            return;
+        }
+
+        const items = try self.stack.popNExprs(len);
+        const starred = try self.allocator.alloc(*Expr, items.len);
+        var starred_count: usize = 0;
+        errdefer {
+            for (starred[0..starred_count]) |expr| {
+                expr.deinit(self.allocator);
+                self.allocator.destroy(expr);
+            }
+            for (items[starred_count..]) |item| {
+                @constCast(item).deinit(self.allocator);
+                self.allocator.destroy(item);
+            }
+            self.allocator.free(items);
+            self.allocator.free(starred);
+        }
+
+        for (items, 0..) |item, idx| {
+            starred[idx] = try ast.makeStarred(self.allocator, item, .load);
+            starred_count += 1;
+        }
+
+        const expr = switch (kind) {
+            .list => try ast.makeList(self.allocator, starred, .load),
+            .tuple => try ast.makeTuple(self.allocator, starred, .load),
+            .set => blk: {
+                const set_expr = try self.allocator.create(Expr);
+                set_expr.* = .{ .set = .{ .elts = starred } };
+                break :blk set_expr;
+            },
+        };
+        try self.stack.push(.{ .expr = expr });
+        self.allocator.free(items);
+    }
+
+    fn buildDictUnpack(self: *SimContext, count: u32) SimError!void {
+        const len: usize = @intCast(count);
+        const items = if (len == 0) &[_]*Expr{} else try self.stack.popNExprs(len);
+        errdefer if (len > 0) deinitExprSlice(self.allocator, items);
+
+        const keys = try self.allocator.alloc(?*Expr, len);
+        errdefer self.allocator.free(keys);
+        const values = try self.allocator.alloc(*Expr, len);
+        errdefer self.allocator.free(values);
+
+        for (items, 0..) |item, idx| {
+            keys[idx] = null;
+            values[idx] = item;
+        }
+
+        const expr = try self.allocator.create(Expr);
+        expr.* = .{ .dict = .{ .keys = keys, .values = values } };
+        try self.stack.push(.{ .expr = expr });
+        if (len > 0) self.allocator.free(items);
+    }
+
+    fn handleCallExpr(
+        self: *SimContext,
+        callee_expr: *Expr,
+        args_vals: []StackValue,
+        keywords: []ast.Keyword,
+    ) SimError!void {
+        var cleanup_callee = true;
+        var cleanup_args = true;
+        var cleanup_keywords = keywords.len > 0;
+
+        errdefer {
+            if (cleanup_keywords) deinitKeywordsOwned(self.allocator, keywords);
+            if (cleanup_callee) {
+                callee_expr.deinit(self.allocator);
+                self.allocator.destroy(callee_expr);
+            }
+            if (cleanup_args) self.deinitStackValues(args_vals);
+        }
+
+        if (keywords.len == 0 and args_vals.len == 1) {
+            switch (args_vals[0]) {
+                .function_obj => |func| {
+                    try func.decorators.append(self.allocator, callee_expr);
+                    cleanup_callee = false;
+                    cleanup_args = false;
+                    self.allocator.free(args_vals);
+                    try self.stack.push(.{ .function_obj = func });
+                    return;
+                },
+                .class_obj => |cls| {
+                    try cls.decorators.append(self.allocator, callee_expr);
+                    cleanup_callee = false;
+                    cleanup_args = false;
+                    self.allocator.free(args_vals);
+                    try self.stack.push(.{ .class_obj = cls });
+                    return;
+                },
+                else => {},
+            }
+        }
+
+        if (keywords.len == 0 and self.isBuildClass(callee_expr)) {
+            if (try self.buildClassValue(callee_expr, args_vals)) {
+                cleanup_callee = false;
+                cleanup_args = false;
+                return;
+            }
+        }
+
+        const args = self.stack.valuesToExprs(args_vals) catch |err| {
+            cleanup_args = false;
+            return err;
+        };
+        cleanup_args = false;
+
+        const expr = try ast.makeCallWithKeywords(self.allocator, callee_expr, args, keywords);
+        errdefer {
+            expr.deinit(self.allocator);
+            self.allocator.destroy(expr);
+        }
+        cleanup_callee = false;
+        cleanup_keywords = false;
+        try self.stack.push(.{ .expr = expr });
+    }
+
+    fn handleCall(
+        self: *SimContext,
+        callable: StackValue,
+        args_vals: []StackValue,
+        keywords: []ast.Keyword,
+        iter_expr_override: ?*Expr,
+    ) SimError!void {
+        switch (callable) {
+            .comp_obj => |comp| {
+                if (keywords.len != 0) {
+                    deinitKeywordsOwned(self.allocator, keywords);
+                    self.deinitStackValues(args_vals);
+                    return error.InvalidComprehension;
+                }
+
+                var iter_expr: *Expr = undefined;
+                var cleanup_iter = true;
+                errdefer if (cleanup_iter) {
+                    iter_expr.deinit(self.allocator);
+                    self.allocator.destroy(iter_expr);
+                };
+                if (iter_expr_override) |override_expr| {
+                    if (args_vals.len != 0) {
+                        override_expr.deinit(self.allocator);
+                        self.allocator.destroy(override_expr);
+                        self.deinitStackValues(args_vals);
+                        return error.InvalidComprehension;
+                    }
+                    iter_expr = override_expr;
+                } else {
+                    if (args_vals.len != 1) {
+                        self.deinitStackValues(args_vals);
+                        return error.InvalidComprehension;
+                    }
+                    switch (args_vals[0]) {
+                        .expr => |expr| iter_expr = expr,
+                        else => {
+                            self.deinitStackValues(args_vals);
+                            return error.NotAnExpression;
+                        },
+                    }
+                }
+
+                const comp_expr = try self.buildComprehensionFromCode(comp, iter_expr);
+                cleanup_iter = false;
+                self.allocator.free(args_vals);
+                try self.stack.push(.{ .expr = comp_expr });
+            },
+            .expr => |callee_expr| {
+                try self.handleCallExpr(callee_expr, args_vals, keywords);
+            },
+            else => {
+                deinitKeywordsOwned(self.allocator, keywords);
+                self.deinitStackValues(args_vals);
+                var val = callable;
+                val.deinit(self.allocator);
+                return error.NotAnExpression;
+            },
+        }
+    }
+
     fn cloneStackValue(self: *SimContext, value: StackValue) !StackValue {
         return switch (value) {
             .expr => |e| .{ .expr = try ast.cloneExpr(self.allocator, e) },
@@ -915,7 +1169,11 @@ pub const SimContext = struct {
             },
 
             .LOAD_NAME, .LOAD_GLOBAL => {
-                if (self.getName(if (inst.opcode == .LOAD_GLOBAL) inst.arg >> 1 else inst.arg)) |name| {
+                const name_idx = if (inst.opcode == .LOAD_GLOBAL and self.version.gte(3, 11))
+                    inst.arg >> 1
+                else
+                    inst.arg;
+                if (self.getName(name_idx)) |name| {
                     const expr = try ast.makeName(self.allocator, name, .load);
                     try self.stack.push(.{ .expr = expr });
                 } else {
@@ -977,6 +1235,14 @@ pub const SimContext = struct {
             .STORE_NAME, .STORE_GLOBAL => {
                 // Pop the value and create assignment
                 // For now, just pop the value
+                if (self.stack.pop()) |v| {
+                    var val = v;
+                    val.deinit(self.allocator);
+                }
+            },
+
+            .STORE_ANNOTATION => {
+                // STORE_ANNOTATION namei - stores annotation, value is on stack
                 if (self.stack.pop()) |v| {
                     var val = v;
                     val.deinit(self.allocator);
@@ -1080,6 +1346,10 @@ pub const SimContext = struct {
                 }
             },
 
+            .BUILD_LIST_UNPACK => {
+                try self.buildStarredSequence(.list, inst.arg);
+            },
+
             .BUILD_TUPLE => {
                 const count = inst.arg;
                 if (count == 0) {
@@ -1092,6 +1362,10 @@ pub const SimContext = struct {
                 }
             },
 
+            .BUILD_TUPLE_UNPACK, .BUILD_TUPLE_UNPACK_WITH_CALL => {
+                try self.buildStarredSequence(.tuple, inst.arg);
+            },
+
             .BUILD_SET => {
                 const count = inst.arg;
                 const elts = if (count == 0) &[_]*Expr{} else try self.stack.popNExprs(count);
@@ -1100,28 +1374,52 @@ pub const SimContext = struct {
                 try self.stack.push(.{ .expr = expr });
             },
 
+            .BUILD_SET_UNPACK => {
+                try self.buildStarredSequence(.set, inst.arg);
+            },
+
+            .LIST_TO_TUPLE => {
+                const value = try self.stack.popExpr();
+                if (value.* == .list) {
+                    const elts = value.list.elts;
+                    value.list.elts = &.{};
+                    value.deinit(self.allocator);
+                    self.allocator.destroy(value);
+                    const expr = try ast.makeTuple(self.allocator, elts, .load);
+                    try self.stack.push(.{ .expr = expr });
+                } else {
+                    errdefer {
+                        value.deinit(self.allocator);
+                        self.allocator.destroy(value);
+                    }
+                    const func = try ast.makeName(self.allocator, "tuple", .load);
+                    errdefer {
+                        func.deinit(self.allocator);
+                        self.allocator.destroy(func);
+                    }
+                    const args = try self.allocator.alloc(*Expr, 1);
+                    args[0] = value;
+                    const expr = try ast.makeCall(self.allocator, func, args);
+                    try self.stack.push(.{ .expr = expr });
+                }
+            },
+
             .CALL => {
-                // In 3.12+: CALL argc
-                // Stack: callable, NULL, arg0, ..., argN -> result
-                // Pop argc args, then NULL marker (if present), then callable
+                // In 3.11+: CALL argc with optional NULL marker.
                 const argc = inst.arg;
                 const args_vals = try self.stack.popN(argc);
-                var cleanup_args = true;
-                defer {
-                    if (cleanup_args) {
-                        for (args_vals) |*val| {
-                            val.deinit(self.allocator);
-                        }
-                        self.allocator.free(args_vals);
-                    }
-                }
 
-                // Check for NULL marker (PUSH_NULL before function)
-                const maybe_null = self.stack.pop() orelse return error.StackUnderflow;
+                const maybe_null = self.stack.pop() orelse {
+                    self.deinitStackValues(args_vals);
+                    return error.StackUnderflow;
+                };
                 var callable = maybe_null;
                 var iter_expr_from_stack: ?*Expr = null;
                 if (maybe_null == .null_marker) {
-                    callable = self.stack.pop() orelse return error.StackUnderflow;
+                    callable = self.stack.pop() orelse {
+                        self.deinitStackValues(args_vals);
+                        return error.StackUnderflow;
+                    };
                 } else if (argc == 0 and maybe_null == .expr) {
                     if (self.stack.peek()) |peek| {
                         if (peek == .comp_obj) {
@@ -1131,86 +1429,247 @@ pub const SimContext = struct {
                     }
                 }
 
+                try self.handleCall(callable, args_vals, &[_]ast.Keyword{}, iter_expr_from_stack);
+            },
+
+            .CALL_METHOD => {
+                // 3.7-3.10: CALL_METHOD argc (expects extra self/NULL slot)
+                const argc = inst.arg;
+                var args_vals = try self.stack.popN(argc);
+                const marker = self.stack.pop() orelse {
+                    self.deinitStackValues(args_vals);
+                    return error.StackUnderflow;
+                };
+                var marker_expr: ?*Expr = null;
+                if (marker == .expr) {
+                    marker_expr = marker.expr;
+                } else if (marker != .null_marker) {
+                    var val = marker;
+                    val.deinit(self.allocator);
+                }
+                if (marker_expr) |expr| {
+                    const args_with_self = self.allocator.alloc(StackValue, args_vals.len + 1) catch |err| {
+                        expr.deinit(self.allocator);
+                        self.allocator.destroy(expr);
+                        self.deinitStackValues(args_vals);
+                        return err;
+                    };
+                    args_with_self[0] = .{ .expr = expr };
+                    @memcpy(args_with_self[1..], args_vals);
+                    self.allocator.free(args_vals);
+                    args_vals = args_with_self;
+                }
+                const callable = self.stack.pop() orelse {
+                    self.deinitStackValues(args_vals);
+                    return error.StackUnderflow;
+                };
+                try self.handleCall(callable, args_vals, &[_]ast.Keyword{}, null);
+            },
+
+            .CALL_FUNCTION => {
+                const argc = inst.arg;
+                const args_vals = try self.stack.popN(argc);
+                const callable = self.stack.pop() orelse {
+                    self.deinitStackValues(args_vals);
+                    return error.StackUnderflow;
+                };
+                try self.handleCall(callable, args_vals, &[_]ast.Keyword{}, null);
+            },
+
+            .CALL_FUNCTION_KW => {
+                const names_val = self.stack.pop() orelse return error.StackUnderflow;
+                const kw_names = try self.keywordNamesFromValue(names_val);
+                var kw_names_owned = true;
+                errdefer if (kw_names_owned) {
+                    for (kw_names) |name| {
+                        if (name.len > 0) self.allocator.free(name);
+                    }
+                    self.allocator.free(kw_names);
+                };
+
+                const argc = inst.arg;
+                const args_vals = try self.stack.popN(argc);
+                var args_owned = true;
+                errdefer if (args_owned) self.deinitStackValues(args_vals);
+
+                const callable = self.stack.pop() orelse return error.StackUnderflow;
+
+                if (kw_names.len > args_vals.len) return error.InvalidKeywordNames;
+
+                const pos_count = args_vals.len - kw_names.len;
+                var args: []*Expr = &.{};
+                if (pos_count > 0) {
+                    args = try self.allocator.alloc(*Expr, pos_count);
+                }
+                var args_filled: usize = 0;
+                errdefer {
+                    for (args[0..args_filled]) |arg| {
+                        arg.deinit(self.allocator);
+                        self.allocator.destroy(arg);
+                    }
+                    if (pos_count > 0) self.allocator.free(args);
+                }
+
+                for (args_vals[0..pos_count], 0..) |val, idx| {
+                    switch (val) {
+                        .expr => |expr| {
+                            args[idx] = expr;
+                            args_filled += 1;
+                        },
+                        else => return error.NotAnExpression,
+                    }
+                }
+
+                var keywords: []ast.Keyword = &.{};
+                if (kw_names.len > 0) {
+                    keywords = try self.allocator.alloc(ast.Keyword, kw_names.len);
+                }
+                var kw_filled: usize = 0;
+                errdefer {
+                    for (keywords[0..kw_filled]) |kw| {
+                        if (kw.arg) |arg| self.allocator.free(arg);
+                        kw.value.deinit(self.allocator);
+                        self.allocator.destroy(kw.value);
+                    }
+                    if (kw_names.len > 0) self.allocator.free(keywords);
+                }
+
+                var kw_names_mut = @constCast(kw_names);
+                for (kw_names, 0..) |name, idx| {
+                    const arg_idx = pos_count + idx;
+                    const val = args_vals[arg_idx];
+                    switch (val) {
+                        .expr => |expr| {
+                            keywords[idx] = .{ .arg = name, .value = expr };
+                            kw_filled += 1;
+                            kw_names_mut[idx] = "";
+                        },
+                        else => return error.NotAnExpression,
+                    }
+                }
+
+                for (args_vals) |*val| val.* = .unknown;
+                self.allocator.free(args_vals);
+                args_owned = false;
+                self.allocator.free(kw_names);
+                kw_names_owned = false;
+
                 switch (callable) {
-                    .comp_obj => |comp| {
-                        var iter_expr: *Expr = undefined;
-                        if (iter_expr_from_stack) |iter_expr_value| {
-                            if (args_vals.len != 0) {
-                                iter_expr_value.deinit(self.allocator);
-                                self.allocator.destroy(iter_expr_value);
-                                return error.InvalidComprehension;
-                            }
-                            iter_expr = iter_expr_value;
-                            cleanup_args = false;
-                            self.allocator.free(args_vals);
-                        } else {
-                            if (args_vals.len != 1) return error.InvalidComprehension;
-                            switch (args_vals[0]) {
-                                .expr => |expr| {
-                                    iter_expr = expr;
-                                    cleanup_args = false;
-                                    self.allocator.free(args_vals);
-                                },
-                                else => return error.NotAnExpression,
+                    .expr => |callee_expr| {
+                        errdefer {
+                            callee_expr.deinit(self.allocator);
+                            self.allocator.destroy(callee_expr);
+                            if (keywords.len > 0) deinitKeywordsOwned(self.allocator, keywords);
+                            if (pos_count > 0) {
+                                for (args) |arg| {
+                                    arg.deinit(self.allocator);
+                                    self.allocator.destroy(arg);
+                                }
+                                self.allocator.free(args);
                             }
                         }
-
-                        const comp_expr = try self.buildComprehensionFromCode(comp, iter_expr);
-                        try self.stack.push(.{ .expr = comp_expr });
-                        return;
+                        const expr = try ast.makeCallWithKeywords(self.allocator, callee_expr, args, keywords);
+                        errdefer {
+                            expr.deinit(self.allocator);
+                            self.allocator.destroy(expr);
+                        }
+                        try self.stack.push(.{ .expr = expr });
                     },
+                    else => {
+                        deinitKeywordsOwned(self.allocator, keywords);
+                        if (pos_count > 0) {
+                            for (args) |arg| {
+                                arg.deinit(self.allocator);
+                                self.allocator.destroy(arg);
+                            }
+                            self.allocator.free(args);
+                        }
+                        var val = callable;
+                        val.deinit(self.allocator);
+                        return error.NotAnExpression;
+                    },
+                }
+            },
+
+            .CALL_FUNCTION_EX => {
+                const has_kwargs = (inst.arg & 0x01) != 0;
+                var kwargs_expr: ?*Expr = null;
+                if (has_kwargs) {
+                    const kw_val = self.stack.pop() orelse return error.StackUnderflow;
+                    switch (kw_val) {
+                        .expr => |expr| kwargs_expr = expr,
+                        else => {
+                            var val = kw_val;
+                            val.deinit(self.allocator);
+                            return error.NotAnExpression;
+                        },
+                    }
+                }
+                errdefer if (kwargs_expr) |expr| {
+                    expr.deinit(self.allocator);
+                    self.allocator.destroy(expr);
+                };
+
+                const args_val = self.stack.pop() orelse return error.StackUnderflow;
+                const args_expr = switch (args_val) {
+                    .expr => |expr| expr,
+                    else => {
+                        var val = args_val;
+                        val.deinit(self.allocator);
+                        return error.NotAnExpression;
+                    },
+                };
+
+                const callable = self.stack.pop() orelse return error.StackUnderflow;
+
+                const starred_arg = if (args_expr.* == .starred)
+                    args_expr
+                else blk: {
+                    errdefer {
+                        args_expr.deinit(self.allocator);
+                        self.allocator.destroy(args_expr);
+                    }
+                    break :blk try ast.makeStarred(self.allocator, args_expr, .load);
+                };
+                const args = try self.allocator.alloc(*Expr, 1);
+                args[0] = starred_arg;
+
+                var keywords: []ast.Keyword = &.{};
+                if (kwargs_expr) |expr| {
+                    keywords = try self.allocator.alloc(ast.Keyword, 1);
+                    keywords[0] = .{ .arg = null, .value = expr };
+                    kwargs_expr = null;
+                }
+
+                var cleanup_args = true;
+                var cleanup_keywords = keywords.len > 0;
+                errdefer {
+                    if (cleanup_keywords) deinitKeywordsOwned(self.allocator, keywords);
+                    if (cleanup_args) {
+                        for (args) |arg| {
+                            arg.deinit(self.allocator);
+                            self.allocator.destroy(arg);
+                        }
+                        self.allocator.free(args);
+                    }
+                }
+
+                switch (callable) {
                     .expr => |callee_expr| {
                         var cleanup_callee = true;
                         errdefer if (cleanup_callee) {
                             callee_expr.deinit(self.allocator);
                             self.allocator.destroy(callee_expr);
                         };
-
-                        if (args_vals.len == 1) {
-                            switch (args_vals[0]) {
-                                .function_obj => |func| {
-                                    try func.decorators.append(self.allocator, callee_expr);
-                                    cleanup_callee = false;
-                                    cleanup_args = false;
-                                    self.allocator.free(args_vals);
-                                    try self.stack.push(.{ .function_obj = func });
-                                    return;
-                                },
-                                .class_obj => |cls| {
-                                    try cls.decorators.append(self.allocator, callee_expr);
-                                    cleanup_callee = false;
-                                    cleanup_args = false;
-                                    self.allocator.free(args_vals);
-                                    try self.stack.push(.{ .class_obj = cls });
-                                    return;
-                                },
-                                else => {},
-                            }
-                        }
-
-                        if (self.isBuildClass(callee_expr)) {
-                            if (try self.buildClassValue(callee_expr, args_vals)) {
-                                cleanup_args = false;
-                                cleanup_callee = false;
-                                return;
-                            }
-                        }
-
-                        const args = self.stack.valuesToExprs(args_vals) catch |err| {
-                            cleanup_args = false;
-                            return err;
-                        };
-                        cleanup_args = false;
+                        const call_expr = try ast.makeCallWithKeywords(self.allocator, callee_expr, args, keywords);
                         errdefer {
-                            for (args) |arg| {
-                                arg.deinit(self.allocator);
-                                self.allocator.destroy(arg);
-                            }
-                            if (args.len > 0) self.allocator.free(args);
+                            call_expr.deinit(self.allocator);
+                            self.allocator.destroy(call_expr);
                         }
-                        const expr = try ast.makeCall(self.allocator, callee_expr, args);
+                        try self.stack.push(.{ .expr = call_expr });
                         cleanup_callee = false;
-                        try self.stack.push(.{ .expr = expr });
+                        cleanup_args = false;
+                        cleanup_keywords = false;
                     },
                     else => {
                         var val = callable;
@@ -1409,6 +1868,20 @@ pub const SimContext = struct {
                 self.stack.items.items[len - 4] = top;
             },
 
+            .ROT_N => {
+                const count: usize = @intCast(inst.arg);
+                if (count < 2) return error.InvalidSwapArg;
+                const len = self.stack.items.items.len;
+                if (count > len) return error.StackUnderflow;
+                const start = len - count;
+                const top = self.stack.items.items[len - 1];
+                var idx = len - 1;
+                while (idx > start) : (idx -= 1) {
+                    self.stack.items.items[idx] = self.stack.items.items[idx - 1];
+                }
+                self.stack.items.items[start] = top;
+            },
+
             .SWAP => {
                 // SWAP i - swap TOS with stack item at position i
                 if (inst.arg < 2) return error.InvalidSwapArg;
@@ -1542,7 +2015,8 @@ pub const SimContext = struct {
                     obj.deinit(self.allocator);
                     self.allocator.destroy(obj);
                 }
-                if (self.getName(inst.arg >> 1)) |attr_name| {
+                const name_idx = if (self.version.gte(3, 11)) inst.arg >> 1 else inst.arg;
+                if (self.getName(name_idx)) |attr_name| {
                     const attr = try ast.makeAttribute(self.allocator, obj, attr_name, .load);
                     try self.stack.push(.{ .expr = attr });
                 } else {
@@ -1550,6 +2024,25 @@ pub const SimContext = struct {
                     self.allocator.destroy(obj);
                     try self.stack.push(.unknown);
                 }
+            },
+
+            .LOAD_METHOD => {
+                // LOAD_METHOD namei - prepare method call with optional self slot
+                const obj = try self.stack.popExpr();
+                errdefer {
+                    obj.deinit(self.allocator);
+                    self.allocator.destroy(obj);
+                }
+                const name_idx = if (self.version.gte(3, 11)) inst.arg >> 1 else inst.arg;
+                if (self.getName(name_idx)) |attr_name| {
+                    const attr = try ast.makeAttribute(self.allocator, obj, attr_name, .load);
+                    try self.stack.push(.{ .expr = attr });
+                } else {
+                    obj.deinit(self.allocator);
+                    self.allocator.destroy(obj);
+                    try self.stack.push(.unknown);
+                }
+                try self.stack.push(.null_marker);
             },
 
             .STORE_ATTR => {
@@ -1644,6 +2137,10 @@ pub const SimContext = struct {
                 try self.stack.push(.{ .expr = expr });
             },
 
+            .BUILD_MAP_UNPACK, .BUILD_MAP_UNPACK_WITH_CALL => {
+                try self.buildDictUnpack(inst.arg);
+            },
+
             // Slice operations
             .BUILD_SLICE => {
                 // BUILD_SLICE argc - build slice from argc elements
@@ -1710,12 +2207,36 @@ pub const SimContext = struct {
                 try self.stack.push(.unknown);
             },
 
+            .JUMP_IF_NOT_EXC_MATCH => {
+                // JUMP_IF_NOT_EXC_MATCH - pop two exception values
+                if (self.stack.pop()) |v| {
+                    var val = v;
+                    val.deinit(self.allocator);
+                } else {
+                    return error.StackUnderflow;
+                }
+                if (self.stack.pop()) |v| {
+                    var val = v;
+                    val.deinit(self.allocator);
+                } else {
+                    return error.StackUnderflow;
+                }
+            },
+
             .RERAISE => {
                 // RERAISE depth - re-raise the exception
                 // Pops nothing new, exception info already on stack
             },
 
-            .SETUP_FINALLY, .POP_EXCEPT => {
+            .SETUP_FINALLY,
+            .SETUP_ASYNC_WITH,
+            .BEGIN_FINALLY,
+            .CALL_FINALLY,
+            .POP_FINALLY,
+            .WITH_CLEANUP_START,
+            .WITH_CLEANUP_FINISH,
+            .POP_EXCEPT,
+            => {
                 // These are control flow markers, no stack effect
             },
 
@@ -1787,13 +2308,34 @@ pub const SimContext = struct {
                 // Preserve the existing expression for decompilation.
             },
 
-            .POP_JUMP_IF_TRUE, .POP_JUMP_IF_FALSE, .POP_JUMP_IF_NONE, .POP_JUMP_IF_NOT_NONE => {
+            .POP_JUMP_IF_TRUE,
+            .POP_JUMP_IF_FALSE,
+            .POP_JUMP_IF_NONE,
+            .POP_JUMP_IF_NOT_NONE,
+            .POP_JUMP_FORWARD_IF_TRUE,
+            .POP_JUMP_FORWARD_IF_FALSE,
+            .POP_JUMP_FORWARD_IF_NONE,
+            .POP_JUMP_FORWARD_IF_NOT_NONE,
+            .POP_JUMP_BACKWARD_IF_TRUE,
+            .POP_JUMP_BACKWARD_IF_FALSE,
+            .POP_JUMP_BACKWARD_IF_NONE,
+            .POP_JUMP_BACKWARD_IF_NOT_NONE,
+            => {
                 const cond = try self.stack.popExpr();
                 if (self.findActiveCompBuilder()) |builder| {
                     const final_cond = switch (inst.opcode) {
-                        .POP_JUMP_IF_FALSE => try ast.makeUnaryOp(self.allocator, .not_, cond),
-                        .POP_JUMP_IF_NONE => try self.makeIsNoneCompare(cond, false),
-                        .POP_JUMP_IF_NOT_NONE => try self.makeIsNoneCompare(cond, true),
+                        .POP_JUMP_IF_FALSE,
+                        .POP_JUMP_FORWARD_IF_FALSE,
+                        .POP_JUMP_BACKWARD_IF_FALSE,
+                        => try ast.makeUnaryOp(self.allocator, .not_, cond),
+                        .POP_JUMP_IF_NONE,
+                        .POP_JUMP_FORWARD_IF_NONE,
+                        .POP_JUMP_BACKWARD_IF_NONE,
+                        => try self.makeIsNoneCompare(cond, false),
+                        .POP_JUMP_IF_NOT_NONE,
+                        .POP_JUMP_FORWARD_IF_NOT_NONE,
+                        .POP_JUMP_BACKWARD_IF_NOT_NONE,
+                        => try self.makeIsNoneCompare(cond, true),
                         else => cond,
                     };
                     errdefer {
@@ -1812,6 +2354,16 @@ pub const SimContext = struct {
             .GET_YIELD_FROM_ITER => {
                 // GET_YIELD_FROM_ITER - prepare iterator for yield from
                 // TOS is the iterable, result is the iterator
+            },
+
+            .GEN_START => {
+                // GEN_START - pop None placeholder
+                if (self.stack.pop()) |v| {
+                    var val = v;
+                    val.deinit(self.allocator);
+                } else {
+                    return error.StackUnderflow;
+                }
             },
 
             .YIELD_VALUE => {
@@ -1836,6 +2388,18 @@ pub const SimContext = struct {
                 }
                 const expr = try self.allocator.create(Expr);
                 expr.* = .{ .yield_expr = .{ .value = value } };
+                try self.stack.push(.{ .expr = expr });
+            },
+
+            .YIELD_FROM => {
+                // YIELD_FROM - yield from iterable
+                const value = try self.stack.popExpr();
+                errdefer {
+                    value.deinit(self.allocator);
+                    self.allocator.destroy(value);
+                }
+                const expr = try self.allocator.create(Expr);
+                expr.* = .{ .yield_from = .{ .value = value } };
                 try self.stack.push(.{ .expr = expr });
             },
 
@@ -1936,6 +2500,17 @@ pub const SimContext = struct {
                     var val = v;
                     val.deinit(self.allocator);
                 }
+            },
+
+            .COPY_DICT_WITHOUT_KEYS => {
+                // COPY_DICT_WITHOUT_KEYS - remove keys tuple from a dict copy
+                if (self.stack.pop()) |v| {
+                    var val = v;
+                    val.deinit(self.allocator);
+                } else {
+                    return error.StackUnderflow;
+                }
+                try self.stack.push(.unknown);
             },
 
             .DICT_MERGE => {

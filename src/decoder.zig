@@ -29,12 +29,25 @@ pub const Instruction = struct {
             .JUMP_FORWARD,
             .JUMP_BACKWARD,
             .JUMP_BACKWARD_NO_INTERRUPT,
+            .JUMP_ABSOLUTE,
             .POP_JUMP_IF_TRUE,
             .POP_JUMP_IF_FALSE,
             .POP_JUMP_IF_NONE,
             .POP_JUMP_IF_NOT_NONE,
+            .POP_JUMP_FORWARD_IF_TRUE,
+            .POP_JUMP_FORWARD_IF_FALSE,
+            .POP_JUMP_FORWARD_IF_NONE,
+            .POP_JUMP_FORWARD_IF_NOT_NONE,
+            .POP_JUMP_BACKWARD_IF_TRUE,
+            .POP_JUMP_BACKWARD_IF_FALSE,
+            .POP_JUMP_BACKWARD_IF_NONE,
+            .POP_JUMP_BACKWARD_IF_NOT_NONE,
+            .JUMP_IF_TRUE_OR_POP,
+            .JUMP_IF_FALSE_OR_POP,
+            .JUMP_IF_NOT_EXC_MATCH,
             .FOR_ITER,
             .SEND,
+            .CONTINUE_LOOP,
             => true,
             else => false,
         };
@@ -46,6 +59,8 @@ pub const Instruction = struct {
             .JUMP_FORWARD,
             .JUMP_BACKWARD,
             .JUMP_BACKWARD_NO_INTERRUPT,
+            .JUMP_ABSOLUTE,
+            .CONTINUE_LOOP,
             => true,
             else => false,
         };
@@ -58,6 +73,17 @@ pub const Instruction = struct {
             .POP_JUMP_IF_FALSE,
             .POP_JUMP_IF_NONE,
             .POP_JUMP_IF_NOT_NONE,
+            .POP_JUMP_FORWARD_IF_TRUE,
+            .POP_JUMP_FORWARD_IF_FALSE,
+            .POP_JUMP_FORWARD_IF_NONE,
+            .POP_JUMP_FORWARD_IF_NOT_NONE,
+            .POP_JUMP_BACKWARD_IF_TRUE,
+            .POP_JUMP_BACKWARD_IF_FALSE,
+            .POP_JUMP_BACKWARD_IF_NONE,
+            .POP_JUMP_BACKWARD_IF_NOT_NONE,
+            .JUMP_IF_TRUE_OR_POP,
+            .JUMP_IF_FALSE_OR_POP,
+            .JUMP_IF_NOT_EXC_MATCH,
             .FOR_ITER,
             .SEND,
             => true,
@@ -75,6 +101,8 @@ pub const Instruction = struct {
             .JUMP_FORWARD,
             .JUMP_BACKWARD,
             .JUMP_BACKWARD_NO_INTERRUPT,
+            .JUMP_ABSOLUTE,
+            .CONTINUE_LOOP,
             => true,
             else => false,
         };
@@ -90,13 +118,14 @@ pub const Instruction = struct {
         // Next instruction offset
         const next_offset = self.offset + self.size;
 
-        // In Python 3.10+, jump args are instruction offsets (word units), not byte offsets
-        // In Python < 3.10, jump args are byte offsets
-        const multiplier: u32 = if (ver.gte(3, 10)) 2 else 1;
+        // In Python 3.11+, jump args are instruction offsets (word units).
+        // In Python <= 3.10, jump args are byte offsets.
+        const multiplier: u32 = if (ver.gte(3, 11)) 2 else 1;
 
         return switch (self.opcode) {
             .JUMP_FORWARD => next_offset + self.arg * multiplier,
             .JUMP_BACKWARD, .JUMP_BACKWARD_NO_INTERRUPT => next_offset -| (self.arg *| multiplier),
+            .JUMP_ABSOLUTE, .CONTINUE_LOOP => self.arg * multiplier,
             .FOR_ITER, .SEND => next_offset + self.arg * multiplier, // Jump on exhaustion/end
             .POP_JUMP_IF_TRUE,
             .POP_JUMP_IF_FALSE,
@@ -106,14 +135,31 @@ pub const Instruction = struct {
                 // Python 3.14+: relative offsets from next instruction
                 // Python 3.12-3.13: absolute offsets in word units
                 // Python 3.11: split into forward/backward variants (handled by opcode)
+                // Python <= 3.10: absolute offsets in bytes
                 if (ver.gte(3, 14)) {
                     break :blk next_offset + self.arg * multiplier;
                 } else if (ver.gte(3, 12)) {
                     break :blk self.arg * multiplier;
+                } else if (ver.gte(3, 11)) {
+                    // Forward/backward variants are normalized to POP_JUMP_IF_*.
+                    break :blk next_offset + self.arg * multiplier;
                 }
-                // For 3.11 and earlier, use relative (forward assumed)
-                break :blk next_offset + self.arg * multiplier;
+                break :blk self.arg * multiplier;
             },
+            .POP_JUMP_FORWARD_IF_TRUE,
+            .POP_JUMP_FORWARD_IF_FALSE,
+            .POP_JUMP_FORWARD_IF_NONE,
+            .POP_JUMP_FORWARD_IF_NOT_NONE,
+            => next_offset + self.arg * multiplier,
+            .POP_JUMP_BACKWARD_IF_TRUE,
+            .POP_JUMP_BACKWARD_IF_FALSE,
+            .POP_JUMP_BACKWARD_IF_NONE,
+            .POP_JUMP_BACKWARD_IF_NOT_NONE,
+            => next_offset -| (self.arg *| multiplier),
+            .JUMP_IF_TRUE_OR_POP,
+            .JUMP_IF_FALSE_OR_POP,
+            .JUMP_IF_NOT_EXC_MATCH,
+            => self.arg * multiplier,
             else => null,
         };
     }
@@ -297,6 +343,29 @@ test "extended arg" {
     try testing.expectEqual(@as(u32, 2), inst.offset);
 
     try testing.expect(iter.next() == null);
+}
+
+test "jump target pop jump 3.11" {
+    const testing = std.testing;
+    const v311 = Version.init(3, 11);
+
+    const forward = Instruction{
+        .opcode = .POP_JUMP_FORWARD_IF_FALSE,
+        .arg = 2,
+        .offset = 10,
+        .size = 2,
+        .cache_entries = 0,
+    };
+    try testing.expectEqual(@as(u32, 16), forward.jumpTarget(v311).?);
+
+    const backward = Instruction{
+        .opcode = .POP_JUMP_BACKWARD_IF_FALSE,
+        .arg = 2,
+        .offset = 10,
+        .size = 2,
+        .cache_entries = 0,
+    };
+    try testing.expectEqual(@as(u32, 8), backward.jumpTarget(v311).?);
 }
 
 // ============================================================================

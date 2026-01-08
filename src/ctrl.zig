@@ -169,7 +169,7 @@ pub const Analyzer = struct {
     }
 
     /// Detect the control flow pattern starting at a block.
-    pub fn detectPattern(self: *Analyzer, block_id: u32) ControlFlowPattern {
+    pub fn detectPattern(self: *Analyzer, block_id: u32) !ControlFlowPattern {
         if (block_id >= self.cfg.blocks.len) return .unknown;
         if (self.processed.isSet(block_id)) return .unknown;
 
@@ -178,7 +178,7 @@ pub const Analyzer = struct {
 
         // Check for conditional jump (if statement pattern)
         if (self.isConditionalJump(term.opcode)) {
-            if (self.detectIfPattern(block_id)) |pattern| {
+            if (try self.detectIfPattern(block_id)) |pattern| {
                 return .{ .if_stmt = pattern };
             }
         }
@@ -206,7 +206,7 @@ pub const Analyzer = struct {
 
         // Check for try/except pattern (block with exception edge)
         if (self.hasExceptionEdge(block)) {
-            if (self.detectTryPattern(block_id)) |pattern| {
+            if (try self.detectTryPattern(block_id)) |pattern| {
                 return .{ .try_stmt = pattern };
             }
         }
@@ -311,6 +311,14 @@ pub const Analyzer = struct {
             .POP_JUMP_IF_FALSE,
             .POP_JUMP_IF_NONE,
             .POP_JUMP_IF_NOT_NONE,
+            .POP_JUMP_FORWARD_IF_TRUE,
+            .POP_JUMP_FORWARD_IF_FALSE,
+            .POP_JUMP_FORWARD_IF_NONE,
+            .POP_JUMP_FORWARD_IF_NOT_NONE,
+            .POP_JUMP_BACKWARD_IF_TRUE,
+            .POP_JUMP_BACKWARD_IF_FALSE,
+            .POP_JUMP_BACKWARD_IF_NONE,
+            .POP_JUMP_BACKWARD_IF_NOT_NONE,
             .JUMP_IF_TRUE_OR_POP,
             .JUMP_IF_FALSE_OR_POP,
             => true,
@@ -319,7 +327,7 @@ pub const Analyzer = struct {
     }
 
     /// Detect if/elif/else pattern.
-    fn detectIfPattern(self: *Analyzer, block_id: u32) ?IfPattern {
+    fn detectIfPattern(self: *Analyzer, block_id: u32) !?IfPattern {
         const block = &self.cfg.blocks[block_id];
 
         // Need exactly two successors for a conditional
@@ -341,7 +349,13 @@ pub const Analyzer = struct {
 
         // For POP_JUMP_IF_FALSE, fallthrough is the then-block
         const term = block.terminator() orelse return null;
-        if (term.opcode == .POP_JUMP_IF_FALSE or term.opcode == .POP_JUMP_IF_NONE) {
+        if (term.opcode == .POP_JUMP_IF_FALSE or
+            term.opcode == .POP_JUMP_IF_NONE or
+            term.opcode == .POP_JUMP_FORWARD_IF_FALSE or
+            term.opcode == .POP_JUMP_FORWARD_IF_NONE or
+            term.opcode == .POP_JUMP_BACKWARD_IF_FALSE or
+            term.opcode == .POP_JUMP_BACKWARD_IF_NONE)
+        {
             // Jump target is else, fallthrough is then
             for (block.successors) |edge| {
                 if (edge.edge_type == .conditional_true or edge.edge_type == .normal) {
@@ -355,7 +369,7 @@ pub const Analyzer = struct {
         const then_id = then_block orelse return null;
 
         // Find merge point - where both branches converge
-        const merge = self.findMergePoint(then_id, else_block);
+        const merge = try self.findMergePoint(then_id, else_block);
 
         // Check if else block is actually an elif
         var is_elif = false;
@@ -453,7 +467,7 @@ pub const Analyzer = struct {
     }
 
     /// Detect try/except/finally pattern.
-    fn detectTryPattern(self: *Analyzer, block_id: u32) ?TryPattern {
+    fn detectTryPattern(self: *Analyzer, block_id: u32) !?TryPattern {
         if (block_id >= self.cfg.blocks.len) return null;
         const block = &self.cfg.blocks[block_id];
         if (block.is_exception_handler) return null;
@@ -461,7 +475,7 @@ pub const Analyzer = struct {
         var handler_targets: std.ArrayList(u32) = .{};
         defer handler_targets.deinit(self.allocator);
 
-        self.collectExceptionTargets(block_id, &handler_targets) catch return null;
+        try self.collectExceptionTargets(block_id, &handler_targets);
         if (handler_targets.items.len == 0) return null;
 
         var pred_targets: std.ArrayList(u32) = .{};
@@ -474,7 +488,7 @@ pub const Analyzer = struct {
             const edge_type = self.edgeTypeTo(pred_id, block_id) orelse continue;
             if (edge_type == .exception or edge_type == .loop_back) continue;
 
-            self.collectExceptionTargets(pred_id, &pred_targets) catch continue;
+            try self.collectExceptionTargets(pred_id, &pred_targets);
             if (pred_targets.items.len != handler_targets.items.len) continue;
 
             var same = true;
@@ -495,10 +509,10 @@ pub const Analyzer = struct {
             if (hid >= self.cfg.blocks.len) continue;
             const handler_block = &self.cfg.blocks[hid];
             const is_bare = !self.hasExceptionTypeCheck(handler_block);
-            handler_list.append(self.allocator, .{
+            try handler_list.append(self.allocator, .{
                 .handler_block = hid,
                 .is_bare = is_bare,
-            }) catch continue;
+            });
         }
 
         if (handler_list.items.len == 0) return null;
@@ -516,7 +530,7 @@ pub const Analyzer = struct {
             if (exit_block != null) break;
         }
 
-        const handlers = self.allocator.dupe(HandlerInfo, handler_list.items) catch return null;
+        const handlers = try self.allocator.dupe(HandlerInfo, handler_list.items);
 
         return TryPattern{
             .try_block = block_id,
@@ -620,7 +634,7 @@ pub const Analyzer = struct {
     }
 
     /// Find the merge point where two branches converge.
-    fn findMergePoint(self: *Analyzer, then_block: u32, else_block: ?u32) ?u32 {
+    fn findMergePoint(self: *Analyzer, then_block: u32, else_block: ?u32) !?u32 {
         const else_id = else_block orelse return null;
 
         // Simple approach: follow each branch until we find a common successor
@@ -630,17 +644,17 @@ pub const Analyzer = struct {
         // Mark all blocks reachable from then-branch
         var queue: std.ArrayList(u32) = .{};
         defer queue.deinit(self.allocator);
-        queue.append(self.allocator, then_block) catch return null;
+        try queue.append(self.allocator, then_block);
 
         while (queue.items.len > 0) {
             const bid = queue.pop().?;
             if (then_visited.contains(bid)) continue;
-            then_visited.put(bid, {}) catch continue;
+            try then_visited.put(bid, {});
 
             const blk = &self.cfg.blocks[bid];
             for (blk.successors) |edge| {
                 if (!then_visited.contains(edge.target)) {
-                    queue.append(self.allocator, edge.target) catch continue;
+                    try queue.append(self.allocator, edge.target);
                 }
             }
         }
@@ -649,7 +663,7 @@ pub const Analyzer = struct {
         queue.clearRetainingCapacity();
         var else_visited = std.AutoHashMap(u32, void).init(self.allocator);
         defer else_visited.deinit();
-        queue.append(self.allocator, else_id) catch return null;
+        try queue.append(self.allocator, else_id);
 
         while (queue.items.len > 0) {
             const bid = queue.pop().?;
@@ -660,12 +674,12 @@ pub const Analyzer = struct {
                 return bid;
             }
 
-            else_visited.put(bid, {}) catch continue;
+            try else_visited.put(bid, {});
 
             const blk = &self.cfg.blocks[bid];
             for (blk.successors) |edge| {
                 if (!else_visited.contains(edge.target)) {
-                    queue.append(self.allocator, edge.target) catch continue;
+                    try queue.append(self.allocator, edge.target);
                 }
             }
         }

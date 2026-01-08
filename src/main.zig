@@ -106,7 +106,7 @@ fn dumpCodeCFG(allocator: std.mem.Allocator, code: *const pyc.Code, version: dec
 
         for (cfg.blocks, 0..) |block, block_idx| {
             const bid: u32 = @intCast(block_idx);
-            const pattern = analyzer.detectPattern(bid);
+            const pattern = try analyzer.detectPattern(bid);
 
             i = 0;
             while (i < indent) : (i += 1) {

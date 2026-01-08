@@ -651,6 +651,21 @@ loop_end:
 
 ---
 
+## Opcode Semantics Notes
+
+### COPY_DICT_WITHOUT_KEYS (3.10)
+- Stack before: `... subject_dict, keys_tuple`
+- Stack after: `... subject_dict, rest_dict`
+- Behavior: creates `dict(subject_dict)`, deletes each key from `keys_tuple`, replaces TOS with `rest_dict`.
+- Source: https://raw.githubusercontent.com/python/cpython/v3.10.13/Python/ceval.c (TARGET(COPY_DICT_WITHOUT_KEYS))
+
+### 3.11 Inline Cache Entries
+- `Lib/opcode.py` `_cache_format` defines which opcodes carry inline cache entries.
+- POP_JUMP_* opcodes have zero cache entries (instruction size remains 2 bytes).
+- Source: https://raw.githubusercontent.com/python/cpython/v3.11.9/Lib/opcode.py
+
+---
+
 ## Version Differences Summary
 
 ### Major Breaking Changes
@@ -780,3 +795,11 @@ def decode_svarint(val):
 - [PEP 626](https://peps.python.org/pep-0626/)
 - [CPython InternalDocs/code_objects.md](https://github.com/python/cpython/blob/main/InternalDocs/code_objects.md)
 - [CPython Objects/locations.md](https://chromium.googlesource.com/external/github.com/python/cpython/+/refs/tags/v3.11.7/Objects/locations.md)
+- [CPython 3.6.15 Lib/opcode.py](https://github.com/python/cpython/blob/v3.6.15/Lib/opcode.py)
+- [CPython 3.7.17 Lib/opcode.py](https://github.com/python/cpython/blob/v3.7.17/Lib/opcode.py)
+- [CPython 3.8.19 Lib/opcode.py](https://github.com/python/cpython/blob/v3.8.19/Lib/opcode.py)
+- [CPython 3.9.19 Lib/opcode.py](https://github.com/python/cpython/blob/v3.9.19/Lib/opcode.py)
+- [CPython 3.10.14 Lib/opcode.py](https://github.com/python/cpython/blob/v3.10.14/Lib/opcode.py)
+- [CPython 3.6.15 Python/ceval.c](https://github.com/python/cpython/blob/v3.6.15/Python/ceval.c)
+- [CPython 3.8.19 Python/ceval.c](https://github.com/python/cpython/blob/v3.8.19/Python/ceval.c)
+- [CPython 3.10.14 Python/ceval.c](https://github.com/python/cpython/blob/v3.10.14/Python/ceval.c)

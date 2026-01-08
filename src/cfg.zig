@@ -224,8 +224,21 @@ pub fn buildCFG(allocator: Allocator, bytecode: []const u8, version: Version) !C
                         // For POP_JUMP_IF_TRUE/NOT_NONE, jump target is the TRUE branch
                         // For FOR_ITER, jump target is the exhausted/exit path
                         break :blk switch (t.opcode) {
-                            .POP_JUMP_IF_FALSE, .POP_JUMP_IF_NONE, .FOR_ITER => .conditional_false,
-                            .POP_JUMP_IF_TRUE, .POP_JUMP_IF_NOT_NONE => .conditional_true,
+                            .POP_JUMP_IF_FALSE,
+                            .POP_JUMP_IF_NONE,
+                            .POP_JUMP_FORWARD_IF_FALSE,
+                            .POP_JUMP_FORWARD_IF_NONE,
+                            .POP_JUMP_BACKWARD_IF_FALSE,
+                            .POP_JUMP_BACKWARD_IF_NONE,
+                            .FOR_ITER,
+                            => .conditional_false,
+                            .POP_JUMP_IF_TRUE,
+                            .POP_JUMP_IF_NOT_NONE,
+                            .POP_JUMP_FORWARD_IF_TRUE,
+                            .POP_JUMP_FORWARD_IF_NOT_NONE,
+                            .POP_JUMP_BACKWARD_IF_TRUE,
+                            .POP_JUMP_BACKWARD_IF_NOT_NONE,
+                            => .conditional_true,
                             else => .conditional_true,
                         };
                     } else if (t.opcode == .JUMP_BACKWARD or t.opcode == .JUMP_BACKWARD_NO_INTERRUPT)
@@ -245,8 +258,21 @@ pub fn buildCFG(allocator: Allocator, bytecode: []const u8, version: Version) !C
                         // Fallthrough is the opposite of jump target
                         // FOR_ITER fallthrough is the body (normal path)
                         break :blk switch (t.opcode) {
-                            .POP_JUMP_IF_FALSE, .POP_JUMP_IF_NONE => .conditional_true,
-                            .POP_JUMP_IF_TRUE, .POP_JUMP_IF_NOT_NONE, .FOR_ITER => .normal,
+                            .POP_JUMP_IF_FALSE,
+                            .POP_JUMP_IF_NONE,
+                            .POP_JUMP_FORWARD_IF_FALSE,
+                            .POP_JUMP_FORWARD_IF_NONE,
+                            .POP_JUMP_BACKWARD_IF_FALSE,
+                            .POP_JUMP_BACKWARD_IF_NONE,
+                            => .conditional_true,
+                            .POP_JUMP_IF_TRUE,
+                            .POP_JUMP_IF_NOT_NONE,
+                            .POP_JUMP_FORWARD_IF_TRUE,
+                            .POP_JUMP_FORWARD_IF_NOT_NONE,
+                            .POP_JUMP_BACKWARD_IF_TRUE,
+                            .POP_JUMP_BACKWARD_IF_NOT_NONE,
+                            .FOR_ITER,
+                            => .normal,
                             else => .conditional_false,
                         };
                     }

@@ -538,6 +538,10 @@ pub const Arguments = struct {
     kw_defaults: []const ?*Expr,
     kwarg: ?Arg,
     defaults: []const *Expr,
+
+    pub fn deinit(self: *Arguments, allocator: Allocator) void {
+        deinitArguments(allocator, self);
+    }
 };
 
 /// A single function argument.
@@ -567,6 +571,7 @@ fn deinitOptionalExprSlice(allocator: Allocator, items: []const ?*Expr) void {
 
 fn deinitKeywords(allocator: Allocator, keywords: []const Keyword) void {
     for (keywords) |kw| {
+        if (kw.arg) |arg| allocator.free(arg);
         kw.value.deinit(allocator);
         allocator.destroy(kw.value);
     }
@@ -582,6 +587,106 @@ fn deinitComprehensions(allocator: Allocator, generators: []const Comprehension)
         deinitExprSlice(allocator, gen.ifs);
     }
     if (generators.len > 0) allocator.free(generators);
+}
+
+fn deinitStmtSlice(allocator: Allocator, items: []const *Stmt) void {
+    for (items) |stmt| {
+        @constCast(stmt).deinit(allocator);
+        allocator.destroy(stmt);
+    }
+    if (items.len > 0) allocator.free(items);
+}
+
+fn deinitWithItems(allocator: Allocator, items: []const WithItem) void {
+    for (items) |item| {
+        item.context_expr.deinit(allocator);
+        allocator.destroy(item.context_expr);
+        if (item.optional_vars) |vars| {
+            vars.deinit(allocator);
+            allocator.destroy(vars);
+        }
+    }
+    if (items.len > 0) allocator.free(items);
+}
+
+fn deinitAliasSlice(allocator: Allocator, items: []const Alias) void {
+    if (items.len > 0) allocator.free(items);
+}
+
+fn deinitNameSlice(allocator: Allocator, items: []const []const u8) void {
+    if (items.len > 0) allocator.free(items);
+}
+
+fn deinitExceptHandlers(allocator: Allocator, handlers: []const ExceptHandler) void {
+    for (handlers) |handler| {
+        if (handler.type) |exc_type| {
+            exc_type.deinit(allocator);
+            allocator.destroy(exc_type);
+        }
+        deinitStmtSlice(allocator, handler.body);
+    }
+    if (handlers.len > 0) allocator.free(handlers);
+}
+
+fn deinitMatchCases(allocator: Allocator, cases: []const MatchCase) void {
+    for (cases) |case| {
+        case.pattern.deinit(allocator);
+        allocator.destroy(case.pattern);
+        if (case.guard) |guard| {
+            guard.deinit(allocator);
+            allocator.destroy(guard);
+        }
+        deinitStmtSlice(allocator, case.body);
+    }
+    if (cases.len > 0) allocator.free(cases);
+}
+
+fn deinitPatternSlice(allocator: Allocator, items: []const *Pattern) void {
+    for (items) |item| {
+        item.deinit(allocator);
+        allocator.destroy(item);
+    }
+    if (items.len > 0) allocator.free(items);
+}
+
+fn deinitPatternMapping(allocator: Allocator, keys: []const *Expr, patterns: []const *Pattern) void {
+    deinitExprSlice(allocator, keys);
+    deinitPatternSlice(allocator, patterns);
+}
+
+fn deinitPatternClass(
+    allocator: Allocator,
+    cls: *Expr,
+    patterns: []const *Pattern,
+    kwd_attrs: []const []const u8,
+    kwd_patterns: []const *Pattern,
+) void {
+    cls.deinit(allocator);
+    allocator.destroy(cls);
+    deinitPatternSlice(allocator, patterns);
+    if (kwd_attrs.len > 0) allocator.free(kwd_attrs);
+    deinitPatternSlice(allocator, kwd_patterns);
+}
+
+fn deinitPattern(self: *Pattern, allocator: Allocator) void {
+    switch (self.*) {
+        .match_value => |expr| {
+            expr.deinit(allocator);
+            allocator.destroy(expr);
+        },
+        .match_singleton => |value| value.deinit(allocator),
+        .match_sequence => |items| deinitPatternSlice(allocator, items),
+        .match_mapping => |v| deinitPatternMapping(allocator, v.keys, v.patterns),
+        .match_class => |v| deinitPatternClass(allocator, v.cls, v.patterns, v.kwd_attrs, v.kwd_patterns),
+        .match_star => {},
+        .match_as => |v| {
+            if (v.pattern) |pat| {
+                pat.deinit(allocator);
+                allocator.destroy(pat);
+            }
+        },
+        .match_or => |items| deinitPatternSlice(allocator, items),
+    }
 }
 
 fn deinitArguments(allocator: Allocator, args: *Arguments) void {
@@ -716,6 +821,7 @@ fn cloneKeywords(allocator: Allocator, keywords: []const Keyword) CloneError![]c
     errdefer {
         var i: usize = 0;
         while (i < count) : (i += 1) {
+            if (out[i].arg) |arg| allocator.free(arg);
             out[i].value.deinit(allocator);
             allocator.destroy(out[i].value);
         }
@@ -724,7 +830,7 @@ fn cloneKeywords(allocator: Allocator, keywords: []const Keyword) CloneError![]c
 
     for (keywords, 0..) |kw, idx| {
         out[idx] = .{
-            .arg = kw.arg,
+            .arg = if (kw.arg) |arg| try allocator.dupe(u8, arg) else null,
             .value = try cloneExpr(allocator, kw.value),
         };
         count += 1;
@@ -1144,6 +1250,128 @@ pub const Stmt = union(enum) {
 
     /// Continue statement
     continue_stmt,
+
+    pub fn deinit(self: *Stmt, allocator: Allocator) void {
+        switch (self.*) {
+            .function_def => |v| {
+                if (v.name.len > 0) allocator.free(v.name);
+                deinitArguments(allocator, v.args);
+                deinitStmtSlice(allocator, v.body);
+                deinitExprSlice(allocator, v.decorator_list);
+                if (v.returns) |ret| {
+                    ret.deinit(allocator);
+                    allocator.destroy(ret);
+                }
+            },
+            .class_def => |v| {
+                if (v.name.len > 0) allocator.free(v.name);
+                deinitExprSlice(allocator, v.bases);
+                deinitKeywords(allocator, v.keywords);
+                deinitStmtSlice(allocator, v.body);
+                deinitExprSlice(allocator, v.decorator_list);
+            },
+            .return_stmt => |v| {
+                if (v.value) |val| {
+                    val.deinit(allocator);
+                    allocator.destroy(val);
+                }
+            },
+            .delete => |v| {
+                deinitExprSlice(allocator, v.targets);
+            },
+            .assign => |v| {
+                deinitExprSlice(allocator, v.targets);
+                v.value.deinit(allocator);
+                allocator.destroy(v.value);
+            },
+            .aug_assign => |v| {
+                v.target.deinit(allocator);
+                allocator.destroy(v.target);
+                v.value.deinit(allocator);
+                allocator.destroy(v.value);
+            },
+            .ann_assign => |v| {
+                v.target.deinit(allocator);
+                allocator.destroy(v.target);
+                v.annotation.deinit(allocator);
+                allocator.destroy(v.annotation);
+                if (v.value) |val| {
+                    val.deinit(allocator);
+                    allocator.destroy(val);
+                }
+            },
+            .for_stmt => |v| {
+                v.target.deinit(allocator);
+                allocator.destroy(v.target);
+                v.iter.deinit(allocator);
+                allocator.destroy(v.iter);
+                deinitStmtSlice(allocator, v.body);
+                deinitStmtSlice(allocator, v.else_body);
+            },
+            .while_stmt => |v| {
+                v.condition.deinit(allocator);
+                allocator.destroy(v.condition);
+                deinitStmtSlice(allocator, v.body);
+                deinitStmtSlice(allocator, v.else_body);
+            },
+            .if_stmt => |v| {
+                v.condition.deinit(allocator);
+                allocator.destroy(v.condition);
+                deinitStmtSlice(allocator, v.body);
+                deinitStmtSlice(allocator, v.else_body);
+            },
+            .with_stmt => |v| {
+                deinitWithItems(allocator, v.items);
+                deinitStmtSlice(allocator, v.body);
+            },
+            .match_stmt => |v| {
+                v.subject.deinit(allocator);
+                allocator.destroy(v.subject);
+                deinitMatchCases(allocator, v.cases);
+            },
+            .raise_stmt => |v| {
+                if (v.exc) |exc| {
+                    exc.deinit(allocator);
+                    allocator.destroy(exc);
+                }
+                if (v.cause) |cause| {
+                    cause.deinit(allocator);
+                    allocator.destroy(cause);
+                }
+            },
+            .try_stmt => |v| {
+                deinitStmtSlice(allocator, v.body);
+                deinitExceptHandlers(allocator, v.handlers);
+                deinitStmtSlice(allocator, v.else_body);
+                deinitStmtSlice(allocator, v.finalbody);
+            },
+            .assert_stmt => |v| {
+                v.condition.deinit(allocator);
+                allocator.destroy(v.condition);
+                if (v.msg) |msg| {
+                    msg.deinit(allocator);
+                    allocator.destroy(msg);
+                }
+            },
+            .import_stmt => |v| {
+                deinitAliasSlice(allocator, v.names);
+            },
+            .import_from => |v| {
+                deinitAliasSlice(allocator, v.names);
+            },
+            .global_stmt => |v| {
+                deinitNameSlice(allocator, v.names);
+            },
+            .nonlocal_stmt => |v| {
+                deinitNameSlice(allocator, v.names);
+            },
+            .expr_stmt => |v| {
+                v.value.deinit(allocator);
+                allocator.destroy(v.value);
+            },
+            .pass, .break_stmt, .continue_stmt => {},
+        }
+    }
 };
 
 /// With item: expr as target
@@ -1181,6 +1409,10 @@ pub const Pattern = union(enum) {
         name: ?[]const u8,
     },
     match_or: []const *Pattern,
+
+    pub fn deinit(self: *Pattern, allocator: Allocator) void {
+        deinitPattern(self, allocator);
+    }
 };
 
 /// Exception handler
@@ -1230,8 +1462,18 @@ pub fn makeBinOp(allocator: Allocator, left: *Expr, op: BinOp, right: *Expr) !*E
 
 /// Create a function call expression.
 pub fn makeCall(allocator: Allocator, func: *Expr, args: []const *Expr) !*Expr {
+    return makeCallWithKeywords(allocator, func, args, &.{});
+}
+
+/// Create a function call expression with keywords.
+pub fn makeCallWithKeywords(
+    allocator: Allocator,
+    func: *Expr,
+    args: []const *Expr,
+    keywords: []const Keyword,
+) !*Expr {
     const expr = try allocator.create(Expr);
-    expr.* = .{ .call = .{ .func = func, .args = args, .keywords = &.{} } };
+    expr.* = .{ .call = .{ .func = func, .args = args, .keywords = keywords } };
     return expr;
 }
 
@@ -1260,6 +1502,13 @@ pub fn makeAttribute(allocator: Allocator, value: *Expr, attr: []const u8, ctx: 
 pub fn makeSubscript(allocator: Allocator, value: *Expr, slice_expr: *Expr, ctx: ExprContext) !*Expr {
     const expr = try allocator.create(Expr);
     expr.* = .{ .subscript = .{ .value = value, .slice = slice_expr, .ctx = ctx } };
+    return expr;
+}
+
+/// Create a starred expression.
+pub fn makeStarred(allocator: Allocator, value: *Expr, ctx: ExprContext) !*Expr {
+    const expr = try allocator.create(Expr);
+    expr.* = .{ .starred = .{ .value = value, .ctx = ctx } };
     return expr;
 }
 
