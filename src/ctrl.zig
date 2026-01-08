@@ -116,6 +116,26 @@ pub const WithPattern = struct {
     exit_block: u32,
 };
 
+/// Break/continue detection result.
+pub const LoopExit = union(enum) {
+    /// A break statement (exits the loop).
+    break_stmt: struct {
+        /// Block containing the break.
+        block: u32,
+        /// The loop header block being broken from.
+        loop_header: u32,
+    },
+    /// A continue statement (jumps to loop header).
+    continue_stmt: struct {
+        /// Block containing the continue.
+        block: u32,
+        /// The loop header block being continued to.
+        loop_header: u32,
+    },
+    /// Not a break or continue.
+    none,
+};
+
 /// Control flow analyzer.
 pub const Analyzer = struct {
     cfg: *const CFG,
@@ -512,6 +532,111 @@ pub const Analyzer = struct {
         while (i < end and i < self.cfg.blocks.len) : (i += 1) {
             self.processed.set(i);
         }
+    }
+
+    /// Detect if a block ends with break or continue.
+    /// This requires knowing the enclosing loop(s).
+    pub fn detectLoopExit(self: *const Analyzer, block_id: u32, loop_headers: []const u32) LoopExit {
+        if (block_id >= self.cfg.blocks.len) return .none;
+        const block = &self.cfg.blocks[block_id];
+        const term = block.terminator() orelse return .none;
+
+        // Only unconditional jumps can be break/continue
+        if (term.opcode != .JUMP_FORWARD and term.opcode != .JUMP_BACKWARD and term.opcode != .JUMP_BACKWARD_NO_INTERRUPT) {
+            return .none;
+        }
+
+        // Get jump target block
+        if (term.jumpTarget(self.cfg.version)) |target_offset| {
+            const target_block = self.cfg.blockAtOffset(target_offset) orelse return .none;
+
+            // Check if jumping to a loop header = continue
+            for (loop_headers) |header| {
+                if (target_block == header) {
+                    return .{ .continue_stmt = .{
+                        .block = block_id,
+                        .loop_header = header,
+                    } };
+                }
+            }
+
+            // Check if jumping past the innermost loop's exit = break
+            // For simplicity, if we jump forward and out of the loop body, it's a break
+            if (loop_headers.len > 0) {
+                const innermost_header = loop_headers[loop_headers.len - 1];
+                const header_block = &self.cfg.blocks[innermost_header];
+
+                // Find the loop's exit block
+                for (header_block.successors) |edge| {
+                    if (edge.edge_type == .conditional_false) {
+                        // This is the exit block - if we're jumping to it or past, it's a break
+                        if (target_block >= edge.target) {
+                            return .{ .break_stmt = .{
+                                .block = block_id,
+                                .loop_header = innermost_header,
+                            } };
+                        }
+                    }
+                }
+            }
+        }
+
+        return .none;
+    }
+
+    /// Find all loop headers that contain a given block.
+    pub fn findEnclosingLoops(self: *const Analyzer, block_id: u32) ![]u32 {
+        var loops: std.ArrayList(u32) = .{};
+        errdefer loops.deinit(self.allocator);
+
+        // Simple approach: a block is in a loop if there's a path from a loop header
+        // to the block and a back edge from somewhere after the block to the header
+        for (self.cfg.blocks, 0..) |block, i| {
+            if (block.is_loop_header) {
+                // Check if block_id is reachable from this loop header
+                // and if there's a back edge to this header from a block >= block_id
+                const header_id: u32 = @intCast(i);
+                if (self.isInLoop(block_id, header_id)) {
+                    try loops.append(self.allocator, header_id);
+                }
+            }
+        }
+
+        return loops.toOwnedSlice(self.allocator);
+    }
+
+    /// Check if a block is within a loop.
+    fn isInLoop(self: *const Analyzer, block_id: u32, loop_header: u32) bool {
+        // A block is in a loop if:
+        // 1. It's reachable from the loop header via normal/true edges
+        // 2. There's a back edge to the loop header from some block after it
+
+        if (block_id == loop_header) return true;
+        if (block_id < loop_header) return false;
+
+        // Check if this block can reach the loop header via a back edge
+        const block = &self.cfg.blocks[block_id];
+        for (block.successors) |edge| {
+            if (edge.edge_type == .loop_back and edge.target == loop_header) {
+                return true;
+            }
+        }
+
+        // Check if any successor is in the loop (without going through back edges)
+        // This is approximate - for precise analysis we'd need dominance info
+        const header = &self.cfg.blocks[loop_header];
+        for (header.successors) |edge| {
+            if (edge.edge_type == .conditional_true or edge.edge_type == .normal) {
+                // The loop body starts here
+                const body_start = edge.target;
+                if (block_id >= body_start and block_id < loop_header + 10) {
+                    // Approximate: block is between body start and some blocks after
+                    return true;
+                }
+            }
+        }
+
+        return false;
     }
 };
 
