@@ -1429,15 +1429,38 @@ pub fn extractFunctionSignature(allocator: std.mem.Allocator, code: *const pyc.C
         }
     }
 
-    // TODO: Extract *args and **kwargs from code flags and varnames
+    // *args and **kwargs follow positional and keyword-only args in varnames
+    var next_arg_idx: usize = @intCast(argcount + kwonlyargcount);
+    var vararg: ?ast.Arg = null;
+    if ((code.flags & pyc.Code.CO_VARARGS) != 0) {
+        if (next_arg_idx < code.varnames.len) {
+            vararg = .{
+                .arg = code.varnames[next_arg_idx],
+                .annotation = null,
+                .type_comment = null,
+            };
+            next_arg_idx += 1;
+        }
+    }
+
+    var kwarg: ?ast.Arg = null;
+    if ((code.flags & pyc.Code.CO_VARKEYWORDS) != 0) {
+        if (next_arg_idx < code.varnames.len) {
+            kwarg = .{
+                .arg = code.varnames[next_arg_idx],
+                .annotation = null,
+                .type_comment = null,
+            };
+        }
+    }
 
     args.* = .{
         .posonlyargs = posonly_args,
         .args = regular_args,
-        .vararg = null, // TODO: detect from code.flags
+        .vararg = vararg,
         .kwonlyargs = kwonly_args,
         .kw_defaults = &.{},
-        .kwarg = null, // TODO: detect from code.flags
+        .kwarg = kwarg,
         .defaults = &.{}, // TODO: extract from consts
     };
 
