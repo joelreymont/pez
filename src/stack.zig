@@ -19,6 +19,8 @@ pub const Version = opcodes.Version;
 pub const StackValue = union(enum) {
     /// An AST expression.
     expr: *Expr,
+    /// A code object constant (non-owning).
+    code_obj: *const pyc.Code,
     /// A NULL marker (for PUSH_NULL).
     null_marker,
     /// Unknown/untracked value.
@@ -171,6 +173,112 @@ pub const SimContext = struct {
         };
     }
 
+    const ObjToExprError = Allocator.Error || error{UnsupportedConstant};
+
+    fn objectsToExprs(self: *SimContext, items: []const pyc.Object) ObjToExprError![]const *Expr {
+        const exprs = try self.allocator.alloc(*Expr, items.len);
+        var count: usize = 0;
+        errdefer {
+            var i: usize = 0;
+            while (i < count) : (i += 1) {
+                exprs[i].deinit(self.allocator);
+                self.allocator.destroy(exprs[i]);
+            }
+            self.allocator.free(exprs);
+        }
+
+        for (items, 0..) |item, idx| {
+            exprs[idx] = try self.objToExpr(item);
+            count += 1;
+        }
+
+        return exprs;
+    }
+
+    /// Convert a pyc.Object to a literal expression, including composites.
+    pub fn objToExpr(self: *SimContext, obj: pyc.Object) ObjToExprError!*Expr {
+        return switch (obj) {
+            .tuple => |items| {
+                const elts = try self.objectsToExprs(items);
+                return ast.makeTuple(self.allocator, elts, .load);
+            },
+            .list => |items| {
+                const elts = try self.objectsToExprs(items);
+                return ast.makeList(self.allocator, elts, .load);
+            },
+            .set => |items| {
+                const elts = try self.objectsToExprs(items);
+                const expr = try self.allocator.create(Expr);
+                expr.* = .{ .set = .{ .elts = elts } };
+                return expr;
+            },
+            .frozenset => |items| {
+                const elts = try self.objectsToExprs(items);
+                const list_expr = try ast.makeList(self.allocator, elts, .load);
+                errdefer {
+                    list_expr.deinit(self.allocator);
+                    self.allocator.destroy(list_expr);
+                }
+                const func = try ast.makeName(self.allocator, "frozenset", .load);
+                errdefer {
+                    func.deinit(self.allocator);
+                    self.allocator.destroy(func);
+                }
+                const args = try self.allocator.alloc(*Expr, 1);
+                args[0] = list_expr;
+                return ast.makeCall(self.allocator, func, args);
+            },
+            .dict => |entries| {
+                const keys = try self.allocator.alloc(?*Expr, entries.len);
+                errdefer self.allocator.free(keys);
+                const values = try self.allocator.alloc(*Expr, entries.len);
+                errdefer self.allocator.free(values);
+
+                var count: usize = 0;
+                errdefer {
+                    var i: usize = 0;
+                    while (i < count) : (i += 1) {
+                        if (keys[i]) |k| {
+                            k.deinit(self.allocator);
+                            self.allocator.destroy(k);
+                        }
+                        values[i].deinit(self.allocator);
+                        self.allocator.destroy(values[i]);
+                    }
+                }
+
+                for (entries, 0..) |entry, idx| {
+                    keys[idx] = try self.objToExpr(entry.key);
+                    values[idx] = try self.objToExpr(entry.value);
+                    count += 1;
+                }
+
+                const expr = try self.allocator.create(Expr);
+                expr.* = .{ .dict = .{ .keys = keys, .values = values } };
+                return expr;
+            },
+            .code, .code_ref => error.UnsupportedConstant,
+            else => {
+                const constant = try self.objToConstant(obj);
+                return ast.makeConstant(self.allocator, constant);
+            },
+        };
+    }
+
+    fn qualnameLeaf(self: *SimContext, qualname: []const u8) []const u8 {
+        _ = self;
+        if (qualname.len == 0) return qualname;
+        var idx = qualname.len;
+        while (idx > 0) {
+            idx -= 1;
+            if (qualname[idx] == '.') {
+                if (idx + 1 < qualname.len) return qualname[idx + 1 ..];
+                break;
+            }
+        }
+        return qualname;
+    }
+
     /// Simulate a single instruction.
     pub fn simulate(self: *SimContext, inst: Instruction) !void {
         switch (inst.opcode) {
@@ -191,9 +299,18 @@ pub const SimContext = struct {
 
             .LOAD_CONST => {
                 if (self.getConst(inst.arg)) |obj| {
-                    const constant = try self.objToConstant(obj);
-                    const expr = try ast.makeConstant(self.allocator, constant);
-                    try self.stack.push(.{ .expr = expr });
+                    switch (obj) {
+                        .code, .code_ref => |code| {
+                            try self.stack.push(.{ .code_obj = code });
+                        },
+                        else => {
+                            const expr = self.objToExpr(obj) catch {
+                                try self.stack.push(.unknown);
+                                return;
+                            };
+                            try self.stack.push(.{ .expr = expr });
+                        },
+                    }
                 } else {
                     try self.stack.push(.unknown);
                 }
@@ -394,8 +511,14 @@ pub const SimContext = struct {
                 const code_val = self.stack.pop() orelse return error.StackUnderflow;
 
                 // Try to get the function name from the code object
-                // TODO: Extract name from code object's co_qualname when available
-                const func_name: []const u8 = "<function>";
+                const func_name: []const u8 = switch (code_val) {
+                    .code_obj => |code| blk: {
+                        if (code.qualname.len > 0) break :blk self.qualnameLeaf(code.qualname);
+                        if (code.name.len > 0) break :blk code.name;
+                        break :blk "<function>";
+                    },
+                    else => "<function>",
+                };
 
                 // Create a placeholder Name expression for the function
                 const expr = try ast.makeName(self.allocator, func_name, .load);
@@ -984,4 +1107,77 @@ test "stack simulation load const" {
     try testing.expect(val == .expr);
     try testing.expect(val.expr.constant == .int);
     try testing.expectEqual(@as(i64, 42), val.expr.constant.int);
+}
+
+test "stack simulation composite load const" {
+    const testing = std.testing;
+    const allocator = testing.allocator;
+    const codegen = @import("codegen.zig");
+
+    const DictEntry = @typeInfo(@FieldType(pyc.Object, "dict")).pointer.child;
+
+    var tuple_items = try allocator.alloc(pyc.Object, 2);
+    tuple_items[0] = .{ .int = pyc.Int.fromI64(1) };
+    tuple_items[1] = .{ .int = pyc.Int.fromI64(2) };
+
+    var dict_entries = try allocator.alloc(DictEntry, 1);
+    dict_entries[0] = .{
+        .key = .{ .int = pyc.Int.fromI64(1) },
+        .value = .{ .int = pyc.Int.fromI64(2) },
+    };
+
+    var consts = [_]pyc.Object{
+        .{ .tuple = tuple_items },
+        .{ .dict = dict_entries },
+    };
+    defer {
+        for (consts[0..]) |*obj| obj.deinit(allocator);
+    }
+
+    var code = pyc.Code{
+        .allocator = allocator,
+        .consts = &consts,
+    };
+    const version = Version.init(3, 12);
+
+    var ctx = SimContext.init(allocator, &code, version);
+    defer ctx.deinit();
+
+    const tuple_inst = Instruction{
+        .opcode = .LOAD_CONST,
+        .arg = 0,
+        .offset = 0,
+        .size = 2,
+        .cache_entries = 0,
+    };
+    try ctx.simulate(tuple_inst);
+    const tuple_val = ctx.stack.pop().?;
+    defer tuple_val.deinit(allocator);
+    try testing.expect(tuple_val == .expr);
+
+    var tuple_writer = codegen.Writer.init(allocator);
+    defer tuple_writer.deinit(allocator);
+    try tuple_writer.writeExpr(allocator, tuple_val.expr);
+    const tuple_output = try tuple_writer.getOutput(allocator);
+    defer allocator.free(tuple_output);
+    try testing.expectEqualStrings("(1, 2)", tuple_output);
+
+    const dict_inst = Instruction{
+        .opcode = .LOAD_CONST,
+        .arg = 1,
+        .offset = 2,
+        .size = 2,
+        .cache_entries = 0,
+    };
+    try ctx.simulate(dict_inst);
+    const dict_val = ctx.stack.pop().?;
+    defer dict_val.deinit(allocator);
+    try testing.expect(dict_val == .expr);
+
+    var dict_writer = codegen.Writer.init(allocator);
+    defer dict_writer.deinit(allocator);
+    try dict_writer.writeExpr(allocator, dict_val.expr);
+    const dict_output = try dict_writer.getOutput(allocator);
+    defer allocator.free(dict_output);
+    try testing.expectEqualStrings("{1: 2}", dict_output);
 }

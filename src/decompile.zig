@@ -189,8 +189,7 @@ pub const Decompiler = struct {
                 },
                 .RETURN_CONST => {
                     if (sim.getConst(inst.arg)) |obj| {
-                        const constant = try sim.objToConstant(obj);
-                        const value = try ast.makeConstant(self.allocator, constant);
+                        const value = try sim.objToExpr(obj);
                         const stmt = try self.makeReturn(value);
                         try self.statements.append(self.allocator, stmt);
                     }
@@ -258,8 +257,7 @@ pub const Decompiler = struct {
                 },
                 .RETURN_CONST => {
                     if (sim.getConst(inst.arg)) |obj| {
-                        const constant = try sim.objToConstant(obj);
-                        const value = try ast.makeConstant(self.allocator, constant);
+                        const value = try sim.objToExpr(obj);
                         const stmt = try self.makeReturn(value);
                         try stmts.append(self.allocator, stmt);
                     }
@@ -972,8 +970,7 @@ pub const Decompiler = struct {
                 },
                 .RETURN_CONST => {
                     if (sim.getConst(inst.arg)) |obj| {
-                        const constant = try sim.objToConstant(obj);
-                        const value = try ast.makeConstant(self.allocator, constant);
+                        const value = try sim.objToExpr(obj);
                         const stmt = try self.makeReturn(value);
                         try stmts.append(self.allocator, stmt);
                     }

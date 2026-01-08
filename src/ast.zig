@@ -391,6 +391,18 @@ pub const Expr = union(enum) {
                 }
                 allocator.free(v.elts);
             },
+            .dict => |v| {
+                for (v.keys, v.values) |maybe_key, value| {
+                    if (maybe_key) |k| {
+                        @constCast(k).deinit(allocator);
+                        allocator.destroy(k);
+                    }
+                    @constCast(value).deinit(allocator);
+                    allocator.destroy(value);
+                }
+                allocator.free(v.keys);
+                allocator.free(v.values);
+            },
             .attribute => |v| {
                 v.value.deinit(allocator);
                 allocator.destroy(v.value);
