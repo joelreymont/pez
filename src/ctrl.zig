@@ -30,6 +30,10 @@ pub const ControlFlowPattern = union(enum) {
     while_loop: WhilePattern,
     /// For loop.
     for_loop: ForPattern,
+    /// Try/except/finally statement.
+    try_stmt: TryPattern,
+    /// With statement.
+    with_stmt: WithPattern,
     /// Sequential block (no special control flow).
     sequential: SequentialPattern,
     /// Unknown/unrecognized pattern.
@@ -76,6 +80,40 @@ pub const ForPattern = struct {
 pub const SequentialPattern = struct {
     /// Block IDs in order.
     blocks: []const u32,
+};
+
+/// Pattern for try/except/finally statements.
+pub const TryPattern = struct {
+    /// First block of the try body.
+    try_block: u32,
+    /// Exception handler blocks (each except clause).
+    handlers: []const HandlerInfo,
+    /// First block of the else clause (if any).
+    else_block: ?u32,
+    /// First block of the finally clause (if any).
+    finally_block: ?u32,
+    /// Block where control resumes after the try statement.
+    exit_block: ?u32,
+};
+
+/// Information about an exception handler.
+pub const HandlerInfo = struct {
+    /// Block ID of the handler entry.
+    handler_block: u32,
+    /// True if this catches all exceptions (bare except or Exception).
+    is_bare: bool,
+};
+
+/// Pattern for with statements.
+pub const WithPattern = struct {
+    /// Block containing the context manager setup (BEFORE_WITH).
+    setup_block: u32,
+    /// First block of the with body.
+    body_block: u32,
+    /// Block containing cleanup (WITH_EXCEPT_START, etc.).
+    cleanup_block: u32,
+    /// Block after the with statement.
+    exit_block: u32,
 };
 
 /// Control flow analyzer.
@@ -127,7 +165,39 @@ pub const Analyzer = struct {
             }
         }
 
+        // Check for try/except pattern (block with exception edge)
+        if (self.hasExceptionEdge(block)) {
+            if (self.detectTryPattern(block_id)) |pattern| {
+                return .{ .try_stmt = pattern };
+            }
+        }
+
+        // Check for with statement (BEFORE_WITH opcode)
+        if (self.hasWithSetup(block)) {
+            if (self.detectWithPattern(block_id)) |pattern| {
+                return .{ .with_stmt = pattern };
+            }
+        }
+
         return .unknown;
+    }
+
+    /// Check if block has any exception edges.
+    fn hasExceptionEdge(self: *const Analyzer, block: *const BasicBlock) bool {
+        _ = self;
+        for (block.successors) |edge| {
+            if (edge.edge_type == .exception) return true;
+        }
+        return false;
+    }
+
+    /// Check if block has BEFORE_WITH setup.
+    fn hasWithSetup(self: *const Analyzer, block: *const BasicBlock) bool {
+        _ = self;
+        for (block.instructions) |inst| {
+            if (inst.opcode == .BEFORE_WITH) return true;
+        }
+        return false;
     }
 
     /// Check if an opcode is a conditional jump.
@@ -276,6 +346,109 @@ pub const Analyzer = struct {
             .header_block = block_id,
             .body_block = body_id,
             .exit_block = exit_id,
+        };
+    }
+
+    /// Detect try/except/finally pattern.
+    fn detectTryPattern(self: *Analyzer, block_id: u32) ?TryPattern {
+        const block = &self.cfg.blocks[block_id];
+
+        // Collect all exception handlers reachable from this block
+        var handler_list: std.ArrayList(HandlerInfo) = .{};
+        defer handler_list.deinit(self.allocator);
+
+        for (block.successors) |edge| {
+            if (edge.edge_type == .exception) {
+                const handler_block = &self.cfg.blocks[edge.target];
+                // Check if this is a bare except (no type check)
+                const is_bare = !self.hasExceptionTypeCheck(handler_block);
+                handler_list.append(self.allocator, .{
+                    .handler_block = edge.target,
+                    .is_bare = is_bare,
+                }) catch continue;
+            }
+        }
+
+        if (handler_list.items.len == 0) return null;
+
+        // Find exit block - where control goes after all handlers
+        var exit_block: ?u32 = null;
+        for (handler_list.items) |handler| {
+            const h_block = &self.cfg.blocks[handler.handler_block];
+            for (h_block.successors) |edge| {
+                if (edge.edge_type == .normal and !self.cfg.blocks[edge.target].is_exception_handler) {
+                    exit_block = edge.target;
+                    break;
+                }
+            }
+            if (exit_block != null) break;
+        }
+
+        const handlers = self.allocator.dupe(HandlerInfo, handler_list.items) catch return null;
+
+        return TryPattern{
+            .try_block = block_id,
+            .handlers = handlers,
+            .else_block = null, // TODO: detect else clause
+            .finally_block = null, // TODO: detect finally clause
+            .exit_block = exit_block,
+        };
+    }
+
+    /// Check if handler block has exception type check (CHECK_EXC_MATCH).
+    fn hasExceptionTypeCheck(self: *const Analyzer, block: *const BasicBlock) bool {
+        _ = self;
+        for (block.instructions) |inst| {
+            if (inst.opcode == .CHECK_EXC_MATCH) return true;
+        }
+        return false;
+    }
+
+    /// Detect with statement pattern.
+    fn detectWithPattern(self: *Analyzer, block_id: u32) ?WithPattern {
+        const block = &self.cfg.blocks[block_id];
+
+        // Find BEFORE_WITH instruction
+        var has_before_with = false;
+        for (block.instructions) |inst| {
+            if (inst.opcode == .BEFORE_WITH) {
+                has_before_with = true;
+                break;
+            }
+        }
+
+        if (!has_before_with) return null;
+
+        // The body is the normal successor
+        var body_block: ?u32 = null;
+        var cleanup_block: ?u32 = null;
+
+        for (block.successors) |edge| {
+            if (edge.edge_type == .normal) {
+                body_block = edge.target;
+            } else if (edge.edge_type == .exception) {
+                cleanup_block = edge.target;
+            }
+        }
+
+        const body_id = body_block orelse return null;
+        const cleanup_id = cleanup_block orelse return null;
+
+        // Find exit block - where control goes after cleanup
+        var exit_block: ?u32 = null;
+        const cleanup_blk = &self.cfg.blocks[cleanup_id];
+        for (cleanup_blk.successors) |edge| {
+            if (edge.edge_type == .normal) {
+                exit_block = edge.target;
+                break;
+            }
+        }
+
+        return WithPattern{
+            .setup_block = block_id,
+            .body_block = body_id,
+            .cleanup_block = cleanup_id,
+            .exit_block = exit_block orelse block_id + 1,
         };
     }
 
