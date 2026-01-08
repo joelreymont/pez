@@ -472,26 +472,28 @@ pub const SimContext = struct {
                 // Pop argc args, then NULL marker (if present), then callable
                 const argc = inst.arg;
                 const args = try self.stack.popNExprs(argc);
+                errdefer {
+                    for (args) |arg| {
+                        arg.deinit(self.allocator);
+                        self.allocator.destroy(arg);
+                    }
+                    self.allocator.free(args);
+                }
 
                 // Check for NULL marker (PUSH_NULL before function)
-                const maybe_null = self.stack.pop();
+                const maybe_null = self.stack.pop() orelse return error.StackUnderflow;
                 var func_val: StackValue = undefined;
-                if (maybe_null) |val| {
-                    if (val == .null_marker) {
-                        // Pop the actual function
-                        func_val = self.stack.pop() orelse return error.StackUnderflow;
-                    } else {
-                        // Not a NULL marker, this is the function
-                        func_val = val;
-                    }
+                if (maybe_null == .null_marker) {
+                    // Pop the actual function
+                    func_val = self.stack.pop() orelse return error.StackUnderflow;
                 } else {
-                    return error.StackUnderflow;
+                    // Not a NULL marker, this is the function
+                    func_val = maybe_null;
                 }
 
                 const func = switch (func_val) {
                     .expr => |e| e,
                     else => {
-                        self.allocator.free(args);
                         return error.NotAnExpression;
                     },
                 };
@@ -502,7 +504,12 @@ pub const SimContext = struct {
 
             .RETURN_VALUE => {
                 // Pop return value - typically ends simulation
-                _ = self.stack.pop();
+                if (self.stack.pop()) |v| {
+                    var val = v;
+                    val.deinit(self.allocator);
+                } else {
+                    return error.StackUnderflow;
+                }
             },
 
             .RETURN_CONST => {
@@ -727,8 +734,18 @@ pub const SimContext = struct {
             .IMPORT_NAME => {
                 // IMPORT_NAME namei - imports module names[namei]
                 // Stack: fromlist, level -> module
-                _ = self.stack.pop(); // level
-                _ = self.stack.pop(); // fromlist
+                if (self.stack.pop()) |v| {
+                    var val = v;
+                    val.deinit(self.allocator);
+                } else {
+                    return error.StackUnderflow;
+                }
+                if (self.stack.pop()) |v| {
+                    var val = v;
+                    val.deinit(self.allocator);
+                } else {
+                    return error.StackUnderflow;
+                }
                 if (self.getName(inst.arg)) |name| {
                     const expr = try ast.makeName(self.allocator, name, .load);
                     try self.stack.push(.{ .expr = expr });
@@ -890,7 +907,12 @@ pub const SimContext = struct {
             .CHECK_EXC_MATCH => {
                 // CHECK_EXC_MATCH - checks if TOS matches TOS1 exception type
                 // Pops the exception type, leaves bool result on stack
-                _ = self.stack.pop();
+                if (self.stack.pop()) |v| {
+                    var val = v;
+                    val.deinit(self.allocator);
+                } else {
+                    return error.StackUnderflow;
+                }
                 try self.stack.push(.unknown);
             },
 
@@ -982,7 +1004,12 @@ pub const SimContext = struct {
             .SEND => {
                 // SEND delta - send value to generator
                 // TOS is the value to send, TOS1 is the generator
-                _ = self.stack.pop(); // pop sent value
+                if (self.stack.pop()) |v| {
+                    var val = v;
+                    val.deinit(self.allocator);
+                } else {
+                    return error.StackUnderflow;
+                }
                 // Generator stays, received value pushed
                 try self.stack.push(.unknown);
             },
@@ -1068,7 +1095,12 @@ pub const SimContext = struct {
             .UNPACK_SEQUENCE => {
                 // UNPACK_SEQUENCE count - unpack TOS into count values
                 const count = inst.arg;
-                _ = self.stack.pop();
+                if (self.stack.pop()) |v| {
+                    var val = v;
+                    val.deinit(self.allocator);
+                } else {
+                    return error.StackUnderflow;
+                }
                 var i: u32 = 0;
                 while (i < count) : (i += 1) {
                     try self.stack.push(.unknown);
@@ -1080,7 +1112,12 @@ pub const SimContext = struct {
                 // Low byte: before star, high byte: after star
                 const before = inst.arg & 0xFF;
                 const after = (inst.arg >> 8) & 0xFF;
-                _ = self.stack.pop();
+                if (self.stack.pop()) |v| {
+                    var val = v;
+                    val.deinit(self.allocator);
+                } else {
+                    return error.StackUnderflow;
+                }
                 var i: u32 = 0;
                 while (i < before + 1 + after) : (i += 1) {
                     try self.stack.push(.unknown);
