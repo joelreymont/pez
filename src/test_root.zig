@@ -9,6 +9,8 @@ pub const pyc = @import("pyc.zig");
 pub const opcodes = @import("opcodes.zig");
 pub const decoder = @import("decoder.zig");
 pub const cfg = @import("cfg.zig");
+pub const ast = @import("ast.zig");
+pub const stack = @import("stack.zig");
 
 // Utilities
 pub const quickcheck = @import("util/quickcheck.zig");
@@ -19,6 +21,8 @@ comptime {
     _ = opcodes;
     _ = decoder;
     _ = cfg;
+    _ = ast;
+    _ = stack;
     _ = quickcheck;
 }
 
