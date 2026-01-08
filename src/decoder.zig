@@ -103,13 +103,8 @@ pub const Instruction = struct {
             .POP_JUMP_IF_NONE,
             .POP_JUMP_IF_NOT_NONE,
             => blk: {
-                // In 3.11, these were split into forward/backward variants
-                // In 3.12+, they use absolute offsets (word units)
-                if (ver.gte(3, 12)) {
-                    break :blk self.arg * multiplier;
-                }
-                // For 3.11 forward variants (byte 114, 115, 128, 129), arg is forward offset
-                // This is a simplification - in practice we'd check the raw byte
+                // In Python 3.12+ and 3.14+, these use relative offsets from next instruction
+                // (in word units for 3.10+)
                 break :blk next_offset + self.arg * multiplier;
             },
             else => null,

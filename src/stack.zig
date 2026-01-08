@@ -292,7 +292,7 @@ pub const SimContext = struct {
                 const comparators = try self.allocator.alloc(*Expr, 1);
                 comparators[0] = right;
                 const ops = try self.allocator.alloc(ast.CmpOp, 1);
-                ops[0] = cmpOpFromArg(inst.arg);
+                ops[0] = cmpOpFromArg(inst.arg, self.version);
 
                 const expr = try self.allocator.create(Expr);
                 expr.* = .{ .compare = .{
@@ -931,9 +931,17 @@ fn binOpFromArg(arg: u32) ast.BinOp {
 }
 
 /// Convert COMPARE_OP arg to CmpOp enum.
-fn cmpOpFromArg(arg: u32) ast.CmpOp {
-    // The arg encodes the comparison in the low bits
-    const cmp = arg & 0xF;
+/// In Python 3.13+, comparison type is in bits 5+.
+/// In Python 3.12, it's in bits 4+.
+/// In earlier versions, it's the raw arg.
+fn cmpOpFromArg(arg: u32, ver: Version) ast.CmpOp {
+    const cmp: u8 = if (ver.gte(3, 13))
+        @truncate(arg >> 5)
+    else if (ver.gte(3, 12))
+        @truncate(arg >> 4)
+    else
+        @truncate(arg);
+
     return switch (cmp) {
         0 => .lt,
         1 => .lte,
