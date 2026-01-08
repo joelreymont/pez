@@ -275,6 +275,7 @@ pub const ObjectType = enum(u8) {
     TYPE_STRING = 's',
     TYPE_INTERNED = 't',
     TYPE_REF = 'r',
+    TYPE_STRINGREF = 'R', // Python 2.x: reference to interned string by index
     TYPE_TUPLE = '(',
     TYPE_LIST = '[',
     TYPE_DICT = '{',
@@ -769,6 +770,7 @@ pub const Module = struct {
         OutOfMemory,
         UnsupportedPythonVersion,
         InvalidRef,
+        InvalidStringRef,
     };
 
     fn readCode(self: *Module, reader: *BufferReader) ParseError!*Code {
@@ -1100,6 +1102,12 @@ pub const Module = struct {
                 // Add a copy to interns list for TYPE_STRINGREF lookups (interns owns its copies)
                 try self.interns.append(self.allocator, try self.allocator.dupe(u8, slice));
                 break :blk .{ .string = str };
+            },
+            .TYPE_STRINGREF => blk: {
+                // Python 2.x: reference to interned string by index
+                const idx = try reader.readU32();
+                if (idx >= self.interns.items.len) return error.InvalidStringRef;
+                break :blk .{ .string = try self.allocator.dupe(u8, self.interns.items[idx]) };
             },
             .TYPE_UNICODE => blk: {
                 const len = try reader.readU32();
