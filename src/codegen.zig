@@ -4,6 +4,7 @@
 
 const std = @import("std");
 const ast = @import("ast.zig");
+const pyc = @import("pyc.zig");
 
 pub const Expr = ast.Expr;
 pub const Stmt = ast.Stmt;
@@ -1057,6 +1058,108 @@ pub const DebugPrinter = struct {
         }
     }
 };
+
+// ============================================================================
+// Function Signature Extraction
+// ============================================================================
+
+/// Extract function signature from a code object.
+/// Returns an Arguments structure suitable for AST function definition.
+pub fn extractFunctionSignature(allocator: std.mem.Allocator, code: *const pyc.Code) !*ast.Arguments {
+    const args = try allocator.create(ast.Arguments);
+    errdefer allocator.destroy(args);
+
+    // Calculate argument positions
+    const argcount = code.argcount;
+    const posonlyargcount = code.posonlyargcount;
+    const kwonlyargcount = code.kwonlyargcount;
+
+    // Position-only args: varnames[0..posonlyargcount]
+    var posonly_args: []ast.Arg = &.{};
+    if (posonlyargcount > 0 and code.varnames.len >= posonlyargcount) {
+        posonly_args = try allocator.alloc(ast.Arg, posonlyargcount);
+        for (code.varnames[0..posonlyargcount], 0..) |name, i| {
+            posonly_args[i] = .{ .arg = name, .annotation = null, .type_comment = null };
+        }
+    }
+
+    // Regular args: varnames[posonlyargcount..argcount]
+    var regular_args: []ast.Arg = &.{};
+    const regular_start = posonlyargcount;
+    const regular_end = argcount;
+    if (regular_end > regular_start and code.varnames.len >= regular_end) {
+        regular_args = try allocator.alloc(ast.Arg, regular_end - regular_start);
+        for (code.varnames[regular_start..regular_end], 0..) |name, i| {
+            regular_args[i] = .{ .arg = name, .annotation = null, .type_comment = null };
+        }
+    }
+
+    // Keyword-only args: after argcount
+    var kwonly_args: []ast.Arg = &.{};
+    const kwonly_start = argcount;
+    const kwonly_end = argcount + kwonlyargcount;
+    if (kwonlyargcount > 0 and code.varnames.len >= kwonly_end) {
+        kwonly_args = try allocator.alloc(ast.Arg, kwonlyargcount);
+        for (code.varnames[kwonly_start..kwonly_end], 0..) |name, i| {
+            kwonly_args[i] = .{ .arg = name, .annotation = null, .type_comment = null };
+        }
+    }
+
+    // TODO: Extract *args and **kwargs from code flags and varnames
+
+    args.* = .{
+        .posonlyargs = posonly_args,
+        .args = regular_args,
+        .vararg = null, // TODO: detect from code.flags
+        .kwonlyargs = kwonly_args,
+        .kw_defaults = &.{},
+        .kwarg = null, // TODO: detect from code.flags
+        .defaults = &.{}, // TODO: extract from consts
+    };
+
+    return args;
+}
+
+/// Extract function name from code object.
+pub fn extractFunctionName(code: *const pyc.Code) []const u8 {
+    if (code.name.len > 0) {
+        return code.name;
+    }
+    return "<unknown>";
+}
+
+/// Check if code object is a lambda (has name "<lambda>").
+pub fn isLambda(code: *const pyc.Code) bool {
+    return std.mem.eql(u8, code.name, "<lambda>");
+}
+
+/// Check if code object is a generator (from code flags).
+pub fn isGenerator(code: *const pyc.Code) bool {
+    // CO_GENERATOR = 0x20
+    return (code.flags & 0x20) != 0;
+}
+
+/// Check if code object is a coroutine (from code flags).
+pub fn isCoroutine(code: *const pyc.Code) bool {
+    // CO_COROUTINE = 0x80
+    return (code.flags & 0x80) != 0;
+}
+
+/// Check if code object is an async generator (from code flags).
+pub fn isAsyncGenerator(code: *const pyc.Code) bool {
+    // CO_ASYNC_GENERATOR = 0x200
+    return (code.flags & 0x200) != 0;
+}
+
+/// Extract docstring from code object if first constant is a string.
+pub fn extractDocstring(code: *const pyc.Code) ?[]const u8 {
+    if (code.consts.len > 0) {
+        if (code.consts[0] == .string) {
+            return code.consts[0].string;
+        }
+    }
+    return null;
+}
 
 test "debug printer expr" {
     const testing = std.testing;
