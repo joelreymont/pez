@@ -1153,39 +1153,51 @@ pub fn isAsyncGenerator(code: *const pyc.Code) bool {
 
 /// Extract docstring from code object.
 /// A docstring is the first statement of a function that is a string literal.
-/// We check if the bytecode starts with RESUME, LOAD_CONST 0, then either
-/// POP_TOP (discarded string expression) or RETURN_VALUE (single-line function).
+/// Detection strategy:
+/// - Python 3.11-3.13: RESUME, LOAD_CONST 0, POP_TOP pattern
+/// - Python 3.14+: const[0] is a string but never loaded (optimized away)
 pub fn extractDocstring(code: *const pyc.Code) ?[]const u8 {
     // Need at least a string constant
     if (code.consts.len == 0) return null;
     if (code.consts[0] != .string) return null;
 
-    // Check bytecode pattern
-    // In Python 3.11+, functions start with RESUME
-    // A docstring would be: RESUME, LOAD_CONST 0, POP_TOP (or just used)
-    if (code.code.len < 6) return null;
+    if (code.code.len < 4) return null;
 
-    // RESUME is typically at offset 0 with opcode ~149-151 or similar
-    // LOAD_CONST is typically opcode 100 (pre-3.11) or 83 (3.12+)
-    // We need to check if instruction at offset 2 loads const 0
+    // Check if bytecode ever loads const[0]
+    // LOAD_CONST opcodes: 100 (pre-3.11), 83 (3.12-3.13), 82 (3.14+)
+    var loads_const_0 = false;
+    var offset: usize = 0;
+    while (offset + 1 < code.code.len) {
+        const opcode = code.code[offset];
+        const arg = code.code[offset + 1];
 
-    // Simple heuristic: if first const is a string and it's not used anywhere
-    // visible in the bytecode for calls/operations, it might be a docstring.
-    // For now, be conservative and only detect actual docstring patterns.
+        // Check various LOAD_CONST opcodes
+        if ((opcode == 100 or opcode == 83 or opcode == 82) and arg == 0) {
+            loads_const_0 = true;
+            break;
+        }
 
-    // Check if the second instruction (after RESUME at 0) is LOAD_CONST 0
-    // and third is POP_TOP (meaning the string is just an expression statement)
-    // RESUME = 149 (0x95), LOAD_CONST = 83 (0x53), POP_TOP = 31 (0x1F)
+        offset += 2; // Word-aligned bytecode (Python 3.6+)
+    }
+
+    if (!loads_const_0) {
+        // Python 3.14+ style: docstring stored but not loaded
+        return code.consts[0].string;
+    }
+
+    // Python 3.11-3.13 style: check for LOAD_CONST 0 followed by POP_TOP
+    // offset 0: RESUME (128, 149-151)
+    // offset 2: LOAD_CONST 0
+    // offset 4: POP_TOP (31)
     if (code.code.len >= 6) {
-        // offset 0: RESUME
-        // offset 2: should be LOAD_CONST with arg 0
-        // offset 4: should be POP_TOP (discarding the string)
         const inst2_opcode = code.code[2];
-        const inst2_arg = if (code.code.len > 3) code.code[3] else 0;
-        const inst4_opcode = if (code.code.len > 4) code.code[4] else 0;
+        const inst2_arg = code.code[3];
+        const inst4_opcode = code.code[4];
 
-        // LOAD_CONST = 83 in 3.12+, POP_TOP = 31
-        if (inst2_opcode == 83 and inst2_arg == 0 and inst4_opcode == 31) {
+        // LOAD_CONST (100, 83, 82) with arg 0, followed by POP_TOP (31)
+        if ((inst2_opcode == 100 or inst2_opcode == 83 or inst2_opcode == 82) and
+            inst2_arg == 0 and inst4_opcode == 31)
+        {
             return code.consts[0].string;
         }
     }

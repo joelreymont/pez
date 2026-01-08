@@ -274,6 +274,18 @@ pub const Decompiler = struct {
         } };
         return stmt;
     }
+
+    /// Check if a statement is `return None`.
+    pub fn isReturnNone(stmt: *const Stmt) bool {
+        if (stmt.* != .return_stmt) return false;
+        const ret = stmt.return_stmt;
+        if (ret.value) |val| {
+            if (val.* == .constant) {
+                return val.constant == .none;
+            }
+        }
+        return false;
+    }
 };
 
 /// Decompile a code object and write Python source to writer.
@@ -382,7 +394,13 @@ fn decompileFunctionToSource(allocator: Allocator, code: *const pyc.Code, versio
 
         const stmts = try decompiler.decompile();
 
-        if (stmts.len == 0) {
+        // Filter out trailing `return None` (implicit in Python)
+        var effective_stmts = stmts;
+        while (effective_stmts.len > 0 and Decompiler.isReturnNone(effective_stmts[effective_stmts.len - 1])) {
+            effective_stmts = effective_stmts[0 .. effective_stmts.len - 1];
+        }
+
+        if (effective_stmts.len == 0) {
             // Empty body - write pass
             i = 0;
             while (i < indent + 1) : (i += 1) {
@@ -395,7 +413,7 @@ fn decompileFunctionToSource(allocator: Allocator, code: *const pyc.Code, versio
             defer cg.deinit(allocator);
             cg.indent_level = indent + 1;
 
-            for (stmts) |stmt| {
+            for (effective_stmts) |stmt| {
                 try cg.writeStmt(allocator, stmt);
             }
 
