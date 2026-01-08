@@ -636,6 +636,127 @@ pub const SimContext = struct {
                 try self.stack.push(.{ .expr = expr });
             },
 
+            // Class-related opcodes
+            .LOAD_BUILD_CLASS => {
+                // LOAD_BUILD_CLASS - push __build_class__ builtin onto stack
+                // Used to construct classes: __build_class__(func, name, *bases, **keywords)
+                const expr = try ast.makeName(self.allocator, "__build_class__", .load);
+                try self.stack.push(.{ .expr = expr });
+            },
+
+            .LOAD_CLASSDEREF => {
+                // LOAD_CLASSDEREF i - load value from cell or free variable for class scoping
+                // Similar to LOAD_DEREF but with special class scope handling
+                try self.stack.push(.unknown);
+            },
+
+            // Exception handling opcodes
+            .PUSH_EXC_INFO => {
+                // PUSH_EXC_INFO - pushes exception info onto stack
+                // Used when entering except handler, pushes (exc, tb)
+                try self.stack.push(.unknown);
+            },
+
+            .CHECK_EXC_MATCH => {
+                // CHECK_EXC_MATCH - checks if TOS matches TOS1 exception type
+                // Pops the exception type, leaves bool result on stack
+                _ = self.stack.pop();
+                try self.stack.push(.unknown);
+            },
+
+            .RERAISE => {
+                // RERAISE depth - re-raise the exception
+                // Pops nothing new, exception info already on stack
+            },
+
+            .SETUP_FINALLY, .POP_EXCEPT => {
+                // These are control flow markers, no stack effect
+            },
+
+            // Global/name deletion
+            .DELETE_NAME, .DELETE_GLOBAL => {
+                // DELETE_NAME/GLOBAL namei - deletes names[namei]
+                // No stack effect
+            },
+
+            .DELETE_FAST => {
+                // DELETE_FAST i - deletes local variable
+                // No stack effect
+            },
+
+            // Format string opcodes
+            .FORMAT_VALUE => {
+                // FORMAT_VALUE flags - format TOS for f-string
+                // flags & 0x03: conversion (0=none, 1=str, 2=repr, 3=ascii)
+                // flags & 0x04: format spec on stack
+                const has_spec = (inst.arg & 0x04) != 0;
+                var format_spec: ?*Expr = null;
+                if (has_spec) {
+                    format_spec = self.stack.popExpr();
+                }
+
+                const value = self.stack.popExpr() orelse {
+                    if (format_spec) |spec| {
+                        spec.deinit(self.allocator);
+                        self.allocator.destroy(spec);
+                    }
+                    return error.StackUnderflow;
+                };
+
+                const conversion: ?u8 = switch (inst.arg & 0x03) {
+                    1 => 's', // str
+                    2 => 'r', // repr
+                    3 => 'a', // ascii
+                    else => null,
+                };
+
+                const expr = try self.allocator.create(Expr);
+                expr.* = .{ .formatted_value = .{
+                    .value = value,
+                    .conversion = conversion,
+                    .format_spec = format_spec,
+                } };
+                try self.stack.push(.{ .expr = expr });
+            },
+
+            .BUILD_STRING => {
+                // BUILD_STRING count - build f-string from count pieces
+                const count = inst.arg;
+                const values = if (count == 0) &[_]*Expr{} else try self.stack.popNExprs(count);
+
+                const expr = try self.allocator.create(Expr);
+                expr.* = .{ .joined_str = .{ .values = values } };
+                try self.stack.push(.{ .expr = expr });
+            },
+
+            // Boolean operations (for short-circuit evaluation)
+            .JUMP_IF_TRUE_OR_POP, .JUMP_IF_FALSE_OR_POP => {
+                // These leave TOS on stack if condition matches, otherwise pop and jump
+                // For simulation, we leave the value on stack (the expr stays)
+            },
+
+            // Yield opcodes
+            .GET_YIELD_FROM_ITER => {
+                // GET_YIELD_FROM_ITER - prepare iterator for yield from
+                // TOS is the iterable, result is the iterator
+            },
+
+            .YIELD_VALUE => {
+                // YIELD_VALUE - yield TOS
+                const value = self.stack.popExpr();
+                const expr = try self.allocator.create(Expr);
+                expr.* = .{ .yield_expr = .{ .value = value } };
+                try self.stack.push(.{ .expr = expr });
+            },
+
+            .SEND => {
+                // SEND delta - send value to generator
+                // TOS is the value to send, TOS1 is the generator
+                _ = self.stack.pop(); // pop sent value
+                // Generator stays, received value pushed
+                try self.stack.push(.unknown);
+            },
+
             else => {
                 // Unhandled opcode - push unknown for each value it would produce
                 // For now, just push unknown
