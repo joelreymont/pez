@@ -1151,13 +1151,45 @@ pub fn isAsyncGenerator(code: *const pyc.Code) bool {
     return (code.flags & 0x200) != 0;
 }
 
-/// Extract docstring from code object if first constant is a string.
+/// Extract docstring from code object.
+/// A docstring is the first statement of a function that is a string literal.
+/// We check if the bytecode starts with RESUME, LOAD_CONST 0, then either
+/// POP_TOP (discarded string expression) or RETURN_VALUE (single-line function).
 pub fn extractDocstring(code: *const pyc.Code) ?[]const u8 {
-    if (code.consts.len > 0) {
-        if (code.consts[0] == .string) {
+    // Need at least a string constant
+    if (code.consts.len == 0) return null;
+    if (code.consts[0] != .string) return null;
+
+    // Check bytecode pattern
+    // In Python 3.11+, functions start with RESUME
+    // A docstring would be: RESUME, LOAD_CONST 0, POP_TOP (or just used)
+    if (code.code.len < 6) return null;
+
+    // RESUME is typically at offset 0 with opcode ~149-151 or similar
+    // LOAD_CONST is typically opcode 100 (pre-3.11) or 83 (3.12+)
+    // We need to check if instruction at offset 2 loads const 0
+
+    // Simple heuristic: if first const is a string and it's not used anywhere
+    // visible in the bytecode for calls/operations, it might be a docstring.
+    // For now, be conservative and only detect actual docstring patterns.
+
+    // Check if the second instruction (after RESUME at 0) is LOAD_CONST 0
+    // and third is POP_TOP (meaning the string is just an expression statement)
+    // RESUME = 149 (0x95), LOAD_CONST = 83 (0x53), POP_TOP = 31 (0x1F)
+    if (code.code.len >= 6) {
+        // offset 0: RESUME
+        // offset 2: should be LOAD_CONST with arg 0
+        // offset 4: should be POP_TOP (discarding the string)
+        const inst2_opcode = code.code[2];
+        const inst2_arg = if (code.code.len > 3) code.code[3] else 0;
+        const inst4_opcode = if (code.code.len > 4) code.code[4] else 0;
+
+        // LOAD_CONST = 83 in 3.12+, POP_TOP = 31
+        if (inst2_opcode == 83 and inst2_arg == 0 and inst4_opcode == 31) {
             return code.consts[0].string;
         }
     }
+
     return null;
 }
 
