@@ -222,8 +222,9 @@ pub fn buildCFG(allocator: Allocator, bytecode: []const u8, version: Version) !C
                     const edge_type: EdgeType = if (t.isConditionalJump()) blk: {
                         // For POP_JUMP_IF_FALSE/NONE, jump target is the FALSE branch
                         // For POP_JUMP_IF_TRUE/NOT_NONE, jump target is the TRUE branch
+                        // For FOR_ITER, jump target is the exhausted/exit path
                         break :blk switch (t.opcode) {
-                            .POP_JUMP_IF_FALSE, .POP_JUMP_IF_NONE => .conditional_false,
+                            .POP_JUMP_IF_FALSE, .POP_JUMP_IF_NONE, .FOR_ITER => .conditional_false,
                             .POP_JUMP_IF_TRUE, .POP_JUMP_IF_NOT_NONE => .conditional_true,
                             else => .conditional_true,
                         };
@@ -242,9 +243,10 @@ pub fn buildCFG(allocator: Allocator, bytecode: []const u8, version: Version) !C
                 const edge_type: EdgeType = if (term) |t| blk: {
                     if (t.isConditionalJump()) {
                         // Fallthrough is the opposite of jump target
+                        // FOR_ITER fallthrough is the body (normal path)
                         break :blk switch (t.opcode) {
                             .POP_JUMP_IF_FALSE, .POP_JUMP_IF_NONE => .conditional_true,
-                            .POP_JUMP_IF_TRUE, .POP_JUMP_IF_NOT_NONE => .conditional_false,
+                            .POP_JUMP_IF_TRUE, .POP_JUMP_IF_NOT_NONE, .FOR_ITER => .normal,
                             else => .conditional_false,
                         };
                     }

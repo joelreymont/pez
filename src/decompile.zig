@@ -335,22 +335,104 @@ pub const Decompiler = struct {
 
     /// Decompile a for loop pattern.
     fn decompileFor(self: *Decompiler, pattern: ctrl.ForPattern) !?*Stmt {
-        _ = pattern;
+        // Get the iterator expression from the setup block
+        // The setup block contains: ... GET_ITER
+        // The expression before GET_ITER is the iterator
+        const setup = &self.cfg.blocks[pattern.setup_block];
 
-        // For loops need the iterator expression and target
-        // This requires more complex analysis
+        var iter_sim = SimContext.init(self.allocator, self.code, self.version);
+        defer iter_sim.deinit();
+
+        for (setup.instructions) |inst| {
+            if (inst.opcode == .GET_ITER) break;
+            iter_sim.simulate(inst) catch {};
+        }
+
+        const iter_expr = iter_sim.stack.popExpr() orelse
+            try ast.makeName(self.allocator, "iter", .load);
+
+        // Get the loop target from the body block's first STORE_FAST
+        const body = &self.cfg.blocks[pattern.body_block];
+        var target_name: []const u8 = "_";
+
+        for (body.instructions) |inst| {
+            if (inst.opcode == .STORE_FAST) {
+                if (self.code.varnames.len > inst.arg) {
+                    target_name = self.code.varnames[inst.arg];
+                }
+                break;
+            }
+        }
+
+        const target = try ast.makeName(self.allocator, target_name, .store);
+
+        // Decompile the body (skip the first STORE_FAST which is the target)
+        const body_stmts = try self.decompileForBody(pattern.body_block);
 
         const stmt = try self.allocator.create(Stmt);
         stmt.* = .{ .for_stmt = .{
-            .target = try ast.makeName(self.allocator, "_", .store),
-            .iter = try ast.makeName(self.allocator, "iter", .load),
-            .body = &.{},
+            .target = target,
+            .iter = iter_expr,
+            .body = body_stmts,
             .else_body = &.{},
             .type_comment = null,
             .is_async = false,
         } };
 
         return stmt;
+    }
+
+    /// Decompile a for loop body, skipping the initial STORE_FAST (loop target).
+    fn decompileForBody(self: *Decompiler, body_block_id: u32) ![]const *Stmt {
+        var stmts: std.ArrayList(*Stmt) = .{};
+        errdefer stmts.deinit(self.allocator);
+
+        if (body_block_id >= self.cfg.blocks.len) return &.{};
+        const block = &self.cfg.blocks[body_block_id];
+
+        var sim = SimContext.init(self.allocator, self.code, self.version);
+        defer sim.deinit();
+
+        var skip_first_store = true;
+
+        for (block.instructions) |inst| {
+            switch (inst.opcode) {
+                .STORE_FAST => {
+                    if (skip_first_store) {
+                        skip_first_store = false;
+                        continue;
+                    }
+                    // Regular assignment
+                    if (sim.stack.popExpr()) |value| {
+                        const name = sim.getLocal(inst.arg) orelse "<unknown>";
+                        const target = try ast.makeName(self.allocator, name, .store);
+                        const stmt = try self.makeAssign(target, value);
+                        try stmts.append(self.allocator, stmt);
+                    }
+                },
+                .JUMP_BACKWARD, .JUMP_BACKWARD_NO_INTERRUPT => {
+                    // End of loop body
+                    break;
+                },
+                .RETURN_VALUE => {
+                    if (sim.stack.popExpr()) |value| {
+                        const stmt = try self.makeReturn(value);
+                        try stmts.append(self.allocator, stmt);
+                    }
+                },
+                .POP_TOP => {
+                    if (sim.stack.popExpr()) |value| {
+                        const stmt = try self.makeExprStmt(value);
+                        try stmts.append(self.allocator, stmt);
+                    }
+                },
+                else => {
+                    sim.simulate(inst) catch {};
+                },
+            }
+        }
+
+        return stmts.toOwnedSlice(self.allocator);
     }
 
     /// Create an assignment statement.
