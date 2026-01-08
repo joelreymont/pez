@@ -1311,15 +1311,18 @@ pub const Module = struct {
                 }
             },
             .COMPARE_OP => {
-                // In Python 3.12+, COMPARE_OP arg encodes both operation and invert flag
-                if (ver.gte(3, 12)) {
-                    const cmp_op = arg >> 4;
-                    if (cmp_op < 6) {
-                        const cmp: opcodes.CompareOp = @enumFromInt(cmp_op);
-                        try writer.print("  # {s}", .{cmp.symbol()});
-                    }
-                } else if (arg < 6) {
-                    const cmp: opcodes.CompareOp = @enumFromInt(arg);
+                // In Python 3.13+, COMPARE_OP uses 5 bits for flags, so op = arg >> 5
+                // In Python 3.12, COMPARE_OP uses 4 bits for flags, so op = arg >> 4
+                // In Python < 3.12, arg is just the operation index
+                const cmp_op: u8 = if (ver.gte(3, 13))
+                    @truncate(arg >> 5)
+                else if (ver.gte(3, 12))
+                    @truncate(arg >> 4)
+                else
+                    @truncate(arg);
+
+                if (cmp_op < 6) {
+                    const cmp: opcodes.CompareOp = @enumFromInt(cmp_op);
                     try writer.print("  # {s}", .{cmp.symbol()});
                 }
             },
