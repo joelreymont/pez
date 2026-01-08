@@ -9,6 +9,7 @@ const ast = @import("ast.zig");
 const cfg_mod = @import("cfg.zig");
 const ctrl = @import("ctrl.zig");
 const decoder = @import("decoder.zig");
+const dom_mod = @import("dom.zig");
 const stack_mod = @import("stack.zig");
 const pyc = @import("pyc.zig");
 const codegen = @import("codegen.zig");
@@ -28,6 +29,7 @@ pub const Decompiler = struct {
     version: Version,
     cfg: *CFG,
     analyzer: Analyzer,
+    dom: dom_mod.DomTree,
 
     /// Accumulated statements.
     statements: std.ArrayList(*Stmt),
@@ -43,17 +45,22 @@ pub const Decompiler = struct {
         var analyzer = try Analyzer.init(allocator, cfg);
         errdefer analyzer.deinit();
 
+        var dom = try dom_mod.DomTree.init(allocator, cfg);
+        errdefer dom.deinit();
+
         return .{
             .allocator = allocator,
             .code = code,
             .version = version,
             .cfg = cfg,
             .analyzer = analyzer,
+            .dom = dom,
             .statements = .{},
         };
     }
 
     pub fn deinit(self: *Decompiler) void {
+        self.dom.deinit();
         self.analyzer.deinit();
         self.cfg.deinit();
         self.allocator.destroy(self.cfg);
@@ -324,11 +331,13 @@ pub const Decompiler = struct {
         };
 
         const stmt = try self.allocator.create(Stmt);
-        stmt.* = .{ .while_stmt = .{
-            .condition = condition,
-            .body = &.{}, // TODO: decompile body
-            .else_body = &.{},
-        } };
+        stmt.* = .{
+            .while_stmt = .{
+                .condition = condition,
+                .body = &.{}, // TODO: decompile body
+                .else_body = &.{},
+            },
+        };
 
         return stmt;
     }
@@ -367,7 +376,7 @@ pub const Decompiler = struct {
         const target = try ast.makeName(self.allocator, target_name, .store);
 
         // Decompile the body (skip the first STORE_FAST which is the target)
-        const body_stmts = try self.decompileForBody(pattern.body_block);
+        const body_stmts = try self.decompileForBody(pattern.body_block, pattern.header_block);
 
         const stmt = try self.allocator.create(Stmt);
         stmt.* = .{ .for_stmt = .{
@@ -382,27 +391,81 @@ pub const Decompiler = struct {
         return stmt;
     }
 
-    /// Decompile a for loop body, skipping the initial STORE_FAST (loop target).
-    fn decompileForBody(self: *Decompiler, body_block_id: u32) ![]const *Stmt {
+    /// Decompile a for loop body using dominator-based loop membership.
+    fn decompileForBody(self: *Decompiler, body_block_id: u32, header_block_id: u32) ![]const *Stmt {
         var stmts: std.ArrayList(*Stmt) = .{};
         errdefer stmts.deinit(self.allocator);
 
-        if (body_block_id >= self.cfg.blocks.len) return &.{};
-        const block = &self.cfg.blocks[body_block_id];
-
-        var sim = SimContext.init(self.allocator, self.code, self.version);
-        defer sim.deinit();
+        var visited = try std.DynamicBitSet.initEmpty(self.allocator, self.cfg.blocks.len);
+        defer visited.deinit();
 
         var skip_first_store = true;
+        var block_idx = body_block_id;
+
+        while (block_idx < self.cfg.blocks.len) {
+            // Use dominator tree to check loop membership
+            if (!self.dom.isInLoop(block_idx, header_block_id)) break;
+
+            const block = &self.cfg.blocks[block_idx];
+
+            if (visited.isSet(block_idx)) {
+                block_idx += 1;
+                continue;
+            }
+            visited.set(block_idx);
+
+            // Check for nested control flow patterns
+            const pattern = self.analyzer.detectPattern(block_idx);
+
+            switch (pattern) {
+                .if_stmt => |p| {
+                    // Process statements before the condition
+                    try self.processPartialBlock(block, &stmts, &skip_first_store);
+
+                    // Handle nested if
+                    const if_stmt = try self.decompileLoopIf(p, header_block_id, &visited);
+                    if (if_stmt) |s| {
+                        try stmts.append(self.allocator, s);
+                    }
+                    block_idx += 1;
+                    continue;
+                },
+                else => {
+                    // Process block statements, stop at loop-back jump
+                    const has_back_edge = self.hasLoopBackEdge(block, header_block_id);
+                    try self.processBlockStatements(block, &stmts, &skip_first_store, has_back_edge);
+                    if (has_back_edge) break;
+                    block_idx += 1;
+                },
+            }
+        }
+
+        return stmts.toOwnedSlice(self.allocator);
+    }
+
+    /// Check if a block has a back edge to the loop header.
+    fn hasLoopBackEdge(self: *Decompiler, block: *const cfg_mod.BasicBlock, header_id: u32) bool {
+        _ = self;
+        for (block.successors) |edge| {
+            if (edge.edge_type == .loop_back and edge.target == header_id) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    /// Process statements in a block, stopping before control flow jumps.
+    fn processBlockStatements(self: *Decompiler, block: *const cfg_mod.BasicBlock, stmts: *std.ArrayList(*Stmt), skip_first_store: *bool, stop_at_jump: bool) !void {
+        var sim = SimContext.init(self.allocator, self.code, self.version);
+        defer sim.deinit();
 
         for (block.instructions) |inst| {
             switch (inst.opcode) {
                 .STORE_FAST => {
-                    if (skip_first_store) {
-                        skip_first_store = false;
+                    if (skip_first_store.*) {
+                        skip_first_store.* = false;
                         continue;
                     }
-                    // Regular assignment
                     if (sim.stack.popExpr()) |value| {
                         const name = sim.getLocal(inst.arg) orelse "<unknown>";
                         const target = try ast.makeName(self.allocator, name, .store);
@@ -410,12 +473,27 @@ pub const Decompiler = struct {
                         try stmts.append(self.allocator, stmt);
                     }
                 },
+                .STORE_NAME, .STORE_GLOBAL => {
+                    if (sim.stack.popExpr()) |value| {
+                        const name = sim.getName(inst.arg) orelse "<unknown>";
+                        const target = try ast.makeName(self.allocator, name, .store);
+                        const stmt = try self.makeAssign(target, value);
+                        try stmts.append(self.allocator, stmt);
+                    }
+                },
                 .JUMP_BACKWARD, .JUMP_BACKWARD_NO_INTERRUPT => {
-                    // End of loop body
-                    break;
+                    if (stop_at_jump) return;
                 },
                 .RETURN_VALUE => {
                     if (sim.stack.popExpr()) |value| {
+                        const stmt = try self.makeReturn(value);
+                        try stmts.append(self.allocator, stmt);
+                    }
+                },
+                .RETURN_CONST => {
+                    if (sim.getConst(inst.arg)) |obj| {
+                        const constant = try sim.objToConstant(obj);
+                        const value = try ast.makeConstant(self.allocator, constant);
                         const stmt = try self.makeReturn(value);
                         try stmts.append(self.allocator, stmt);
                     }
@@ -428,6 +506,182 @@ pub const Decompiler = struct {
                 },
                 else => {
                     sim.simulate(inst) catch {};
+                },
+            }
+        }
+    }
+
+    /// Process part of a block (before control flow instruction).
+    fn processPartialBlock(self: *Decompiler, block: *const cfg_mod.BasicBlock, stmts: *std.ArrayList(*Stmt), skip_first_store: *bool) !void {
+        var sim = SimContext.init(self.allocator, self.code, self.version);
+        defer sim.deinit();
+
+        for (block.instructions) |inst| {
+            // Stop at control flow instructions
+            if (ctrl.Analyzer.isConditionalJump(undefined, inst.opcode)) break;
+            if (inst.opcode == .JUMP_BACKWARD or inst.opcode == .JUMP_BACKWARD_NO_INTERRUPT) break;
+
+            switch (inst.opcode) {
+                .STORE_FAST => {
+                    if (skip_first_store.*) {
+                        skip_first_store.* = false;
+                        continue;
+                    }
+                    if (sim.stack.popExpr()) |value| {
+                        const name = sim.getLocal(inst.arg) orelse "<unknown>";
+                        const target = try ast.makeName(self.allocator, name, .store);
+                        const stmt = try self.makeAssign(target, value);
+                        try stmts.append(self.allocator, stmt);
+                    }
+                },
+                else => {
+                    sim.simulate(inst) catch {};
+                },
+            }
+        }
+    }
+
+    /// Decompile an if statement that's inside a loop.
+    fn decompileLoopIf(self: *Decompiler, pattern: ctrl.IfPattern, loop_header: u32, visited: *std.DynamicBitSet) !?*Stmt {
+        const cond_block = &self.cfg.blocks[pattern.condition_block];
+
+        // Get the condition expression
+        var sim = SimContext.init(self.allocator, self.code, self.version);
+        defer sim.deinit();
+
+        for (cond_block.instructions) |inst| {
+            if (ctrl.Analyzer.isConditionalJump(undefined, inst.opcode)) break;
+            sim.simulate(inst) catch {};
+        }
+
+        const condition = sim.stack.popExpr() orelse return null;
+
+        const then_in_loop = self.dom.isInLoop(pattern.then_block, loop_header);
+        const else_in_loop = if (pattern.else_block) |else_id|
+            self.dom.isInLoop(else_id, loop_header)
+        else
+            false;
+        const merge_in_loop = if (pattern.merge_block) |merge_id|
+            self.dom.isInLoop(merge_id, loop_header)
+        else
+            false;
+        const else_is_continuation = else_in_loop and !then_in_loop and !merge_in_loop;
+
+        // Decompile the then body
+        var skip_first = false;
+        const then_body = try self.decompileLoopBody(
+            pattern.then_block,
+            loop_header,
+            &skip_first,
+            visited,
+            if (merge_in_loop) pattern.merge_block else null,
+        );
+
+        // Decompile the else body if present
+        const else_body = if (pattern.else_block) |else_id| blk: {
+            if (else_is_continuation) break :blk &[_]*Stmt{};
+            if (pattern.is_elif) {
+                const else_pattern = self.analyzer.detectPattern(else_id);
+                if (else_pattern == .if_stmt) {
+                    const elif_stmt = try self.decompileLoopIf(else_pattern.if_stmt, loop_header, visited);
+                    if (elif_stmt) |s| {
+                        const body = try self.allocator.alloc(*Stmt, 1);
+                        body[0] = s;
+                        break :blk body;
+                    }
+                }
+            }
+            var skip = false;
+            break :blk try self.decompileLoopBody(
+                else_id,
+                loop_header,
+                &skip,
+                visited,
+                if (merge_in_loop) pattern.merge_block else null,
+            );
+        } else &[_]*Stmt{};
+
+        const stmt = try self.allocator.create(Stmt);
+        stmt.* = .{ .if_stmt = .{
+            .condition = condition,
+            .body = then_body,
+            .else_body = else_body,
+        } };
+
+        return stmt;
+    }
+
+    /// Decompile a body within a loop using dominator-based membership.
+    fn decompileLoopBody(
+        self: *Decompiler,
+        start_block: u32,
+        loop_header: u32,
+        skip_first_store: *bool,
+        visited: *std.DynamicBitSet,
+        stop_block: ?u32,
+    ) ![]const *Stmt {
+        var stmts: std.ArrayList(*Stmt) = .{};
+        errdefer stmts.deinit(self.allocator);
+
+        var block_idx = start_block;
+
+        while (block_idx < self.cfg.blocks.len) {
+            if (stop_block) |stop_id| {
+                if (block_idx == stop_id) break;
+            }
+            // Use dominator tree for membership check
+            if (!self.dom.isInLoop(block_idx, loop_header)) break;
+            if (visited.isSet(block_idx)) break;
+            visited.set(block_idx);
+
+            const block = &self.cfg.blocks[block_idx];
+            const has_back_edge = self.hasLoopBackEdge(block, loop_header);
+            const pattern = self.analyzer.detectPattern(block_idx);
+
+            switch (pattern) {
+                .if_stmt => |p| {
+                    try self.processPartialBlock(block, &stmts, skip_first_store);
+
+                    const if_stmt = try self.decompileLoopIf(p, loop_header, visited);
+                    if (if_stmt) |s| {
+                        try stmts.append(self.allocator, s);
+                    }
+
+                    if (p.merge_block) |merge_id| {
+                        if (stop_block) |stop_id| {
+                            if (merge_id == stop_id) break;
+                        }
+                        if (!self.dom.isInLoop(merge_id, loop_header)) break;
+                        block_idx = merge_id;
+                        continue;
+                    }
+
+                    break;
+                },
+                else => {
+                    // Process statements, stopping at back edge
+                    try self.processBlockStatements(block, &stmts, skip_first_store, has_back_edge);
+                    if (has_back_edge) break;
+
+                    // Move to next block
+                    if (block.successors.len == 0) break;
+
+                    // Find the non-loop-back successor
+                    var next_block: ?u32 = null;
+                    for (block.successors) |edge| {
+                        if (edge.edge_type != .loop_back) {
+                            next_block = edge.target;
+                            break;
+                        }
+                    }
+                    if (next_block) |next_id| {
+                        if (stop_block) |stop_id| {
+                            if (next_id == stop_id) break;
+                        }
+                        block_idx = next_id;
+                        continue;
+                    }
+                    break;
                 },
             }
         }
