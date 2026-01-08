@@ -12,7 +12,52 @@ pub const Location = struct {
     col: u32 = 0,
     end_line: u32 = 0,
     end_col: u32 = 0,
+
+    /// Create a location from line info.
+    pub fn fromLine(line: u32) Location {
+        return .{ .line = line, .end_line = line };
+    }
+
+    /// Merge two locations to span both.
+    pub fn merge(self: Location, other: Location) Location {
+        const start_line = @min(self.line, other.line);
+        const start_col = if (self.line < other.line) self.col else if (other.line < self.line) other.col else @min(self.col, other.col);
+        const end_line = @max(self.end_line, other.end_line);
+        const end_col = if (self.end_line > other.end_line) self.end_col else if (other.end_line > self.end_line) other.end_col else @max(self.end_col, other.end_col);
+        return .{
+            .line = start_line,
+            .col = start_col,
+            .end_line = end_line,
+            .end_col = end_col,
+        };
+    }
+
+    /// Check if location is valid (has non-zero line).
+    pub fn isValid(self: Location) bool {
+        return self.line > 0;
+    }
 };
+
+/// A located node wrapper that adds source location to any type.
+pub fn Located(comptime T: type) type {
+    return struct {
+        value: T,
+        location: Location = .{},
+
+        const Self = @This();
+
+        pub fn init(value: T, location: Location) Self {
+            return .{ .value = value, .location = location };
+        }
+
+        pub fn withLocation(value: T, line: u32, col: u32, end_line: u32, end_col: u32) Self {
+            return .{
+                .value = value,
+                .location = .{ .line = line, .col = col, .end_line = end_line, .end_col = end_col },
+            };
+        }
+    };
+}
 
 /// Comparison operators.
 pub const CmpOp = enum {
