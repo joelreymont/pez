@@ -5,6 +5,7 @@ const cfg_mod = @import("cfg.zig");
 const ctrl = @import("ctrl.zig");
 const decoder = @import("decoder.zig");
 const codegen = @import("codegen.zig");
+const decompile = @import("decompile.zig");
 
 pub fn main() !void {
     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
@@ -71,7 +72,7 @@ pub fn main() !void {
             try stdout.print("# Python {d}.{d}\n", .{ module.major_ver, module.minor_ver });
             try stdout.print("# Decompiled by pez\n\n", .{});
             if (module.code) |code| {
-                try decompileCode(allocator, code, version, stdout);
+                try decompile.decompileToSource(allocator, code, version, stdout);
             }
         },
     }
@@ -146,105 +147,6 @@ fn dumpCodeCFG(allocator: std.mem.Allocator, code: *const pyc.Code, version: dec
         if (c == .code) {
             const nested = c.code;
             try dumpCodeCFG(allocator, nested, version, writer, indent + 1);
-        }
-    }
-}
-
-fn decompileCode(allocator: std.mem.Allocator, code: *const pyc.Code, version: decoder.Version, writer: anytype) !void {
-    // For now, show function signatures and basic structure
-    // Full decompilation requires more work
-
-    // Check if this is module-level code
-    if (std.mem.eql(u8, code.name, "<module>")) {
-        // Process top-level definitions
-        for (code.consts) |c| {
-            if (c == .code) {
-                const nested = c.code;
-                try decompileFunction(allocator, nested, version, writer, 0);
-                try writer.writeByte('\n');
-            }
-        }
-    } else {
-        try decompileFunction(allocator, code, version, writer, 0);
-    }
-}
-
-fn decompileFunction(allocator: std.mem.Allocator, code: *const pyc.Code, version: decoder.Version, writer: anytype, indent: u32) !void {
-    // Write indent
-    var i: u32 = 0;
-    while (i < indent) : (i += 1) {
-        try writer.writeAll("    ");
-    }
-
-    // Check if lambda
-    if (codegen.isLambda(code)) {
-        try writer.writeAll("lambda ");
-        // Write args
-        var first = true;
-        const argcount = code.argcount;
-        for (code.varnames[0..@min(argcount, code.varnames.len)]) |name| {
-            if (!first) try writer.writeAll(", ");
-            first = false;
-            try writer.writeAll(name);
-        }
-        try writer.writeAll(": ...\n");
-        return;
-    }
-
-    // Check if async
-    if (codegen.isCoroutine(code)) {
-        try writer.writeAll("async ");
-    }
-
-    // Write function definition
-    try writer.writeAll("def ");
-    try writer.writeAll(code.name);
-    try writer.writeByte('(');
-
-    // Write arguments
-    var first = true;
-    const total_args = code.argcount + code.kwonlyargcount;
-    const posonly = code.posonlyargcount;
-
-    for (code.varnames[0..@min(total_args, code.varnames.len)], 0..) |name, idx| {
-        if (!first) try writer.writeAll(", ");
-        first = false;
-        try writer.writeAll(name);
-
-        // Add / after position-only args
-        if (posonly > 0 and idx == posonly - 1) {
-            try writer.writeAll(", /");
-        }
-    }
-
-    try writer.writeAll("):\n");
-
-    // Write docstring if present
-    if (codegen.extractDocstring(code)) |doc| {
-        i = 0;
-        while (i < indent + 1) : (i += 1) {
-            try writer.writeAll("    ");
-        }
-        try writer.writeAll("\"\"\"");
-        try writer.writeAll(doc);
-        try writer.writeAll("\"\"\"\n");
-    }
-
-    // Placeholder body
-    i = 0;
-    while (i < indent + 1) : (i += 1) {
-        try writer.writeAll("    ");
-    }
-    try writer.writeAll("...\n");
-
-    // Process nested functions (closures)
-    for (code.consts) |c| {
-        if (c == .code) {
-            const nested = c.code;
-            if (!std.mem.eql(u8, nested.name, "<lambda>")) {
-                try writer.writeByte('\n');
-                try decompileFunction(allocator, nested, version, writer, indent + 1);
-            }
         }
     }
 }

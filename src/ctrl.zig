@@ -304,7 +304,7 @@ pub const Analyzer = struct {
     }
 
     /// Check if an opcode is a conditional jump.
-    fn isConditionalJump(self: *const Analyzer, opcode: Opcode) bool {
+    pub fn isConditionalJump(self: *const Analyzer, opcode: Opcode) bool {
         _ = self;
         return switch (opcode) {
             .POP_JUMP_IF_TRUE,

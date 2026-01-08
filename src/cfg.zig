@@ -54,7 +54,7 @@ pub const BasicBlock = struct {
     is_loop_header: bool,
 
     /// Get the terminating instruction of this block.
-    pub fn terminator(self: BasicBlock) ?Instruction {
+    pub fn terminator(self: *const BasicBlock) ?Instruction {
         if (self.instructions.len == 0) return null;
         return self.instructions[self.instructions.len - 1];
     }

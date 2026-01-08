@@ -13,6 +13,7 @@ pub const ctrl = @import("ctrl.zig");
 pub const ast = @import("ast.zig");
 pub const stack = @import("stack.zig");
 pub const codegen = @import("codegen.zig");
+pub const decompile = @import("decompile.zig");
 
 // Property testing
 pub const zcheck = @import("zcheck");
@@ -30,6 +31,7 @@ comptime {
     _ = ast;
     _ = stack;
     _ = codegen;
+    _ = decompile;
     _ = property_tests;
 }
 

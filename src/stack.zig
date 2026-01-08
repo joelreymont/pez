@@ -218,6 +218,30 @@ pub const SimContext = struct {
                 }
             },
 
+            .LOAD_FAST_BORROW_LOAD_FAST_BORROW => {
+                // Combined instruction that loads two fast variables
+                // arg encodes two indices: first in high byte, second in low byte
+                // (because we push first, then second onto the stack)
+                const second_idx = inst.arg & 0xFF;
+                const first_idx = (inst.arg >> 8) & 0xFF;
+
+                // Push first variable
+                if (self.getLocal(first_idx)) |name| {
+                    const expr = try ast.makeName(self.allocator, name, .load);
+                    try self.stack.push(.{ .expr = expr });
+                } else {
+                    try self.stack.push(.unknown);
+                }
+
+                // Push second variable
+                if (self.getLocal(second_idx)) |name| {
+                    const expr = try ast.makeName(self.allocator, name, .load);
+                    try self.stack.push(.{ .expr = expr });
+                } else {
+                    try self.stack.push(.unknown);
+                }
+            },
+
             .STORE_NAME, .STORE_GLOBAL => {
                 // Pop the value and create assignment
                 // For now, just pop the value
