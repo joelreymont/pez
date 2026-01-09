@@ -187,6 +187,9 @@ pub const Decompiler = struct {
                     const stmt = try self.makeExprStmt(value);
                     try stmts.append(self.allocator, stmt);
                 },
+                .END_FOR, .POP_ITER => {
+                    // Loop cleanup opcodes - skip in non-loop context
+                },
                 else => {
                     try sim.simulate(inst);
                 },
