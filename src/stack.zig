@@ -1542,11 +1542,16 @@ pub const SimContext = struct {
                 };
 
                 const argc = inst.arg;
-                const args_vals = try self.stack.popN(argc);
+                var args_vals = try self.stack.popN(argc);
                 var args_owned = true;
                 errdefer if (args_owned) self.deinitStackValues(args_vals);
 
                 const callable = self.stack.pop() orelse return error.StackUnderflow;
+                var callable_owned = true;
+                errdefer if (callable_owned) {
+                    var val = callable;
+                    val.deinit(self.allocator);
+                };
 
                 if (kw_names.len > args_vals.len) return error.InvalidKeywordNames;
 
@@ -1569,6 +1574,7 @@ pub const SimContext = struct {
                         .expr => |expr| {
                             args[idx] = expr;
                             args_filled += 1;
+                            args_vals[idx] = .unknown;
                         },
                         else => return error.NotAnExpression,
                     }
@@ -1597,6 +1603,7 @@ pub const SimContext = struct {
                             keywords[idx] = .{ .arg = name, .value = expr };
                             kw_filled += 1;
                             kw_names_mut[idx] = "";
+                            args_vals[arg_idx] = .unknown;
                         },
                         else => return error.NotAnExpression,
                     }
@@ -1610,6 +1617,7 @@ pub const SimContext = struct {
 
                 switch (callable) {
                     .expr => |callee_expr| {
+                        callable_owned = false;
                         errdefer {
                             callee_expr.deinit(self.allocator);
                             self.allocator.destroy(callee_expr);
@@ -1638,8 +1646,6 @@ pub const SimContext = struct {
                             }
                             self.allocator.free(args);
                         }
-                        var val = callable;
-                        val.deinit(self.allocator);
                         return error.NotAnExpression;
                     },
                 }
@@ -3003,4 +3009,41 @@ test "stack simulation composite load const" {
     const dict_output = try dict_writer.getOutput(allocator);
     defer allocator.free(dict_output);
     try testing.expectEqualStrings("{1: 2}", dict_output);
+}
+
+test "stack simulation CALL_FUNCTION_KW error clears moved args" {
+    const testing = std.testing;
+    const allocator = testing.allocator;
+
+    var code = pyc.Code{
+        .allocator = allocator,
+    };
+    const version = Version.init(3, 9);
+
+    var ctx = SimContext.init(allocator, &code, version);
+    defer ctx.deinit();
+
+    const callable = try ast.makeName(allocator, "f", .load);
+    try ctx.stack.push(.{ .expr = callable });
+
+    const pos_expr = try ast.makeConstant(allocator, .{ .int = 1 });
+    try ctx.stack.push(.{ .expr = pos_expr });
+
+    try ctx.stack.push(.unknown);
+
+    const kw_name = try allocator.dupe(u8, "x");
+    const kw_name_expr = try ast.makeConstant(allocator, .{ .string = kw_name });
+    const kw_elts = try allocator.alloc(*Expr, 1);
+    kw_elts[0] = kw_name_expr;
+    const kw_names_tuple = try ast.makeTuple(allocator, kw_elts, .load);
+    try ctx.stack.push(.{ .expr = kw_names_tuple });
+
+    const inst = Instruction{
+        .opcode = .CALL_FUNCTION_KW,
+        .arg = 2,
+        .offset = 0,
+        .size = 2,
+        .cache_entries = 0,
+    };
+    try testing.expectError(error.NotAnExpression, ctx.simulate(inst));
 }
