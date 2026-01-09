@@ -1,9 +1,11 @@
 ---
 title: Fix COPY_DICT_WITHOUT_KEYS stack effect
-status: open
+status: closed
 priority: 2
 issue-type: task
-created-at: "2026-01-09T06:18:55.517616+02:00"
+created-at: "\"2026-01-09T06:18:55.517616+02:00\""
+closed-at: "2026-01-09T06:56:47.106000+02:00"
+close-reason: completed
 ---
 
 File: src/stack.zig:2505-2513. COPY_DICT_WITHOUT_KEYS currently pops only keys and pushes unknown, leaving the subject dict on the stack and leaking ownership. It should pop keys and subject, deinit both, then push the replacement value to keep stack depth correct and avoid leaks.
