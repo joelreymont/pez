@@ -823,7 +823,7 @@ pub const SimContext = struct {
         }
     }
 
-    fn cloneStackValue(self: *SimContext, value: StackValue) !StackValue {
+    pub fn cloneStackValue(self: *SimContext, value: StackValue) !StackValue {
         return switch (value) {
             .expr => |e| .{ .expr = try ast.cloneExpr(self.allocator, e) },
             .function_obj => |func| .{ .function_obj = try self.cloneFunctionValue(func) },

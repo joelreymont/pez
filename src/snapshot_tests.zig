@@ -758,6 +758,49 @@ test "snapshot decorated function output" {
     ).expectEqual(output);
 }
 
+test "snapshot ternary expression output" {
+    const allocator = testing.allocator;
+    const version = Version.init(3, 10);
+
+    var module = pyc.Code{
+        .allocator = allocator,
+    };
+    defer module.deinit();
+
+    module.name = try allocator.dupe(u8, "<module>");
+    module.names = try dupeStrings(allocator, &[_][]const u8{ "a", "x" });
+
+    const consts = try allocator.alloc(pyc.Object, 3);
+    consts[0] = .{ .int = pyc.Int.fromI64(1) };
+    consts[1] = .{ .int = pyc.Int.fromI64(2) };
+    consts[2] = .none;
+    module.consts = consts;
+
+    const module_ops = [_]OpArg{
+        .{ .op = .LOAD_NAME, .arg = 0 },
+        .{ .op = .POP_JUMP_IF_FALSE, .arg = 8 },
+        .{ .op = .LOAD_CONST, .arg = 0 },
+        .{ .op = .JUMP_FORWARD, .arg = 2 },
+        .{ .op = .LOAD_CONST, .arg = 1 },
+        .{ .op = .STORE_NAME, .arg = 1 },
+        .{ .op = .LOAD_CONST, .arg = 2 },
+        .{ .op = .RETURN_VALUE, .arg = 0 },
+    };
+    module.code = try emitOpsOwned(allocator, version, &module_ops);
+
+    var out: std.ArrayList(u8) = .{};
+    defer out.deinit(allocator);
+    try decompile.decompileToSource(allocator, &module, version, out.writer(allocator));
+    const output: []const u8 = out.items;
+
+    const oh = OhSnap{};
+    try oh.snap(@src(),
+        \\[]const u8
+        \\  "x = 1 if a else 2
+        \\"
+    ).expectEqual(output);
+}
+
 test "snapshot python 2.7 class output" {
     const allocator = testing.allocator;
     const version = Version.init(2, 7);

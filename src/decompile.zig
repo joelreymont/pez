@@ -21,6 +21,8 @@ pub const SimContext = stack_mod.SimContext;
 pub const Version = decoder.Version;
 pub const Expr = ast.Expr;
 pub const Stmt = ast.Stmt;
+const StackValue = stack_mod.StackValue;
+const Opcode = decoder.Opcode;
 pub const DecompileError = stack_mod.SimError || error{UnexpectedEmptyWorklist};
 
 /// Decompiler state for a single code object.
@@ -75,6 +77,251 @@ pub const Decompiler = struct {
         self.statements.deinit(self.allocator);
     }
 
+    fn isStatementOpcode(op: Opcode) bool {
+        const name = op.name();
+        return std.mem.startsWith(u8, name, "STORE_") or
+            std.mem.startsWith(u8, name, "DELETE_") or
+            std.mem.startsWith(u8, name, "IMPORT_") or
+            std.mem.startsWith(u8, name, "RETURN_") or
+            std.mem.startsWith(u8, name, "RAISE_") or
+            std.mem.startsWith(u8, name, "PRINT_") or
+            std.mem.startsWith(u8, name, "EXEC_") or
+            std.mem.eql(u8, name, "POP_TOP") or
+            std.mem.eql(u8, name, "RERAISE") or
+            std.mem.eql(u8, name, "SETUP_EXCEPT") or
+            std.mem.eql(u8, name, "SETUP_FINALLY") or
+            std.mem.eql(u8, name, "SETUP_WITH") or
+            std.mem.eql(u8, name, "SETUP_ASYNC_WITH") or
+            std.mem.eql(u8, name, "END_FINALLY") or
+            std.mem.eql(u8, name, "WITH_CLEANUP") or
+            std.mem.eql(u8, name, "POP_BLOCK") or
+            std.mem.eql(u8, name, "POP_EXCEPT") or
+            std.mem.eql(u8, name, "BREAK_LOOP") or
+            std.mem.eql(u8, name, "CONTINUE_LOOP") or
+            std.mem.eql(u8, name, "YIELD_VALUE") or
+            std.mem.eql(u8, name, "YIELD_FROM") or
+            std.mem.eql(u8, name, "END_FOR") or
+            std.mem.eql(u8, name, "END_SEND");
+    }
+
+    fn deinitStackValuesSlice(allocator: Allocator, values: []StackValue) void {
+        for (values) |val| {
+            val.deinit(allocator);
+        }
+        if (values.len > 0) allocator.free(values);
+    }
+
+    fn cloneStackValues(
+        self: *Decompiler,
+        sim: *SimContext,
+        values: []const StackValue,
+    ) DecompileError![]StackValue {
+        const out = try self.allocator.alloc(StackValue, values.len);
+        var count: usize = 0;
+        errdefer {
+            for (out[0..count]) |val| {
+                val.deinit(self.allocator);
+            }
+            self.allocator.free(out);
+        }
+
+        for (values, 0..) |val, idx| {
+            out[idx] = try sim.cloneStackValue(val);
+            count += 1;
+        }
+
+        return out;
+    }
+
+    fn moveStackValuesToSim(
+        self: *Decompiler,
+        sim: *SimContext,
+        values: []StackValue,
+    ) DecompileError!void {
+        var moved: usize = 0;
+        errdefer {
+            for (values[moved..]) |val| {
+                val.deinit(self.allocator);
+            }
+        }
+
+        for (values) |val| {
+            try sim.stack.push(val);
+            moved += 1;
+        }
+    }
+
+    fn processBlockWithSim(
+        self: *Decompiler,
+        block: *const BasicBlock,
+        sim: *SimContext,
+        stmts: *std.ArrayList(*Stmt),
+    ) DecompileError!void {
+        for (block.instructions) |inst| {
+            switch (inst.opcode) {
+                .STORE_NAME, .STORE_FAST, .STORE_GLOBAL => {
+                    const name = switch (inst.opcode) {
+                        .STORE_NAME, .STORE_GLOBAL => sim.getName(inst.arg) orelse "<unknown>",
+                        .STORE_FAST => sim.getLocal(inst.arg) orelse "<unknown>",
+                        else => "<unknown>",
+                    };
+                    const value = sim.stack.pop() orelse return error.StackUnderflow;
+                    if (try self.handleStoreValue(name, value)) |stmt| {
+                        try stmts.append(self.allocator, stmt);
+                    }
+                },
+                .RETURN_VALUE => {
+                    const value = try sim.stack.popExpr();
+                    const stmt = try self.makeReturn(value);
+                    try stmts.append(self.allocator, stmt);
+                },
+                .RETURN_CONST => {
+                    if (sim.getConst(inst.arg)) |obj| {
+                        const value = try sim.objToExpr(obj);
+                        const stmt = try self.makeReturn(value);
+                        try stmts.append(self.allocator, stmt);
+                    }
+                },
+                .POP_TOP => {
+                    const value = try sim.stack.popExpr();
+                    const stmt = try self.makeExprStmt(value);
+                    try stmts.append(self.allocator, stmt);
+                },
+                else => {
+                    try sim.simulate(inst);
+                },
+            }
+        }
+    }
+
+    fn simulateTernaryBranch(
+        self: *Decompiler,
+        block_id: u32,
+        base_vals: []const StackValue,
+    ) DecompileError!?*Expr {
+        if (block_id >= self.cfg.blocks.len) return null;
+        const block = &self.cfg.blocks[block_id];
+
+        var sim = SimContext.init(self.allocator, self.code, self.version);
+        defer sim.deinit();
+
+        for (base_vals) |val| {
+            try sim.stack.push(try sim.cloneStackValue(val));
+        }
+
+        for (block.instructions) |inst| {
+            if (inst.isConditionalJump()) return null;
+            if (inst.isUnconditionalJump()) break;
+            if (isStatementOpcode(inst.opcode)) return null;
+            try sim.simulate(inst);
+        }
+
+        if (sim.stack.len() != base_vals.len + 1) return null;
+        const expr = sim.stack.popExpr() catch return null;
+        return expr;
+    }
+
+    fn tryDecompileTernaryInto(
+        self: *Decompiler,
+        block_id: u32,
+        limit: u32,
+        stmts: *std.ArrayList(*Stmt),
+    ) DecompileError!?u32 {
+        const pattern = self.analyzer.detectTernary(block_id) orelse return null;
+        if (pattern.true_block >= limit or pattern.false_block >= limit or pattern.merge_block >= limit) {
+            return null;
+        }
+        if (pattern.merge_block <= block_id) return null;
+        if ((try self.analyzer.detectPattern(pattern.merge_block)) != .unknown) return null;
+
+        var condition: *Expr = undefined;
+        var condition_owned = false;
+        var base_vals: []StackValue = &.{};
+        var base_owned = false;
+        var true_expr: *Expr = undefined;
+        var true_owned = false;
+        var false_expr: *Expr = undefined;
+        var false_owned = false;
+        var if_expr: *Expr = undefined;
+        var if_owned = false;
+
+        defer {
+            if (if_owned) {
+                if_expr.deinit(self.allocator);
+                self.allocator.destroy(if_expr);
+            }
+            if (false_owned) {
+                false_expr.deinit(self.allocator);
+                self.allocator.destroy(false_expr);
+            }
+            if (true_owned) {
+                true_expr.deinit(self.allocator);
+                self.allocator.destroy(true_expr);
+            }
+            if (condition_owned) {
+                condition.deinit(self.allocator);
+                self.allocator.destroy(condition);
+            }
+            if (base_owned) {
+                deinitStackValuesSlice(self.allocator, base_vals);
+            }
+        }
+
+        const cond_block = &self.cfg.blocks[pattern.condition_block];
+        var cond_sim = SimContext.init(self.allocator, self.code, self.version);
+        defer cond_sim.deinit();
+
+        for (cond_block.instructions) |inst| {
+            if (ctrl.Analyzer.isConditionalJump(undefined, inst.opcode)) break;
+            if (isStatementOpcode(inst.opcode)) return null;
+            try cond_sim.simulate(inst);
+        }
+
+        condition = cond_sim.stack.popExpr() catch return null;
+        condition_owned = true;
+
+        base_vals = try self.cloneStackValues(&cond_sim, cond_sim.stack.items.items);
+        base_owned = true;
+
+        const true_opt = try self.simulateTernaryBranch(pattern.true_block, base_vals);
+        if (true_opt == null) return null;
+        true_expr = true_opt.?;
+        true_owned = true;
+
+        const false_opt = try self.simulateTernaryBranch(pattern.false_block, base_vals);
+        if (false_opt == null) return null;
+        false_expr = false_opt.?;
+        false_owned = true;
+
+        if_expr = try self.allocator.create(Expr);
+        if_owned = true;
+        if_expr.* = .{ .if_exp = .{
+            .condition = condition,
+            .body = true_expr,
+            .else_body = false_expr,
+        } };
+
+        condition_owned = false;
+        true_owned = false;
+        false_owned = false;
+
+        var merge_sim = SimContext.init(self.allocator, self.code, self.version);
+        defer merge_sim.deinit();
+
+        base_owned = false;
+        errdefer self.allocator.free(base_vals);
+        try self.moveStackValuesToSim(&merge_sim, base_vals);
+        self.allocator.free(base_vals);
+
+        try merge_sim.stack.push(.{ .expr = if_expr });
+        if_owned = false;
+
+        const merge_block = &self.cfg.blocks[pattern.merge_block];
+        try self.processBlockWithSim(merge_block, &merge_sim, stmts);
+
+        return pattern.merge_block + 1;
+    }
+
     /// Find the last block that's part of an if-elif-else chain.
     fn findIfChainEnd(self: *Decompiler, pattern: ctrl.IfPattern) DecompileError!u32 {
         var max_block = pattern.then_block;
@@ -108,6 +355,14 @@ pub const Decompiler = struct {
         // Process blocks in order, using control flow patterns
         var block_idx: u32 = 0;
         while (block_idx < self.cfg.blocks.len) {
+            if (try self.tryDecompileTernaryInto(
+                block_idx,
+                @intCast(self.cfg.blocks.len),
+                &self.statements,
+            )) |next_block| {
+                block_idx = next_block;
+                continue;
+            }
             const pattern = try self.analyzer.detectPattern(block_idx);
 
             switch (pattern) {
@@ -165,45 +420,7 @@ pub const Decompiler = struct {
 
         var sim = SimContext.init(self.allocator, self.code, self.version);
         defer sim.deinit();
-
-        for (block.instructions) |inst| {
-            // Check for statement-producing instructions
-            switch (inst.opcode) {
-                .STORE_NAME, .STORE_FAST, .STORE_GLOBAL => {
-                    const name = switch (inst.opcode) {
-                        .STORE_NAME, .STORE_GLOBAL => sim.getName(inst.arg) orelse "<unknown>",
-                        .STORE_FAST => sim.getLocal(inst.arg) orelse "<unknown>",
-                        else => "<unknown>",
-                    };
-                    const value = sim.stack.pop() orelse return error.StackUnderflow;
-                    if (try self.handleStoreValue(name, value)) |stmt| {
-                        try self.statements.append(self.allocator, stmt);
-                    }
-                },
-                .RETURN_VALUE => {
-                    const value = try sim.stack.popExpr();
-                    const stmt = try self.makeReturn(value);
-                    try self.statements.append(self.allocator, stmt);
-                },
-                .RETURN_CONST => {
-                    if (sim.getConst(inst.arg)) |obj| {
-                        const value = try sim.objToExpr(obj);
-                        const stmt = try self.makeReturn(value);
-                        try self.statements.append(self.allocator, stmt);
-                    }
-                },
-                .POP_TOP => {
-                    // Expression statement (result discarded)
-                    const value = try sim.stack.popExpr();
-                    const stmt = try self.makeExprStmt(value);
-                    try self.statements.append(self.allocator, stmt);
-                },
-                else => {
-                    // Simulate the instruction to build up expressions
-                    try sim.simulate(inst);
-                },
-            }
-        }
+        try self.processBlockWithSim(block, &sim, &self.statements);
     }
 
     /// Decompile a range of blocks into a statement list.
@@ -217,6 +434,10 @@ pub const Decompiler = struct {
 
         while (block_idx < limit) {
             // Process this block's statements
+            if (try self.tryDecompileTernaryInto(block_idx, limit, &stmts)) |next_block| {
+                block_idx = next_block;
+                continue;
+            }
             try self.decompileBlockInto(block_idx, &stmts);
             block_idx += 1;
         }
@@ -231,42 +452,7 @@ pub const Decompiler = struct {
 
         var sim = SimContext.init(self.allocator, self.code, self.version);
         defer sim.deinit();
-
-        for (block.instructions) |inst| {
-            switch (inst.opcode) {
-                .STORE_NAME, .STORE_FAST, .STORE_GLOBAL => {
-                    const name = switch (inst.opcode) {
-                        .STORE_NAME, .STORE_GLOBAL => sim.getName(inst.arg) orelse "<unknown>",
-                        .STORE_FAST => sim.getLocal(inst.arg) orelse "<unknown>",
-                        else => "<unknown>",
-                    };
-                    const value = sim.stack.pop() orelse return error.StackUnderflow;
-                    if (try self.handleStoreValue(name, value)) |stmt| {
-                        try stmts.append(self.allocator, stmt);
-                    }
-                },
-                .RETURN_VALUE => {
-                    const value = try sim.stack.popExpr();
-                    const stmt = try self.makeReturn(value);
-                    try stmts.append(self.allocator, stmt);
-                },
-                .RETURN_CONST => {
-                    if (sim.getConst(inst.arg)) |obj| {
-                        const value = try sim.objToExpr(obj);
-                        const stmt = try self.makeReturn(value);
-                        try stmts.append(self.allocator, stmt);
-                    }
-                },
-                .POP_TOP => {
-                    const value = try sim.stack.popExpr();
-                    const stmt = try self.makeExprStmt(value);
-                    try stmts.append(self.allocator, stmt);
-                },
-                else => {
-                    try sim.simulate(inst);
-                },
-            }
-        }
+        try self.processBlockWithSim(block, &sim, stmts);
     }
 
     /// Decompile an if statement pattern.
