@@ -97,16 +97,25 @@ fn emitOps(bytes: *std.ArrayList(u8), allocator: Allocator, version: Version, op
     }
 }
 
+fn emitOpsOwned(allocator: Allocator, version: Version, ops: []const OpArg) ![]u8 {
+    var bytes: std.ArrayList(u8) = .{};
+    errdefer bytes.deinit(allocator);
+    try emitOps(&bytes, allocator, version, ops);
+    return bytes.toOwnedSlice(allocator);
+}
+
 fn allocCode(
     allocator: Allocator,
     name: []const u8,
     varnames_in: []const []const u8,
     consts_in: []const pyc.Object,
-    bytecode: []const u8,
+    bytecode: []u8,
     argcount: u32,
 ) !*pyc.Code {
     const code = try allocator.create(pyc.Code);
     errdefer allocator.destroy(code);
+
+    errdefer allocator.free(bytecode);
 
     const name_copy = try allocator.dupe(u8, name);
     errdefer allocator.free(name_copy);
@@ -123,19 +132,29 @@ fn allocCode(
         consts[idx] = obj;
     }
 
-    const code_bytes = try allocator.dupe(u8, bytecode);
-    errdefer allocator.free(code_bytes);
-
     code.* = .{
         .allocator = allocator,
         .argcount = argcount,
         .nlocals = @intCast(varnames_in.len),
-        .code = code_bytes,
+        .code = bytecode,
         .consts = consts,
         .varnames = varnames,
         .name = name_copy,
     };
     return code;
+}
+
+fn allocCodeFromOps(
+    allocator: Allocator,
+    version: Version,
+    name: []const u8,
+    varnames_in: []const []const u8,
+    consts_in: []const pyc.Object,
+    ops: []const OpArg,
+    argcount: u32,
+) !*pyc.Code {
+    const bytecode = try emitOpsOwned(allocator, version, ops);
+    return allocCode(allocator, name, varnames_in, consts_in, bytecode, argcount);
 }
 
 test "snapshot list comprehension" {
@@ -408,8 +427,6 @@ test "snapshot generator expression" {
     const allocator = testing.allocator;
     const version = Version.init(3, 14);
 
-    var gen_bytes: std.ArrayList(u8) = .{};
-    defer gen_bytes.deinit(allocator);
     const gen_ops = [_]OpArg{
         .{ .op = .RESUME, .arg = 0 },
         .{ .op = .LOAD_FAST, .arg = 0 },
@@ -422,15 +439,15 @@ test "snapshot generator expression" {
         .{ .op = .LOAD_CONST, .arg = 0 },
         .{ .op = .RETURN_VALUE, .arg = 0 },
     };
-    try emitOps(&gen_bytes, allocator, version, &gen_ops);
 
     const gen_consts = [_]pyc.Object{.none};
-    const gen_code = try allocCode(
+    const gen_code = try allocCodeFromOps(
         allocator,
+        version,
         "<genexpr>",
         &[_][]const u8{ ".0", "y" },
         &gen_consts,
-        gen_bytes.items,
+        &gen_ops,
         1,
     );
 
@@ -477,22 +494,20 @@ test "snapshot lambda expression" {
     const allocator = testing.allocator;
     const version = Version.init(3, 14);
 
-    var lambda_bytes: std.ArrayList(u8) = .{};
-    defer lambda_bytes.deinit(allocator);
     const lambda_ops = [_]OpArg{
         .{ .op = .RESUME, .arg = 0 },
         .{ .op = .LOAD_FAST, .arg = 0 },
         .{ .op = .RETURN_VALUE, .arg = 0 },
     };
-    try emitOps(&lambda_bytes, allocator, version, &lambda_ops);
 
     const lambda_consts = [_]pyc.Object{};
-    const lambda_code = try allocCode(
+    const lambda_code = try allocCodeFromOps(
         allocator,
+        version,
         "<lambda>",
         &[_][]const u8{"x"},
         &lambda_consts,
-        lambda_bytes.items,
+        &lambda_ops,
         1,
     );
 
@@ -674,21 +689,21 @@ test "snapshot decorated function output" {
     const allocator = testing.allocator;
     const version = Version.init(3, 10);
 
-    var func_bytes: std.ArrayList(u8) = .{};
-    defer func_bytes.deinit(allocator);
     const func_ops = [_]OpArg{
         .{ .op = .LOAD_CONST, .arg = 0 },
         .{ .op = .RETURN_VALUE, .arg = 0 },
     };
-    try emitOps(&func_bytes, allocator, version, &func_ops);
 
     const func_consts = [_]pyc.Object{.none};
-    const func_code = try allocCode(allocator, "foo", &[_][]const u8{}, &func_consts, func_bytes.items, 0);
-    var func_code_owned = true;
-    errdefer if (func_code_owned) {
-        func_code.deinit();
-        allocator.destroy(func_code);
-    };
+    const func_code = try allocCodeFromOps(
+        allocator,
+        version,
+        "foo",
+        &[_][]const u8{},
+        &func_consts,
+        &func_ops,
+        0,
+    );
 
     var module = pyc.Code{
         .allocator = allocator,
@@ -698,8 +713,6 @@ test "snapshot decorated function output" {
     module.name = try allocator.dupe(u8, "<module>");
     module.names = try dupeStrings(allocator, &[_][]const u8{ "decorator", "foo" });
 
-    var module_bytes: std.ArrayList(u8) = .{};
-    defer module_bytes.deinit(allocator);
     const module_ops = [_]OpArg{
         .{ .op = .LOAD_NAME, .arg = 0 },
         .{ .op = .LOAD_CONST, .arg = 0 },
@@ -710,9 +723,7 @@ test "snapshot decorated function output" {
         .{ .op = .LOAD_CONST, .arg = 2 },
         .{ .op = .RETURN_VALUE, .arg = 0 },
     };
-    try emitOps(&module_bytes, allocator, version, &module_ops);
-
-    module.code = try allocator.dupe(u8, module_bytes.items);
+    module.code = try emitOpsOwned(allocator, version, &module_ops);
 
     const consts = try allocator.alloc(pyc.Object, 3);
     consts[0] = .none;
@@ -720,15 +731,9 @@ test "snapshot decorated function output" {
     consts[2] = .none;
     module.consts = consts;
 
-    const func_name_const = try allocator.dupe(u8, "foo");
-    var func_name_owned = true;
-    errdefer if (func_name_owned) allocator.free(func_name_const);
-
     module.consts[0] = .{ .code = func_code };
-    module.consts[1] = .{ .string = func_name_const };
+    module.consts[1] = .{ .string = try allocator.dupe(u8, "foo") };
     module.consts[2] = .none;
-    func_code_owned = false;
-    func_name_owned = false;
 
     var out: std.ArrayList(u8) = .{};
     defer out.deinit(allocator);
