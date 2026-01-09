@@ -1270,8 +1270,9 @@ pub const Decompiler = struct {
         var cleanup_cls = true;
         errdefer if (cleanup_cls) cls.deinit(self.allocator);
 
-        const body = try self.decompileNestedBody(cls.code);
+        var body = try self.decompileNestedBody(cls.code);
         errdefer self.deinitStmtSlice(body);
+        body = try self.trimTrailingReturnNone(body);
 
         const decorator_list = try self.takeDecorators(&cls.decorators);
         errdefer self.deinitExprSlice(decorator_list);

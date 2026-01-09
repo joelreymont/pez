@@ -536,6 +536,37 @@ test "property name" {
 }
 ```
 
+## Python 2.7 class construction (BUILD_CLASS)
+
+Python 2.7 uses the `BUILD_CLASS` opcode to construct classes. The compiler
+emits bytecode that pushes the class name and base tuple, builds the class
+body function, calls it to produce the methods dict, then executes
+`BUILD_CLASS`:
+
+- `LOAD_CONST <name>`
+- `BUILD_TUPLE <bases>`
+- `LOAD_CONST <code>`
+- `MAKE_FUNCTION 0`
+- `CALL_FUNCTION 0`
+- `BUILD_CLASS`
+- `STORE_NAME <class>`
+
+The VM pops the methods dict, bases tuple, and name (top to third) and calls
+`build_class(methods, bases, name)`.
+
+Sources:
+- https://raw.githubusercontent.com/python/cpython/v2.7.18/Python/compile.c
+- https://raw.githubusercontent.com/python/cpython/v2.7.18/Python/ceval.c
+
+## Python 3.10 MAKE_FUNCTION stack order
+
+CPython 3.10 emits `LOAD_CONST <code>`, `LOAD_CONST <qualname>`, then
+`MAKE_FUNCTION <flags>`. The runtime pops the qualname (3.0-3.10) in addition
+to the code object before constructing the function.
+
+Source:
+- https://raw.githubusercontent.com/python/cpython/v3.10.14/Python/compile.c
+
 **Configuration:**
 - `.iterations` - test case count (default: 100)
 - `.seed` - reproducibility (default: timestamp)

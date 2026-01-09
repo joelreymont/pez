@@ -516,6 +516,45 @@ pub const SimContext = struct {
         return true;
     }
 
+    fn takeClassName(self: *SimContext, value: StackValue) SimError![]const u8 {
+        var owned = value;
+        errdefer owned.deinit(self.allocator);
+
+        const expr = switch (owned) {
+            .expr => |e| e,
+            else => return error.NotAnExpression,
+        };
+
+        if (expr.* != .constant or expr.constant != .string) return error.InvalidConstant;
+        const name = try self.allocator.dupe(u8, expr.constant.string);
+        expr.deinit(self.allocator);
+        self.allocator.destroy(expr);
+        return name;
+    }
+
+    fn takeClassBases(self: *SimContext, value: StackValue) SimError![]const *Expr {
+        var owned = value;
+        const expr = switch (owned) {
+            .expr => |e| e,
+            else => {
+                owned.deinit(self.allocator);
+                return error.NotAnExpression;
+            },
+        };
+
+        if (expr.* == .tuple) {
+            const bases = expr.tuple.elts;
+            expr.tuple.elts = &.{};
+            expr.deinit(self.allocator);
+            self.allocator.destroy(expr);
+            return bases;
+        }
+
+        const bases = try self.allocator.alloc(*Expr, 1);
+        bases[0] = expr;
+        return bases;
+    }
+
     fn deinitStackValues(self: *SimContext, values: []StackValue) void {
         for (values) |val| {
             val.deinit(self.allocator);
@@ -715,6 +754,21 @@ pub const SimContext = struct {
         keywords: []ast.Keyword,
         iter_expr_override: ?*Expr,
     ) SimError!void {
+        if (callable == .function_obj and args_vals.len == 0 and keywords.len == 0 and self.version.lt(3, 0)) {
+            const func = callable.function_obj;
+            const cls = try self.allocator.create(ClassValue);
+            cls.* = .{
+                .code = func.code,
+                .name = &.{},
+                .bases = &.{},
+                .decorators = .{},
+            };
+            func.deinit(self.allocator);
+            if (args_vals.len > 0) self.allocator.free(args_vals);
+            try self.stack.push(.{ .class_obj = cls });
+            return;
+        }
+
         switch (callable) {
             .comp_obj => |comp| {
                 if (keywords.len != 0) {
@@ -1700,7 +1754,8 @@ pub const SimContext = struct {
 
             .MAKE_FUNCTION => {
                 // MAKE_FUNCTION creates a function from a code object on the stack.
-                // Python 3.10: qualname, codeobj on stack.
+                // Python 2.x: codeobj on stack.
+                // Python 3.0-3.10: qualname, codeobj on stack.
                 // Python 3.11+: codeobj on stack.
                 // The function name comes from the code object's co_qualname.
                 //
@@ -1708,7 +1763,7 @@ pub const SimContext = struct {
                 //
                 // For now, we create a placeholder Name expression for the function.
                 // Full function decompilation requires recursively processing the code object.
-                if (self.version.lt(3, 11)) {
+                if (self.version.major == 3 and self.version.lt(3, 11)) {
                     if (self.stack.pop()) |qualname| {
                         var val = qualname;
                         val.deinit(self.allocator);
@@ -2218,6 +2273,46 @@ pub const SimContext = struct {
             },
 
             // Class-related opcodes
+            .BUILD_CLASS => {
+                var methods_val = self.stack.pop() orelse return error.StackUnderflow;
+                const bases_val = self.stack.pop() orelse {
+                    methods_val.deinit(self.allocator);
+                    return error.StackUnderflow;
+                };
+                const name_val = self.stack.pop() orelse {
+                    bases_val.deinit(self.allocator);
+                    methods_val.deinit(self.allocator);
+                    return error.StackUnderflow;
+                };
+
+                const class_name = self.takeClassName(name_val) catch |err| {
+                    bases_val.deinit(self.allocator);
+                    methods_val.deinit(self.allocator);
+                    return err;
+                };
+                const bases = self.takeClassBases(bases_val) catch |err| {
+                    self.allocator.free(class_name);
+                    methods_val.deinit(self.allocator);
+                    return err;
+                };
+
+                if (methods_val == .class_obj) {
+                    const cls = methods_val.class_obj;
+                    if (cls.name.len > 0) self.allocator.free(cls.name);
+                    if (cls.bases.len > 0) {
+                        deinitExprSlice(self.allocator, cls.bases);
+                        cls.bases = &.{};
+                    }
+                    cls.name = class_name;
+                    cls.bases = bases;
+                    try self.stack.push(.{ .class_obj = cls });
+                } else {
+                    self.allocator.free(class_name);
+                    deinitExprSlice(self.allocator, bases);
+                    methods_val.deinit(self.allocator);
+                    return error.NotAnExpression;
+                }
+            },
             .LOAD_BUILD_CLASS => {
                 // LOAD_BUILD_CLASS - push __build_class__ builtin onto stack
                 // Used to construct classes: __build_class__(func, name, *bases, **keywords)

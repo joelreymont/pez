@@ -77,12 +77,20 @@ fn opcodeByte(version: Version, op: Opcode) u8 {
 
 fn emitOp(bytes: *std.ArrayList(u8), allocator: Allocator, version: Version, op: Opcode, arg: u32) !void {
     try bytes.append(allocator, opcodeByte(version, op));
-    try bytes.append(allocator, @intCast(arg & 0xFF));
+    if (version.gte(3, 6)) {
+        try bytes.append(allocator, @intCast(arg & 0xFF));
 
-    const cache_entries = opcodes.cacheEntries(op, version);
-    if (cache_entries > 0) {
-        const cache_bytes = @as(usize, cache_entries) * 2;
-        try bytes.appendNTimes(allocator, 0, cache_bytes);
+        const cache_entries = opcodes.cacheEntries(op, version);
+        if (cache_entries > 0) {
+            const cache_bytes = @as(usize, cache_entries) * 2;
+            try bytes.appendNTimes(allocator, 0, cache_bytes);
+        }
+        return;
+    }
+
+    if (op.hasArg(version)) {
+        try bytes.append(allocator, @intCast(arg & 0xFF));
+        try bytes.append(allocator, @intCast((arg >> 8) & 0xFF));
     }
 }
 
@@ -745,6 +753,66 @@ test "snapshot decorated function output" {
         \\[]const u8
         \\  "@decorator
         \\def foo():
+        \\    pass
+        \\"
+    ).expectEqual(output);
+}
+
+test "snapshot python 2.7 class output" {
+    const allocator = testing.allocator;
+    const version = Version.init(2, 7);
+
+    const class_ops = [_]OpArg{
+        .{ .op = .LOAD_CONST, .arg = 0 },
+        .{ .op = .RETURN_VALUE, .arg = 0 },
+    };
+    const class_consts = [_]pyc.Object{.none};
+    const class_code = try allocCodeFromOps(
+        allocator,
+        version,
+        "C",
+        &[_][]const u8{},
+        &class_consts,
+        &class_ops,
+        0,
+    );
+
+    var module = pyc.Code{
+        .allocator = allocator,
+    };
+    defer module.deinit();
+
+    module.name = try allocator.dupe(u8, "<module>");
+    module.names = try dupeStrings(allocator, &[_][]const u8{"C"});
+
+    const consts = try allocator.alloc(pyc.Object, 3);
+    consts[0] = .{ .code = class_code };
+    consts[1] = .{ .string = try allocator.dupe(u8, "C") };
+    consts[2] = .none;
+    module.consts = consts;
+
+    const module_ops = [_]OpArg{
+        .{ .op = .LOAD_CONST, .arg = 1 },
+        .{ .op = .BUILD_TUPLE, .arg = 0 },
+        .{ .op = .LOAD_CONST, .arg = 0 },
+        .{ .op = .MAKE_FUNCTION, .arg = 0 },
+        .{ .op = .CALL_FUNCTION, .arg = 0 },
+        .{ .op = .BUILD_CLASS, .arg = 0 },
+        .{ .op = .STORE_NAME, .arg = 0 },
+        .{ .op = .LOAD_CONST, .arg = 2 },
+        .{ .op = .RETURN_VALUE, .arg = 0 },
+    };
+    module.code = try emitOpsOwned(allocator, version, &module_ops);
+
+    var out: std.ArrayList(u8) = .{};
+    defer out.deinit(allocator);
+    try decompile.decompileToSource(allocator, &module, version, out.writer(allocator));
+    const output: []const u8 = out.items;
+
+    const oh = OhSnap{};
+    try oh.snap(@src(),
+        \\[]const u8
+        \\  "class C:
         \\    pass
         \\"
     ).expectEqual(output);
