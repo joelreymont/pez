@@ -193,6 +193,7 @@ pub const InstructionIterator = struct {
 
         // In Python 3.6+, all instructions are 2 bytes (word-based)
         const word_based = self.version.gte(3, 6);
+        const ext_shift: u5 = if (word_based) 8 else 16;
 
         var arg: u32 = 0;
         if (word_based) {
@@ -212,7 +213,7 @@ pub const InstructionIterator = struct {
 
         // Handle EXTENDED_ARG
         if (opcode == .EXTENDED_ARG) {
-            self.extended_arg = (self.extended_arg | arg) << 8;
+            self.extended_arg = (self.extended_arg | arg) << ext_shift;
             // Recursively get the next instruction with accumulated extended_arg
             return self.next();
         }
@@ -259,6 +260,50 @@ pub const InstructionIterator = struct {
         return instructions.toOwnedSlice(allocator);
     }
 };
+
+fn opcodeByte(version: Version, op: Opcode) u8 {
+    const table = opcodes.getOpcodeTable(version);
+    for (table, 0..) |entry, idx| {
+        if (entry == op) return @intCast(idx);
+    }
+    @panic("opcode not in table");
+}
+
+test "pre-3.6 EXTENDED_ARG uses 16-bit chunks" {
+    const testing = std.testing;
+    const version = Version.init(2, 7);
+
+    const bytecode = [_]u8{
+        opcodeByte(version, .EXTENDED_ARG),
+        0x01,
+        0x00,
+        opcodeByte(version, .LOAD_CONST),
+        0x45,
+        0x23,
+    };
+
+    var iter = InstructionIterator.init(&bytecode, version);
+    const inst = iter.next().?;
+    try testing.expectEqual(Opcode.LOAD_CONST, inst.opcode);
+    try testing.expectEqual(@as(u32, 0x12345), inst.arg);
+    try testing.expectEqual(@as(u32, 3), inst.offset);
+    try testing.expectEqual(@as(u16, 3), inst.size);
+    try testing.expect(iter.next() == null);
+}
+
+test "pre-3.6 opcode without arg is size 1" {
+    const testing = std.testing;
+    const version = Version.init(2, 7);
+    const bytecode = [_]u8{opcodeByte(version, .NOP)};
+
+    var iter = InstructionIterator.init(&bytecode, version);
+    const inst = iter.next().?;
+    try testing.expectEqual(Opcode.NOP, inst.opcode);
+    try testing.expectEqual(@as(u32, 0), inst.arg);
+    try testing.expectEqual(@as(u32, 0), inst.offset);
+    try testing.expectEqual(@as(u16, 1), inst.size);
+    try testing.expect(iter.next() == null);
+}
 
 test "instruction iterator basic" {
     const testing = std.testing;
