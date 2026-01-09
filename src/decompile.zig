@@ -21,6 +21,7 @@ pub const SimContext = stack_mod.SimContext;
 pub const Version = decoder.Version;
 pub const Expr = ast.Expr;
 pub const Stmt = ast.Stmt;
+pub const DecompileError = stack_mod.SimError || error{UnexpectedEmptyWorklist};
 
 /// Decompiler state for a single code object.
 pub const Decompiler = struct {
@@ -34,7 +35,7 @@ pub const Decompiler = struct {
     /// Accumulated statements.
     statements: std.ArrayList(*Stmt),
 
-    pub fn init(allocator: Allocator, code: *const pyc.Code, version: Version) !Decompiler {
+    pub fn init(allocator: Allocator, code: *const pyc.Code, version: Version) DecompileError!Decompiler {
         // Allocate CFG on heap so pointer stays valid
         const cfg = try allocator.create(CFG);
         errdefer allocator.destroy(cfg);
@@ -75,7 +76,7 @@ pub const Decompiler = struct {
     }
 
     /// Find the last block that's part of an if-elif-else chain.
-    fn findIfChainEnd(self: *Decompiler, pattern: ctrl.IfPattern) !u32 {
+    fn findIfChainEnd(self: *Decompiler, pattern: ctrl.IfPattern) DecompileError!u32 {
         var max_block = pattern.then_block;
 
         if (pattern.else_block) |else_id| {
@@ -99,7 +100,7 @@ pub const Decompiler = struct {
     }
 
     /// Decompile the code object into a list of statements.
-    pub fn decompile(self: *Decompiler) ![]const *Stmt {
+    pub fn decompile(self: *Decompiler) DecompileError![]const *Stmt {
         if (self.cfg.blocks.len == 0) {
             return self.statements.items;
         }
@@ -158,7 +159,7 @@ pub const Decompiler = struct {
     }
 
     /// Decompile a single basic block into statements.
-    fn decompileBlock(self: *Decompiler, block_id: u32) !void {
+    fn decompileBlock(self: *Decompiler, block_id: u32) DecompileError!void {
         if (block_id >= self.cfg.blocks.len) return;
         const block = &self.cfg.blocks[block_id];
 
@@ -207,7 +208,7 @@ pub const Decompiler = struct {
 
     /// Decompile a range of blocks into a statement list.
     /// Returns statements from start_block up to (but not including) end_block.
-    fn decompileBlockRange(self: *Decompiler, start_block: u32, end_block: ?u32) ![]const *Stmt {
+    fn decompileBlockRange(self: *Decompiler, start_block: u32, end_block: ?u32) DecompileError![]const *Stmt {
         var stmts: std.ArrayList(*Stmt) = .{};
         errdefer stmts.deinit(self.allocator);
 
@@ -224,7 +225,7 @@ pub const Decompiler = struct {
     }
 
     /// Decompile a single block's statements into the provided list.
-    fn decompileBlockInto(self: *Decompiler, block_id: u32, stmts: *std.ArrayList(*Stmt)) !void {
+    fn decompileBlockInto(self: *Decompiler, block_id: u32, stmts: *std.ArrayList(*Stmt)) DecompileError!void {
         if (block_id >= self.cfg.blocks.len) return;
         const block = &self.cfg.blocks[block_id];
 
@@ -269,7 +270,7 @@ pub const Decompiler = struct {
     }
 
     /// Decompile an if statement pattern.
-    fn decompileIf(self: *Decompiler, pattern: ctrl.IfPattern) !?*Stmt {
+    fn decompileIf(self: *Decompiler, pattern: ctrl.IfPattern) DecompileError!?*Stmt {
         const cond_block = &self.cfg.blocks[pattern.condition_block];
 
         // Get the condition expression from the last instruction before the jump
@@ -319,7 +320,7 @@ pub const Decompiler = struct {
     }
 
     /// Decompile a while loop pattern.
-    fn decompileWhile(self: *Decompiler, pattern: ctrl.WhilePattern) !?*Stmt {
+    fn decompileWhile(self: *Decompiler, pattern: ctrl.WhilePattern) DecompileError!?*Stmt {
         const header = &self.cfg.blocks[pattern.header_block];
 
         // Get the condition expression
@@ -362,8 +363,8 @@ pub const Decompiler = struct {
         next_block: u32,
     };
 
-    fn decompileTry(self: *Decompiler, pattern: ctrl.TryPattern) !PatternResult {
-        var handler_blocks = std.ArrayList(u32).init(self.allocator);
+    fn decompileTry(self: *Decompiler, pattern: ctrl.TryPattern) DecompileError!PatternResult {
+        var handler_blocks: std.ArrayList(u32) = .{};
         defer handler_blocks.deinit(self.allocator);
 
         for (pattern.handlers) |handler| {
@@ -545,7 +546,7 @@ pub const Decompiler = struct {
         return .{ .stmt = stmt, .next_block = next_block };
     }
 
-    fn decompileWith(self: *Decompiler, pattern: ctrl.WithPattern) !PatternResult {
+    fn decompileWith(self: *Decompiler, pattern: ctrl.WithPattern) DecompileError!PatternResult {
         const setup = &self.cfg.blocks[pattern.setup_block];
         var sim = SimContext.init(self.allocator, self.code, self.version);
         defer sim.deinit();
@@ -607,7 +608,7 @@ pub const Decompiler = struct {
         return .{ .stmt = stmt, .next_block = pattern.exit_block };
     }
 
-    fn decompileStructuredRange(self: *Decompiler, start: u32, end: u32) ![]const *Stmt {
+    fn decompileStructuredRange(self: *Decompiler, start: u32, end: u32) DecompileError![]const *Stmt {
         var stmts: std.ArrayList(*Stmt) = .{};
         errdefer stmts.deinit(self.allocator);
 
@@ -669,7 +670,7 @@ pub const Decompiler = struct {
         skip_first_store: bool,
     };
 
-    fn extractHandlerHeader(self: *Decompiler, handler_block: u32) !HandlerHeader {
+    fn extractHandlerHeader(self: *Decompiler, handler_block: u32) DecompileError!HandlerHeader {
         const block = &self.cfg.blocks[handler_block];
         var sim = SimContext.init(self.allocator, self.code, self.version);
         defer sim.deinit();
@@ -705,7 +706,12 @@ pub const Decompiler = struct {
         };
     }
 
-    fn decompileHandlerBody(self: *Decompiler, start: u32, end: u32, skip_first_store: bool) ![]const *Stmt {
+    fn decompileHandlerBody(
+        self: *Decompiler,
+        start: u32,
+        end: u32,
+        skip_first_store: bool,
+    ) DecompileError![]const *Stmt {
         var stmts: std.ArrayList(*Stmt) = .{};
         errdefer stmts.deinit(self.allocator);
 
@@ -735,7 +741,7 @@ pub const Decompiler = struct {
         self: *Decompiler,
         start: u32,
         handler_set: *const std.DynamicBitSet,
-    ) !std.DynamicBitSet {
+    ) DecompileError!std.DynamicBitSet {
         var visited = try std.DynamicBitSet.initEmpty(self.allocator, self.cfg.blocks.len);
         var queue: std.ArrayList(u32) = .{};
         defer queue.deinit(self.allocator);
@@ -775,7 +781,7 @@ pub const Decompiler = struct {
     }
 
     /// Decompile a for loop pattern.
-    fn decompileFor(self: *Decompiler, pattern: ctrl.ForPattern) !?*Stmt {
+    fn decompileFor(self: *Decompiler, pattern: ctrl.ForPattern) DecompileError!?*Stmt {
         // Get the iterator expression from the setup block
         // The setup block contains: ... GET_ITER
         // The expression before GET_ITER is the iterator
@@ -823,7 +829,7 @@ pub const Decompiler = struct {
     }
 
     /// Decompile a for loop body using dominator-based loop membership.
-    fn decompileForBody(self: *Decompiler, body_block_id: u32, header_block_id: u32) ![]const *Stmt {
+    fn decompileForBody(self: *Decompiler, body_block_id: u32, header_block_id: u32) DecompileError![]const *Stmt {
         var stmts: std.ArrayList(*Stmt) = .{};
         errdefer stmts.deinit(self.allocator);
 
@@ -901,7 +907,7 @@ pub const Decompiler = struct {
         skip_first_store: *bool,
         stop_at_jump: bool,
         loop_header: ?u32,
-    ) !void {
+    ) DecompileError!void {
         var sim = SimContext.init(self.allocator, self.code, self.version);
         defer sim.deinit();
 
@@ -969,7 +975,12 @@ pub const Decompiler = struct {
     }
 
     /// Process part of a block (before control flow instruction).
-    fn processPartialBlock(self: *Decompiler, block: *const cfg_mod.BasicBlock, stmts: *std.ArrayList(*Stmt), skip_first_store: *bool) !void {
+    fn processPartialBlock(
+        self: *Decompiler,
+        block: *const cfg_mod.BasicBlock,
+        stmts: *std.ArrayList(*Stmt),
+        skip_first_store: *bool,
+    ) DecompileError!void {
         var sim = SimContext.init(self.allocator, self.code, self.version);
         defer sim.deinit();
 
@@ -998,7 +1009,12 @@ pub const Decompiler = struct {
     }
 
     /// Decompile an if statement that's inside a loop.
-    fn decompileLoopIf(self: *Decompiler, pattern: ctrl.IfPattern, loop_header: u32, visited: *std.DynamicBitSet) !?*Stmt {
+    fn decompileLoopIf(
+        self: *Decompiler,
+        pattern: ctrl.IfPattern,
+        loop_header: u32,
+        visited: *std.DynamicBitSet,
+    ) DecompileError!?*Stmt {
         const cond_block = &self.cfg.blocks[pattern.condition_block];
 
         // Get the condition expression
@@ -1075,7 +1091,7 @@ pub const Decompiler = struct {
         skip_first_store: *bool,
         visited: *std.DynamicBitSet,
         stop_block: ?u32,
-    ) ![]const *Stmt {
+    ) DecompileError![]const *Stmt {
         var stmts: std.ArrayList(*Stmt) = .{};
         errdefer stmts.deinit(self.allocator);
 
@@ -1168,7 +1184,30 @@ pub const Decompiler = struct {
         if (items.len > 0) self.allocator.free(items);
     }
 
-    fn takeDecorators(self: *Decompiler, decorators: *std.ArrayList(*Expr)) ![]const *Expr {
+    fn trimTrailingReturnNone(self: *Decompiler, items: []const *Stmt) DecompileError![]const *Stmt {
+        if (items.len == 0) return items;
+
+        var end = items.len;
+        while (end > 0 and Decompiler.isReturnNone(items[end - 1])) {
+            const stmt = items[end - 1];
+            stmt.deinit(self.allocator);
+            self.allocator.destroy(stmt);
+            end -= 1;
+        }
+
+        if (end == items.len) return items;
+        if (end == 0) {
+            self.allocator.free(items);
+            return &.{};
+        }
+
+        const trimmed = try self.allocator.alloc(*Stmt, end);
+        @memcpy(trimmed, items[0..end]);
+        self.allocator.free(items);
+        return trimmed;
+    }
+
+    fn takeDecorators(self: *Decompiler, decorators: *std.ArrayList(*Expr)) DecompileError![]const *Expr {
         if (decorators.items.len == 0) return &.{};
         const count = decorators.items.len;
         const out = try self.allocator.alloc(*Expr, count);
@@ -1181,7 +1220,7 @@ pub const Decompiler = struct {
         return out;
     }
 
-    fn decompileNestedBody(self: *Decompiler, code: *const pyc.Code) ![]const *Stmt {
+    fn decompileNestedBody(self: *Decompiler, code: *const pyc.Code) DecompileError![]const *Stmt {
         var nested = try Decompiler.init(self.allocator, code, self.version);
         defer nested.deinit();
         _ = try nested.decompile();
@@ -1190,12 +1229,13 @@ pub const Decompiler = struct {
         return body;
     }
 
-    fn makeFunctionDef(self: *Decompiler, name: []const u8, func: *stack_mod.FunctionValue) !*Stmt {
+    fn makeFunctionDef(self: *Decompiler, name: []const u8, func: *stack_mod.FunctionValue) DecompileError!*Stmt {
         var cleanup_func = true;
         errdefer if (cleanup_func) func.deinit(self.allocator);
 
-        const body = try self.decompileNestedBody(func.code);
+        var body = try self.decompileNestedBody(func.code);
         errdefer self.deinitStmtSlice(body);
+        body = try self.trimTrailingReturnNone(body);
 
         const args = try codegen.extractFunctionSignature(self.allocator, func.code);
         errdefer args.deinit(self.allocator);
@@ -1226,7 +1266,7 @@ pub const Decompiler = struct {
         return stmt;
     }
 
-    fn makeClassDef(self: *Decompiler, name: []const u8, cls: *stack_mod.ClassValue) !*Stmt {
+    fn makeClassDef(self: *Decompiler, name: []const u8, cls: *stack_mod.ClassValue) DecompileError!*Stmt {
         var cleanup_cls = true;
         errdefer if (cleanup_cls) cls.deinit(self.allocator);
 
@@ -1266,7 +1306,7 @@ pub const Decompiler = struct {
         return stmt;
     }
 
-    fn handleStoreValue(self: *Decompiler, name: []const u8, value: stack_mod.StackValue) !?*Stmt {
+    fn handleStoreValue(self: *Decompiler, name: []const u8, value: stack_mod.StackValue) DecompileError!?*Stmt {
         return switch (value) {
             .expr => |expr| blk: {
                 const target = try ast.makeName(self.allocator, name, .store);
@@ -1284,7 +1324,7 @@ pub const Decompiler = struct {
     }
 
     /// Create an assignment statement.
-    fn makeAssign(self: *Decompiler, target: *Expr, value: *Expr) !*Stmt {
+    fn makeAssign(self: *Decompiler, target: *Expr, value: *Expr) DecompileError!*Stmt {
         const targets = try self.allocator.alloc(*Expr, 1);
         targets[0] = target;
 
@@ -1298,21 +1338,21 @@ pub const Decompiler = struct {
     }
 
     /// Create a break statement.
-    fn makeBreak(self: *Decompiler) !*Stmt {
+    fn makeBreak(self: *Decompiler) DecompileError!*Stmt {
         const stmt = try self.allocator.create(Stmt);
         stmt.* = .break_stmt;
         return stmt;
     }
 
     /// Create a continue statement.
-    fn makeContinue(self: *Decompiler) !*Stmt {
+    fn makeContinue(self: *Decompiler) DecompileError!*Stmt {
         const stmt = try self.allocator.create(Stmt);
         stmt.* = .continue_stmt;
         return stmt;
     }
 
     /// Create a return statement.
-    fn makeReturn(self: *Decompiler, value: *Expr) !*Stmt {
+    fn makeReturn(self: *Decompiler, value: *Expr) DecompileError!*Stmt {
         const stmt = try self.allocator.create(Stmt);
         stmt.* = .{ .return_stmt = .{
             .value = value,
@@ -1321,7 +1361,7 @@ pub const Decompiler = struct {
     }
 
     /// Create an expression statement.
-    fn makeExprStmt(self: *Decompiler, value: *Expr) !*Stmt {
+    fn makeExprStmt(self: *Decompiler, value: *Expr) DecompileError!*Stmt {
         const stmt = try self.allocator.create(Stmt);
         stmt.* = .{ .expr_stmt = .{
             .value = value,
@@ -1346,15 +1386,28 @@ pub const Decompiler = struct {
 pub fn decompileToSource(allocator: Allocator, code: *const pyc.Code, version: Version, writer: anytype) !void {
     // Handle module-level code
     if (std.mem.eql(u8, code.name, "<module>")) {
-        // Process imports first (TODO)
+        var decompiler = try Decompiler.init(allocator, code, version);
+        defer decompiler.deinit();
 
-        // Process function/class definitions
-        for (code.consts) |c| {
-            if (c == .code) {
-                try decompileFunctionToSource(allocator, c.code, version, writer, 0);
-                try writer.writeByte('\n');
-            }
+        const stmts = try decompiler.decompile();
+        var effective_stmts = stmts;
+        while (effective_stmts.len > 0 and Decompiler.isReturnNone(effective_stmts[effective_stmts.len - 1])) {
+            effective_stmts = effective_stmts[0 .. effective_stmts.len - 1];
         }
+
+        if (effective_stmts.len == 0) return;
+
+        var cg = codegen.Writer.init(allocator);
+        defer cg.deinit(allocator);
+
+        for (effective_stmts) |stmt| {
+            try cg.writeStmt(allocator, stmt);
+        }
+
+        const output = try cg.getOutput(allocator);
+        defer allocator.free(output);
+        try writer.writeAll(output);
+        return;
     } else {
         try decompileFunctionToSource(allocator, code, version, writer, 0);
     }
@@ -1386,7 +1439,7 @@ fn decompileFunctionToSource(allocator: Allocator, code: *const pyc.Code, versio
         return;
     }
 
-    // Write decorators (TODO: extract from bytecode)
+    // Decorators are emitted from module-level AST output.
 
     // Write async if coroutine
     if (codegen.isCoroutine(code)) {

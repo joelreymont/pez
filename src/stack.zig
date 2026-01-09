@@ -1700,14 +1700,57 @@ pub const SimContext = struct {
 
             .MAKE_FUNCTION => {
                 // MAKE_FUNCTION creates a function from a code object on the stack.
-                // In Python 3.12+, the code object is on top of stack.
+                // Python 3.10: qualname, codeobj on stack.
+                // Python 3.11+: codeobj on stack.
                 // The function name comes from the code object's co_qualname.
                 //
-                // Stack: code_obj -> function
+                // Stack: [qualname], code_obj -> function
                 //
                 // For now, we create a placeholder Name expression for the function.
                 // Full function decompilation requires recursively processing the code object.
+                if (self.version.lt(3, 11)) {
+                    if (self.stack.pop()) |qualname| {
+                        var val = qualname;
+                        val.deinit(self.allocator);
+                    } else {
+                        return error.StackUnderflow;
+                    }
+                }
+
                 const code_val = self.stack.pop() orelse return error.StackUnderflow;
+
+                if ((inst.arg & 0x08) != 0) {
+                    if (self.stack.pop()) |closure| {
+                        var val = closure;
+                        val.deinit(self.allocator);
+                    } else {
+                        return error.StackUnderflow;
+                    }
+                }
+                if ((inst.arg & 0x04) != 0) {
+                    if (self.stack.pop()) |annotations| {
+                        var val = annotations;
+                        val.deinit(self.allocator);
+                    } else {
+                        return error.StackUnderflow;
+                    }
+                }
+                if ((inst.arg & 0x02) != 0) {
+                    if (self.stack.pop()) |kwdefaults| {
+                        var val = kwdefaults;
+                        val.deinit(self.allocator);
+                    } else {
+                        return error.StackUnderflow;
+                    }
+                }
+                if ((inst.arg & 0x01) != 0) {
+                    if (self.stack.pop()) |defaults| {
+                        var val = defaults;
+                        val.deinit(self.allocator);
+                    } else {
+                        return error.StackUnderflow;
+                    }
+                }
 
                 switch (code_val) {
                     .code_obj => |code| {
@@ -2504,6 +2547,12 @@ pub const SimContext = struct {
 
             .COPY_DICT_WITHOUT_KEYS => {
                 // COPY_DICT_WITHOUT_KEYS - remove keys tuple from a dict copy
+                if (self.stack.pop()) |v| {
+                    var val = v;
+                    val.deinit(self.allocator);
+                } else {
+                    return error.StackUnderflow;
+                }
                 if (self.stack.pop()) |v| {
                     var val = v;
                     val.deinit(self.allocator);
