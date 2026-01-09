@@ -1,0 +1,14 @@
+{
+  "lsp": {
+    "banjo-notes": {
+      "binary": { "path": "/Users/joel/Work/banjo/zig-out/bin/banjo", "arguments": ["--lsp"] }
+    }
+  },
+  "languages": {
+    "Python": { "language_servers": ["pyright", "banjo-notes"] },
+    "C": { "language_servers": ["clangd", "banjo-notes"] },
+    "Zig": { "language_servers": ["zls", "banjo-notes"] },
+    "C++": { "language_servers": ["clangd", "banjo-notes"] },
+    "Markdown": { "language_servers": ["banjo-notes"] }
+  }
+}

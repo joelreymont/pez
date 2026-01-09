@@ -403,6 +403,12 @@ pub const Decompiler = struct {
                     block_idx = result.next_block;
                 },
                 else => {
+                    const block = &self.cfg.blocks[block_idx];
+                    // Skip exception handler blocks - they're decompiled as part of try/except
+                    if (block.is_exception_handler or self.hasExceptionHandlerOpcodes(block)) {
+                        block_idx += 1;
+                        continue;
+                    }
                     // Process block as sequential statements
                     try self.decompileBlock(block_idx);
                     block_idx += 1;
@@ -646,7 +652,7 @@ pub const Decompiler = struct {
             if (start < try_end) try_end = start;
         }
 
-        const try_body = if (pattern.try_block < try_end)
+        const try_body = if (pattern.try_block < try_end and pattern.try_block != try_end)
             try self.decompileStructuredRange(pattern.try_block, try_end)
         else
             &[_]*Stmt{};
@@ -795,6 +801,9 @@ pub const Decompiler = struct {
     }
 
     fn decompileStructuredRange(self: *Decompiler, start: u32, end: u32) DecompileError![]const *Stmt {
+        // Handle empty range (start == end)
+        if (start >= end) return &[_]*Stmt{};
+
         var stmts: std.ArrayList(*Stmt) = .{};
         errdefer stmts.deinit(self.allocator);
 
@@ -962,6 +971,14 @@ pub const Decompiler = struct {
         }
         for (block.instructions) |inst| {
             if (inst.opcode == .RERAISE) return true;
+        }
+        return false;
+    }
+
+    fn hasExceptionHandlerOpcodes(self: *Decompiler, block: *const BasicBlock) bool {
+        _ = self;
+        for (block.instructions) |inst| {
+            if (inst.opcode == .PUSH_EXC_INFO or inst.opcode == .CHECK_EXC_MATCH or inst.opcode == .POP_EXCEPT) return true;
         }
         return false;
     }

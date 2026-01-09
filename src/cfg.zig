@@ -116,6 +116,16 @@ pub const CFG = struct {
 
 /// Build a CFG from bytecode.
 pub fn buildCFG(allocator: Allocator, bytecode: []const u8, version: Version) !CFG {
+    return buildCFGWithLeaders(allocator, bytecode, version, &.{});
+}
+
+/// Build a CFG from bytecode with additional leader offsets.
+fn buildCFGWithLeaders(
+    allocator: Allocator,
+    bytecode: []const u8,
+    version: Version,
+    exception_entries: []const ExceptionEntry,
+) !CFG {
     // Step 1: Decode all instructions
     var iter = decoder.InstructionIterator.init(bytecode, version);
     const instructions = try iter.collectAlloc(allocator);
@@ -136,8 +146,14 @@ pub fn buildCFG(allocator: Allocator, bytecode: []const u8, version: Version) !C
     // - First instruction
     // - Target of any jump
     // - Instruction following a jump or terminator
+    // - Exception handler entry points
     var leaders = std.AutoHashMap(u32, void).init(allocator);
     defer leaders.deinit();
+
+    // Add exception handler targets as leaders
+    for (exception_entries) |entry| {
+        try leaders.put(entry.target, {});
+    }
 
     // First instruction is always a leader
     try leaders.put(instructions[0].offset, {});
@@ -354,6 +370,8 @@ pub const ExceptionEntry = struct {
 };
 
 /// Parse the exception table (3.11+ format).
+/// Note: Exception table stores offsets in instruction units (words).
+/// For 3.11+, each instruction is 2 bytes, so offsets are multiplied by 2.
 pub fn parseExceptionTable(table: []const u8, allocator: Allocator) ![]ExceptionEntry {
     if (table.len == 0) return &.{};
 
@@ -365,20 +383,20 @@ pub fn parseExceptionTable(table: []const u8, allocator: Allocator) ![]Exception
         // First byte must have S bit (bit 7) set
         if ((table[pos] & 0x80) == 0) break;
 
-        // Read start offset
+        // Read start offset (in instruction units)
         const start_result = readVarint7(table, pos);
         pos = start_result.new_pos;
-        const start = start_result.value;
+        const start = start_result.value * 2; // Convert to byte offset
 
-        // Read size (end - start)
+        // Read size (end - start, in instruction units)
         const size_result = readVarint7(table, pos);
         pos = size_result.new_pos;
-        const size = size_result.value;
+        const size = size_result.value * 2; // Convert to bytes
 
-        // Read target handler offset
+        // Read target handler offset (in instruction units)
         const target_result = readVarint7(table, pos);
         pos = target_result.new_pos;
-        const target = target_result.value;
+        const target = target_result.value * 2; // Convert to byte offset
 
         // Read combined depth_lasti value
         const depth_lasti_result = readVarint7(table, pos);
@@ -428,31 +446,40 @@ pub fn buildCFGWithExceptions(
     exception_table: []const u8,
     version: Version,
 ) !CFG {
-    // First build the basic CFG
-    var cfg = try buildCFG(allocator, bytecode, version);
-    errdefer cfg.deinit();
-
-    // Parse exception table (only for 3.11+)
+    // Parse exception table first (only for 3.11+)
     if (!version.gte(3, 11) or exception_table.len == 0) {
-        return cfg;
+        return try buildCFG(allocator, bytecode, version);
     }
 
     const entries = try parseExceptionTable(exception_table, allocator);
     defer allocator.free(entries);
 
-    // Add exception edges and mark handler blocks
+    // Build CFG with exception handler offsets as additional leaders
+    var cfg = try buildCFGWithLeaders(allocator, bytecode, version, entries);
+    errdefer cfg.deinit();
+
+    // Collect edges to add (two-pass to avoid iterator invalidation)
+    const EdgeToAdd = struct { from: u32, to: u32 };
+    var edges_to_add: std.ArrayList(EdgeToAdd) = .{};
+    defer edges_to_add.deinit(allocator);
+
+    // First pass: mark handlers and collect edges
     for (entries) |entry| {
-        // Find the handler block
-        const handler_block_id = cfg.blockAtOffset(entry.target);
+        // Find the handler block - use blockContaining since handler offset may be mid-block
+        const handler_block_ptr = cfg.blockContaining(entry.target);
+        var handler_block_id: ?u32 = null;
+        if (handler_block_ptr) |ptr| {
+            handler_block_id = ptr.id;
+        }
         if (handler_block_id) |hid| {
             cfg.blocks[hid].is_exception_handler = true;
         }
 
-        // Add exception edges from all blocks in the protected range
+        // Collect exception edges from all blocks in the protected range
         for (cfg.blocks, 0..) |*block, block_idx| {
             // Check if this block overlaps with the protected range
             if (block.start_offset < entry.end and block.end_offset > entry.start) {
-                // Add exception edge if handler exists
+                // Collect exception edge if handler exists
                 if (handler_block_id) |hid| {
                     // Check if edge already exists
                     var has_edge = false;
@@ -464,33 +491,44 @@ pub fn buildCFGWithExceptions(
                     }
 
                     if (!has_edge) {
-                        // Reallocate successors to add exception edge
-                        const new_succs = try allocator.alloc(Edge, block.successors.len + 1);
-                        @memcpy(new_succs[0..block.successors.len], block.successors);
-                        new_succs[block.successors.len] = .{
-                            .target = hid,
-                            .edge_type = .exception,
-                        };
-
-                        if (block.successors.len > 0) {
-                            allocator.free(block.successors);
-                        }
-                        cfg.blocks[block_idx].successors = new_succs;
-
-                        // Update handler's predecessors
-                        var handler = &cfg.blocks[hid];
-                        const new_preds = try allocator.alloc(u32, handler.predecessors.len + 1);
-                        @memcpy(new_preds[0..handler.predecessors.len], handler.predecessors);
-                        new_preds[handler.predecessors.len] = block.id;
-
-                        if (handler.predecessors.len > 0) {
-                            allocator.free(handler.predecessors);
-                        }
-                        handler.predecessors = new_preds;
+                        try edges_to_add.append(allocator, .{ .from = @intCast(block_idx), .to = hid });
                     }
                 }
             }
         }
+    }
+
+    // Second pass: add all collected edges
+    for (edges_to_add.items) |edge_info| {
+        const block_idx = edge_info.from;
+        const hid = edge_info.to;
+
+        // Add to successors
+        const block = &cfg.blocks[block_idx];
+        const old_len = block.successors.len;
+        const new_succs = try allocator.alloc(Edge, old_len + 1);
+        @memcpy(new_succs[0..old_len], block.successors);
+        new_succs[old_len] = .{
+            .target = hid,
+            .edge_type = .exception,
+        };
+
+        if (old_len > 0) {
+            allocator.free(block.successors);
+        }
+        cfg.blocks[block_idx].successors = new_succs;
+
+        // Add to predecessors
+        const handler = &cfg.blocks[hid];
+        const old_preds = handler.predecessors;
+        const new_preds = try allocator.alloc(u32, old_preds.len + 1);
+        @memcpy(new_preds[0..old_preds.len], old_preds);
+        new_preds[old_preds.len] = block.id;
+
+        if (old_preds.len > 0) {
+            allocator.free(old_preds);
+        }
+        cfg.blocks[hid].predecessors = new_preds;
     }
 
     return cfg;
@@ -609,8 +647,8 @@ test "exception table parsing" {
 
     try testing.expectEqual(@as(usize, 1), entries.len);
     try testing.expectEqual(@as(u32, 0), entries[0].start);
-    try testing.expectEqual(@as(u32, 10), entries[0].end);
-    try testing.expectEqual(@as(u32, 20), entries[0].target);
+    try testing.expectEqual(@as(u32, 20), entries[0].end); // 10 words * 2 = 20 bytes
+    try testing.expectEqual(@as(u32, 40), entries[0].target); // 20 words * 2 = 40 bytes
     try testing.expectEqual(@as(u16, 1), entries[0].depth);
     try testing.expectEqual(false, entries[0].push_lasti);
 }

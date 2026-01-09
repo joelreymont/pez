@@ -159,9 +159,10 @@ test "exception table entry fields are correctly parsed" {
             if (entries.len != 1) return false;
 
             const e = entries[0];
-            return e.start == start_val and
-                e.end == start_val + size_val and
-                e.target == target_val and
+            // Exception table values are in instruction units, converted to bytes (*2)
+            return e.start == start_val * 2 and
+                e.end == (start_val + size_val) * 2 and
+                e.target == target_val * 2 and
                 e.depth == depth_val and
                 e.push_lasti == args.lasti;
         }

@@ -176,6 +176,11 @@ pub const Analyzer = struct {
         const block = &self.cfg.blocks[block_id];
         const term = block.terminator() orelse return .unknown;
 
+        // Check for exception handler with CHECK_EXC_MATCH - not a regular if
+        if (block.is_exception_handler or self.hasCheckExcMatch(block)) {
+            return .unknown;
+        }
+
         // Check for conditional jump (if statement pattern)
         if (self.isConditionalJump(term.opcode)) {
             if (try self.detectIfPattern(block_id)) |pattern| {
@@ -228,6 +233,15 @@ pub const Analyzer = struct {
         _ = self;
         for (block.instructions) |inst| {
             if (inst.opcode == .BEFORE_WITH or inst.opcode == .BEFORE_ASYNC_WITH) return true;
+        }
+        return false;
+    }
+
+    /// Check if block has CHECK_EXC_MATCH (exception handler).
+    fn hasCheckExcMatch(self: *const Analyzer, block: *const BasicBlock) bool {
+        _ = self;
+        for (block.instructions) |inst| {
+            if (inst.opcode == .CHECK_EXC_MATCH or inst.opcode == .PUSH_EXC_INFO) return true;
         }
         return false;
     }
@@ -477,29 +491,6 @@ pub const Analyzer = struct {
 
         try self.collectExceptionTargets(block_id, &handler_targets);
         if (handler_targets.items.len == 0) return null;
-
-        var pred_targets: std.ArrayList(u32) = .{};
-        defer pred_targets.deinit(self.allocator);
-
-        for (block.predecessors) |pred_id| {
-            if (pred_id >= self.cfg.blocks.len) continue;
-            const pred = &self.cfg.blocks[pred_id];
-            if (pred.is_exception_handler) continue;
-            const edge_type = self.edgeTypeTo(pred_id, block_id) orelse continue;
-            if (edge_type == .exception or edge_type == .loop_back) continue;
-
-            try self.collectExceptionTargets(pred_id, &pred_targets);
-            if (pred_targets.items.len != handler_targets.items.len) continue;
-
-            var same = true;
-            for (pred_targets.items, 0..) |hid, idx| {
-                if (handler_targets.items[idx] != hid) {
-                    same = false;
-                    break;
-                }
-            }
-            if (same) return null;
-        }
 
         // Collect all exception handlers reachable from this block
         var handler_list: std.ArrayList(HandlerInfo) = .{};
