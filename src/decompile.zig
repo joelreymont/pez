@@ -578,188 +578,188 @@ pub const Decompiler = struct {
 
         // DISABLED CODE - needs fixing for 3.11+ exception tables
         // std.mem.sort(u32, handler_blocks.items, {}, std.sort.asc(u32));
-// 
-//         var handler_set = try std.DynamicBitSet.initEmpty(self.allocator, self.cfg.blocks.len);
-//         defer handler_set.deinit();
-//         for (handler_blocks.items) |hid| {
-//             handler_set.set(hid);
-//         }
-// 
-//         var protected_set = try std.DynamicBitSet.initEmpty(self.allocator, self.cfg.blocks.len);
-//         defer protected_set.deinit();
-//         for (self.cfg.blocks, 0..) |block, i| {
-//             for (block.successors) |edge| {
-//                 if (edge.edge_type == .exception and handler_set.isSet(edge.target)) {
-//                     protected_set.set(i);
-//                     break;
-//                 }
-//             }
-//         }
-// 
-//         var post_try_entry: ?u32 = null;
-//         for (self.cfg.blocks, 0..) |block, i| {
-//             if (!protected_set.isSet(i)) continue;
-//             for (block.successors) |edge| {
-//                 if (edge.edge_type == .exception) continue;
-//                 if (edge.target >= self.cfg.blocks.len) continue;
-//                 if (protected_set.isSet(edge.target)) continue;
-//                 if (handler_set.isSet(edge.target)) continue;
-//                 post_try_entry = if (post_try_entry) |prev|
-//                     @min(prev, edge.target)
-//                 else
-//                     edge.target;
-//             }
-//         }
-// 
-//         var handler_reach = try std.DynamicBitSet.initEmpty(self.allocator, self.cfg.blocks.len);
-//         defer handler_reach.deinit();
-//         for (handler_blocks.items) |hid| {
-//             var reach = try self.collectReachableNoException(hid, &handler_set);
-//             defer reach.deinit();
-//             handler_reach.setUnion(reach);
-//         }
-// 
-//         std.debug.print("Computing join_block, post_try_entry={?}\n", .{post_try_entry});
-//         var join_block: ?u32 = null;
-//         if (post_try_entry) |entry| {
-//             var normal_reach = try self.collectReachableNoException(entry, &handler_set);
-//             defer normal_reach.deinit();
-//             var it = normal_reach.iterator(.{});
-//             while (it.next()) |bit| {
-//                 if (handler_reach.isSet(bit)) {
-//                     join_block = @intCast(bit);
-//                     break;
-//                 }
-//             }
-//         }
-//         std.debug.print("join_block={?}\n", .{join_block});
-// 
-//         var has_finally = false;
-//         for (handler_blocks.items) |hid| {
-//             if (self.isFinallyHandler(hid)) {
-//                 has_finally = true;
-//                 break;
-//             }
-//         }
-// 
-//         var else_start: ?u32 = null;
-//         if (post_try_entry) |entry| {
-//             if (!handler_reach.isSet(entry)) {
-//                 if (join_block == null or entry != join_block.?) {
-//                     else_start = entry;
-//                 }
-//             }
-//         }
-// 
-//         var finally_start: ?u32 = null;
-//         if (has_finally) {
-//             finally_start = join_block orelse post_try_entry;
-//         }
-// 
-//         const handler_start = handler_blocks.items[0];
-//         var try_end: u32 = handler_start;
-//         if (else_start) |start| {
-//             if (start < try_end) try_end = start;
-//         }
-//         if (finally_start) |start| {
-//             if (start < try_end) try_end = start;
-//         }
-// 
-//         const try_body = if (pattern.try_block < try_end and pattern.try_block != try_end)
-//             try self.decompileStructuredRange(pattern.try_block, try_end)
-//         else
-//             &[_]*Stmt{};
-// 
-//         var else_end: u32 = handler_start;
-//         if (else_start) |start| {
-//             if (finally_start) |final_start| {
-//                 if (final_start > start and final_start < else_end) else_end = final_start;
-//             }
-//             if (join_block) |join| {
-//                 if (join > start and join < else_end) else_end = join;
-//             }
-//         }
-// 
-//         const else_body = if (else_start) |start| blk: {
-//             if (start >= else_end) break :blk &[_]*Stmt{};
-//             break :blk try self.decompileStructuredRange(start, else_end);
-//         } else &[_]*Stmt{};
-// 
-//         var final_end: u32 = pattern.exit_block orelse @as(u32, @intCast(self.cfg.blocks.len));
-//         if (finally_start) |final_start| {
-//             if (handler_start > final_start and handler_start < final_end) {
-//                 final_end = handler_start;
-//             }
-//         }
-// 
-//         const final_body = if (finally_start) |start| blk: {
-//             if (start >= final_end) break :blk &[_]*Stmt{};
-//             break :blk try self.decompileStructuredRange(start, final_end);
-//         } else &[_]*Stmt{};
-// 
-//         var handler_nodes = try self.allocator.alloc(ast.ExceptHandler, handler_blocks.items.len);
-//         errdefer {
-//             for (handler_nodes) |*h| {
-//                 if (h.type) |t| {
-//                     t.deinit(self.allocator);
-//                     self.allocator.destroy(t);
-//                 }
-//                 if (h.body.len > 0) self.allocator.free(h.body);
-//             }
-//             self.allocator.free(handler_nodes);
-//         }
-// 
-//         for (handler_blocks.items, 0..) |hid, idx| {
-//             std.debug.print("Processing handler {}: id={}\n", .{idx, hid});
-//             const handler_end = blk: {
-//                 const next_handler = if (idx + 1 < handler_blocks.items.len)
-//                     handler_blocks.items[idx + 1]
-//                 else
-//                     (pattern.exit_block orelse @as(u32, @intCast(self.cfg.blocks.len)));
-//                 if (finally_start) |start| {
-//                     if (start > hid and start < next_handler) break :blk start;
-//                 }
-//                 break :blk next_handler;
-//             };
-//             std.debug.print("handler_end={}\n", .{handler_end});
-// 
-//             const info = try self.extractHandlerHeader(hid);
-//             const body = try self.decompileHandlerBody(hid, handler_end, info.skip_first_store);
-//             handler_nodes[idx] = .{
-//                 .type = info.exc_type,
-//                 .name = info.name,
-//                 .body = body,
-//             };
-//         }
-// 
-//         const stmt = try self.allocator.create(Stmt);
-//         stmt.* = .{
-//             .try_stmt = .{
-//                 .body = try_body,
-//                 .handlers = handler_nodes,
-//                 .else_body = else_body,
-//                 .finalbody = final_body,
-//             },
-//         };
-// 
-//         std.debug.print("final_end={}, try_end={}, else_start={?}, exit={?}\n", .{final_end, try_end, else_start, pattern.exit_block});
-//         var next_block: u32 = final_end;
-//         if (next_block < try_end) next_block = try_end;
-//         if (else_start) |start| {
-//             if (start > next_block) next_block = start;
-//         }
-//         if (pattern.exit_block) |exit| {
-//             if (exit > next_block) next_block = exit;
-//         }
-// 
-//         // Ensure forward progress - must advance past all handlers
-//         const last_handler = handler_blocks.items[handler_blocks.items.len - 1];
-//         if (next_block <= last_handler) {
-//             next_block = last_handler + 1;
-//         }
-// 
-//         std.debug.print("next_block={}\n", .{next_block});
-//         return .{ .stmt = stmt, .next_block = next_block };
+        //
+        //         var handler_set = try std.DynamicBitSet.initEmpty(self.allocator, self.cfg.blocks.len);
+        //         defer handler_set.deinit();
+        //         for (handler_blocks.items) |hid| {
+        //             handler_set.set(hid);
+        //         }
+        //
+        //         var protected_set = try std.DynamicBitSet.initEmpty(self.allocator, self.cfg.blocks.len);
+        //         defer protected_set.deinit();
+        //         for (self.cfg.blocks, 0..) |block, i| {
+        //             for (block.successors) |edge| {
+        //                 if (edge.edge_type == .exception and handler_set.isSet(edge.target)) {
+        //                     protected_set.set(i);
+        //                     break;
+        //                 }
+        //             }
+        //         }
+        //
+        //         var post_try_entry: ?u32 = null;
+        //         for (self.cfg.blocks, 0..) |block, i| {
+        //             if (!protected_set.isSet(i)) continue;
+        //             for (block.successors) |edge| {
+        //                 if (edge.edge_type == .exception) continue;
+        //                 if (edge.target >= self.cfg.blocks.len) continue;
+        //                 if (protected_set.isSet(edge.target)) continue;
+        //                 if (handler_set.isSet(edge.target)) continue;
+        //                 post_try_entry = if (post_try_entry) |prev|
+        //                     @min(prev, edge.target)
+        //                 else
+        //                     edge.target;
+        //             }
+        //         }
+        //
+        //         var handler_reach = try std.DynamicBitSet.initEmpty(self.allocator, self.cfg.blocks.len);
+        //         defer handler_reach.deinit();
+        //         for (handler_blocks.items) |hid| {
+        //             var reach = try self.collectReachableNoException(hid, &handler_set);
+        //             defer reach.deinit();
+        //             handler_reach.setUnion(reach);
+        //         }
+        //
+        //         std.debug.print("Computing join_block, post_try_entry={?}\n", .{post_try_entry});
+        //         var join_block: ?u32 = null;
+        //         if (post_try_entry) |entry| {
+        //             var normal_reach = try self.collectReachableNoException(entry, &handler_set);
+        //             defer normal_reach.deinit();
+        //             var it = normal_reach.iterator(.{});
+        //             while (it.next()) |bit| {
+        //                 if (handler_reach.isSet(bit)) {
+        //                     join_block = @intCast(bit);
+        //                     break;
+        //                 }
+        //             }
+        //         }
+        //         std.debug.print("join_block={?}\n", .{join_block});
+        //
+        //         var has_finally = false;
+        //         for (handler_blocks.items) |hid| {
+        //             if (self.isFinallyHandler(hid)) {
+        //                 has_finally = true;
+        //                 break;
+        //             }
+        //         }
+        //
+        //         var else_start: ?u32 = null;
+        //         if (post_try_entry) |entry| {
+        //             if (!handler_reach.isSet(entry)) {
+        //                 if (join_block == null or entry != join_block.?) {
+        //                     else_start = entry;
+        //                 }
+        //             }
+        //         }
+        //
+        //         var finally_start: ?u32 = null;
+        //         if (has_finally) {
+        //             finally_start = join_block orelse post_try_entry;
+        //         }
+        //
+        //         const handler_start = handler_blocks.items[0];
+        //         var try_end: u32 = handler_start;
+        //         if (else_start) |start| {
+        //             if (start < try_end) try_end = start;
+        //         }
+        //         if (finally_start) |start| {
+        //             if (start < try_end) try_end = start;
+        //         }
+        //
+        //         const try_body = if (pattern.try_block < try_end and pattern.try_block != try_end)
+        //             try self.decompileStructuredRange(pattern.try_block, try_end)
+        //         else
+        //             &[_]*Stmt{};
+        //
+        //         var else_end: u32 = handler_start;
+        //         if (else_start) |start| {
+        //             if (finally_start) |final_start| {
+        //                 if (final_start > start and final_start < else_end) else_end = final_start;
+        //             }
+        //             if (join_block) |join| {
+        //                 if (join > start and join < else_end) else_end = join;
+        //             }
+        //         }
+        //
+        //         const else_body = if (else_start) |start| blk: {
+        //             if (start >= else_end) break :blk &[_]*Stmt{};
+        //             break :blk try self.decompileStructuredRange(start, else_end);
+        //         } else &[_]*Stmt{};
+        //
+        //         var final_end: u32 = pattern.exit_block orelse @as(u32, @intCast(self.cfg.blocks.len));
+        //         if (finally_start) |final_start| {
+        //             if (handler_start > final_start and handler_start < final_end) {
+        //                 final_end = handler_start;
+        //             }
+        //         }
+        //
+        //         const final_body = if (finally_start) |start| blk: {
+        //             if (start >= final_end) break :blk &[_]*Stmt{};
+        //             break :blk try self.decompileStructuredRange(start, final_end);
+        //         } else &[_]*Stmt{};
+        //
+        //         var handler_nodes = try self.allocator.alloc(ast.ExceptHandler, handler_blocks.items.len);
+        //         errdefer {
+        //             for (handler_nodes) |*h| {
+        //                 if (h.type) |t| {
+        //                     t.deinit(self.allocator);
+        //                     self.allocator.destroy(t);
+        //                 }
+        //                 if (h.body.len > 0) self.allocator.free(h.body);
+        //             }
+        //             self.allocator.free(handler_nodes);
+        //         }
+        //
+        //         for (handler_blocks.items, 0..) |hid, idx| {
+        //             std.debug.print("Processing handler {}: id={}\n", .{idx, hid});
+        //             const handler_end = blk: {
+        //                 const next_handler = if (idx + 1 < handler_blocks.items.len)
+        //                     handler_blocks.items[idx + 1]
+        //                 else
+        //                     (pattern.exit_block orelse @as(u32, @intCast(self.cfg.blocks.len)));
+        //                 if (finally_start) |start| {
+        //                     if (start > hid and start < next_handler) break :blk start;
+        //                 }
+        //                 break :blk next_handler;
+        //             };
+        //             std.debug.print("handler_end={}\n", .{handler_end});
+        //
+        //             const info = try self.extractHandlerHeader(hid);
+        //             const body = try self.decompileHandlerBody(hid, handler_end, info.skip_first_store);
+        //             handler_nodes[idx] = .{
+        //                 .type = info.exc_type,
+        //                 .name = info.name,
+        //                 .body = body,
+        //             };
+        //         }
+        //
+        //         const stmt = try self.allocator.create(Stmt);
+        //         stmt.* = .{
+        //             .try_stmt = .{
+        //                 .body = try_body,
+        //                 .handlers = handler_nodes,
+        //                 .else_body = else_body,
+        //                 .finalbody = final_body,
+        //             },
+        //         };
+        //
+        //         std.debug.print("final_end={}, try_end={}, else_start={?}, exit={?}\n", .{final_end, try_end, else_start, pattern.exit_block});
+        //         var next_block: u32 = final_end;
+        //         if (next_block < try_end) next_block = try_end;
+        //         if (else_start) |start| {
+        //             if (start > next_block) next_block = start;
+        //         }
+        //         if (pattern.exit_block) |exit| {
+        //             if (exit > next_block) next_block = exit;
+        //         }
+        //
+        //         // Ensure forward progress - must advance past all handlers
+        //         const last_handler = handler_blocks.items[handler_blocks.items.len - 1];
+        //         if (next_block <= last_handler) {
+        //             next_block = last_handler + 1;
+        //         }
+        //
+        //         std.debug.print("next_block={}\n", .{next_block});
+        //         return .{ .stmt = stmt, .next_block = next_block };
     }
 
     fn decompileWith(self: *Decompiler, pattern: ctrl.WithPattern) DecompileError!PatternResult {
@@ -1153,6 +1153,11 @@ pub const Decompiler = struct {
                     }
                 },
                 .STORE_NAME, .STORE_GLOBAL => {
+                    if (skip_first_store.*) {
+                        skip_first_store.* = false;
+                        try sim.simulate(inst);
+                        continue;
+                    }
                     const name = sim.getName(inst.arg) orelse "<unknown>";
                     const value = sim.stack.pop() orelse return error.StackUnderflow;
                     if (try self.handleStoreValue(name, value)) |stmt| {
