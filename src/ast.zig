@@ -1460,6 +1460,13 @@ pub fn makeBinOp(allocator: Allocator, left: *Expr, op: BinOp, right: *Expr) !*E
     return expr;
 }
 
+/// Create a comparison expression.
+pub fn makeCompare(allocator: Allocator, left: *Expr, ops: []const CmpOp, comparators: []const *Expr) !*Expr {
+    const expr = try allocator.create(Expr);
+    expr.* = .{ .compare = .{ .left = left, .ops = ops, .comparators = comparators } };
+    return expr;
+}
+
 /// Create a function call expression.
 pub fn makeCall(allocator: Allocator, func: *Expr, args: []const *Expr) !*Expr {
     return makeCallWithKeywords(allocator, func, args, &.{});
