@@ -389,12 +389,138 @@ pub const Decompiler = struct {
         return expr;
     }
 
+    fn simulateConditionExpr(
+        self: *Decompiler,
+        block_id: u32,
+        base_vals: []const StackValue,
+    ) DecompileError!?*Expr {
+        if (block_id >= self.cfg.blocks.len) return null;
+        const block = &self.cfg.blocks[block_id];
+
+        var sim = SimContext.init(self.arena.allocator(), self.code, self.version);
+        defer sim.deinit();
+
+        for (base_vals) |val| {
+            try sim.stack.push(try sim.cloneStackValue(val));
+        }
+
+        for (block.instructions) |inst| {
+            if (ctrl.Analyzer.isConditionalJump(undefined, inst.opcode)) break;
+            if (isStatementOpcode(inst.opcode)) return null;
+            try sim.simulate(inst);
+        }
+
+        const expr = sim.stack.popExpr() catch return null;
+        if (sim.stack.len() != base_vals.len) return null;
+        return expr;
+    }
+
     fn tryDecompileTernaryInto(
         self: *Decompiler,
         block_id: u32,
         limit: u32,
         stmts: *std.ArrayList(*Stmt),
     ) DecompileError!?u32 {
+        if (try self.analyzer.detectTernaryChain(block_id)) |chain| {
+            defer self.allocator.free(chain.condition_blocks);
+            if (chain.true_block >= limit or chain.false_block >= limit or chain.merge_block >= limit) {
+                return null;
+            }
+            if (chain.merge_block <= block_id) return null;
+
+            var condition: *Expr = undefined;
+            var base_vals: []StackValue = &.{};
+            var base_owned = false;
+            var true_expr: *Expr = undefined;
+            var false_expr: *Expr = undefined;
+            var if_expr: *Expr = undefined;
+
+            var cond_list: std.ArrayListUnmanaged(*Expr) = .{};
+            defer cond_list.deinit(self.allocator);
+
+            // Note: expressions are arena-allocated, so no explicit cleanup needed
+            defer {
+                if (base_owned) {
+                    deinitStackValuesSlice(self.allocator, base_vals);
+                }
+            }
+
+            const cond_block = &self.cfg.blocks[chain.condition_blocks[0]];
+            var cond_sim = SimContext.init(self.arena.allocator(), self.code, self.version);
+            defer cond_sim.deinit();
+
+            // Check for pending ternary expression from a previous ternary
+            if (self.pending_ternary_expr) |expr| {
+                try cond_sim.stack.push(.{ .expr = expr });
+                self.pending_ternary_expr = null;
+            }
+
+            // Process condition block, emitting any leading statements
+            for (cond_block.instructions) |inst| {
+                if (ctrl.Analyzer.isConditionalJump(undefined, inst.opcode)) break;
+                if (isStatementOpcode(inst.opcode)) {
+                    if (try self.tryEmitStatement(inst, &cond_sim)) |stmt| {
+                        try stmts.append(self.allocator, stmt);
+                    }
+                } else {
+                    try cond_sim.simulate(inst);
+                }
+            }
+
+            const first_cond = cond_sim.stack.popExpr() catch return null;
+            try cond_list.append(self.allocator, first_cond);
+
+            base_vals = try self.cloneStackValues(&cond_sim, cond_sim.stack.items.items);
+            base_owned = true;
+
+            if (chain.condition_blocks.len > 1) {
+                for (chain.condition_blocks[1..]) |cond_id| {
+                    const cond_opt = try self.simulateConditionExpr(cond_id, base_vals);
+                    if (cond_opt == null) return null;
+                    try cond_list.append(self.allocator, cond_opt.?);
+                }
+            }
+
+            if (cond_list.items.len == 1) {
+                condition = cond_list.items[0];
+            } else {
+                const a = self.arena.allocator();
+                const values = try a.dupe(*Expr, cond_list.items);
+                const bool_expr = try a.create(Expr);
+                bool_expr.* = .{ .bool_op = .{
+                    .op = if (chain.is_and) .and_ else .or_,
+                    .values = values,
+                } };
+                condition = bool_expr;
+            }
+
+            const true_opt = try self.simulateTernaryBranch(chain.true_block, base_vals);
+            if (true_opt == null) return null;
+            true_expr = true_opt.?;
+
+            const false_opt = try self.simulateTernaryBranch(chain.false_block, base_vals);
+            if (false_opt == null) return null;
+            false_expr = false_opt.?;
+
+            const a = self.arena.allocator();
+            if_expr = try a.create(Expr);
+            if_expr.* = .{ .if_exp = .{
+                .condition = condition,
+                .body = true_expr,
+                .else_body = false_expr,
+            } };
+
+            // Don't process the merge block here - just save the ternary result
+            // The main loop will process the merge block and consume this expression
+            self.pending_ternary_expr = if_expr;
+
+            // Free base_vals since we're not using them
+            base_owned = false;
+            deinitStackValuesSlice(self.allocator, base_vals);
+
+            return chain.merge_block;
+        }
+
         const pattern = self.analyzer.detectTernary(block_id) orelse return null;
         if (pattern.true_block >= limit or pattern.false_block >= limit or pattern.merge_block >= limit) {
             return null;

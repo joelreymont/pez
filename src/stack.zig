@@ -2060,19 +2060,43 @@ pub const SimContext = struct {
                     }
                 }
 
-                // Python 2.x and 3.0-3.2: arg is count of defaults
+                // Python 2.x: arg is count of defaults
+                // Python 3.0-3.2: arg low 8 bits = positional defaults, high 8 bits = kw-only defaults
                 // Python 3.3+: arg is flags bitmap
                 if (self.version.lt(3, 3)) {
                     // Pop the code object first
                     const code_val = self.stack.pop() orelse return error.StackUnderflow;
 
-                    // Pop 'arg' defaults from stack
-                    const num_defaults = inst.arg;
-                    if (num_defaults > 0) {
-                        const def_exprs = try self.allocator.alloc(*Expr, num_defaults);
+                    // Python 3.0-3.2: split 16-bit arg into positional and kw-only defaults
+                    // Python 2.x: just positional defaults count
+                    const num_pos_defaults: usize = if (self.version.gte(3, 0))
+                        inst.arg & 0xFF
+                    else
+                        inst.arg;
+                    const num_kw_defaults: usize = if (self.version.gte(3, 0))
+                        (inst.arg >> 8) & 0xFF
+                    else
+                        0;
+
+                    // Pop keyword-only defaults (pairs of name, value)
+                    if (num_kw_defaults > 0) {
                         var i: usize = 0;
-                        while (i < num_defaults) : (i += 1) {
-                            const idx = num_defaults - 1 - i;
+                        while (i < num_kw_defaults * 2) : (i += 1) {
+                            if (self.stack.pop()) |val| {
+                                var v = val;
+                                v.deinit(self.allocator);
+                            } else {
+                                return error.StackUnderflow;
+                            }
+                        }
+                    }
+
+                    // Pop positional defaults
+                    if (num_pos_defaults > 0) {
+                        const def_exprs = try self.allocator.alloc(*Expr, num_pos_defaults);
+                        var i: usize = 0;
+                        while (i < num_pos_defaults) : (i += 1) {
+                            const idx = num_pos_defaults - 1 - i;
                             if (self.stack.pop()) |val| {
                                 switch (val) {
                                     .expr => |e| def_exprs[idx] = e,

@@ -170,6 +170,20 @@ pub const TernaryPattern = struct {
     merge_block: u32,
 };
 
+/// Pattern for ternary expressions with chained conditions (a and b if cond else c).
+pub const TernaryChainPattern = struct {
+    /// Blocks containing the condition tests in order.
+    condition_blocks: []const u32,
+    /// Block containing the true value.
+    true_block: u32,
+    /// Block containing the false value.
+    false_block: u32,
+    /// Block where both branches merge.
+    merge_block: u32,
+    /// True for 'and', false for 'or'.
+    is_and: bool,
+};
+
 /// Pattern for short-circuit boolean expressions (x and y, x or y).
 pub const BoolOpPattern = struct {
     /// Block containing first operand and condition test.
@@ -355,6 +369,135 @@ pub const Analyzer = struct {
             .true_block = true_id,
             .false_block = false_id,
             .merge_block = merge,
+        };
+    }
+
+    /// Detect ternary expression pattern with chained and/or conditions.
+    pub fn detectTernaryChain(self: *const Analyzer, block_id: u32) Allocator.Error!?TernaryChainPattern {
+        if (block_id >= self.cfg.blocks.len) return null;
+
+        var cond_blocks: std.ArrayListUnmanaged(u32) = .{};
+        var moved = false;
+        defer if (!moved) cond_blocks.deinit(self.allocator);
+
+        var is_and: ?bool = null;
+        var short_id: ?u32 = null;
+        var cont_id: ?u32 = null;
+        var cur = block_id;
+
+        while (true) {
+            if (cur >= self.cfg.blocks.len) break;
+            const blk = &self.cfg.blocks[cur];
+            const term = blk.terminator() orelse break;
+            if (!self.isConditionalJump(term.opcode)) break;
+            if (blk.successors.len != 2) break;
+
+            const jump_is_and = switch (term.opcode) {
+                .POP_JUMP_IF_FALSE, .POP_JUMP_FORWARD_IF_FALSE, .POP_JUMP_BACKWARD_IF_FALSE => true,
+                .POP_JUMP_IF_TRUE, .POP_JUMP_FORWARD_IF_TRUE, .POP_JUMP_BACKWARD_IF_TRUE => false,
+                else => break,
+            };
+
+            if (is_and) |v| {
+                if (v != jump_is_and) return null;
+            } else {
+                is_and = jump_is_and;
+            }
+
+            var true_id: ?u32 = null;
+            var false_id: ?u32 = null;
+            for (blk.successors) |edge| {
+                if (edge.edge_type == .conditional_true or edge.edge_type == .normal) {
+                    true_id = edge.target;
+                } else if (edge.edge_type == .conditional_false) {
+                    false_id = edge.target;
+                }
+            }
+            if (true_id == null or false_id == null) return null;
+
+            const short = if (jump_is_and) false_id.? else true_id.?;
+            const cont = if (jump_is_and) true_id.? else false_id.?;
+
+            if (short_id) |sid| {
+                if (sid != short) return null;
+            } else {
+                short_id = short;
+            }
+
+            try cond_blocks.append(self.allocator, cur);
+            cont_id = cont;
+
+            const next_blk = &self.cfg.blocks[cont];
+            const next_term = next_blk.terminator() orelse break;
+            if (!self.isConditionalJump(next_term.opcode)) break;
+            if (next_blk.successors.len != 2) return null;
+
+            const next_is_and = switch (next_term.opcode) {
+                .POP_JUMP_IF_FALSE, .POP_JUMP_FORWARD_IF_FALSE, .POP_JUMP_BACKWARD_IF_FALSE => true,
+                .POP_JUMP_IF_TRUE, .POP_JUMP_FORWARD_IF_TRUE, .POP_JUMP_BACKWARD_IF_TRUE => false,
+                else => return null,
+            };
+            if (next_is_and != jump_is_and) return null;
+
+            var next_true: ?u32 = null;
+            var next_false: ?u32 = null;
+            for (next_blk.successors) |edge| {
+                if (edge.edge_type == .conditional_true or edge.edge_type == .normal) {
+                    next_true = edge.target;
+                } else if (edge.edge_type == .conditional_false) {
+                    next_false = edge.target;
+                }
+            }
+            if (next_true == null or next_false == null) return null;
+
+            const next_short = if (next_is_and) next_false.? else next_true.?;
+            if (next_short != short) return null;
+
+            cur = cont;
+        }
+
+        if (cond_blocks.items.len == 0) return null;
+        const chain_is_and = is_and orelse return null;
+        const short_target = short_id orelse return null;
+        const end_id = cont_id orelse return null;
+
+        const true_id = if (chain_is_and) end_id else short_target;
+        const false_id = if (chain_is_and) short_target else end_id;
+
+        const true_blk = &self.cfg.blocks[true_id];
+        const false_blk = &self.cfg.blocks[false_id];
+
+        const true_merge = blk: {
+            for (true_blk.successors) |edge| {
+                if (edge.edge_type == .normal) break :blk edge.target;
+            }
+            break :blk null;
+        };
+
+        const false_merge = blk: {
+            for (false_blk.successors) |edge| {
+                if (edge.edge_type == .normal) break :blk edge.target;
+            }
+            break :blk null;
+        };
+
+        if (true_merge == null or false_merge == null) return null;
+
+        const merge = if (true_merge == false_id)
+            false_merge.?
+        else if (true_merge == false_merge)
+            true_merge.?
+        else
+            return null;
+
+        const blocks = try cond_blocks.toOwnedSlice(self.allocator);
+        moved = true;
+        return .{
+            .condition_blocks = blocks,
+            .true_block = true_id,
+            .false_block = false_id,
+            .merge_block = merge,
+            .is_and = chain_is_and,
         };
     }
 
