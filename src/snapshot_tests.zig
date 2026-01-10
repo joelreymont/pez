@@ -595,6 +595,50 @@ test "snapshot list unpack" {
     ).expectEqual(output);
 }
 
+test "snapshot list extend const tuple" {
+    const allocator = testing.allocator;
+    const version = Version.init(3, 10);
+
+    const name = try allocator.dupe(u8, "list_extend_const_tuple");
+    defer allocator.free(name);
+
+    var tuple_items = [_]pyc.Object{
+        .{ .int = pyc.Int.fromI64(1) },
+        .{ .int = pyc.Int.fromI64(2) },
+    };
+    var consts = [_]pyc.Object{
+        .{ .tuple = tuple_items[0..] },
+    };
+
+    var code = pyc.Code{
+        .allocator = allocator,
+        .consts = &consts,
+        .name = name,
+    };
+
+    const insts = [_]Instruction{
+        inst(.BUILD_LIST, 0),
+        inst(.LOAD_CONST, 0),
+        inst(.LIST_EXTEND, 1),
+    };
+
+    const expr = try simulateExpr(allocator, &code, version, &insts);
+    defer {
+        expr.deinit(allocator);
+        allocator.destroy(expr);
+    }
+
+    const output = try renderExprWithNewline(allocator, expr);
+    defer allocator.free(output);
+
+    const oh = OhSnap{};
+    try oh.snap(@src(),
+        \\[]const u8
+        \\  "[1, 2]
+        \\"
+    ).expectEqual(output);
+}
+
 test "snapshot call with keywords" {
     const allocator = testing.allocator;
     const version = Version.init(3, 10);
@@ -797,6 +841,59 @@ test "snapshot ternary expression output" {
     try oh.snap(@src(),
         \\[]const u8
         \\  "x = 1 if a else 2
+        \\"
+    ).expectEqual(output);
+}
+
+test "snapshot ternary boolop condition output" {
+    const allocator = testing.allocator;
+    const version = Version.init(3, 10);
+
+    var module = pyc.Code{
+        .allocator = allocator,
+    };
+    defer module.deinit();
+
+    module.name = try allocator.dupe(u8, "<module>");
+    module.names = try dupeStrings(allocator, &[_][]const u8{ "a", "result" });
+
+    const consts = try allocator.alloc(pyc.Object, 5);
+    consts[0] = .{ .int = pyc.Int.fromI64(0) };
+    consts[1] = .{ .int = pyc.Int.fromI64(2) };
+    consts[2] = .{ .string = try allocator.dupe(u8, "yes") };
+    consts[3] = .{ .string = try allocator.dupe(u8, "no") };
+    consts[4] = .none;
+    module.consts = consts;
+
+    const module_ops = [_]OpArg{
+        .{ .op = .LOAD_NAME, .arg = 0 },
+        .{ .op = .LOAD_CONST, .arg = 0 },
+        .{ .op = .COMPARE_OP, .arg = 0 },
+        .{ .op = .POP_JUMP_IF_FALSE, .arg = 24 },
+        .{ .op = .LOAD_NAME, .arg = 0 },
+        .{ .op = .LOAD_CONST, .arg = 1 },
+        .{ .op = .BINARY_MODULO, .arg = 0 },
+        .{ .op = .LOAD_CONST, .arg = 0 },
+        .{ .op = .COMPARE_OP, .arg = 2 },
+        .{ .op = .POP_JUMP_IF_FALSE, .arg = 24 },
+        .{ .op = .LOAD_CONST, .arg = 2 },
+        .{ .op = .JUMP_FORWARD, .arg = 2 },
+        .{ .op = .LOAD_CONST, .arg = 3 },
+        .{ .op = .STORE_NAME, .arg = 1 },
+        .{ .op = .LOAD_CONST, .arg = 4 },
+        .{ .op = .RETURN_VALUE, .arg = 0 },
+    };
+    module.code = try emitOpsOwned(allocator, version, &module_ops);
+
+    var out: std.ArrayList(u8) = .{};
+    defer out.deinit(allocator);
+    try decompile.decompileToSource(allocator, &module, version, out.writer(allocator));
+    const output: []const u8 = out.items;
+
+    const oh = OhSnap{};
+    try oh.snap(@src(),
+        \\[]const u8
+        \\  "result = "yes" if a < 0 and a % 2 == 0 else "no"
         \\"
     ).expectEqual(output);
 }

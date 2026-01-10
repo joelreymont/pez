@@ -2042,14 +2042,15 @@ pub const SimContext = struct {
 
             .MAKE_FUNCTION => {
                 // MAKE_FUNCTION creates a function from a code object on the stack.
-                // Python 2.x: codeobj on stack.
-                // Python 3.0-3.2: codeobj on stack.
-                // Python 3.3-3.10: TOS=qualname, TOS1=code (PEP 3155).
-                // Python 3.11+: codeobj on stack (qualname in code object).
-                //
-                // Stack: code_obj, [qualname] -> function (qualname on TOS for 3.3-3.10)
+                // Python 2.x/3.0-3.2: arg = number of defaults to pop
+                // Python 3.3-3.10: arg = flags bitmap, qualname on TOS
+                // Python 3.11+: arg = flags bitmap, qualname in code object
 
-                // Python 3.3-3.10 has qualname on TOS (PEP 3155)
+                var defaults: []const *Expr = &.{};
+                var kw_defaults: []const ?*Expr = &.{};
+                var annotations: []const Annotation = &.{};
+
+                // Python 3.3+ has qualname on TOS (PEP 3155) until 3.11
                 if (self.version.gte(3, 3) and self.version.lt(3, 11)) {
                     if (self.stack.pop()) |qualname| {
                         var val = qualname;
@@ -2059,6 +2060,68 @@ pub const SimContext = struct {
                     }
                 }
 
+                // Python 2.x and 3.0-3.2: arg is count of defaults
+                // Python 3.3+: arg is flags bitmap
+                if (self.version.lt(3, 3)) {
+                    // Pop the code object first
+                    const code_val = self.stack.pop() orelse return error.StackUnderflow;
+
+                    // Pop 'arg' defaults from stack
+                    const num_defaults = inst.arg;
+                    if (num_defaults > 0) {
+                        const def_exprs = try self.allocator.alloc(*Expr, num_defaults);
+                        var i: usize = 0;
+                        while (i < num_defaults) : (i += 1) {
+                            const idx = num_defaults - 1 - i;
+                            if (self.stack.pop()) |val| {
+                                switch (val) {
+                                    .expr => |e| def_exprs[idx] = e,
+                                    else => {
+                                        var v = val;
+                                        v.deinit(self.allocator);
+                                        def_exprs[idx] = try ast.makeName(self.allocator, "<default>", .load);
+                                    },
+                                }
+                            } else {
+                                return error.StackUnderflow;
+                            }
+                        }
+                        defaults = def_exprs;
+                    }
+
+                    switch (code_val) {
+                        .code_obj => |code| {
+                            if (compKindFromName(code.name)) |kind| {
+                                try self.stack.push(.{ .comp_obj = .{ .code = code, .kind = kind } });
+                                return;
+                            }
+                            if (std.mem.eql(u8, code.name, "<lambda>")) {
+                                const expr = try buildLambdaExpr(self.allocator, code, self.version);
+                                try self.stack.push(.{ .expr = expr });
+                                return;
+                            }
+
+                            const func = try self.allocator.create(FunctionValue);
+                            func.* = .{
+                                .code = code,
+                                .decorators = .{},
+                                .defaults = defaults,
+                                .kw_defaults = &.{},
+                                .annotations = &.{},
+                            };
+                            try self.stack.push(.{ .function_obj = func });
+                        },
+                        else => {
+                            var v = code_val;
+                            v.deinit(self.allocator);
+                            const expr = try ast.makeName(self.allocator, "<function>", .load);
+                            try self.stack.push(.{ .expr = expr });
+                        },
+                    }
+                    return;
+                }
+
+                // Python 3.3+: pop code object
                 const code_val = self.stack.pop() orelse return error.StackUnderflow;
 
                 if ((inst.arg & 0x08) != 0) {
@@ -2069,7 +2132,6 @@ pub const SimContext = struct {
                         return error.StackUnderflow;
                     }
                 }
-                var annotations: []const Annotation = &.{};
                 if ((inst.arg & 0x04) != 0) {
                     if (self.stack.pop()) |ann_val| {
                         annotations = try self.parseAnnotations(ann_val);
@@ -2077,7 +2139,6 @@ pub const SimContext = struct {
                         return error.StackUnderflow;
                     }
                 }
-                var kw_defaults: []const ?*Expr = &.{};
                 if ((inst.arg & 0x02) != 0) {
                     if (self.stack.pop()) |kwdefaults| {
                         kw_defaults = try self.parseKwDefaults(kwdefaults);
@@ -2085,7 +2146,6 @@ pub const SimContext = struct {
                         return error.StackUnderflow;
                     }
                 }
-                var defaults: []const *Expr = &.{};
                 if ((inst.arg & 0x01) != 0) {
                     if (self.stack.pop()) |def_val| {
                         defaults = try self.parseDefaults(def_val);
@@ -2838,6 +2898,22 @@ pub const SimContext = struct {
                 // Used to construct classes: __build_class__(func, name, *bases, **keywords)
                 const expr = try ast.makeName(self.allocator, "__build_class__", .load);
                 try self.stack.push(.{ .expr = expr });
+            },
+
+            .LOAD_LOCALS => {
+                // LOAD_LOCALS - Python 2.x: push locals() dict onto stack
+                // Used at end of class body to return the class namespace
+                const func_expr = try ast.makeName(self.allocator, "locals", .load);
+                const expr = try ast.makeCall(self.allocator, func_expr, &.{});
+                try self.stack.push(.{ .expr = expr });
+            },
+
+            .STORE_LOCALS => {
+                // STORE_LOCALS - Python 3.0-3.3: store TOS to locals (used in class bodies)
+                if (self.stack.pop()) |v| {
+                    var val = v;
+                    val.deinit(self.allocator);
+                }
             },
 
             .LOAD_CLASSDEREF => {

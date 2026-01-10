@@ -883,6 +883,13 @@ pub const Module = struct {
             };
         }
 
+        // TYPE_STRINGREF - Python 2.x reference to interned string by index
+        if (obj_type == .TYPE_STRINGREF) {
+            const ref_idx = try reader.readU32();
+            if (ref_idx >= self.interns.items.len) return error.InvalidRef;
+            return try self.allocator.dupe(u8, self.interns.items[ref_idx]);
+        }
+
         const len: usize = switch (obj_type) {
             .TYPE_STRING, .TYPE_ASCII, .TYPE_INTERNED, .TYPE_ASCII_INTERNED, .TYPE_UNICODE => try reader.readU32(),
             .TYPE_SHORT_ASCII, .TYPE_SHORT_ASCII_INTERNED => try reader.readByte(),
