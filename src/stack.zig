@@ -1464,6 +1464,63 @@ pub const SimContext = struct {
                 try self.handleCall(callable, args_vals, &[_]ast.Keyword{}, iter_expr_from_stack);
             },
 
+            .CALL_KW => {
+                // CALL_KW argc - call with kwargs
+                // Stack: callable, posargs..., kwvalues..., kwnames_tuple
+                const argc = inst.arg;
+
+                // Pop kwnames tuple
+                const kwnames_val = self.stack.pop() orelse return error.StackUnderflow;
+                defer kwnames_val.deinit(self.allocator);
+
+                var kwnames: []const []const u8 = &.{};
+                if (kwnames_val == .expr and kwnames_val.expr.* == .tuple) {
+                    const tuple_elts = kwnames_val.expr.tuple.elts;
+                    const names = try self.allocator.alloc([]const u8, tuple_elts.len);
+                    for (tuple_elts, 0..) |elt, i| {
+                        if (elt.* == .constant and elt.constant == .string) {
+                            names[i] = elt.constant.string;
+                        } else {
+                            names[i] = "<unknown>";
+                        }
+                    }
+                    kwnames = names;
+                }
+                defer if (kwnames.len > 0) self.allocator.free(kwnames);
+
+                const num_kwargs = kwnames.len;
+                const num_posargs = argc - num_kwargs;
+
+                // Pop all args (positional + keyword values)
+                const all_vals = try self.stack.popN(argc);
+                defer self.deinitStackValues(all_vals);
+
+                const posargs = all_vals[0..num_posargs];
+                const kwvalues = all_vals[num_posargs..];
+
+                // Pop callable (with optional NULL marker)
+                const maybe_null = self.stack.pop() orelse return error.StackUnderflow;
+                var callable = maybe_null;
+                if (maybe_null == .null_marker) {
+                    callable = self.stack.pop() orelse return error.StackUnderflow;
+                }
+
+                // Build kwargs
+                const keywords = try self.allocator.alloc(ast.Keyword, num_kwargs);
+                for (kwnames, kwvalues, 0..) |name, kwval, i| {
+                    const value = switch (kwval) {
+                        .expr => |e| e,
+                        else => return error.NotAnExpression,
+                    };
+                    keywords[i] = .{
+                        .arg = if (std.mem.eql(u8, name, "<unknown>")) null else name,
+                        .value = value,
+                    };
+                }
+
+                try self.handleCall(callable, posargs, keywords, null);
+            },
+
             .CALL_METHOD => {
                 // 3.7-3.10: CALL_METHOD argc (expects extra self/NULL slot)
                 const argc = inst.arg;
@@ -2451,6 +2508,46 @@ pub const SimContext = struct {
             },
 
             // Format string opcodes
+            .FORMAT_SIMPLE => {
+                // FORMAT_SIMPLE - format TOS for f-string (no conversion, no format spec)
+                const value = try self.stack.popExpr();
+                errdefer {
+                    value.deinit(self.allocator);
+                    self.allocator.destroy(value);
+                }
+
+                const expr = try self.allocator.create(Expr);
+                expr.* = .{ .formatted_value = .{
+                    .value = value,
+                    .conversion = null,
+                    .format_spec = null,
+                } };
+                try self.stack.push(.{ .expr = expr });
+            },
+
+            .FORMAT_WITH_SPEC => {
+                // FORMAT_WITH_SPEC - format value with format spec from stack
+                const format_spec = try self.stack.popExpr();
+                errdefer {
+                    format_spec.deinit(self.allocator);
+                    self.allocator.destroy(format_spec);
+                }
+
+                const value = try self.stack.popExpr();
+                errdefer {
+                    value.deinit(self.allocator);
+                    self.allocator.destroy(value);
+                }
+
+                const expr = try self.allocator.create(Expr);
+                expr.* = .{ .formatted_value = .{
+                    .value = value,
+                    .conversion = null,
+                    .format_spec = format_spec,
+                } };
+                try self.stack.push(.{ .expr = expr });
+            },
+
             .FORMAT_VALUE => {
                 // FORMAT_VALUE flags - format TOS for f-string
                 // flags & 0x03: conversion (0=none, 1=str, 2=repr, 3=ascii)
