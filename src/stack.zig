@@ -259,6 +259,8 @@ pub const SimContext = struct {
     iter_override: ?IterOverride = null,
     /// Optional comprehension builder not stored on the stack.
     comp_builder: ?*CompBuilder = null,
+    /// Pending keyword argument names from KW_NAMES (3.11+).
+    pending_kwnames: ?[]const []const u8 = null,
 
     pub fn init(allocator: Allocator, code: *const pyc.Code, version: Version) SimContext {
         return .{
@@ -1436,6 +1438,30 @@ pub const SimContext = struct {
                 }
             },
 
+            .KW_NAMES => {
+                // KW_NAMES arg - sets keyword names for following CALL (3.11+)
+                // arg is index into co_consts for tuple of keyword name strings
+                if (self.getConst(inst.arg)) |obj| {
+                    if (obj == .tuple) {
+                        const tuple = obj.tuple;
+                        const names = try self.allocator.alloc([]const u8, tuple.len);
+                        for (tuple, 0..) |elem, i| {
+                            if (elem == .string) {
+                                names[i] = elem.string;
+                            } else {
+                                names[i] = "<unknown>";
+                            }
+                        }
+                        self.pending_kwnames = names;
+                    }
+                }
+            },
+
+            .PRECALL => {
+                // PRECALL - no-op in 3.11, removed in 3.12
+                // Used for specialization hints, no stack effect
+            },
+
             .CALL => {
                 // In 3.11+: CALL argc with optional NULL marker.
                 const argc = inst.arg;
@@ -1461,7 +1487,37 @@ pub const SimContext = struct {
                     }
                 }
 
-                try self.handleCall(callable, args_vals, &[_]ast.Keyword{}, iter_expr_from_stack);
+                // Check if KW_NAMES set up keyword argument names
+                if (self.pending_kwnames) |kwnames| {
+                    defer {
+                        self.allocator.free(kwnames);
+                        self.pending_kwnames = null;
+                    }
+                    const num_kwargs = kwnames.len;
+                    const num_posargs = argc - num_kwargs;
+
+                    // Split args into positional and keyword
+                    const posargs = args_vals[0..num_posargs];
+                    const kwvalues = args_vals[num_posargs..];
+
+                    // Build keyword arguments
+                    const keywords = try self.allocator.alloc(ast.Keyword, num_kwargs);
+                    errdefer self.allocator.free(keywords);
+                    for (kwnames, kwvalues, 0..) |name, kwval, i| {
+                        const value = switch (kwval) {
+                            .expr => |e| e,
+                            else => return error.NotAnExpression,
+                        };
+                        keywords[i] = .{
+                            .arg = if (std.mem.eql(u8, name, "<unknown>")) null else name,
+                            .value = value,
+                        };
+                    }
+
+                    try self.handleCall(callable, posargs, keywords, iter_expr_from_stack);
+                } else {
+                    try self.handleCall(callable, args_vals, &[_]ast.Keyword{}, iter_expr_from_stack);
+                }
             },
 
             .CALL_KW => {
