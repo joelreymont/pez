@@ -1240,7 +1240,7 @@ pub const SimContext = struct {
                 }
             },
 
-            .LOAD_FAST_BORROW_LOAD_FAST_BORROW => {
+            .LOAD_FAST_LOAD_FAST, .LOAD_FAST_BORROW_LOAD_FAST_BORROW => {
                 // Combined instruction that loads two fast variables
                 // arg encodes two 4-bit indices: first in high nibble, second in low nibble
                 // For arg=0x12: first_idx=1, second_idx=2

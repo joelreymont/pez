@@ -550,6 +550,7 @@ pub const Decompiler = struct {
         if (cmp_inst.opcode != .COMPARE_OP) return null;
         if (load_inst.opcode != .LOAD_NAME and
             load_inst.opcode != .LOAD_FAST and
+            load_inst.opcode != .LOAD_FAST_BORROW and
             load_inst.opcode != .LOAD_GLOBAL) return null;
 
         // This is a chained comparison!
@@ -1650,9 +1651,12 @@ pub const Decompiler = struct {
         errdefer self.allocator.destroy(nested_ptr);
 
         nested_ptr.* = try Decompiler.init(self.allocator, code, self.version);
-        try self.nested_decompilers.append(self.allocator, nested_ptr);
+        errdefer nested_ptr.deinit();
 
         _ = try nested_ptr.decompile();
+
+        // Only track after successful decompile - errdefer handles failure cleanup
+        try self.nested_decompilers.append(self.allocator, nested_ptr);
         const a = self.arena.allocator();
         const body = try a.dupe(*Stmt, nested_ptr.statements.items);
         return body;
