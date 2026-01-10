@@ -21,7 +21,7 @@ PYC2=$(find "$TMPDIR/__pycache__" -name "first*.pyc" | head -1)
 # Second decompile
 ./zig-out/bin/pez "$PYC2" > "$TMPDIR/second.py"
 
-# Compare (normalize whitespace)
-diff -u <(cat "$TMPDIR/first.py" | sed 's/[[:space:]]*$//' | grep -v '^$') \
-        <(cat "$TMPDIR/second.py" | sed 's/[[:space:]]*$//' | grep -v '^$') \
+# Compare (normalize whitespace, skip header comments)
+diff -u <(cat "$TMPDIR/first.py" | sed 's/[[:space:]]*$//' | grep -v '^#' | grep -v '^$') \
+        <(cat "$TMPDIR/second.py" | sed 's/[[:space:]]*$//' | grep -v '^#' | grep -v '^$') \
     && echo "PASS" || echo "FAIL"
