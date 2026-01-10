@@ -1233,7 +1233,7 @@ pub const SimContext = struct {
     /// Simulate a single instruction.
     pub fn simulate(self: *SimContext, inst: Instruction) SimError!void {
         switch (inst.opcode) {
-            .NOP, .RESUME, .CACHE, .EXTENDED_ARG => {
+            .NOP, .RESUME, .CACHE, .EXTENDED_ARG, .NOT_TAKEN => {
                 // No stack effect
             },
 
@@ -1406,6 +1406,51 @@ pub const SimContext = struct {
                 }
 
                 const op = binOpFromArg(inst.arg);
+                const expr = try ast.makeBinOp(self.allocator, left, op, right);
+                try self.stack.push(.{ .expr = expr });
+            },
+
+            // Legacy binary operators (Python < 3.11)
+            .BINARY_ADD,
+            .BINARY_SUBTRACT,
+            .BINARY_MULTIPLY,
+            .BINARY_MODULO,
+            .BINARY_POWER,
+            .BINARY_TRUE_DIVIDE,
+            .BINARY_FLOOR_DIVIDE,
+            .BINARY_LSHIFT,
+            .BINARY_RSHIFT,
+            .BINARY_AND,
+            .BINARY_XOR,
+            .BINARY_OR,
+            .BINARY_MATRIX_MULTIPLY,
+            => {
+                const right = try self.stack.popExpr();
+                errdefer {
+                    right.deinit(self.allocator);
+                    self.allocator.destroy(right);
+                }
+                const left = try self.stack.popExpr();
+                errdefer {
+                    left.deinit(self.allocator);
+                    self.allocator.destroy(left);
+                }
+                const op: ast.BinOp = switch (inst.opcode) {
+                    .BINARY_ADD => .add,
+                    .BINARY_SUBTRACT => .sub,
+                    .BINARY_MULTIPLY => .mult,
+                    .BINARY_MODULO => .mod,
+                    .BINARY_POWER => .pow,
+                    .BINARY_TRUE_DIVIDE => .div,
+                    .BINARY_FLOOR_DIVIDE => .floordiv,
+                    .BINARY_LSHIFT => .lshift,
+                    .BINARY_RSHIFT => .rshift,
+                    .BINARY_AND => .bitand,
+                    .BINARY_XOR => .bitxor,
+                    .BINARY_OR => .bitor,
+                    .BINARY_MATRIX_MULTIPLY => .matmult,
+                    else => unreachable,
+                };
                 const expr = try ast.makeBinOp(self.allocator, left, op, right);
                 try self.stack.push(.{ .expr = expr });
             },

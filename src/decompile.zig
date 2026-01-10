@@ -49,6 +49,8 @@ pub const Decompiler = struct {
     nested_decompilers: std.ArrayList(*Decompiler),
     /// Next block after chained comparison (set by tryDecompileChainedComparison).
     chained_cmp_next_block: ?u32 = null,
+    /// Pending ternary expression to be consumed by next STORE instruction.
+    pending_ternary_expr: ?*Expr = null,
     /// Accumulated print items for Python 2.x PRINT_ITEM/PRINT_NEWLINE.
     print_items: std.ArrayList(*Expr),
     /// Print destination for PRINT_ITEM_TO.
@@ -131,6 +133,40 @@ pub const Decompiler = struct {
             std.mem.eql(u8, name, "END_SEND");
     }
 
+    /// Try to emit a statement for the given opcode from the current stack state.
+    /// Returns the statement if one was emitted, null otherwise.
+    fn tryEmitStatement(self: *Decompiler, inst: decoder.Instruction, sim: *SimContext) DecompileError!?*Stmt {
+        switch (inst.opcode) {
+            .STORE_NAME, .STORE_FAST, .STORE_GLOBAL => {
+                const name = switch (inst.opcode) {
+                    .STORE_NAME, .STORE_GLOBAL => sim.getName(inst.arg) orelse "<unknown>",
+                    .STORE_FAST => sim.getLocal(inst.arg) orelse "<unknown>",
+                    else => "<unknown>",
+                };
+                const value = sim.stack.pop() orelse return error.StackUnderflow;
+                errdefer value.deinit(self.allocator);
+                return try self.handleStoreValue(name, value);
+            },
+            .POP_TOP => {
+                const val = sim.stack.pop() orelse return error.StackUnderflow;
+                switch (val) {
+                    .expr => |e| {
+                        return try self.makeExprStmt(e);
+                    },
+                    else => {
+                        val.deinit(self.allocator);
+                        return null;
+                    },
+                }
+            },
+            else => {
+                // For other statement opcodes, simulate and don't emit
+                try sim.simulate(inst);
+                return null;
+            },
+        }
+    }
+
     fn deinitStackValuesSlice(allocator: Allocator, values: []StackValue) void {
         for (values) |val| {
             val.deinit(allocator);
@@ -194,6 +230,12 @@ pub const Decompiler = struct {
         stmts: *std.ArrayList(*Stmt),
         skip_first: usize,
     ) DecompileError!void {
+        // Check for pending ternary expression from tryDecompileTernaryInto
+        if (self.pending_ternary_expr) |expr| {
+            try sim.stack.push(.{ .expr = expr });
+            self.pending_ternary_expr = null;
+        }
+
         for (block.instructions[skip_first..]) |inst| {
             errdefer self.last_error_ctx = .{
                 .code_name = self.code.name,
@@ -318,36 +360,16 @@ pub const Decompiler = struct {
             return null;
         }
         if (pattern.merge_block <= block_id) return null;
-        if ((try self.analyzer.detectPattern(pattern.merge_block)) != .unknown) return null;
 
         var condition: *Expr = undefined;
-        var condition_owned = false;
         var base_vals: []StackValue = &.{};
         var base_owned = false;
         var true_expr: *Expr = undefined;
-        var true_owned = false;
         var false_expr: *Expr = undefined;
-        var false_owned = false;
         var if_expr: *Expr = undefined;
-        var if_owned = false;
 
+        // Note: expressions are arena-allocated, so no explicit cleanup needed
         defer {
-            if (if_owned) {
-                if_expr.deinit(self.allocator);
-                self.allocator.destroy(if_expr);
-            }
-            if (false_owned) {
-                false_expr.deinit(self.allocator);
-                self.allocator.destroy(false_expr);
-            }
-            if (true_owned) {
-                true_expr.deinit(self.allocator);
-                self.allocator.destroy(true_expr);
-            }
-            if (condition_owned) {
-                condition.deinit(self.allocator);
-                self.allocator.destroy(condition);
-            }
             if (base_owned) {
                 deinitStackValuesSlice(self.allocator, base_vals);
             }
@@ -357,14 +379,25 @@ pub const Decompiler = struct {
         var cond_sim = SimContext.init(self.arena.allocator(), self.code, self.version);
         defer cond_sim.deinit();
 
+        // Check for pending ternary expression from a previous ternary
+        if (self.pending_ternary_expr) |expr| {
+            try cond_sim.stack.push(.{ .expr = expr });
+            self.pending_ternary_expr = null;
+        }
+
+        // Process condition block, emitting any leading statements
         for (cond_block.instructions) |inst| {
             if (ctrl.Analyzer.isConditionalJump(undefined, inst.opcode)) break;
-            if (isStatementOpcode(inst.opcode)) return null;
-            try cond_sim.simulate(inst);
+            if (isStatementOpcode(inst.opcode)) {
+                if (try self.tryEmitStatement(inst, &cond_sim)) |stmt| {
+                    try stmts.append(self.allocator, stmt);
+                }
+            } else {
+                try cond_sim.simulate(inst);
+            }
         }
 
         condition = cond_sim.stack.popExpr() catch return null;
-        condition_owned = true;
 
         base_vals = try self.cloneStackValues(&cond_sim, cond_sim.stack.items.items);
         base_owned = true;
@@ -372,41 +405,28 @@ pub const Decompiler = struct {
         const true_opt = try self.simulateTernaryBranch(pattern.true_block, base_vals);
         if (true_opt == null) return null;
         true_expr = true_opt.?;
-        true_owned = true;
 
         const false_opt = try self.simulateTernaryBranch(pattern.false_block, base_vals);
         if (false_opt == null) return null;
         false_expr = false_opt.?;
-        false_owned = true;
 
         const a = self.arena.allocator();
         if_expr = try a.create(Expr);
-        if_owned = true;
         if_expr.* = .{ .if_exp = .{
             .condition = condition,
             .body = true_expr,
             .else_body = false_expr,
         } };
 
-        condition_owned = false;
-        true_owned = false;
-        false_owned = false;
+        // Don't process the merge block here - just save the ternary result
+        // The main loop will process the merge block and consume this expression
+        self.pending_ternary_expr = if_expr;
 
-        var merge_sim = SimContext.init(self.arena.allocator(), self.code, self.version);
-        defer merge_sim.deinit();
-
+        // Free base_vals since we're not using them
         base_owned = false;
-        errdefer self.allocator.free(base_vals);
-        try self.moveStackValuesToSim(&merge_sim, base_vals);
-        self.allocator.free(base_vals);
+        deinitStackValuesSlice(self.allocator, base_vals);
 
-        try merge_sim.stack.push(.{ .expr = if_expr });
-        if_owned = false;
-
-        const merge_block = &self.cfg.blocks[pattern.merge_block];
-        try self.processBlockWithSim(merge_block, &merge_sim, stmts);
-
-        return pattern.merge_block + 1;
+        return pattern.merge_block;
     }
 
     /// Try to decompile a short-circuit boolean expression (x and y, x or y).
