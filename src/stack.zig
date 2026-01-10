@@ -27,6 +27,7 @@ pub const SimError = Allocator.Error || error{
     InvalidKeywordNames,
     InvalidStackDepth,
     UnsupportedConstant,
+    InvalidConstKeyMap,
 };
 
 pub const FunctionValue = struct {
@@ -2252,6 +2253,51 @@ pub const SimContext = struct {
 
             .BUILD_MAP_UNPACK, .BUILD_MAP_UNPACK_WITH_CALL => {
                 try self.buildDictUnpack(inst.arg);
+            },
+
+            .BUILD_CONST_KEY_MAP => {
+                // BUILD_CONST_KEY_MAP count - create dict from tuple of keys and count values
+                // Stack: keys_tuple, val1, val2, ..., valN -> dict
+                const count = inst.arg;
+
+                // Pop values in reverse order
+                const values = try self.allocator.alloc(*Expr, count);
+                errdefer self.allocator.free(values);
+
+                var i: usize = 0;
+                while (i < count) : (i += 1) {
+                    values[count - 1 - i] = try self.stack.popExpr();
+                }
+                errdefer {
+                    for (values) |v| {
+                        v.deinit(self.allocator);
+                        self.allocator.destroy(v);
+                    }
+                }
+
+                // Pop keys tuple
+                const keys_val = self.stack.pop() orelse return error.StackUnderflow;
+                defer keys_val.deinit(self.allocator);
+
+                // Extract keys from tuple expr
+                const keys = try self.allocator.alloc(?*Expr, count);
+                errdefer self.allocator.free(keys);
+
+                if (keys_val == .expr and keys_val.expr.* == .tuple) {
+                    const key_exprs = keys_val.expr.tuple.elts;
+                    if (key_exprs.len != count) return error.InvalidConstKeyMap;
+
+                    for (key_exprs, 0..) |key, j| {
+                        keys[j] = try ast.cloneExpr(self.allocator, key);
+                    }
+                } else {
+                    // Fall back to unknown keys
+                    for (keys) |*k| k.* = null;
+                }
+
+                const expr = try self.allocator.create(Expr);
+                expr.* = .{ .dict = .{ .keys = keys, .values = values } };
+                try self.stack.push(.{ .expr = expr });
             },
 
             // Slice operations
