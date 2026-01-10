@@ -344,6 +344,139 @@ pub const Decompiler = struct {
         return pattern.merge_block + 1;
     }
 
+    /// Try to decompile a short-circuit boolean expression (x and y, x or y).
+    fn tryDecompileBoolOpInto(
+        self: *Decompiler,
+        block_id: u32,
+        limit: u32,
+        stmts: *std.ArrayList(*Stmt),
+    ) DecompileError!?u32 {
+        const pattern = self.analyzer.detectBoolOp(block_id) orelse return null;
+        if (pattern.second_block >= limit or pattern.merge_block >= limit) {
+            return null;
+        }
+
+        const cond_block = &self.cfg.blocks[pattern.condition_block];
+        var cond_sim = SimContext.init(self.arena.allocator(), self.code, self.version);
+        defer cond_sim.deinit();
+
+        // Simulate condition block up to COPY (before TO_BOOL)
+        for (cond_block.instructions, 0..) |inst, i| {
+            // Stop before COPY, TO_BOOL, POP_JUMP sequence
+            if (i + 3 >= cond_block.instructions.len) break;
+            if (inst.opcode == .COPY and
+                cond_block.instructions[i + 1].opcode == .TO_BOOL and
+                ctrl.Analyzer.isConditionalJump(undefined, cond_block.instructions[i + 2].opcode))
+            {
+                break;
+            }
+            if (ctrl.Analyzer.isConditionalJump(undefined, inst.opcode)) break;
+            try cond_sim.simulate(inst);
+        }
+
+        // First operand is on stack
+        const first = cond_sim.stack.popExpr() catch return null;
+        errdefer {
+            first.deinit(self.allocator);
+            self.allocator.destroy(first);
+        }
+
+        // Build potentially nested BoolOp expression
+        const bool_result = try self.buildBoolOpExpr(first, pattern);
+        const bool_expr = bool_result.expr;
+        const final_merge = bool_result.merge_block;
+
+        // Process merge block with the bool expression on stack
+        var merge_sim = SimContext.init(self.arena.allocator(), self.code, self.version);
+        defer merge_sim.deinit();
+        try merge_sim.stack.push(.{ .expr = bool_expr });
+
+        const merge_block = &self.cfg.blocks[final_merge];
+        try self.processBlockWithSim(merge_block, &merge_sim, stmts);
+
+        return final_merge + 1;
+    }
+
+    const BoolOpResult = struct {
+        expr: *Expr,
+        merge_block: u32,
+    };
+
+    /// Build a BoolOp expression, handling nested chains (x and y and z).
+    fn buildBoolOpExpr(self: *Decompiler, first: *Expr, pattern: ctrl.BoolOpPattern) DecompileError!BoolOpResult {
+        const sec_block = &self.cfg.blocks[pattern.second_block];
+        var sec_sim = SimContext.init(self.arena.allocator(), self.code, self.version);
+        defer sec_sim.deinit();
+
+        var skip: usize = 0;
+        if (sec_block.instructions.len > 0 and sec_block.instructions[0].opcode == .NOT_TAKEN) {
+            skip = 1;
+        }
+        if (sec_block.instructions.len > skip and sec_block.instructions[skip].opcode == .POP_TOP) {
+            skip += 1;
+        }
+
+        // Simulate up to COPY or end
+        for (sec_block.instructions[skip..], 0..) |inst, i| {
+            const actual_idx = skip + i;
+            // Stop before COPY, TO_BOOL, POP_JUMP sequence (nested boolop)
+            if (actual_idx + 3 <= sec_block.instructions.len) {
+                if (inst.opcode == .COPY and inst.arg == 1) {
+                    if (sec_block.instructions[actual_idx + 1].opcode == .TO_BOOL and
+                        ctrl.Analyzer.isConditionalJump(undefined, sec_block.instructions[actual_idx + 2].opcode))
+                    {
+                        break;
+                    }
+                }
+            }
+            if (ctrl.Analyzer.isConditionalJump(undefined, inst.opcode)) break;
+            if (isStatementOpcode(inst.opcode)) break;
+            try sec_sim.simulate(inst);
+        }
+
+        const second = sec_sim.stack.popExpr() catch return error.StackUnderflow;
+
+        // Check if second_block has a nested BoolOp pattern
+        const nested_pattern = self.analyzer.detectBoolOp(pattern.second_block);
+        var final_merge = pattern.merge_block;
+        var values_list: std.ArrayListUnmanaged(*Expr) = .{};
+
+        try values_list.append(self.allocator, first);
+        try values_list.append(self.allocator, second);
+
+        if (nested_pattern) |nested| {
+            // Same operator type - flatten the chain
+            if (nested.is_and == pattern.is_and) {
+                // Recursively build the rest of the chain
+                const nested_result = try self.buildBoolOpExpr(second, nested);
+                // Replace second with the nested expression's operands
+                _ = values_list.pop();
+                const expected_op: ast.BoolOp = if (pattern.is_and) .and_ else .or_;
+                if (nested_result.expr.* == .bool_op and nested_result.expr.bool_op.op == expected_op) {
+                    // Flatten: add all operands from nested
+                    for (nested_result.expr.bool_op.values) |v| {
+                        try values_list.append(self.allocator, v);
+                    }
+                } else {
+                    try values_list.append(self.allocator, nested_result.expr);
+                }
+                final_merge = nested_result.merge_block;
+            }
+        }
+        defer values_list.deinit(self.allocator);
+
+        const a = self.arena.allocator();
+        const values = try a.dupe(*Expr, values_list.items);
+
+        const bool_expr = try a.create(Expr);
+        bool_expr.* = .{ .bool_op = .{
+            .op = if (pattern.is_and) .and_ else .or_,
+            .values = values,
+        } };
+
+        return .{ .expr = bool_expr, .merge_block = final_merge };
+    }
+
     /// Find the last block that's part of an if-elif-else chain.
     fn findIfChainEnd(self: *Decompiler, pattern: ctrl.IfPattern) DecompileError!u32 {
         var max_block = pattern.then_block;
@@ -377,6 +510,15 @@ pub const Decompiler = struct {
         // Process blocks in order, using control flow patterns
         var block_idx: u32 = 0;
         while (block_idx < self.cfg.blocks.len) {
+            // Try BoolOp pattern first (x and y, x or y)
+            if (try self.tryDecompileBoolOpInto(
+                block_idx,
+                @intCast(self.cfg.blocks.len),
+                &self.statements,
+            )) |next_block| {
+                block_idx = next_block;
+                continue;
+            }
             if (try self.tryDecompileTernaryInto(
                 block_idx,
                 @intCast(self.cfg.blocks.len),

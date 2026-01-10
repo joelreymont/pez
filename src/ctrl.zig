@@ -148,6 +148,18 @@ pub const TernaryPattern = struct {
     merge_block: u32,
 };
 
+/// Pattern for short-circuit boolean expressions (x and y, x or y).
+pub const BoolOpPattern = struct {
+    /// Block containing first operand and condition test.
+    condition_block: u32,
+    /// Block containing second operand (fallthrough from condition).
+    second_block: u32,
+    /// Block where both paths merge.
+    merge_block: u32,
+    /// True for 'and', false for 'or'.
+    is_and: bool,
+};
+
 /// Control flow analyzer.
 pub const Analyzer = struct {
     cfg: *const CFG,
@@ -314,6 +326,118 @@ pub const Analyzer = struct {
             .true_block = true_id,
             .false_block = false_id,
             .merge_block = merge,
+        };
+    }
+
+    /// Detect short-circuit boolean expression (x and y, x or y).
+    /// Pattern: COPY, TO_BOOL, POP_JUMP, then POP_TOP + second operand.
+    pub fn detectBoolOp(self: *const Analyzer, block_id: u32) ?BoolOpPattern {
+        if (block_id >= self.cfg.blocks.len) return null;
+        const block = &self.cfg.blocks[block_id];
+        if (block.successors.len != 2) return null;
+
+        // Check for COPY, TO_BOOL, POP_JUMP pattern at end of block
+        const insts = block.instructions;
+        if (insts.len < 3) return null;
+
+        const term = block.terminator() orelse return null;
+
+        // Determine if this is 'and' or 'or' based on jump type
+        const is_and = switch (term.opcode) {
+            .POP_JUMP_IF_FALSE, .POP_JUMP_FORWARD_IF_FALSE, .POP_JUMP_BACKWARD_IF_FALSE => true,
+            .POP_JUMP_IF_TRUE, .POP_JUMP_FORWARD_IF_TRUE, .POP_JUMP_BACKWARD_IF_TRUE => false,
+            else => return null,
+        };
+
+        // Check for TO_BOOL before the jump
+        const to_bool_idx = insts.len - 2;
+        if (insts[to_bool_idx].opcode != .TO_BOOL) return null;
+
+        // Check for COPY before TO_BOOL
+        const copy_idx = insts.len - 3;
+        if (insts[copy_idx].opcode != .COPY) return null;
+        if (insts[copy_idx].arg != 1) return null;
+
+        // Exclude chained comparison pattern: COMPARE_OP, COPY, TO_BOOL, POP_JUMP
+        if (copy_idx >= 1) {
+            const prev_op = insts[copy_idx - 1].opcode;
+            if (prev_op == .COMPARE_OP) return null;
+        }
+
+        // Find the fallthrough (second operand) and jump target blocks
+        var second_block: ?u32 = null;
+        var short_circuit_block: ?u32 = null;
+
+        for (block.successors) |edge| {
+            switch (edge.edge_type) {
+                .conditional_true, .normal => second_block = edge.target,
+                .conditional_false => short_circuit_block = edge.target,
+                else => {},
+            }
+        }
+
+        // For 'and', false branch short-circuits, true branch continues
+        // For 'or', true branch short-circuits, false branch continues
+        if (is_and) {
+            // POP_JUMP_IF_FALSE: fallthrough is second_block, jump is short_circuit
+            for (block.successors) |edge| {
+                switch (edge.edge_type) {
+                    .conditional_true, .normal => second_block = edge.target,
+                    .conditional_false => short_circuit_block = edge.target,
+                    else => {},
+                }
+            }
+        } else {
+            // POP_JUMP_IF_TRUE: fallthrough is second_block, jump is short_circuit
+            for (block.successors) |edge| {
+                switch (edge.edge_type) {
+                    .conditional_false, .normal => second_block = edge.target,
+                    .conditional_true => short_circuit_block = edge.target,
+                    else => {},
+                }
+            }
+        }
+
+        const sec_id = second_block orelse return null;
+        const short_id = short_circuit_block orelse return null;
+
+        // Verify second block starts with POP_TOP (or NOT_TAKEN + POP_TOP)
+        const sec_blk = &self.cfg.blocks[sec_id];
+        if (sec_blk.instructions.len < 1) return null;
+
+        var pop_idx: usize = 0;
+        if (sec_blk.instructions[0].opcode == .NOT_TAKEN) {
+            if (sec_blk.instructions.len < 2) return null;
+            pop_idx = 1;
+        }
+        if (sec_blk.instructions[pop_idx].opcode != .POP_TOP) return null;
+
+        // Both paths should merge at the same point
+        const sec_merge = blk: {
+            for (sec_blk.successors) |edge| {
+                if (edge.edge_type == .normal) break :blk edge.target;
+            }
+            break :blk null;
+        };
+
+        // Short-circuit block should be the merge point OR lead to it
+        if (sec_merge != short_id and sec_merge != null) {
+            // Check if both go to same place
+            const short_blk = &self.cfg.blocks[short_id];
+            const short_merge = blk: {
+                for (short_blk.successors) |edge| {
+                    if (edge.edge_type == .normal) break :blk edge.target;
+                }
+                break :blk null;
+            };
+            if (sec_merge != short_merge) return null;
+        }
+
+        return BoolOpPattern{
+            .condition_block = block_id,
+            .second_block = sec_id,
+            .merge_block = short_id,
+            .is_and = is_and,
         };
     }
 
