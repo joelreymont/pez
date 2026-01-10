@@ -184,7 +184,17 @@ pub const Decompiler = struct {
         sim: *SimContext,
         stmts: *std.ArrayList(*Stmt),
     ) DecompileError!void {
-        for (block.instructions) |inst| {
+        return self.processBlockWithSimAndSkip(block, sim, stmts, 0);
+    }
+
+    fn processBlockWithSimAndSkip(
+        self: *Decompiler,
+        block: *const BasicBlock,
+        sim: *SimContext,
+        stmts: *std.ArrayList(*Stmt),
+        skip_first: usize,
+    ) DecompileError!void {
+        for (block.instructions[skip_first..]) |inst| {
             errdefer self.last_error_ctx = .{
                 .code_name = self.code.name,
                 .block_id = block.id,
@@ -673,6 +683,17 @@ pub const Decompiler = struct {
         end_block: ?u32,
         init_stack: []const StackValue,
     ) DecompileError![]const *Stmt {
+        return self.decompileBlockRangeWithStackAndSkip(start_block, end_block, init_stack, 0);
+    }
+
+    /// Decompile a range of blocks, skipping first N instructions of the first block.
+    fn decompileBlockRangeWithStackAndSkip(
+        self: *Decompiler,
+        start_block: u32,
+        end_block: ?u32,
+        init_stack: []const StackValue,
+        skip_first: usize,
+    ) DecompileError![]const *Stmt {
         var stmts: std.ArrayList(*Stmt) = .{};
         errdefer stmts.deinit(self.allocator);
 
@@ -685,9 +706,9 @@ pub const Decompiler = struct {
                 block_idx = next_block;
                 continue;
             }
-            // First block gets the initial stack
-            if (block_idx == start_block and init_stack.len > 0) {
-                try self.decompileBlockIntoWithStack(block_idx, &stmts, init_stack);
+            // First block gets the initial stack and skip
+            if (block_idx == start_block) {
+                try self.decompileBlockIntoWithStackAndSkip(block_idx, &stmts, init_stack, skip_first);
             } else {
                 try self.decompileBlockInto(block_idx, &stmts);
             }
@@ -709,6 +730,17 @@ pub const Decompiler = struct {
         stmts: *std.ArrayList(*Stmt),
         init_stack: []const StackValue,
     ) DecompileError!void {
+        return self.decompileBlockIntoWithStackAndSkip(block_id, stmts, init_stack, 0);
+    }
+
+    /// Decompile a single block, optionally skipping first N instructions.
+    fn decompileBlockIntoWithStackAndSkip(
+        self: *Decompiler,
+        block_id: u32,
+        stmts: *std.ArrayList(*Stmt),
+        init_stack: []const StackValue,
+        skip_first: usize,
+    ) DecompileError!void {
         if (block_id >= self.cfg.blocks.len) return;
         const block = &self.cfg.blocks[block_id];
 
@@ -723,7 +755,7 @@ pub const Decompiler = struct {
             }
         }
 
-        try self.processBlockWithSim(block, &sim, stmts);
+        try self.processBlockWithSimAndSkip(block, &sim, stmts, skip_first);
     }
 
     const ChainResult = struct {
@@ -866,14 +898,24 @@ pub const Decompiler = struct {
 
     /// Decompile an if statement pattern.
     fn decompileIf(self: *Decompiler, pattern: ctrl.IfPattern) DecompileError!?*Stmt {
+        return self.decompileIfWithSkip(pattern, 0);
+    }
+
+    /// Decompile an if statement pattern, skipping first N instructions of condition block.
+    fn decompileIfWithSkip(self: *Decompiler, pattern: ctrl.IfPattern, skip_cond: usize) DecompileError!?*Stmt {
         const cond_block = &self.cfg.blocks[pattern.condition_block];
 
         // Get the condition expression from the last instruction before the jump
         var sim = SimContext.init(self.arena.allocator(), self.code, self.version);
         defer sim.deinit();
 
-        // Simulate up to but not including the conditional jump
-        for (cond_block.instructions) |inst| {
+        // Check if terminator is Python 3.0 style JUMP_IF_FALSE/TRUE
+        // These don't pop the condition, so branches start with POP_TOP
+        const term = cond_block.terminator();
+        const legacy_cond = if (term) |t| t.opcode == .JUMP_IF_FALSE or t.opcode == .JUMP_IF_TRUE else false;
+
+        // Simulate up to but not including the conditional jump, skipping first N instructions
+        for (cond_block.instructions[skip_cond..]) |inst| {
             if (ctrl.Analyzer.isConditionalJump(undefined, inst.opcode)) break;
             try sim.simulate(inst);
         }
@@ -903,9 +945,13 @@ pub const Decompiler = struct {
             saved += 1;
         }
 
+        // For JUMP_IF_FALSE/TRUE (Python 3.0), skip the leading POP_TOP in each branch
+        // that was used to clean up the condition left on stack
+        const skip: usize = if (legacy_cond) 1 else 0;
+
         // Decompile the then body with inherited stack
         const then_end = pattern.else_block orelse pattern.merge_block;
-        const then_body_tmp = try self.decompileBlockRangeWithStack(pattern.then_block, then_end, base_vals);
+        const then_body_tmp = try self.decompileBlockRangeWithStackAndSkip(pattern.then_block, then_end, base_vals, skip);
         defer self.allocator.free(then_body_tmp);
         const a = self.arena.allocator();
         const then_body = try a.dupe(*Stmt, then_body_tmp);
@@ -919,9 +965,10 @@ pub const Decompiler = struct {
                 self.allocator.free(base_vals);
 
                 // The else block is another if statement - recurse
+                // For legacy conditionals, elif block starts with POP_TOP to clean up previous condition
                 const else_pattern = try self.analyzer.detectPattern(else_id);
                 if (else_pattern == .if_stmt) {
-                    const elif_stmt = try self.decompileIf(else_pattern.if_stmt);
+                    const elif_stmt = try self.decompileIfWithSkip(else_pattern.if_stmt, skip);
                     if (elif_stmt) |s| {
                         const body = try a.alloc(*Stmt, 1);
                         body[0] = s;
@@ -935,7 +982,7 @@ pub const Decompiler = struct {
                 for (base_vals) |val| val.deinit(self.allocator);
                 self.allocator.free(base_vals);
             }
-            const else_body_tmp = try self.decompileBlockRangeWithStack(else_id, pattern.merge_block, base_vals);
+            const else_body_tmp = try self.decompileBlockRangeWithStackAndSkip(else_id, pattern.merge_block, base_vals, skip);
             defer self.allocator.free(else_body_tmp);
             break :blk try a.dupe(*Stmt, else_body_tmp);
         } else blk: {
