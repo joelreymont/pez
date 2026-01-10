@@ -2277,6 +2277,155 @@ const opcode_table_3_6 = [_]?Opcode{
 };
 
 /// Python 2.7 opcode byte values
+/// Python 2.5-2.6 opcode table (BUILD_MAP at 104, no BUILD_SET)
+const opcode_table_2_6 = [_]?Opcode{
+    .STOP_CODE, // 0
+    .POP_TOP, // 1
+    .ROT_TWO, // 2
+    .ROT_THREE, // 3
+    .DUP_TOP, // 4
+    .ROT_FOUR, // 5
+    null, // 6
+    null, // 7
+    null, // 8
+    .NOP, // 9
+    .UNARY_POSITIVE, // 10
+    .UNARY_NEGATIVE, // 11
+    .UNARY_NOT, // 12
+    .UNARY_CONVERT, // 13
+    null, // 14
+    .UNARY_INVERT, // 15
+    null, // 16
+    null, // 17
+    null, // 18
+    .BINARY_POWER, // 19
+    .BINARY_MULTIPLY, // 20
+    .BINARY_DIVIDE, // 21
+    .BINARY_MODULO, // 22
+    .BINARY_ADD, // 23
+    .BINARY_SUBTRACT, // 24
+    .BINARY_SUBSCR, // 25
+    .BINARY_FLOOR_DIVIDE, // 26
+    .BINARY_TRUE_DIVIDE, // 27
+    .INPLACE_FLOOR_DIVIDE, // 28
+    .INPLACE_TRUE_DIVIDE, // 29
+    .SLICE_0, // 30
+    .SLICE_1, // 31
+    .SLICE_2, // 32
+    .SLICE_3, // 33
+    null, // 34
+    null, // 35
+    null, // 36
+    null, // 37
+    null, // 38
+    null, // 39
+    .STORE_SLICE_0, // 40
+    .STORE_SLICE_1, // 41
+    .STORE_SLICE_2, // 42
+    .STORE_SLICE_3, // 43
+    null, // 44
+    null, // 45
+    null, // 46
+    null, // 47
+    null, // 48
+    null, // 49
+    .DELETE_SLICE_0, // 50
+    .DELETE_SLICE_1, // 51
+    .DELETE_SLICE_2, // 52
+    .DELETE_SLICE_3, // 53
+    .STORE_MAP, // 54
+    .INPLACE_ADD, // 55
+    .INPLACE_SUBTRACT, // 56
+    .INPLACE_MULTIPLY, // 57
+    .INPLACE_DIVIDE, // 58
+    .INPLACE_MODULO, // 59
+    .STORE_SUBSCR, // 60
+    .DELETE_SUBSCR, // 61
+    .BINARY_LSHIFT, // 62
+    .BINARY_RSHIFT, // 63
+    .BINARY_AND, // 64
+    .BINARY_XOR, // 65
+    .BINARY_OR, // 66
+    .INPLACE_POWER, // 67
+    .GET_ITER, // 68
+    null, // 69
+    .PRINT_EXPR, // 70
+    .PRINT_ITEM, // 71
+    .PRINT_NEWLINE, // 72
+    .PRINT_ITEM_TO, // 73
+    .PRINT_NEWLINE_TO, // 74
+    .INPLACE_LSHIFT, // 75
+    .INPLACE_RSHIFT, // 76
+    .INPLACE_AND, // 77
+    .INPLACE_XOR, // 78
+    .INPLACE_OR, // 79
+    .BREAK_LOOP, // 80
+    .WITH_CLEANUP, // 81
+    .LOAD_LOCALS, // 82
+    .RETURN_VALUE, // 83
+    .IMPORT_STAR, // 84
+    .EXEC_STMT, // 85
+    .YIELD_VALUE, // 86
+    .POP_BLOCK, // 87
+    .END_FINALLY, // 88
+    .BUILD_CLASS, // 89
+    .STORE_NAME, // 90 (HAVE_ARGUMENT)
+    .DELETE_NAME, // 91
+    .UNPACK_SEQUENCE, // 92
+    .FOR_ITER, // 93
+    .LIST_APPEND, // 94
+    .STORE_ATTR, // 95
+    .DELETE_ATTR, // 96
+    .STORE_GLOBAL, // 97
+    .DELETE_GLOBAL, // 98
+    .DUP_TOPX, // 99
+    .LOAD_CONST, // 100
+    .LOAD_NAME, // 101
+    .BUILD_TUPLE, // 102
+    .BUILD_LIST, // 103
+    .BUILD_SET, // 104 - maps to BUILD_MAP for 2.6 and earlier
+    .BUILD_MAP, // 105
+    .LOAD_ATTR, // 106
+    .COMPARE_OP, // 107
+    .IMPORT_NAME, // 108
+    .IMPORT_FROM, // 109
+    .JUMP_FORWARD, // 110
+    .JUMP_IF_FALSE_OR_POP, // 111
+    .JUMP_IF_TRUE_OR_POP, // 112
+    .JUMP_ABSOLUTE, // 113
+    .POP_JUMP_IF_FALSE, // 114
+    .POP_JUMP_IF_TRUE, // 115
+    .LOAD_GLOBAL, // 116
+    null, // 117
+    null, // 118
+    .CONTINUE_LOOP, // 119
+    .SETUP_LOOP, // 120
+    .SETUP_EXCEPT, // 121
+    .SETUP_FINALLY, // 122
+    null, // 123
+    .LOAD_FAST, // 124
+    .STORE_FAST, // 125
+    .DELETE_FAST, // 126
+    null, // 127
+    null, // 128
+    null, // 129
+    .RAISE_VARARGS, // 130
+    .CALL_FUNCTION, // 131
+    .MAKE_FUNCTION, // 132
+    .BUILD_SLICE, // 133
+    .MAKE_CLOSURE, // 134
+    .LOAD_CLOSURE, // 135
+    .LOAD_DEREF, // 136
+    .STORE_DEREF, // 137
+    null, // 138
+    null, // 139
+    .CALL_FUNCTION_VAR, // 140
+    .CALL_FUNCTION_KW, // 141
+    .CALL_FUNCTION_VAR_KW, // 142
+    .EXTENDED_ARG, // 143
+};
+
+/// Python 2.7 opcode table (BUILD_SET added at 104)
 const opcode_table_2_7 = [_]?Opcode{
     .STOP_CODE, // 0
     .POP_TOP, // 1
@@ -2910,7 +3059,8 @@ pub fn getOpcodeTable(ver: Version) []const ?Opcode {
     if (ver.gte(3, 5)) return &opcode_table_3_5; // Python 3.5
     if (ver.gte(3, 1)) return &opcode_table_3_1; // Python 3.1-3.4
     if (ver.major == 3) return &opcode_table_3_0; // Python 3.0
-    if (ver.major == 2) return &opcode_table_2_7;
+    if (ver.gte(2, 7)) return &opcode_table_2_7; // Python 2.7
+    if (ver.major == 2) return &opcode_table_2_6; // Python 2.5-2.6
     std.debug.panic("unsupported Python version {d}.{d}", .{ ver.major, ver.minor });
 }
 

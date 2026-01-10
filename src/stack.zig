@@ -2673,16 +2673,17 @@ pub const SimContext = struct {
 
             .STORE_MAP => {
                 // STORE_MAP - Python 2.x and 3.0-3.5
-                // Stack: dict, key, value -> dict (with key:value added)
-                const value = try self.stack.popExpr();
-                errdefer {
-                    value.deinit(self.allocator);
-                    self.allocator.destroy(value);
-                }
+                // Stack: dict, value, key -> dict (with key:value added)
+                // TOS is key, TOS1 is value
                 const key = try self.stack.popExpr();
                 errdefer {
                     key.deinit(self.allocator);
                     self.allocator.destroy(key);
+                }
+                const value = try self.stack.popExpr();
+                errdefer {
+                    value.deinit(self.allocator);
+                    self.allocator.destroy(value);
                 }
                 const dict_val = self.stack.pop() orelse return error.StackUnderflow;
 
