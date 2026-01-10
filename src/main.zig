@@ -25,7 +25,7 @@ pub fn main() !void {
     const stderr = &stderr_writer.interface;
 
     // Parse command line
-    var mode: enum { disasm, decompile, cfgdump, test_suite } = .decompile;
+    var mode: enum { disasm, decompile, cfgdump, test_suite, golden } = .decompile;
     var filename: ?[]const u8 = null;
 
     for (args[1..]) |arg| {
@@ -35,6 +35,8 @@ pub fn main() !void {
             mode = .cfgdump;
         } else if (std.mem.eql(u8, arg, "--test")) {
             mode = .test_suite;
+        } else if (std.mem.eql(u8, arg, "--golden")) {
+            mode = .golden;
         } else if (arg[0] != '-') {
             filename = arg;
         }
@@ -49,11 +51,25 @@ pub fn main() !void {
         return;
     }
 
+    // Golden file comparison mode
+    if (mode == .golden) {
+        const stats = try test_harness.runAllGoldenTests(
+            allocator,
+            "refs/pycdc/tests/compiled",
+            "refs/pycdc/tests/input",
+            stdout,
+        );
+        try stdout.flush();
+        if (stats.mismatched > 0 or stats.errors > 0) std.process.exit(1);
+        return;
+    }
+
     if (filename == null) {
-        try stderr.print("Usage: {s} [-d|--disasm|--cfg|--test] <file.pyc>\n", .{args[0]});
+        try stderr.print("Usage: {s} [-d|--disasm|--cfg|--test|--golden] <file.pyc>\n", .{args[0]});
         try stderr.print("  -d, --disasm  Disassemble only\n", .{});
         try stderr.print("  --cfg         Dump CFG analysis\n", .{});
-        try stderr.print("  --test        Run test suite\n", .{});
+        try stderr.print("  --test        Run test suite (decompile check)\n", .{});
+        try stderr.print("  --golden      Compare with golden .py files\n", .{});
         try stderr.flush();
         std.process.exit(1);
     }
@@ -88,7 +104,7 @@ pub fn main() !void {
                 try decompile.decompileToSource(allocator, code, version, stdout);
             }
         },
-        .test_suite => unreachable, // Handled earlier
+        .test_suite, .golden => unreachable, // Handled earlier
     }
     try stdout.flush();
 }

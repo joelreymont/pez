@@ -72,8 +72,8 @@ pub fn testPycFile(
 }
 
 fn computeDiff(allocator: Allocator, expected: []const u8, actual: []const u8) ![]const u8 {
-    var result = std.ArrayList(u8).init(allocator);
-    errdefer result.deinit();
+    var result: std.ArrayList(u8) = .{};
+    errdefer result.deinit(allocator);
     const w = result.writer(allocator);
 
     var exp_lines = std.mem.splitScalar(u8, expected, '\n');
@@ -97,7 +97,7 @@ fn computeDiff(allocator: Allocator, expected: []const u8, actual: []const u8) !
         line_no += 1;
     }
 
-    return result.toOwnedSlice();
+    return result.toOwnedSlice(allocator);
 }
 
 /// Parse Python version from filename like "test.3.11.pyc".
@@ -148,6 +148,50 @@ fn isVersionSupported(version: Version) bool {
     return false;
 }
 
+/// Extract base test name from pyc filename (remove version suffix).
+/// "test_foo.3.11.pyc" -> "test_foo"
+fn getBaseName(filename: []const u8) []const u8 {
+    // Remove .pyc
+    const no_ext = if (std.mem.endsWith(u8, filename, ".pyc"))
+        filename[0 .. filename.len - 4]
+    else
+        filename;
+
+    // Remove version suffix (e.g., ".3.11")
+    var end = no_ext.len;
+    var dots: u8 = 0;
+    while (end > 0) : (end -= 1) {
+        const c = no_ext[end - 1];
+        if (c == '.') {
+            dots += 1;
+            if (dots == 2) {
+                return no_ext[0 .. end - 1];
+            }
+        } else if (!std.ascii.isDigit(c)) {
+            break;
+        }
+    }
+    return no_ext;
+}
+
+/// Normalize source code for comparison (strip trailing whitespace, normalize line endings).
+fn normalizeSource(allocator: Allocator, source: []const u8) ![]const u8 {
+    var result: std.ArrayList(u8) = .{};
+    errdefer result.deinit(allocator);
+
+    var lines = std.mem.splitScalar(u8, source, '\n');
+    var first = true;
+    while (lines.next()) |line| {
+        if (!first) try result.append(allocator, '\n');
+        first = false;
+        // Trim trailing whitespace
+        const trimmed = std.mem.trimRight(u8, line, " \t\r");
+        try result.appendSlice(allocator, trimmed);
+    }
+
+    return result.toOwnedSlice(allocator);
+}
+
 /// Run a single .pyc file test, return true if decompilation succeeds.
 pub fn runSingleTest(allocator: Allocator, pyc_path: []const u8, writer: anytype) !bool {
     const basename = std.fs.path.basename(pyc_path);
@@ -187,6 +231,95 @@ pub fn runSingleTest(allocator: Allocator, pyc_path: []const u8, writer: anytype
 
     try writer.print("PASS {s} ({d} bytes)\n", .{ basename, output.items.len });
     return true;
+}
+
+/// Compare result with golden file and return match status.
+pub const CompareResult = enum { match, mismatch, no_golden, decompile_error };
+
+/// Run test with golden file comparison.
+pub fn runGoldenTest(
+    allocator: Allocator,
+    pyc_path: []const u8,
+    input_dir: []const u8,
+    writer: anytype,
+) !CompareResult {
+    const basename = std.fs.path.basename(pyc_path);
+    const base_name = getBaseName(basename);
+
+    const version = parseVersion(basename) orelse {
+        try writer.print("SKIP {s} (no version)\n", .{basename});
+        return .no_golden;
+    };
+
+    if (!isVersionSupported(version)) {
+        try writer.print("SKIP {s} (unsupported {d}.{d})\n", .{ basename, version.major, version.minor });
+        return .no_golden;
+    }
+
+    // Load expected .py file
+    var golden_path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const golden_path = std.fmt.bufPrint(&golden_path_buf, "{s}/{s}.py", .{ input_dir, base_name }) catch {
+        try writer.print("SKIP {s} (path too long)\n", .{basename});
+        return .no_golden;
+    };
+
+    const golden_file = std.fs.cwd().openFile(golden_path, .{}) catch {
+        try writer.print("SKIP {s} (no golden: {s})\n", .{ basename, golden_path });
+        return .no_golden;
+    };
+    defer golden_file.close();
+
+    const golden_content = golden_file.readToEndAlloc(allocator, 1024 * 1024) catch {
+        try writer.print("ERR  {s}: cannot read golden\n", .{basename});
+        return .no_golden;
+    };
+    defer allocator.free(golden_content);
+
+    // Load and decompile .pyc
+    var module = pyc.Module.init(allocator);
+    defer module.deinit();
+
+    module.loadFromFile(pyc_path) catch |err| {
+        try writer.print("ERR  {s}: load failed: {s}\n", .{ basename, @errorName(err) });
+        return .decompile_error;
+    };
+
+    const code = module.code orelse {
+        try writer.print("ERR  {s}: no code object\n", .{basename});
+        return .decompile_error;
+    };
+
+    var output: std.ArrayList(u8) = .{};
+    defer output.deinit(allocator);
+
+    decompile.decompileToSource(allocator, code, version, output.writer(allocator)) catch |err| {
+        try writer.print("FAIL {s}: {s}\n", .{ basename, @errorName(err) });
+        return .decompile_error;
+    };
+
+    // Normalize and compare
+    const norm_golden = try normalizeSource(allocator, golden_content);
+    defer allocator.free(norm_golden);
+
+    const norm_output = try normalizeSource(allocator, output.items);
+    defer allocator.free(norm_output);
+
+    if (std.mem.eql(u8, norm_golden, norm_output)) {
+        try writer.print("MATCH {s}\n", .{basename});
+        return .match;
+    } else {
+        try writer.print("DIFF  {s}\n", .{basename});
+        // Print first few lines of diff
+        const diff = try computeDiff(allocator, norm_golden, norm_output);
+        defer allocator.free(diff);
+        if (diff.len > 0) {
+            // Limit diff output
+            const max_diff = @min(diff.len, 500);
+            try writer.print("{s}", .{diff[0..max_diff]});
+            if (diff.len > max_diff) try writer.print("... ({d} more bytes)\n", .{diff.len - max_diff});
+        }
+        return .mismatch;
+    }
 }
 
 /// Run all .pyc tests in the given directory.
@@ -230,11 +363,71 @@ pub fn runAllTests(allocator: Allocator, test_dir: []const u8, writer: anytype) 
     return stats;
 }
 
+/// Golden test statistics.
+pub const GoldenStats = struct {
+    total: usize = 0,
+    matched: usize = 0,
+    mismatched: usize = 0,
+    no_golden: usize = 0,
+    errors: usize = 0,
+};
+
+/// Run all golden file comparisons.
+pub fn runAllGoldenTests(
+    allocator: Allocator,
+    compiled_dir: []const u8,
+    input_dir: []const u8,
+    writer: anytype,
+) !GoldenStats {
+    var stats = GoldenStats{};
+
+    var dir = std.fs.cwd().openDir(compiled_dir, .{ .iterate = true }) catch |err| {
+        try writer.print("Cannot open {s}: {s}\n", .{ compiled_dir, @errorName(err) });
+        return stats;
+    };
+    defer dir.close();
+
+    var it = dir.iterate();
+    while (try it.next()) |entry| {
+        if (entry.kind != .file) continue;
+        if (!std.mem.endsWith(u8, entry.name, ".pyc")) continue;
+
+        stats.total += 1;
+
+        var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+        const full_path = std.fmt.bufPrint(&path_buf, "{s}/{s}", .{ compiled_dir, entry.name }) catch continue;
+
+        const result = runGoldenTest(allocator, full_path, input_dir, writer) catch .decompile_error;
+        switch (result) {
+            .match => stats.matched += 1,
+            .mismatch => stats.mismatched += 1,
+            .no_golden => stats.no_golden += 1,
+            .decompile_error => stats.errors += 1,
+        }
+    }
+
+    try writer.print("\n=== Golden Test Results ===\n", .{});
+    try writer.print("Total:      {d}\n", .{stats.total});
+    try writer.print("Matched:    {d}\n", .{stats.matched});
+    try writer.print("Mismatched: {d}\n", .{stats.mismatched});
+    try writer.print("No golden:  {d}\n", .{stats.no_golden});
+    try writer.print("Errors:     {d}\n", .{stats.errors});
+
+    return stats;
+}
+
 test "parse version from filename" {
     const testing = std.testing;
     try testing.expectEqual(Version.init(3, 11), parseVersion("test.3.11.pyc").?);
     try testing.expectEqual(Version.init(2, 7), parseVersion("foo.2.7.pyc").?);
     try testing.expect(parseVersion("nope.pyc") == null);
+}
+
+test "get base name from pyc filename" {
+    const testing = std.testing;
+    try testing.expectEqualStrings("test_foo", getBaseName("test_foo.3.11.pyc"));
+    try testing.expectEqualStrings("swap", getBaseName("swap.2.7.pyc"));
+    try testing.expectEqualStrings("if_elif_else", getBaseName("if_elif_else.3.9.pyc"));
 }
 
 test "run pycdc test suite" {
