@@ -93,6 +93,35 @@ pub const CFG = struct {
         return &self.blocks[id];
     }
 
+    /// Write CFG as DOT graph.
+    pub fn writeDot(self: *const CFG, writer: anytype) !void {
+        try writer.writeAll("digraph CFG {\n");
+        try writer.writeAll("  node [shape=box];\n");
+
+        for (self.blocks) |block| {
+            try writer.print("  block{} [label=\"Block {}", .{ block.id, block.id });
+            if (block.is_exception_handler) try writer.writeAll(" (handler)");
+            if (block.is_loop_header) try writer.writeAll(" (loop)");
+            try writer.print("\\noffset {}\"", .{block.start_offset});
+            if (block.is_exception_handler) try writer.writeAll(", color=red");
+            if (block.is_loop_header) try writer.writeAll(", color=blue");
+            try writer.writeAll("];\n");
+
+            for (block.successors) |edge| {
+                const style = switch (edge.edge_type) {
+                    .normal => "",
+                    .conditional_true => ", label=\"true\", color=green",
+                    .conditional_false => ", label=\"false\", color=red",
+                    .exception => ", label=\"exception\", style=dashed, color=red",
+                    .loop_back => ", label=\"loop\", color=blue, constraint=false",
+                };
+                try writer.print("  block{} -> block{}{};\n", .{ block.id, edge.target, style });
+            }
+        }
+
+        try writer.writeAll("}\n");
+    }
+
     /// Find the block containing a given byte offset.
     pub fn blockContaining(self: *const CFG, offset: u32) ?*const BasicBlock {
         for (self.blocks) |*block| {
