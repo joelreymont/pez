@@ -34,6 +34,8 @@ pub const ControlFlowPattern = union(enum) {
     try_stmt: TryPattern,
     /// With statement.
     with_stmt: WithPattern,
+    /// Match statement.
+    match_stmt: MatchPattern,
     /// Sequential block (no special control flow).
     sequential: SequentialPattern,
     /// Unknown/unrecognized pattern.
@@ -116,6 +118,26 @@ pub const WithPattern = struct {
     exit_block: u32,
 };
 
+/// Pattern for match statements (Python 3.10+).
+pub const MatchPattern = struct {
+    /// Block that loads the subject (before first case).
+    subject_block: u32,
+    /// Blocks for each case pattern test.
+    case_blocks: []const u32,
+    /// Block after all cases (where they merge or wildcard).
+    exit_block: ?u32,
+};
+
+/// Info about a single match case.
+pub const CaseInfo = struct {
+    /// Block containing pattern test.
+    pattern_block: u32,
+    /// First block of case body.
+    body_block: u32,
+    /// True if this is wildcard case (_).
+    is_wildcard: bool,
+};
+
 /// Break/continue detection result.
 pub const LoopExit = union(enum) {
     /// A break statement (exits the loop).
@@ -191,6 +213,13 @@ pub const Analyzer = struct {
         // Check for exception handler with CHECK_EXC_MATCH - not a regular if
         if (block.is_exception_handler or self.hasCheckExcMatch(block)) {
             return .unknown;
+        }
+
+        // Check for match statement (before if, since match uses conditional jumps)
+        if (self.isMatchSubjectBlock(block)) {
+            if (try self.detectMatchPattern(block_id)) |pattern| {
+                return .{ .match_stmt = pattern };
+            }
         }
 
         // Check for conditional jump (if statement pattern)
@@ -746,6 +775,108 @@ pub const Analyzer = struct {
             .cleanup_block = cleanup_id,
             .exit_block = exit_block orelse block_id + 1,
         };
+    }
+
+    /// Check if block looks like start of a match statement.
+    /// Match starts with subject load, then COPY before pattern tests.
+    fn isMatchSubjectBlock(self: *const Analyzer, block: *const BasicBlock) bool {
+        // Look for COPY in successor block followed by MATCH_* or COMPARE_OP
+        if (block.successors.len == 0) return false;
+
+        const succ_id = block.successors[0].target;
+        if (succ_id >= self.cfg.blocks.len) return false;
+        const succ = &self.cfg.blocks[succ_id];
+
+        // Check if successor block starts match pattern
+        return self.hasMatchPattern(succ);
+    }
+
+    /// Check if block has a match pattern (COPY followed by MATCH_* or literal compare).
+    fn hasMatchPattern(self: *const Analyzer, block: *const BasicBlock) bool {
+        _ = self;
+        var has_copy = false;
+        var has_match_op = false;
+
+        for (block.instructions) |inst| {
+            if (inst.opcode == .COPY) has_copy = true;
+            if (inst.opcode == .MATCH_SEQUENCE or
+                inst.opcode == .MATCH_MAPPING or
+                inst.opcode == .MATCH_CLASS)
+            {
+                has_match_op = true;
+            }
+            // COPY + COMPARE_OP is literal case match
+            if (has_copy and inst.opcode == .COMPARE_OP) {
+                has_match_op = true;
+            }
+        }
+        return has_copy and has_match_op;
+    }
+
+    /// Detect match statement pattern.
+    fn detectMatchPattern(self: *Analyzer, block_id: u32) !?MatchPattern {
+        // Block should be subject loading block; first case is in successor
+        const block = &self.cfg.blocks[block_id];
+        if (block.successors.len == 0) return null;
+
+        var case_blocks: std.ArrayList(u32) = .{};
+        defer case_blocks.deinit(self.allocator);
+
+        var current: u32 = block.successors[0].target;
+        var exit_block: ?u32 = null;
+
+        // Follow the chain of case blocks
+        while (current < self.cfg.blocks.len) {
+            const cur_block = &self.cfg.blocks[current];
+
+            // Check if this is a case pattern block
+            if (!self.hasMatchPattern(cur_block) and !self.isWildcardCase(cur_block)) {
+                // Not a case block - this might be exit
+                exit_block = current;
+                break;
+            }
+
+            try case_blocks.append(self.allocator, current);
+
+            // Find next case (false branch of conditional jump)
+            var next_case: ?u32 = null;
+            for (cur_block.successors) |edge| {
+                if (edge.edge_type == .conditional_false) {
+                    next_case = edge.target;
+                    break;
+                }
+            }
+
+            if (next_case) |nc| {
+                current = nc;
+            } else {
+                // No more cases - wildcard or end
+                break;
+            }
+        }
+
+        if (case_blocks.items.len == 0) return null;
+
+        const cases = try self.allocator.dupe(u32, case_blocks.items);
+
+        return MatchPattern{
+            .subject_block = block_id,
+            .case_blocks = cases,
+            .exit_block = exit_block,
+        };
+    }
+
+    /// Check if block is a wildcard case (_).
+    fn isWildcardCase(self: *const Analyzer, block: *const BasicBlock) bool {
+        _ = self;
+        // Wildcard is just NOP (always matches)
+        for (block.instructions) |inst| {
+            if (inst.opcode == .NOP) {
+                // Check if it's followed by body (no conditional jump)
+                if (block.successors.len == 1) return true;
+            }
+        }
+        return false;
     }
 
     /// Find the merge point where two branches converge.
