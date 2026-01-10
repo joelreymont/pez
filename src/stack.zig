@@ -2472,6 +2472,31 @@ pub const SimContext = struct {
                 try self.stack.push(.{ .expr = expr });
             },
 
+            .BINARY_SLICE => {
+                // BINARY_SLICE (Python 3.12+) - TOS = TOS2[TOS1:TOS]
+                const stop = try self.stack.popExpr();
+                const start = try self.stack.popExpr();
+                const container = try self.stack.popExpr();
+
+                // Convert None to null for slice bounds
+                const lower: ?*Expr = if (isNoneExpr(start)) null else start;
+                const upper: ?*Expr = if (isNoneExpr(stop)) null else stop;
+
+                const slice = try self.allocator.create(Expr);
+                slice.* = .{ .slice = .{ .lower = lower, .upper = upper, .step = null } };
+
+                const expr = try ast.makeSubscript(self.allocator, container, slice, .load);
+                try self.stack.push(.{ .expr = expr });
+            },
+
+            .STORE_SLICE => {
+                // STORE_SLICE (Python 3.12+) - TOS3[TOS2:TOS1] = TOS
+                _ = self.stack.pop();
+                _ = self.stack.pop();
+                _ = self.stack.pop();
+                _ = self.stack.pop();
+            },
+
             .STORE_SUBSCR => {
                 // STORE_SUBSCR - TOS1[TOS] = TOS2
                 // Stack: key, container, value -> (empty)
@@ -3050,11 +3075,27 @@ pub const SimContext = struct {
 
             .LIST_EXTEND => {
                 // LIST_EXTEND i - extend list at stack[i] with TOS
-                // Used for [*items] unpacking
-                if (self.stack.pop()) |v| {
-                    var val = v;
-                    val.deinit(self.allocator);
+                // Pattern: BUILD_LIST 0 + LOAD_CONST(tuple) + LIST_EXTEND 1 → [elements...]
+                const items = self.stack.pop() orelse return error.StackUnderflow;
+
+                // Check if extending empty list with tuple expression
+                if (inst.arg == 1 and self.stack.len() >= 1) {
+                    if (self.stack.peek()) |list_val| {
+                        if (list_val == .expr) {
+                            const list_expr = list_val.expr;
+                            if (list_expr.* == .list and list_expr.list.elts.len == 0) {
+                                // Check if items is a tuple expression
+                                if (items == .expr and items.expr.* == .tuple) {
+                                    const tuple_elts = items.expr.tuple.elts;
+                                    // Replace empty list with list containing tuple elements
+                                    list_expr.* = .{ .list = .{ .elts = tuple_elts, .ctx = .load } };
+                                    return;
+                                }
+                            }
+                        }
+                    }
                 }
+                // Default: just consume items (used for [*items] unpacking)
             },
 
             .SET_UPDATE => {
@@ -3347,6 +3388,11 @@ fn binOpFromArg(arg: u32) ast.BinOp {
         25 => .bitxor,
         else => .add,
     };
+}
+
+/// Check if expression is a None constant.
+fn isNoneExpr(expr: *const Expr) bool {
+    return expr.* == .constant and expr.constant == .none;
 }
 
 /// Convert COMPARE_OP arg to CmpOp enum.
