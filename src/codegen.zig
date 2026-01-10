@@ -134,6 +134,15 @@ pub const Writer = struct {
                     try self.writeExprPrec(allocator, cmp, 0);
                 }
             },
+            .named_expr => |n| {
+                const prec: u8 = 1;
+                const needs_parens = prec < parent_prec;
+                if (needs_parens) try self.writeByte(allocator, '(');
+                try self.writeExprPrec(allocator, n.target, prec);
+                try self.write(allocator, " := ");
+                try self.writeExprPrec(allocator, n.value, prec);
+                if (needs_parens) try self.writeByte(allocator, ')');
+            },
             .bool_op => |b| {
                 const prec: u8 = if (b.op == .and_) 4 else 3;
                 const needs_parens = prec < parent_prec;
@@ -314,9 +323,6 @@ pub const Writer = struct {
                 try self.writeArguments(allocator, l.args);
                 try self.write(allocator, ": ");
                 try self.writeExpr(allocator, l.body);
-            },
-            else => {
-                try self.write(allocator, "<?>");
             },
         }
     }

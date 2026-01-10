@@ -793,7 +793,7 @@ pub const Decompiler = struct {
         var optional_vars: ?*Expr = null;
 
         for (setup.instructions) |inst| {
-            if (inst.opcode == .BEFORE_WITH or inst.opcode == .BEFORE_ASYNC_WITH) {
+            if (inst.opcode == .BEFORE_WITH or inst.opcode == .BEFORE_ASYNC_WITH or inst.opcode == .LOAD_SPECIAL) {
                 after_before_with = true;
                 if (inst.opcode == .BEFORE_ASYNC_WITH) {
                     is_async = true;

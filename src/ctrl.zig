@@ -232,7 +232,7 @@ pub const Analyzer = struct {
     fn hasWithSetup(self: *const Analyzer, block: *const BasicBlock) bool {
         _ = self;
         for (block.instructions) |inst| {
-            if (inst.opcode == .BEFORE_WITH or inst.opcode == .BEFORE_ASYNC_WITH) return true;
+            if (inst.opcode == .BEFORE_WITH or inst.opcode == .BEFORE_ASYNC_WITH or inst.opcode == .LOAD_SPECIAL) return true;
         }
         return false;
     }
@@ -580,10 +580,10 @@ pub const Analyzer = struct {
     fn detectWithPattern(self: *Analyzer, block_id: u32) ?WithPattern {
         const block = &self.cfg.blocks[block_id];
 
-        // Find BEFORE_WITH/BEFORE_ASYNC_WITH instruction
+        // Find BEFORE_WITH/BEFORE_ASYNC_WITH/LOAD_SPECIAL instruction
         var has_before_with = false;
         for (block.instructions) |inst| {
-            if (inst.opcode == .BEFORE_WITH or inst.opcode == .BEFORE_ASYNC_WITH) {
+            if (inst.opcode == .BEFORE_WITH or inst.opcode == .BEFORE_ASYNC_WITH or inst.opcode == .LOAD_SPECIAL) {
                 has_before_with = true;
                 break;
             }
