@@ -2895,6 +2895,58 @@ pub const SimContext = struct {
                 }
             },
 
+            // Pattern matching opcodes (Python 3.10+)
+            .MATCH_SEQUENCE => {
+                // Stack effect +1: push bool (subject stays on stack)
+                try self.stack.push(.unknown);
+            },
+
+            .MATCH_MAPPING => {
+                // Stack effect +1: push bool (subject stays on stack)
+                try self.stack.push(.unknown);
+            },
+
+            .MATCH_KEYS => {
+                // Stack effect +1: pop keys tuple, push values tuple or None
+                // (subject and bool stay; net +1 from keys->values)
+                if (self.stack.pop()) |v| {
+                    var val = v;
+                    val.deinit(self.allocator);
+                } else {
+                    return error.StackUnderflow;
+                }
+                try self.stack.push(.unknown); // values tuple or None
+                try self.stack.push(.unknown); // success bool
+            },
+
+            .MATCH_CLASS => {
+                // Stack effect -2: pop attr_names, class, subject (3); push result (1)
+                if (self.stack.pop()) |v| {
+                    var val = v;
+                    val.deinit(self.allocator);
+                } else {
+                    return error.StackUnderflow;
+                }
+                if (self.stack.pop()) |v| {
+                    var val = v;
+                    val.deinit(self.allocator);
+                } else {
+                    return error.StackUnderflow;
+                }
+                if (self.stack.pop()) |v| {
+                    var val = v;
+                    val.deinit(self.allocator);
+                } else {
+                    return error.StackUnderflow;
+                }
+                try self.stack.push(.unknown); // attrs tuple or None
+            },
+
+            .GET_LEN => {
+                // Stack effect +1: push len(TOS), TOS stays
+                try self.stack.push(.unknown);
+            },
+
             else => {
                 // Unhandled opcode - push unknown for each value it would produce
                 // For now, just push unknown

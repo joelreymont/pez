@@ -3306,3 +3306,945 @@ Fundamental fix: Since ALL SimContext allocations use arena, StackValue.deinit/F
 **Claude:** Perfect! Now working on COMPARE_OP - the actual root cause of StackUnderflow errors. Let me implement it:
 
 ---
+
+## Session - 2026-01-10 11:36:54
+
+### Active Work (bd)
+
+```
+(no in-progress items)
+```
+
+### Conversation
+
+**User:** go
+
+**Claude:** Tests pass (96/96) but there are memory leaks in stack tests. Let me check if the chained comparison feature is working.
+
+**Claude:** Python 3.14 magic is already there. The issue is marshal dumps a code object but not a complete pyc. Let me test with a proper pyc file.
+
+**Claude:** Two bugs: double free in `decompileNestedBody` at :1650 and integer overflow in stack simulate at :2052. Let me look at those.
+
+**Claude:** The issue: if `nested_ptr.decompile()` at line 1655 fails, errdefer destroys `nested_ptr`. But the nested_ptr was already appended to `nested_decompilers` at line 1653, so `deinit()` will also try to destroy it. Let me check the deinit.
+
+**Claude:** The fix: append to `nested_decompilers` AFTER `decompile()` succeeds, OR remove the errdefer. Since on success the nested_ptr needs to be cleaned up by deinit, the errdefer must NOT destroy it if it was already appended. Let me fix by moving the append after decompile.
+
+**Claude:** Now fix the second bug - integer overflow in stack simulate at :2052.
+
+**Claude:** At line 2054, if `pos >= self.stack.items.items.len`, then `self.stack.items.items.len - 1 - pos` can underflow. But we check at line 2052. The issue is the comparison on line 2052 - `pos` is from `inst.arg - 1` which is an unsigned int, and this can cause the issue if stack is smaller than expected. Actually wait - the panic is at 2052, which is the comparison itself. Let me check the stack trace more carefully:
+
+```
+/Users/joel/Work/pez/src/stack.zig:2052:56: 0x1050af39f in simulate (pez)
+                if (pos >= self.stack.items.items.len) return error.StackUnderflow;
+```
+
+The issue is `self.stack.items.items.len - 1 - pos` at line 2054 where the subtraction causes underflow. But wait, the panic is at 2052? Let me check again - the column 56 points to the comparison. But actually, the overflow is happening because of the calculation before the comparison... No, wait - the trace says it's at 2052 but maybe it's the calculation on 2054.
+
+Let me look more carefully. The issue could be that the error is thrown from line 2054 where `self.stack.items.items.len - 1 - pos` underflows. But the panic says 2052...
+
+Actually, looking at the decompile trace:
+```
+/Users/joel/Work/pez/src/decompile.zig:632:13: 0x105099acb in decompileIf (pez)
+            try sim.simulate(inst);
+```
+
+This is coming from `decompileIf`. Let me check what line 632 is.
+
+**Claude:** The `sim.simulate(inst)` is failing on some instruction. The panic shows integer overflow on the line 2052. Let me look at the Python bytecode again:
+
+```
+LOAD_FAST_LOAD_FAST      1 (a, b)
+SWAP                     2
+COPY                     2
+COMPARE_OP               2 (<)
+```
+
+The issue might be SWAP or COPY with an empty or insufficient stack. The problem is that `decompileIf` starts with an empty simulator, but the actual bytecode for the function starts earlier with RESUME.
+
+Let me check how the CFG is structured. The issue is that we're simulating the condition block starting from a fresh SimContext without the stack state from previous blocks.
+
+**Claude:** The bytecode shows:
+1. LOAD_FAST_LOAD_FAST loads a and b
+2. SWAP 2 - swap TOS with item at position 2 (so now: b, a)
+3. COPY 2 - copy item at position 2 to TOS (copies b, so: b, a, b)
+4. COMPARE_OP - pops top 2 (a, b), pushes result (so: b, result)
+5. COPY 1 - copy TOS (result, so: b, result, result)
+6. TO_BOOL - convert TOS to bool (so: b, result, bool)
+7. POP_JUMP_IF_FALSE - pops bool, jump if false
+
+The issue is that when `decompileIf` starts simulating the condition block, it starts with a fresh empty stack, but the bytecode expects values already on the stack (from earlier simulation).
+
+Let me trace what's happening. Looking at the error - this is happening in nested function body decompile. The chained comparison code pattern needs to handle the case where the condition block doesn't start at instruction 0.
+
+Let me see how the blocks are structured.
+
+**Claude:** Let me understand the problem better. When we enter `decompileIf`, we start with an empty stack. But the condition block's instructions assume stack state from previous execution. The real issue is that the function starts with LOAD_FAST_LOAD_FAST etc. before any branch.
+
+Let me check how `decompile` processes blocks to understand the control flow.
+
+**Claude:** I see - when a pattern is detected as `if_stmt`, the `decompileIf` is called which starts with a fresh SimContext. But the issue is that for chained comparisons, the condition_block contains instructions that build up the stack before the conditional jump.
+
+Looking back at the bytecode:
+```
+LOAD_FAST_LOAD_FAST      1 (a, b)   # block 0 or part of condition block
+SWAP                     2
+COPY                     2
+COMPARE_OP               2 (<)
+COPY                     1
+TO_BOOL
+POP_JUMP_IF_FALSE        6 (to L1)  # end of condition block
+```
+
+The condition block should include all instructions up to POP_JUMP_IF_FALSE. So when `decompileIf` simulates from an empty stack, these load/swap/copy instructions should work because they start with an empty stack and build it up.
+
+Let me check if LOAD_FAST_LOAD_FAST is implemented.
+
+**Claude:** LOAD_FAST_LOAD_FAST is not implemented in the stack simulator! That's why it fails - an unknown opcode probably leaves the stack in a bad state.
+
+**Claude:** So `LOAD_FAST` is handled, but `LOAD_FAST_LOAD_FAST` is not. Let me search for where unknown opcodes are handled.
+
+**Claude:** Let me see the end of the main simulate switch to understand what happens with unhandled opcodes.
+
+**Claude:** Found it! Line 2898-2902: unhandled opcodes push `.unknown`. But `LOAD_FAST_LOAD_FAST` loads TWO values onto the stack, not one. So it's treated as unknown and pushes one value, but then SWAP 2 expects 2 values and fails.
+
+I need to implement `LOAD_FAST_LOAD_FAST`. Let me find where LOAD_FAST is handled and add it nearby.
+
+**Claude:** I see there's `LOAD_FAST_BORROW_LOAD_FAST_BORROW` at line 1243. I need to add `LOAD_FAST_LOAD_FAST` similarly.
+
+**Claude:** Progress! There's an issue with the chained comparison detection. Let me analyze the bytecode again:
+
+```
+LOAD_FAST_LOAD_FAST      1 (a, b)   → stack: [a, b]
+SWAP                     2          → stack: [b, a]
+COPY                     2          → stack: [b, a, b]
+COMPARE_OP               2 (<)      → stack: [b, (a<b)]
+COPY                     1          → stack: [b, (a<b), (a<b)]
+TO_BOOL                              → stack: [b, (a<b), bool]
+POP_JUMP_IF_FALSE        6 (to L1)  → stack: [b, (a<b)]
+NOT_TAKEN
+POP_TOP                             → stack: [b]
+LOAD_FAST_BORROW         2 (c)      → stack: [b, c]
+COMPARE_OP               2 (<)      → stack: [(b<c)]
+RETURN_VALUE
+```
+
+So when we detect the if pattern, the condition_block contains everything up to POP_JUMP_IF_FALSE. After simulating, we pop the condition expression `(a<b)` and there's `[b]` left on the stack.
+
+Looking at `tryDecompileChainedComparison` at line 522-619, it:
+1. Checks first_cmp is a Compare (✓)
+2. Checks stack has values (✓ - has b)
+3. Checks then_block has POP_TOP, LOAD, COMPARE pattern (should ✓)
+
+Let me trace more to see what's wrong. The output shows `if a < b` which means the chained comparison detection is NOT working. Let me check if `tryDecompileChainedComparison` is returning null.
+
+**Claude:** The issue is at line 551-553: it only accepts LOAD_NAME, LOAD_FAST, and LOAD_GLOBAL, but Python 3.14 uses LOAD_FAST_BORROW.
+
+**Claude:** Now let's test a 3+ chained comparison.
+
+**Claude:** 3+ chains fail. Let me see the bytecode pattern for 3+ chains.
+
+**Claude:** The 3+ chain has TWO nested jumps. The current detection only handles ONE jump. This is a more complex pattern.
+
+The pattern is:
+1. First comparison with jump (a < b)
+2. If true: another comparison with jump (b < c)
+3. If true: final comparison (c < d) and return
+4. L1 is the short-circuit fallback
+
+The current `tryDecompileChainedComparison` only handles one level of nesting. For 3+ chains, the then-block itself contains another conditional pattern.
+
+This is a significantly more complex case. For now, let me check what the current state produces for the simple 2-chain case and make sure tests pass, then we can address 3+ chains separately.
+
+**Claude:** 96/96 tests pass, with some pre-existing memory leaks. Now let me commit these fixes and update the dots.
+
+**Claude:** Done.
+
+Summary:
+- Added `LOAD_FAST_LOAD_FAST` opcode handler (loads two vars, used in Python 3.14)
+- Added `LOAD_FAST_BORROW` to chained comparison detection
+- Fixed double-free in `decompileNestedBody` error path
+
+2-chain comparisons (`a < b < c`) now decompile correctly. 3+ chains still fail - need recursive pattern detection in `tryDecompileChainedComparison`.
+
+**User:** clean up dots, then pick a dot and work on it
+
+**Claude:** Working on `pez-85875f1a84f28441` - Fix TO_BOOL to leave expr on stack.
+
+**Claude:** `TO_BOOL` at line 2603-2605 already preserves the expression (does nothing). Let me check if there's a problem with how it's being used.
+
+**Claude:** Works correctly. Let me test a more complex case with boolean operations.
+
+**Claude:** Found a real issue. The bytecode for `x and y`:
+```
+LOAD_FAST                0 (x)    → [x]
+COPY                     1        → [x, x]
+TO_BOOL                           → [x, bool(x)]  ← THIS IS WRONG
+POP_JUMP_IF_FALSE        3        → [x]
+NOT_TAKEN
+POP_TOP                           → []
+LOAD_FAST                1 (y)    → [y]
+RETURN_VALUE
+```
+
+The issue: `TO_BOOL` in Python 3.14 converts TOS to a bool but should REPLACE TOS with the bool, not leave the original. But wait, looking at the bytecode flow:
+
+1. LOAD_FAST x → [x]
+2. COPY 1 → [x, x]
+3. TO_BOOL → [x, bool] (converts the COPY'd value to bool)
+4. POP_JUMP_IF_FALSE → [x] (pops bool)
+5. If not jumped, POP_TOP → []
+6. LOAD_FAST y → [y]
+7. RETURN_VALUE
+
+So `TO_BOOL` should convert TOS to bool (replacing it). Currently it does nothing, which means after COPY we have [x, x], then TO_BOOL leaves [x, x], then POP_JUMP pops one x leaving [x], then NOT_TAKEN does nothing, then POP_TOP pops the x leaving []. That should work...
+
+But wait, the error is at RETURN_VALUE trying to pop. Let me check RETURN_VALUE handling.
+
+Actually, the issue may be the CFG splitting. The function has a conditional jump, so it gets split into blocks. The decompiler may be processing blocks incorrectly.
+
+**Claude:** No debug flag. Let me add some debug output to understand the issue. First, let me trace the error more carefully. The error is at `processBlockWithSim` line 184 - trying to pop for RETURN_VALUE.
+
+**Claude:** The issue is that when processing blocks sequentially, if the CFG splits the function at the conditional jump, block 1 (after the jump) starts with an empty stack, but the bytecode expects values on it.
+
+Let me look at how blocks are being processed. The `and` expression generates:
+- Block 0: LOAD_FAST, COPY, TO_BOOL, POP_JUMP_IF_FALSE → ends with conditional jump
+- Block 1 (fallthrough): NOT_TAKEN, POP_TOP, LOAD_FAST, RETURN_VALUE
+- Block 2 (jump target L1): RETURN_VALUE
+
+Block 1 processes NOT_TAKEN (no effect), POP_TOP (pops from empty stack - ERROR).
+
+The issue is that this is a short-circuit `and` pattern, not an if statement. The decompiler needs to detect this pattern.
+
+Let me check if there's pattern detection for boolean operations.
+
+**Claude:** The AST has `bool_op` for and/or. Let me check how the decompiler detects these patterns.
+
+**Claude:** No bool_op handling in decompile.zig. Let me check the control flow analyzer.
+
+**Claude:** No pattern detection for boolean expressions. The issue is that Python 3.14's `x and y` uses `COPY` + `TO_BOOL` + `POP_JUMP_IF_FALSE` rather than the older `JUMP_IF_FALSE_OR_POP`.
+
+Looking at older Python versions:
+
+**Claude:** Same pattern in 3.13. This is a Python 3.12+ pattern.
+
+The issue is that when we have:
+```
+LOAD_FAST x        → [x]
+COPY 1             → [x, x]
+TO_BOOL            → [x, bool]
+POP_JUMP_IF_FALSE  → pops bool, if false jumps to L1, stack: [x]
+POP_TOP            → pops x, stack: []
+LOAD_FAST y        → [y]
+L1: RETURN_VALUE   → returns TOS
+```
+
+The CFG splits this into blocks. The decompiler processes block-by-block with fresh stacks. But this is a single expression `return x and y`, not an if statement.
+
+The fix should be: detect this pattern as a BoolOp expression, not as an if statement. Looking at the IfPattern detection, it probably matches this but incorrectly.
+
+Let me see how the pattern is detected.
+
+**Claude:** The IfPattern detection at line 344-406 only checks if there are two successors and a conditional jump. It doesn't distinguish between:
+1. A real if statement: `if x: stmt1 else: stmt2`
+2. A short-circuit boolean: `return x and y`
+
+The difference is:
+- If statement: then-block and else-block have different statements
+- Boolean expr: then-block pops the condition copy, loads the second value, both branches merge
+
+Let me think about how to fix this. The key insight is that for `x and y`, the then-block:
+1. Has POP_TOP (or NOT_TAKEN + POP_TOP in 3.14)
+2. Loads another value
+3. Falls through to the same merge point as the else-block
+
+Actually, looking more carefully at the bytecode:
+```
+L1: RETURN_VALUE
+```
+
+Both the then-block and L1 end at the SAME RETURN_VALUE instruction. This means this is NOT an if statement but an expression.
+
+Let me add pattern detection for short-circuit boolean expressions. This should be detected before if pattern.
+
+**Claude:** I need a different approach. The short-circuit `and`/`or` should be handled during expression simulation, not as a control flow pattern. When we see:
+```
+COPY 1
+TO_BOOL  
+POP_JUMP_IF_FALSE target
+```
+
+This is an `and` expression. The stack simulation should recognize this pattern and build a BoolOp expression.
+
+But the problem is the CFG splits this across blocks, and the decompiler processes blocks with fresh stacks.
+
+Let me look at how ternary expressions are handled - they have a similar structure.
+
+**Claude:** There's a `detectTernary` in ctrl.zig and `tryDecompileTernaryInto` in decompile.zig. Let me understand this pattern.
+
+**Claude:** I see. The ternary pattern detection looks for:
+1. Condition block with conditional jump
+2. Two successors that merge to the same point
+
+For `x and y`:
+```
+Block 0: LOAD_FAST x, COPY 1, TO_BOOL, POP_JUMP_IF_FALSE L1
+  → successors: Block 1 (fallthrough), Block 2 (L1)
+Block 1: NOT_TAKEN, POP_TOP, LOAD_FAST y
+  → successor: Block 2
+Block 2 (L1): RETURN_VALUE
+```
+
+This looks similar to ternary, but the difference is:
+- Ternary: both branches produce a value, they merge
+- And: the "else" branch (false) just returns the first value which is already on stack
+
+Let me add a pattern for BoolOp. The key difference from ternary:
+1. For `and`: then-block has `POP_TOP` followed by loading second operand
+2. For `or`: else-block has `POP_TOP` followed by loading second operand
+
+**Claude:** Actually, let me think about this differently. The short-circuit boolean is really an expression, not a statement. It should be handled like ternary - the decompiler should detect it and build a BoolOp expression before checking for if_stmt.
+
+Let me look at `tryDecompileTernaryInto` to understand the approach.
+
+**Claude:** I need to add a similar function for BoolOp detection. But first, let me understand the bytecode pattern better.
+
+For `x and y`:
+```
+LOAD_FAST x
+COPY 1           ← duplicates x on stack
+TO_BOOL          ← converts TOS to bool (for truth test)
+POP_JUMP_IF_FALSE L1  ← if false, jump to L1 (return x)
+NOT_TAKEN
+POP_TOP          ← pop the duplicate (the bool)
+LOAD_FAST y      ← load y
+L1: RETURN_VALUE ← return TOS (either x or y)
+```
+
+For `x or y`:
+```
+LOAD_FAST x
+COPY 1
+TO_BOOL
+POP_JUMP_IF_TRUE L1   ← if true, jump to L1 (return x)
+NOT_TAKEN
+POP_TOP
+LOAD_FAST y
+L1: RETURN_VALUE
+```
+
+The pattern is:
+1. Condition block: ends with COPY, TO_BOOL, POP_JUMP_IF_FALSE/TRUE
+2. Then-block (fallthrough): starts with NOT_TAKEN (optional), POP_TOP
+3. Both branches merge to the same RETURN
+
+Let me add BoolOp pattern detection. I'll add it to ctrl.zig first.
+
+**Claude:** Now add the detection function.
+
+**Claude:** Now add the decompilation logic in decompile.zig. I'll add it near the ternary handling.
+
+**Claude:** Now add the `tryDecompileBoolOpInto` function. Let me add it near `tryDecompileTernaryInto`.
+
+**Claude:** Now test `or`:
+
+**Claude:** Test chained `and`:
+
+**Claude:** Missing the third operand. The chained `and` generates nested patterns. Let me check the bytecode:
+
+**Claude:** The second operand block also has COPY, TO_BOOL, POP_JUMP - it's another BoolOp. The detection needs to handle nesting. In the second block after POP_TOP, there's another BoolOp pattern.
+
+The issue is that `tryDecompileBoolOpInto` simulates the second block but doesn't recursively detect nested BoolOps. Let me fix this by making the second operand extraction recursive.
+
+Actually, a simpler fix: when simulating the second block, if we detect another BoolOp pattern, we should recursively handle it. Or, the second block's simulation should call back into the pattern detection.
+
+Let me modify `tryDecompileBoolOpInto` to handle chained boolops:
+
+**Claude:** The issue is that after simulating the second block, we stop at the conditional jump and pop the expression. But for chained boolops, the second block ALSO contains a COPY, TO_BOOL, POP_JUMP pattern. We need to recursively detect this.
+
+I'll refactor to extract a helper that builds a BoolOp expr recursively:
+
+**Claude:** Now add the `buildBoolOpExpr` helper function:
+
+**Claude:** Zig 0.15 API change - ArrayList is unmanaged.
+
+**Claude:** Now run all tests:
+
+**Claude:** 96/96 tests pass (pre-existing leaks).
+
+**Claude:** The chained comparison test broke. The BoolOp detection is incorrectly matching the chained comparison pattern. The issue is that chained comparison also uses COPY, TO_BOOL, POP_JUMP but it's NOT a boolean expression.
+
+The difference:
+- BoolOp: `x and y` - evaluates to either x or y
+- Chained comparison: `a < b < c` - evaluates to (a<b) and (b<c) as a boolean
+
+For chained comparison, the COPY duplicates the middle value for the second comparison, not the boolean result. Let me look at the bytecode again:
+
+```
+# x and y:
+LOAD_FAST x
+COPY 1       ← copies x
+TO_BOOL
+POP_JUMP_IF_FALSE
+
+# a < b < c:
+LOAD_FAST_LOAD_FAST (a, b)
+SWAP 2       ← swap to get b,a
+COPY 2       ← copy b (not the comparison result!)
+COMPARE_OP   ← a < b
+COPY 1       ← copy the comparison result
+TO_BOOL
+POP_JUMP_IF_FALSE
+```
+
+The difference is:
+- BoolOp: COPY 1, TO_BOOL, POP_JUMP (copy, then convert to bool)
+- Chained comparison: COMPARE_OP, COPY 1, TO_BOOL, POP_JUMP (compare, then copy, then convert)
+
+The BoolOp pattern should check that the COPY is directly before TO_BOOL with no intervening COMPARE_OP. Let me refine the detection.
+
+**Claude:** The issue is that for chained comparison, the pattern is:
+```
+COMPARE_OP
+COPY 1
+TO_BOOL
+POP_JUMP
+```
+
+And for BoolOp:
+```
+COPY 1
+TO_BOOL
+POP_JUMP
+```
+
+The difference is that COMPARE_OP comes before COPY in chained comparison. Let me add a check to exclude this case:
+
+**Claude:** There's a snapshot test failing. Let me check it:
+
+**Claude:** The test output isn't showing the actual failure details. Let me run just that test:
+
+**Claude:** The actual error is happening in a previous test ("snapshot call with keywords") but it's showing as 11 leaked with some failures. Let me check the snapshot test file:
+
+**Claude:** This shows 96/96 tests passed with 11 leaked, but then there's an error. The leaks are pre-existing and the tests do pass. Let me check if the build summary shows failure:
+
+**Claude:** The error message says "while executing test 'snapshot python 2.7 class output'" but 96/96 tests passed. This seems like a false positive from the test runner due to the memory leaks. Let me check if the leaks are causing exit code 1:
+
+**Claude:** The leaks are causing the test to fail. This is pre-existing behavior - not caused by my changes. Let me verify by checking the git status:
+
+**Claude:** Same behavior before my changes - 96/96 passed, 11 leaked, exit code 1. The test failure is pre-existing.
+
+**Claude:** Completed:
+1. Fixed chained comparison for Python 3.14 (LOAD_FAST_LOAD_FAST, LOAD_FAST_BORROW)
+2. Fixed double-free in decompileNestedBody
+3. Added BoolOp support for `x and y`, `x or y`, including chained `x and y and z`
+4. Closed related dots
+
+Remaining task: `pez-2e8b7feee05f958e` - Support 3+ chained comparisons (a < b < c < d). This requires recursive pattern detection similar to what I did for BoolOp.
+
+**User:** clean up dots, then pick a dot and work on it
+
+**Claude:** Dots look organized. Working on `pez-2e8b7feee05f958e` - Support 3+ chained comparisons.
+
+**Claude:** The pattern for 3+ chains:
+1. First comparison: `a < b` with COPY, COMPARE_OP, COPY, TO_BOOL, POP_JUMP
+2. If true: POP_TOP, LOAD c, SWAP, COPY, COMPARE_OP (b < c), COPY, TO_BOOL, POP_JUMP
+3. If true: POP_TOP, LOAD d, COMPARE_OP (c < d), RETURN_VALUE
+4. L1: SWAP, POP_TOP, RETURN_VALUE (short-circuit path)
+
+The key insight: each chained comparison after the first follows the same pattern in the "then" block. I need to recursively detect these nested chained comparisons.
+
+Let me look at the current `tryDecompileChainedComparison`:
+
+**Claude:** The current code only handles 2-chain. For 3+ chains, after the second COMPARE_OP there's COPY, TO_BOOL, POP_JUMP pattern (another chained comparison).
+
+I need to:
+1. Check if after COMPARE_OP there's another COPY, TO_BOOL, POP_JUMP pattern
+2. If so, recursively build the chain
+3. Collect all comparators and operators
+
+Let me refactor `tryDecompileChainedComparison` to handle recursive chains:
+
+**Claude:** I need to check if after COMPARE_OP there's a COPY, TO_BOOL, POP_JUMP pattern (indicating another link in the chain). Let me rewrite the function to build chains recursively:
+
+**Claude:** There's still an issue. The error is at SWAP handling in stack.zig. The chained comparison detection is failing and falling back to if statement processing which doesn't have the right stack state.
+
+Let me check if the 2-chain still works:
+
+**Claude:** 2-chain works. The 3-chain is failing. Let me trace through what the bytecode looks like for the second block:
+
+**Claude:** So for the 3-chain, the CFG probably splits as:
+- Block 0: insts 0-7 (RESUME through POP_JUMP_IF_FALSE)
+- Block 1: insts 8-16 (NOT_TAKEN through POP_JUMP_IF_FALSE)
+- Block 2: insts 17-21 (NOT_TAKEN through RETURN_VALUE)
+- Block 3: insts 22-24 (SWAP, POP_TOP, RETURN_VALUE) - short circuit
+
+The issue is that Block 1 has its own conditional jump, so it's also detected as an IfPattern. When I check for the chained comparison pattern, I need to handle that block 1 also ends with POP_JUMP_IF_FALSE.
+
+Looking at the second block (Block 1):
+```
+NOT_TAKEN
+POP_TOP
+LOAD_FAST 2       ← idx+1
+SWAP 2            ← idx+2
+COPY 2            ← idx+3
+COMPARE_OP        ← idx+4
+COPY 1            ← idx+5
+TO_BOOL           ← idx+6
+POP_JUMP_IF_FALSE ← idx+7
+```
+
+In my current code, after finding COMPARE_OP at idx+4, I check if idx+5 is COPY and idx+6 is TO_BOOL and idx+7 is conditional jump. But I'm checking `cmp_idx + 1`, `cmp_idx + 2`, `cmp_idx + 3` which would be the same.
+
+Wait, looking at my code again - there's a problem with how I'm finding instructions. Let me trace through:
+
+1. idx = 1 (skip NOT_TAKEN)
+2. load_inst = instructions[2] = LOAD_FAST
+3. load_idx = 2
+4. actual_load = LOAD_FAST
+5. cmp_idx = 3
+6. I then search for COMPARE_OP starting at cmp_idx...
+
+The issue is the pattern is LOAD, SWAP, COPY, COMPARE, not LOAD, COMPARE. Let me fix the logic:
+
+**Claude:** The error is still happening at decompileBlock - the chained comparison detection is failing and it falls back to processing blocks directly which causes SWAP to fail due to empty stack.
+
+The issue is the chained comparison detection returns null too early. Let me add some debugging to understand where it's failing. Actually, let me think about this more carefully.
+
+The problem is that for the 3-chain, the CFG has multiple blocks, and when we try to detect if it's a chained comparison from block 0, we iterate through to block 1, which also has a conditional jump.
+
+The current code detects the IfPattern from block 0, then calls `tryDecompileChainedComparison`. This should iterate through blocks 0, 1, and part of 2 to build the full chain.
+
+But wait - in `decompileIf`, we only process the FIRST block (condition_block) to get the first comparison. Then we call `tryDecompileChainedComparison` which walks through the then_blocks.
+
+Let me trace through what happens:
+1. `decompile()` detects IfPattern for block 0
+2. Calls `decompileIf()` which simulates block 0 to get `a < b`
+3. Calls `tryDecompileChainedComparison()` with pattern.then_block = 1
+4. In `tryDecompileChainedComparison`, we look at block 1's instructions
+
+Block 1 has: NOT_TAKEN, POP_TOP, LOAD_FAST, SWAP, COPY, COMPARE_OP, COPY, TO_BOOL, POP_JUMP
+
+After idx=1 (skipping NOT_TAKEN), we have:
+- POP_TOP at idx=1 ✓
+- Find COMPARE_OP at some cmp_idx
+- sim_start = idx + 1 = 2
+
+Then we simulate from instruction 2 (LOAD_FAST) through COMPARE_OP. But wait, we're pushing `current_mid` which is from the first block's stack (the `b` value). Then simulating LOAD_FAST c, SWAP, COPY should work...
+
+Let me verify the 2-chain still works:
+
+**Claude:** 2-chain works. Let me check what instructions are in each block for the 3-chain:
+
+**Claude:** The offsets tell us how the CFG splits:
+- Block 0: offset 0-22 (through POP_JUMP_IF_FALSE at 22)
+- Block 1: offset 26-50 (NOT_TAKEN through POP_JUMP_IF_FALSE at 50)
+- Block 2: offset 54-64 (NOT_TAKEN through RETURN_VALUE)
+- Block 3: offset 66-70 (SWAP through RETURN_VALUE)
+
+When we're in `tryDecompileChainedComparison` starting from block 1, we need to handle the fact that it ends with POP_JUMP_IF_FALSE, which means it's also a conditional block.
+
+The problem is that after detecting the chained comparison pattern in block 1 and finding the COMPARE_OP at instruction 13, I check if there's COPY, TO_BOOL, POP_JUMP after it:
+
+```
+cmp_idx + 1 = 14 → COPY ✓
+cmp_idx + 2 = 15 → TO_BOOL ✓  
+cmp_idx + 3 = 16 → POP_JUMP_IF_FALSE ✓
+```
+
+So we should be entering the "more chain" branch. But the issue is likely in finding the next block. Let me check if the successors are being found correctly.
+
+Actually wait - the block indices aren't instruction indices. Block 1's instructions are from offset 26-50, which is instructions 8-16 in the full list. But in the block, they'd be indexed 0-8.
+
+Let me re-examine my indexing. When I'm looking at `blk.instructions`:
+- blk.instructions[0] = NOT_TAKEN
+- blk.instructions[1] = POP_TOP  
+- blk.instructions[2] = LOAD_FAST
+- blk.instructions[3] = SWAP
+- blk.instructions[4] = COPY
+- blk.instructions[5] = COMPARE_OP
+- blk.instructions[6] = COPY
+- blk.instructions[7] = TO_BOOL
+- blk.instructions[8] = POP_JUMP_IF_FALSE
+
+So after finding COMPARE_OP at index 5:
+- cmp_idx + 1 = 6 → COPY ✓
+- cmp_idx + 2 = 7 → TO_BOOL ✓
+- cmp_idx + 3 = 8 → POP_JUMP_IF_FALSE ✓
+
+This should work! Let me add some debug output to see what's happening:
+
+**Claude:** The check `cmp_idx + 3 < blk.instructions.len` should be `cmp_idx + 3 <= blk.instructions.len - 1` or equivalently `cmp_idx + 4 <= blk.instructions.len`. Wait no, if `cmp_idx + 3 < blk.instructions.len`, that means cmp_idx + 3 is a valid index.
+
+For block 1 with 9 instructions (indices 0-8), if cmp_idx = 5:
+- cmp_idx + 3 = 8
+- 8 < 9 is true ✓
+
+So that check should pass. Let me check if the popExpr is failing. When we simulate LOAD_FAST, SWAP, COPY, COMPARE_OP on a stack with just `current_mid`, what happens?
+
+Stack starts with: [mid]
+- LOAD_FAST c → [mid, c]  
+- SWAP 2 → [c, mid]
+- COPY 2 → [c, mid, c]
+- COMPARE_OP → [c, (mid < c)]
+
+Then popExpr gets `(mid < c)`, leaving [c] on the stack.
+Then for "more chain", we popExpr to get c as the next mid. That should work.
+
+But wait, block 1's instructions don't match what I listed. Let me check the actual block structure. The CFG might include different instructions due to how basic blocks are split.
+
+Actually, I think the problem is that the IfPattern detection sees block 0's conditional jump and creates a pattern where then_block is block 1. But from `decompileIf`'s perspective, it processes the conditional, then calls `tryDecompileChainedComparison`. If that fails, it falls through to regular if-statement processing.
+
+The issue might be that `tryDecompileChainedComparison` IS returning null, and then the regular if-statement processing tries to decompile blocks with incorrect stack state.
+
+Let me check if the function is returning null before it should:
+
+**Claude:** The first iteration starts with `pattern.then_block` which should be block 1 for the 3-chain. But I think the problem might be that the CFG is structured differently than I expected.
+
+Let me check what the first block looks like - maybe the NOT_TAKEN is in a separate block:
+
+**Claude:** Let me add a simple check - if the then_block's first instruction after skip is NOT POP_TOP (for the 2-chain case with final comparison), we should handle it differently:
+
+Looking at 2-chain then-block:
+```
+NOT_TAKEN
+POP_TOP
+LOAD_FAST_BORROW
+COMPARE_OP
+RETURN_VALUE
+```
+
+Looking at 3-chain first then-block (block 1):
+```
+NOT_TAKEN
+POP_TOP
+LOAD_FAST
+SWAP
+COPY
+COMPARE_OP
+COPY
+TO_BOOL
+POP_JUMP_IF_FALSE
+```
+
+Both start with NOT_TAKEN, POP_TOP. So the check at line 698 should pass for both. Let me verify that the 2-chain takes the "end of chain" path correctly:
+
+For 2-chain, after COMPARE_OP at index 3:
+- cmp_idx + 1 = 4 → RETURN_VALUE (not COPY)
+- So it goes to the "else" branch (end of chain) ✓
+
+For 3-chain block 1, after COMPARE_OP at index 5:
+- cmp_idx + 1 = 6 → COPY ✓
+- cmp_idx + 2 = 7 → TO_BOOL ✓
+- cmp_idx + 3 = 8 → POP_JUMP_IF_FALSE ✓
+- So it should go to "more chain" branch
+
+But then `then_sim.stack.popExpr()` is called to get the next mid value. At this point, after simulating LOAD_FAST, SWAP, COPY, COMPARE_OP:
+- Stack: [c, (b<c)]
+- popExpr gets (b<c), leaving [c]
+- popExpr again for next mid gets c ✓
+
+Then we need to find the next block via successors. But wait, I'm using a `for` loop with `break` which only breaks from the inner loop, not the while loop! Let me fix that:
+
+**Claude:** Still failing. The error is still coming from `decompileBlock` at line 593, which means `tryDecompileChainedComparison` is returning null and it's falling back to regular block processing.
+
+Let me add some logging to understand where it's failing. Actually, let me simplify - let me check if the problem is that `tryDecompileChainedComparison` is not being reached at all because `decompileIf` is detecting an IfPattern but the check at the start fails.
+
+**Claude:** The call to `tryDecompileChainedComparison` is at line 809. If it returns null, we fall through to regular if-statement processing. Since the error is happening in `decompileBlock`, the function must be returning null.
+
+Let me check the initial conditions:
+
+```zig
+if (first_cmp.* != .compare) return null;  // condition must be a Compare
+if (sim.stack.len() == 0) return null;     // stack must have values
+if (pattern.then_block >= self.cfg.blocks.len) return null;  // valid block
+```
+
+For the 3-chain, after simulating block 0:
+- Stack should have: [b] (the middle value left after COPY, COMPARE)
+- condition is the Compare expression (a < b)
+
+So the initial checks should pass. Let me verify by checking if the while loop breaks early.
+
+Actually, I just realized a potential issue: I'm using `try` for list appends, but on failure I'm breaking without cleaning up properly. But more importantly, there's a bug in the logic.
+
+When I enter the while loop for the first time:
+1. current_block_id = pattern.then_block (block 1)
+2. I check block 1's instructions
+3. Block 1 has NOT_TAKEN, POP_TOP, LOAD_FAST, SWAP, COPY, COMPARE_OP, COPY, TO_BOOL, POP_JUMP
+
+But wait - the blocks might not be structured this way! The CFG might create separate blocks at each jump target.
+
+Let me think about this differently. The POP_JUMP_IF_FALSE at the end of block 0 has two successors:
+- Block 1: fallthrough (conditional_true)
+- Block 3: jump target (conditional_false) - the short-circuit L1
+
+Block 1 ends with its own POP_JUMP_IF_FALSE, which has:
+- Block 2: fallthrough (conditional_true)  
+- Block 3: jump target (conditional_false)
+
+So when I look for successors of block 1 to find block 2, I should find it via conditional_true or normal edge.
+
+But wait - I'm checking `edge.edge_type == .conditional_true or edge.edge_type == .normal`. For a POP_JUMP_IF_FALSE, the fallthrough is actually the "true" case (condition is true, so we don't jump). Let me verify the edge types.
+
+Actually, the edge type namin...
+
+**Claude:** I see. For POP_JUMP_IF_FALSE:
+- Jump target is `conditional_false` (we jump when false)
+- Fallthrough is `conditional_true` (we continue when true)
+
+So in my code, when looking for the next block in the chain, I should look for `conditional_true` (the fallthrough when the comparison was true). That seems right.
+
+Let me add a temporary debug check - print something when the function returns null:
+
+Actually, let me try a different approach. The key issue is that the 3-chain has nested conditional blocks, and my current approach might not handle the recursion correctly. Let me check what happens when `tryDecompileChainedComparison` returns null:
+
+The problem is that when it returns null, `decompileIf` falls through to regular if-statement processing, which calls `decompileBlockRangeWithStack` for the then_body. This processes blocks with certain stack values, but the blocks in a chained comparison have different expectations.
+
+Wait - actually I see the issue now! When `tryDecompileChainedComparison` returns null and we fall back to regular if processing, the `condition` expression has already been popped from the stack. So when `decompileBlockRangeWithStack` is called with `base_vals` (the remaining stack values), it might not have what the blocks expect.
+
+But more fundamentally, the issue is that `tryDecompileChainedComparison` IS returning null when it shouldn't. Let me look at the first thing it checks:
+
+**Claude:** I see another issue! At line 685, I do `sim.stack.popExpr()` to get `current_mid`. But `sim` is passed in from `decompileIf`, and after this call, the stack has been modified. If `tryDecompileChainedComparison` returns null later, the caller (`decompileIf`) still uses `sim` with the modified (popped) stack!
+
+Let me check if that's the issue - the 2-chain works because the function returns successfully, but the 3-chain might be failing somewhere in the loop and returning null after already modifying the stack.
+
+The fix should be to either:
+1. Clone the stack value instead of popping it initially, or
+2. Push it back if we return null
+
+But actually, looking at the structure more carefully - if we successfully start iterating (line 687), we've already modified state. If we then break out of the loop without returning a result, we clean up the lists and return null, but the stack damage is done.
+
+Let me restructure to not modify the stack until we're sure we'll succeed. Actually, a simpler fix: check all the conditions first before modifying state.
+
+Let me look at what could cause the while loop to break early:
+
+1. `blk.instructions.len < 3` - need at least NOT_TAKEN + POP_TOP + something
+2. `idx >= blk.instructions.len` - internal error
+3. `blk.instructions[idx].opcode != .POP_TOP` - not our pattern
+4. `cmp_idx >= blk.instructions.len` - no COMPARE_OP found
+5. `cmp_expr.* != .compare` - simulation didn't produce Compare
+6. `then_sim.stack.popExpr() catch break` - stack underflow for next mid
+7. `!found_next` - no successor found
+
+For the 3-chain's first then-block (block 1), let me trace:
+- blk.instructions.len = 9 (NOT_TAKEN through POP_JUMP)
+- idx = 1 after checking NOT_TAKEN
+- blk.instructions[1] = POP_TOP ✓
+- scan for COMPARE_OP finds it at idx 5 (0-indexed in block: NOT_TAKEN=0, POP_TOP=1, LOAD=2, SWAP=3, COPY=4, COMPARE=5)
+- cmp_idx = 5 < 9 ✓
+- sim_start = 2
+- simulate instructions 2-5 (LOAD, SWAP, COPY, COMPARE)
+
+Let me check what SWAP does with only one element ...
+
+**Claude:** Let me check if the 2-chain has different block structure. Maybe the issue is how blocks are split based on jump targets.
+
+**Claude:** For the 2-chain:
+- POP_JUMP_IF_FALSE jumps to offset 6 (which is... wait, that's before the jump itself? That can't be right.)
+
+Actually, the "6" is the jump delta/target in some format. Let me check the actual jump target.
+
+Looking at the dis output more carefully - the offset column is the bytecode offset, and the argument for POP_JUMP_IF_FALSE is the target. In Python 3.14, jump arguments are typically delta-based.
+
+Let me check what L1 means:
+
+**Claude:** L1 is at the SWAP instruction (offset 38). For the 3-chain, both POP_JUMP_IF_FALSE instructions jump to the same L1 (the short-circuit path).
+
+The CFG structure should be:
+- Block 0: RESUME through POP_JUMP_IF_FALSE (offset 0-22)
+- Block 1: NOT_TAKEN through RETURN_VALUE (offset 26-36) - for 2-chain, or through next POP_JUMP for 3-chain
+- Block 2 (L1): SWAP, POP_TOP, RETURN_VALUE (offset 38-42)
+
+For 2-chain, block 1 ends with RETURN_VALUE, not a jump.
+For 3-chain, what used to be block 1 ends with POP_JUMP_IF_FALSE, creating additional blocks.
+
+So for 3-chain:
+- Block 0: RESUME through first POP_JUMP_IF_FALSE
+- Block 1: first NOT_TAKEN through second POP_JUMP_IF_FALSE  
+- Block 2: second NOT_TAKEN through third POP_JUMP_IF_FALSE (if 4+ chain) or RETURN_VALUE
+- Block N (L1): SWAP, POP_TOP, RETURN_VALUE
+
+Wait, but for the 3-chain, both jumps go to the same L1. Let me think about this...
+
+**Claude:** Both POP_JUMP_IF_FALSE go to L1 (the short-circuit path). The CFG should create:
+- Block 0: offsets 0-22 (ends with first POP_JUMP_IF_FALSE)
+- Block 1: offsets 26-50 (ends with second POP_JUMP_IF_FALSE)  
+- Block 2: offsets 54-64 (ends with RETURN_VALUE)
+- Block 3 (L1): offsets 66-70 (SWAP, POP_TOP, RETURN_VALUE)
+
+And successors:
+- Block 0 → Block 1 (true/fallthrough), Block 3 (false/jump)
+- Block 1 → Block 2 (true/fallthrough), Block 3 (false/jump)
+- Block 2 → (ends with RETURN, no successors)
+- Block 3 → (ends with RETURN, no successors)
+
+So when I'm in block 1 and look for the conditional_true successor, I should find block 2. Let me check if this is working by adding some debug output.
+
+Actually, let me just verify that the block structure is correct by adding a simple print:
+
+**Claude:** Let me try a simpler approach - print debug info via std.debug.print:
+
+**Claude:** Interesting! The iteration goes:
+- Block 1, len 9 ✓
+- Block 2, len 5 ✓
+
+But then it breaks somewhere. Block 2 has 5 instructions:
+```
+NOT_TAKEN
+POP_TOP  
+LOAD_FAST_BORROW
+COMPARE_OP
+RETURN_VALUE
+```
+
+Let me add more debug to see where it breaks for block 2:
+
+**Claude:** We're finding COMPARE_OP in both blocks. Block 2 has cmp_idx=3, which means:
+- idx=0: NOT_TAKEN
+- idx=1: POP_TOP
+- idx=2: LOAD_FAST_BORROW
+- idx=3: COMPARE_OP
+- idx=4: RETURN_VALUE
+
+After finding COMPARE_OP, we check if there's more chain:
+- cmp_idx + 3 = 6, but blk.instructions.len = 5
+- So `cmp_idx + 3 < blk.instructions.len` is false (6 < 5 is false)
+- We go to the "else" branch (end of chain)
+
+That should work! We should be building the result and returning. Let me add more debug:
+
+**Claude:** The function IS detecting the chain correctly:
+- Block 1: cmp_idx=5, more chain detected ✓
+- Block 2: cmp_idx=3, end of chain, has_return=true ✓
+
+But then the error still happens. This means the function is returning a statement, but then something else is going wrong. Let me add a print at the return:
+
+**Claude:** The function IS returning a statement with 3 comparators. But the error happens AFTER that. The issue must be elsewhere in the decompilation process.
+
+Looking at the stack trace, the error happens at `decompile()` -> `decompileBlock()`. So after `tryDecompileChainedComparison` returns successfully for the first IfPattern, the main `decompile()` loop continues and tries to process more blocks - but those blocks might have incorrect stack expectations.
+
+The issue is that `decompileIf` returns the chained comparison statement, but the caller (`decompile()`) doesn't know to skip the blocks that were consumed by the chained comparison. Let me check how `decompileIf` normally advances the block index:
+
+**Claude:** I see! After `decompileIf` returns for an if_stmt pattern, the code calls `findIfChainEnd` to determine the next block to process. But `findIfChainEnd` doesn't know about chained comparisons - it just follows the IfPattern structure.
+
+For the 3-chain, `findIfChainEnd` probably returns the merge point (block 3 - the short-circuit L1 block), but block 2 (the final comparison) should have been skipped too.
+
+Let me check what `findIfChainEnd` returns:
+
+**Claude:** `if_stmt: from block 0, next = 3`
+
+The IfPattern for block 0 goes to next block 3 (the short-circuit L1 block). But block 3 contains `SWAP, POP_TOP, RETURN_VALUE` and expects a specific stack state.
+
+The issue is that after successfully decompiling the chained comparison, we skip to block 3 which is the short-circuit fallback. But we never took the short-circuit - we successfully built the chain. We should skip block 3 entirely and move to block 4 (or end if block 3 is the last relevant block).
+
+Actually wait - block 3 is the last block for this function (L1 is the common exit for short-circuit), and we DO need to skip it. But block 3 has the `SWAP, POP_TOP, RETURN_VALUE` sequence which would be incorrect to execute after the chain.
+
+The problem is that block 3 is part of the if-pattern but shouldn't be processed when we've handled it as a chained comparison. When `findIfChainEnd` returns block 3, the caller then tries to process block 3.
+
+Let me check - does the decompile loop continue past block 3?
+
+**Claude:** So the CFG likely has 4 blocks:
+- Block 0: RESUME through first POP_JUMP
+- Block 1: First fallthrough through second POP_JUMP
+- Block 2: Second fallthrough through RETURN_VALUE
+- Block 3: L1 (SWAP, POP_TOP, RETURN_VALUE)
+
+After successfully decompiling the chained comparison from block 0, `findIfChainEnd` returns 3 (the merge/else block). The decompile loop then sets `block_idx = 3` and continues. For block 3, it detects no special pattern (`.else` branch in switch), so it calls `decompileBlock(3)`.
+
+Block 3 starts with SWAP which expects 2 items on stack but the stack is empty. That's the StackUnderflow!
+
+The fix: when a chained comparison is successfully detected and returned, we should skip ALL the blocks involved in the chain pattern, not just follow the IfPattern structure.
+
+The simplest fix is to modify `tryDecompileChainedComparison` to return the last processed block ID, and have `decompileIf` use that to skip properly. Or, we could mark processed blocks.
+
+Actually, looking at this more carefully - the issue is that the chained comparison pattern consumes blocks 0, 1, and 2. Block 3 (L1) is NOT part of the chained comparison - it's the unreachable short-circuit path. Since the chained comparison always evaluates to either true or false and returns, the L1 path is never taken for a properly compiled chained comparison.
+
+So the fix should be: when `tryDecompileChainedComparison` returns successfully, skip to after all the blocks in the chain PLUS the short-circuit block.
+
+Let me modify `decompileIf` to track the max block processed:
+
+**Claude:** I need to modify the approach. Let me change `tryDecompileChainedComparison` to return a struct containing both the statement AND the last block processed:
+
+**Claude:** Let me change the return type to include the next block to process:
+
+**Claude:** Now update the return statements:
+
+**Claude:** Now update the caller in `decompileIf`:
+
+**Claude:** I see - `decompileIf` returns a `?*Stmt`, but now `tryDecompileChainedComparison` returns `?ChainResult`. I need to change the return type of `decompileIf` as well, or handle the ChainResult specially.
+
+The cleanest approach is to have the decompile loop handle chained comparisons before calling `decompileIf`. Let me check how the loop currently works:
+
+**Claude:** Actually, the simplest fix is to change `decompileIf`'s return type to include the next block info. But that's a larger change.
+
+A simpler approach: make `tryDecompileChainedComparison` store the next_block in a field of Decompiler, and have the caller check it.
+
+Actually, the simplest is to just return the stmt and set a field:
+
+**Claude:** Now add the field to Decompiler:
+
+**Claude:** Now update the decompile loop to use this field:
+
+**Claude:** The next_block is 3, but block 3 has SWAP at the beginning. Let me check - the short-circuit block (L1) is block 3. We should skip it. The `next_block` should be 4 (past the last block in the function).
+
+Actually wait, let me check what block 3 is:
+
+For the 3-chain function:
+- Block 0: condition for first comparison  
+- Block 1: first fallthrough (second comparison)
+- Block 2: second fallthrough (final comparison + RETURN)
+- Block 3: L1 short-circuit (SWAP, POP_TOP, RETURN)
+
+When we successfully build the chain from blocks 1 and 2, we're at `current_block_id = 2`. The next_block should be block 3 + 1 = 4 to skip the short-circuit block.
+
+Let me fix the calculation:
+
+**Claude:** Now let me remove the debug output and test all cases:
+
+**Claude:** 96/96 tests pass (pre-existing leak issue). Let me test all the chain cases:
+
+**Claude:** All cases work. Let me commit:
+
+**Claude:** Done.
+
+Summary of session:
+1. Fixed chained comparison for Python 3.14 (LOAD_FAST_LOAD_FAST, LOAD_FAST_BORROW)
+2. Fixed double-free in decompileNestedBody error path
+3. Added BoolOp support for `x and y`, `x or y`, including chained `x and y and z`
+4. Implemented 3+ chained comparisons (`a < b < c < d`)
+
+**User:** clean up dots, then pick a dot and work on it
+
+**Claude:** Dots look organized. Working on `pez-cbfcde7c548f817a` - Research match statement bytecode patterns.
+
+**Claude:** Simple match with literals uses COPY + COMPARE_OP pattern. Let me check more complex patterns:
+
+**Claude:** Now I see `MATCH_SEQUENCE`. Let me check for other MATCH opcodes:
+
+**Claude:** MATCH_MAPPING and MATCH_KEYS. Let me check class patterns:
+
+**Claude:** MATCH_CLASS opcode. Let me check what opcodes exist:
+
+**Claude:** Good - the opcodes exist. Let me check if they're handled in stack.zig:
+
+**Claude:** MATCH opcodes aren't implemented in the stack simulator. Let me document the patterns I found:
+
+**Match Statement Bytecode Patterns (Python 3.10+)**:
+
+1. **Simple literal match**: `case 1:` → `COPY, LOAD_CONST, COMPARE_OP(==), POP_JUMP_IF_FALSE`
+
+2. **Sequence match**: `case [a, b]:` → `MATCH_SEQUENCE, POP_JUMP_IF_FALSE, GET_LEN, LOAD_SMALL_INT, COMPARE_OP(==), POP_JUMP_IF_FALSE, UNPACK_SEQUENCE, STORE_FAST...`
+
+3. **Mapping match**: `case {'a': a}:` → `MATCH_MAPPING, POP_JUMP_IF_FALSE, GET_LEN, COMPARE_OP(>=), LOAD_CONST(keys), MATCH_KEYS, POP_JUMP_IF_NONE, UNPACK_SEQUENCE, STORE_FAST...`
+
+4. **Class match**: `case Point(x, y):` → `LOAD_GLOBAL(class), LOAD_CONST(attr_names), MATCH_CLASS, POP_JUMP_IF_NONE, UNPACK_SEQUENCE, STORE_FAST...`
+
+5. **Wildcard**: `case _:` → `NOP` (falls through)
+
+**Claude:** Guards use `STORE_FAST_LOAD_FAST` to bind and test the value.
+
+**Claude:** Or patterns (`1 | 2 | 3`) compile to separate comparisons with the same body duplicated. This is interesting - the body is duplicated for each alternative.
+
+Let me document and close the research dot:
+
+---
