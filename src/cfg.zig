@@ -276,6 +276,7 @@ fn buildCFGWithLeaders(
                             .POP_JUMP_BACKWARD_IF_FALSE,
                             .POP_JUMP_BACKWARD_IF_NONE,
                             .FOR_ITER,
+                            .JUMP_IF_FALSE, // Python 3.0
                             => .conditional_false,
                             .POP_JUMP_IF_TRUE,
                             .POP_JUMP_IF_NOT_NONE,
@@ -283,6 +284,7 @@ fn buildCFGWithLeaders(
                             .POP_JUMP_FORWARD_IF_NOT_NONE,
                             .POP_JUMP_BACKWARD_IF_TRUE,
                             .POP_JUMP_BACKWARD_IF_NOT_NONE,
+                            .JUMP_IF_TRUE, // Python 3.0
                             => .conditional_true,
                             else => .conditional_true,
                         };
@@ -309,6 +311,7 @@ fn buildCFGWithLeaders(
                             .POP_JUMP_FORWARD_IF_NONE,
                             .POP_JUMP_BACKWARD_IF_FALSE,
                             .POP_JUMP_BACKWARD_IF_NONE,
+                            .JUMP_IF_FALSE, // Python 3.0
                             => .conditional_true,
                             .POP_JUMP_IF_TRUE,
                             .POP_JUMP_IF_NOT_NONE,
@@ -317,6 +320,7 @@ fn buildCFGWithLeaders(
                             .POP_JUMP_BACKWARD_IF_TRUE,
                             .POP_JUMP_BACKWARD_IF_NOT_NONE,
                             .FOR_ITER,
+                            .JUMP_IF_TRUE, // Python 3.0
                             => .normal,
                             else => .conditional_false,
                         };

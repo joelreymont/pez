@@ -2071,7 +2071,16 @@ pub const Decompiler = struct {
             }
         }
 
-        const args = try codegen.extractFunctionSignature(a, func.code, func.defaults, func.kw_defaults);
+        const args = try codegen.extractFunctionSignature(a, func.code, func.defaults, func.kw_defaults, func.annotations);
+
+        // Find return annotation
+        var returns: ?*Expr = null;
+        for (func.annotations) |ann| {
+            if (std.mem.eql(u8, ann.name, "return")) {
+                returns = ann.value;
+                break;
+            }
+        }
 
         const decorator_list = try self.takeDecorators(&func.decorators);
 
@@ -2086,7 +2095,7 @@ pub const Decompiler = struct {
             .args = args,
             .body = body,
             .decorator_list = decorator_list,
-            .returns = null,
+            .returns = returns,
             .type_comment = null,
             .is_async = codegen.isCoroutine(func.code) or codegen.isAsyncGenerator(func.code),
         } };

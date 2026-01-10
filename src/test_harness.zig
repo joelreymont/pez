@@ -144,7 +144,7 @@ pub const TestStats = struct {
 /// Check if version is supported by pez.
 fn isVersionSupported(version: Version) bool {
     if (version.major == 2) return true;
-    if (version.major == 3 and version.minor >= 6) return true;
+    if (version.major == 3) return true; // All Python 3.x supported
     return false;
 }
 

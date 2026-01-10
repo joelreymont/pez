@@ -222,6 +222,7 @@ pub const Magic = enum(u32) {
     _,
 
     pub fn toVersion(self: Magic) ?Version {
+        // First check known enums
         return switch (self) {
             .MAGIC_1_0 => Version.init(1, 0),
             .MAGIC_1_1 => Version.init(1, 1),
@@ -252,8 +253,21 @@ pub const Magic = enum(u32) {
             .MAGIC_3_12 => Version.init(3, 12),
             .MAGIC_3_13 => Version.init(3, 13),
             .MAGIC_3_14 => Version.init(3, 14),
-            _ => null,
+            _ => self.toVersionFromRange(),
         };
+    }
+
+    /// For unrecognized magic numbers, try to determine version from magic range.
+    /// Python 3.x uses magic numbers in predictable ranges.
+    fn toVersionFromRange(self: Magic) ?Version {
+        const val: u32 = @intFromEnum(self);
+        // Magic format: 0x0A0D{magic16} where magic16 is the magic number
+        if ((val & 0xFFFF0000) != 0x0A0D0000) return null;
+        const magic16: u16 = @truncate(val);
+
+        // Python 3.0: 3000-3131, Python 3.1: 3141-3151, Python 3.2: 3160-3180
+        // Python 3.3: 3190-3230, Python 3.4: 3250-3310, Python 3.5: 3320-3351
+        return if (magic16 >= 3000 and magic16 <= 3131) Version.init(3, 0) else if (magic16 >= 3141 and magic16 <= 3151) Version.init(3, 1) else if (magic16 >= 3160 and magic16 <= 3180) Version.init(3, 2) else if (magic16 >= 3190 and magic16 <= 3230) Version.init(3, 3) else if (magic16 >= 3250 and magic16 <= 3310) Version.init(3, 4) else if (magic16 >= 3320 and magic16 <= 3351) Version.init(3, 5) else null;
     }
 };
 
@@ -870,7 +884,7 @@ pub const Module = struct {
         }
 
         const len: usize = switch (obj_type) {
-            .TYPE_STRING, .TYPE_ASCII, .TYPE_INTERNED, .TYPE_ASCII_INTERNED => try reader.readU32(),
+            .TYPE_STRING, .TYPE_ASCII, .TYPE_INTERNED, .TYPE_ASCII_INTERNED, .TYPE_UNICODE => try reader.readU32(),
             .TYPE_SHORT_ASCII, .TYPE_SHORT_ASCII_INTERNED => try reader.readByte(),
             else => return &.{},
         };

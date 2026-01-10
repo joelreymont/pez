@@ -488,6 +488,8 @@ pub const Analyzer = struct {
             .POP_JUMP_BACKWARD_IF_NOT_NONE,
             .JUMP_IF_TRUE_OR_POP,
             .JUMP_IF_FALSE_OR_POP,
+            .JUMP_IF_TRUE, // Python 3.0
+            .JUMP_IF_FALSE, // Python 3.0
             => true,
             else => false,
         };
@@ -514,14 +516,15 @@ pub const Analyzer = struct {
             }
         }
 
-        // For POP_JUMP_IF_FALSE, fallthrough is the then-block
+        // For POP_JUMP_IF_FALSE/JUMP_IF_FALSE, fallthrough is the then-block
         const term = block.terminator() orelse return null;
         if (term.opcode == .POP_JUMP_IF_FALSE or
             term.opcode == .POP_JUMP_IF_NONE or
             term.opcode == .POP_JUMP_FORWARD_IF_FALSE or
             term.opcode == .POP_JUMP_FORWARD_IF_NONE or
             term.opcode == .POP_JUMP_BACKWARD_IF_FALSE or
-            term.opcode == .POP_JUMP_BACKWARD_IF_NONE)
+            term.opcode == .POP_JUMP_BACKWARD_IF_NONE or
+            term.opcode == .JUMP_IF_FALSE) // Python 3.0
         {
             // Jump target is else, fallthrough is then
             for (block.successors) |edge| {

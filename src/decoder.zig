@@ -83,6 +83,8 @@ pub const Instruction = struct {
             .POP_JUMP_BACKWARD_IF_NOT_NONE,
             .JUMP_IF_TRUE_OR_POP,
             .JUMP_IF_FALSE_OR_POP,
+            .JUMP_IF_TRUE, // Python 3.0
+            .JUMP_IF_FALSE, // Python 3.0
             .JUMP_IF_NOT_EXC_MATCH,
             .FOR_ITER,
             .SEND,
@@ -158,6 +160,8 @@ pub const Instruction = struct {
             => next_offset -| (self.arg *| multiplier),
             .JUMP_IF_TRUE_OR_POP,
             .JUMP_IF_FALSE_OR_POP,
+            .JUMP_IF_TRUE, // Python 3.0 - absolute offset
+            .JUMP_IF_FALSE, // Python 3.0 - absolute offset
             .JUMP_IF_NOT_EXC_MATCH,
             => self.arg * multiplier,
             else => null,

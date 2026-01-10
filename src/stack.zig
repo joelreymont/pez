@@ -30,11 +30,18 @@ pub const SimError = Allocator.Error || error{
     InvalidConstKeyMap,
 };
 
+/// Annotation for a function parameter or return type.
+pub const Annotation = struct {
+    name: []const u8, // Parameter name or "return" for return type
+    value: *Expr, // Annotation expression
+};
+
 pub const FunctionValue = struct {
     code: *const pyc.Code,
     decorators: std.ArrayList(*Expr),
     defaults: []const *Expr = &.{},
     kw_defaults: []const ?*Expr = &.{},
+    annotations: []const Annotation = &.{},
 
     pub fn deinit(self: *FunctionValue, allocator: Allocator) void {
         // Arena-allocated, no cleanup needed
@@ -875,6 +882,72 @@ pub const SimContext = struct {
         }
 
         return copy;
+    }
+
+    /// Parse annotations tuple from MAKE_FUNCTION.
+    /// Annotations are a tuple of (name, annotation, ...) pairs.
+    fn parseAnnotations(self: *SimContext, val: StackValue) SimError![]const Annotation {
+        switch (val) {
+            .expr => |expr| {
+                if (expr.* == .tuple) {
+                    const elts = expr.tuple.elts;
+                    // Pairs: name, annotation, name, annotation...
+                    const count = elts.len / 2;
+                    if (count == 0) return &.{};
+
+                    const result = try self.allocator.alloc(Annotation, count);
+                    errdefer self.allocator.free(result);
+
+                    var i: usize = 0;
+                    while (i < count) : (i += 1) {
+                        const name_expr = elts[i * 2];
+                        const ann_expr = elts[i * 2 + 1];
+                        const name = if (name_expr.* == .constant and name_expr.constant == .string)
+                            name_expr.constant.string
+                        else
+                            "<unknown>";
+                        result[i] = .{ .name = name, .value = ann_expr };
+                    }
+                    return result;
+                }
+                // Not a tuple - discard
+                expr.deinit(self.allocator);
+                self.allocator.destroy(expr);
+                return &.{};
+            },
+            else => {
+                var v = val;
+                v.deinit(self.allocator);
+                return &.{};
+            },
+        }
+    }
+
+    /// Parse keyword defaults dict from MAKE_FUNCTION.
+    fn parseKwDefaults(self: *SimContext, val: StackValue) SimError![]const ?*Expr {
+        // For now, just discard - full implementation needs dict handling
+        var v = val;
+        v.deinit(self.allocator);
+        return &.{};
+    }
+
+    /// Parse defaults tuple from MAKE_FUNCTION.
+    fn parseDefaults(self: *SimContext, val: StackValue) SimError![]const *Expr {
+        switch (val) {
+            .expr => |expr| {
+                if (expr.* == .tuple) {
+                    return expr.tuple.elts;
+                }
+                expr.deinit(self.allocator);
+                self.allocator.destroy(expr);
+                return &.{};
+            },
+            else => {
+                var v = val;
+                v.deinit(self.allocator);
+                return &.{};
+            },
+        }
     }
 
     fn cloneCompBuilder(self: *SimContext, builder: *const CompBuilder) !*CompBuilder {
@@ -1852,15 +1925,14 @@ pub const SimContext = struct {
             .MAKE_FUNCTION => {
                 // MAKE_FUNCTION creates a function from a code object on the stack.
                 // Python 2.x: codeobj on stack.
-                // Python 3.0-3.10: qualname, codeobj on stack.
-                // Python 3.11+: codeobj on stack.
-                // The function name comes from the code object's co_qualname.
+                // Python 3.0-3.2: codeobj on stack.
+                // Python 3.3-3.10: TOS=qualname, TOS1=code (PEP 3155).
+                // Python 3.11+: codeobj on stack (qualname in code object).
                 //
-                // Stack: [qualname], code_obj -> function
-                //
-                // For now, we create a placeholder Name expression for the function.
-                // Full function decompilation requires recursively processing the code object.
-                if (self.version.major == 3 and self.version.lt(3, 11)) {
+                // Stack: code_obj, [qualname] -> function (qualname on TOS for 3.3-3.10)
+
+                // Python 3.3-3.10 has qualname on TOS (PEP 3155)
+                if (self.version.gte(3, 3) and self.version.lt(3, 11)) {
                     if (self.stack.pop()) |qualname| {
                         var val = qualname;
                         val.deinit(self.allocator);
@@ -1879,26 +1951,26 @@ pub const SimContext = struct {
                         return error.StackUnderflow;
                     }
                 }
+                var annotations: []const Annotation = &.{};
                 if ((inst.arg & 0x04) != 0) {
-                    if (self.stack.pop()) |annotations| {
-                        var val = annotations;
-                        val.deinit(self.allocator);
+                    if (self.stack.pop()) |ann_val| {
+                        annotations = try self.parseAnnotations(ann_val);
                     } else {
                         return error.StackUnderflow;
                     }
                 }
+                var kw_defaults: []const ?*Expr = &.{};
                 if ((inst.arg & 0x02) != 0) {
                     if (self.stack.pop()) |kwdefaults| {
-                        var val = kwdefaults;
-                        val.deinit(self.allocator);
+                        kw_defaults = try self.parseKwDefaults(kwdefaults);
                     } else {
                         return error.StackUnderflow;
                     }
                 }
+                var defaults: []const *Expr = &.{};
                 if ((inst.arg & 0x01) != 0) {
-                    if (self.stack.pop()) |defaults| {
-                        var val = defaults;
-                        val.deinit(self.allocator);
+                    if (self.stack.pop()) |def_val| {
+                        defaults = try self.parseDefaults(def_val);
                     } else {
                         return error.StackUnderflow;
                     }
@@ -1920,6 +1992,9 @@ pub const SimContext = struct {
                         func.* = .{
                             .code = code,
                             .decorators = .{},
+                            .defaults = defaults,
+                            .kw_defaults = kw_defaults,
+                            .annotations = annotations,
                         };
                         try self.stack.push(.{ .function_obj = func });
                     },
@@ -1970,7 +2045,16 @@ pub const SimContext = struct {
                         // kwdefaults is a dict - need to extract to []?*Expr
                         attr_val.deinit(self.allocator);
                     },
-                    4, 8 => { // annotations, closure - ignore
+                    4 => { // annotations
+                        const func = func_val.function_obj;
+                        func.annotations = self.parseAnnotations(attr_val) catch &.{};
+                    },
+                    8 => { // closure - ignore
+                        attr_val.deinit(self.allocator);
+                    },
+                    16 => { // annotate (Python 3.14+ - PEP 649 deferred annotations)
+                        // This sets __annotate__ which is a function, not a dict
+                        // For now, ignore as we'd need to run/analyze the code object
                         attr_val.deinit(self.allocator);
                     },
                     else => {
@@ -2321,12 +2405,14 @@ pub const SimContext = struct {
 
             // Dict operations
             .BUILD_MAP => {
-                // BUILD_MAP count - create a dict from count key/value pairs
+                // Python 3.6+: BUILD_MAP count - create dict from count key/value pairs on stack
+                // Python 3.0-3.5: BUILD_MAP capacity - create empty dict, pairs added via STORE_MAP
                 const count = inst.arg;
                 const expr = try self.allocator.create(Expr);
                 errdefer self.allocator.destroy(expr);
 
-                if (count == 0) {
+                if (count == 0 or self.version.lt(3, 6)) {
+                    // Pre-3.6 or empty dict: create empty dict (pairs added via STORE_MAP)
                     expr.* = .{ .dict = .{ .keys = &.{}, .values = &.{} } };
                 } else {
                     const keys = try self.allocator.alloc(?*Expr, count);
@@ -2366,6 +2452,48 @@ pub const SimContext = struct {
 
             .BUILD_MAP_UNPACK, .BUILD_MAP_UNPACK_WITH_CALL => {
                 try self.buildDictUnpack(inst.arg);
+            },
+
+            .STORE_MAP => {
+                // STORE_MAP - Python 2.x and 3.0-3.5
+                // Stack: dict, key, value -> dict (with key:value added)
+                const value = try self.stack.popExpr();
+                errdefer {
+                    value.deinit(self.allocator);
+                    self.allocator.destroy(value);
+                }
+                const key = try self.stack.popExpr();
+                errdefer {
+                    key.deinit(self.allocator);
+                    self.allocator.destroy(key);
+                }
+                const dict_val = self.stack.pop() orelse return error.StackUnderflow;
+
+                if (dict_val == .expr and dict_val.expr.* == .dict) {
+                    const dict = &dict_val.expr.dict;
+                    // Append key/value to existing dict
+                    const old_len = dict.keys.len;
+                    const new_keys = try self.allocator.alloc(?*Expr, old_len + 1);
+                    const new_vals = try self.allocator.alloc(*Expr, old_len + 1);
+                    @memcpy(new_keys[0..old_len], dict.keys);
+                    @memcpy(new_vals[0..old_len], dict.values);
+                    new_keys[old_len] = key;
+                    new_vals[old_len] = value;
+                    if (old_len > 0) {
+                        self.allocator.free(dict.keys);
+                        self.allocator.free(dict.values);
+                    }
+                    dict.keys = new_keys;
+                    dict.values = new_vals;
+                    try self.stack.push(dict_val);
+                } else {
+                    // Not a dict on stack, just discard
+                    dict_val.deinit(self.allocator);
+                    key.deinit(self.allocator);
+                    self.allocator.destroy(key);
+                    value.deinit(self.allocator);
+                    self.allocator.destroy(value);
+                }
             },
 
             .BUILD_CONST_KEY_MAP => {
@@ -2654,6 +2782,11 @@ pub const SimContext = struct {
             .JUMP_IF_TRUE_OR_POP, .JUMP_IF_FALSE_OR_POP => {
                 // These leave TOS on stack if condition matches, otherwise pop and jump
                 // For simulation, we leave the value on stack (the expr stays)
+            },
+
+            .JUMP_IF_TRUE, .JUMP_IF_FALSE => {
+                // Python 3.0 only: jump if true/false, value stays on stack
+                // Control flow is handled by the CFG, just leave value on stack
             },
 
             .TO_BOOL => {
@@ -3087,7 +3220,7 @@ pub fn buildLambdaExpr(allocator: Allocator, code: *const pyc.Code, version: Ver
         allocator.destroy(body);
     }
 
-    const args = try codegen.extractFunctionSignature(allocator, code, &.{}, &.{});
+    const args = try codegen.extractFunctionSignature(allocator, code, &.{}, &.{}, &.{});
     errdefer {
         args.deinit(allocator);
         allocator.destroy(args);

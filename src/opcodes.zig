@@ -292,8 +292,11 @@ pub const Opcode = enum(u16) {
     POP_FINALLY,
     BUILD_CLASS,
     DUP_TOPX,
+    JUMP_IF_FALSE, // Python 3.0 only (111) - differs from JUMP_IF_FALSE_OR_POP
+    JUMP_IF_TRUE, // Python 3.0 only (112) - differs from JUMP_IF_TRUE_OR_POP
     JUMP_IF_FALSE_OR_POP,
     JUMP_IF_TRUE_OR_POP,
+    STORE_LOCALS, // Python 3.0 only (69)
     JUMP_ABSOLUTE,
     CONTINUE_LOOP,
     SETUP_LOOP,
@@ -2425,6 +2428,154 @@ const opcode_table_2_7 = [_]?Opcode{
     .MAP_ADD, // 147
 };
 
+/// Python 3.0 opcode byte values (variable-length instructions like Python 2)
+const opcode_table_3_0 = [_]?Opcode{
+    .STOP_CODE, // 0
+    .POP_TOP, // 1
+    .ROT_TWO, // 2
+    .ROT_THREE, // 3
+    .DUP_TOP, // 4
+    .ROT_FOUR, // 5
+    null, // 6
+    null, // 7
+    null, // 8
+    .NOP, // 9
+    .UNARY_POSITIVE, // 10
+    .UNARY_NEGATIVE, // 11
+    .UNARY_NOT, // 12
+    null, // 13
+    null, // 14
+    .UNARY_INVERT, // 15
+    null, // 16
+    .SET_ADD, // 17 - different position from 3.6+
+    .LIST_APPEND, // 18 - different position from 3.6+
+    .BINARY_POWER, // 19
+    .BINARY_MULTIPLY, // 20
+    null, // 21
+    .BINARY_MODULO, // 22
+    .BINARY_ADD, // 23
+    .BINARY_SUBTRACT, // 24
+    .BINARY_SUBSCR, // 25
+    .BINARY_FLOOR_DIVIDE, // 26
+    .BINARY_TRUE_DIVIDE, // 27
+    .INPLACE_FLOOR_DIVIDE, // 28
+    .INPLACE_TRUE_DIVIDE, // 29
+    null, // 30
+    null, // 31
+    null, // 32
+    null, // 33
+    null, // 34
+    null, // 35
+    null, // 36
+    null, // 37
+    null, // 38
+    null, // 39
+    null, // 40
+    null, // 41
+    null, // 42
+    null, // 43
+    null, // 44
+    null, // 45
+    null, // 46
+    null, // 47
+    null, // 48
+    null, // 49
+    null, // 50
+    null, // 51
+    null, // 52
+    null, // 53
+    .STORE_MAP, // 54
+    .INPLACE_ADD, // 55
+    .INPLACE_SUBTRACT, // 56
+    .INPLACE_MULTIPLY, // 57
+    null, // 58
+    .INPLACE_MODULO, // 59
+    .STORE_SUBSCR, // 60
+    .DELETE_SUBSCR, // 61
+    .BINARY_LSHIFT, // 62
+    .BINARY_RSHIFT, // 63
+    .BINARY_AND, // 64
+    .BINARY_XOR, // 65
+    .BINARY_OR, // 66
+    .INPLACE_POWER, // 67
+    .GET_ITER, // 68
+    .STORE_LOCALS, // 69
+    .PRINT_EXPR, // 70
+    .LOAD_BUILD_CLASS, // 71
+    null, // 72
+    null, // 73
+    null, // 74
+    .INPLACE_LSHIFT, // 75
+    .INPLACE_RSHIFT, // 76
+    .INPLACE_AND, // 77
+    .INPLACE_XOR, // 78
+    .INPLACE_OR, // 79
+    .BREAK_LOOP, // 80
+    .WITH_CLEANUP, // 81
+    null, // 82
+    .RETURN_VALUE, // 83
+    .IMPORT_STAR, // 84
+    null, // 85
+    .YIELD_VALUE, // 86
+    .POP_BLOCK, // 87
+    .END_FINALLY, // 88
+    .POP_EXCEPT, // 89
+    .STORE_NAME, // 90
+    .DELETE_NAME, // 91
+    .UNPACK_SEQUENCE, // 92
+    .FOR_ITER, // 93
+    .UNPACK_EX, // 94
+    .STORE_ATTR, // 95
+    .DELETE_ATTR, // 96
+    .STORE_GLOBAL, // 97
+    .DELETE_GLOBAL, // 98
+    .DUP_TOPX, // 99
+    .LOAD_CONST, // 100
+    .LOAD_NAME, // 101
+    .BUILD_TUPLE, // 102
+    .BUILD_LIST, // 103
+    .BUILD_SET, // 104
+    .BUILD_MAP, // 105
+    .LOAD_ATTR, // 106
+    .COMPARE_OP, // 107
+    .IMPORT_NAME, // 108
+    .IMPORT_FROM, // 109
+    .JUMP_FORWARD, // 110
+    .JUMP_IF_FALSE, // 111 - Python 3.0 specific
+    .JUMP_IF_TRUE, // 112 - Python 3.0 specific
+    .JUMP_ABSOLUTE, // 113
+    null, // 114
+    null, // 115
+    .LOAD_GLOBAL, // 116
+    null, // 117
+    null, // 118
+    .CONTINUE_LOOP, // 119
+    .SETUP_LOOP, // 120
+    .SETUP_EXCEPT, // 121
+    .SETUP_FINALLY, // 122
+    null, // 123
+    .LOAD_FAST, // 124
+    .STORE_FAST, // 125
+    .DELETE_FAST, // 126
+    null, // 127
+    null, // 128
+    null, // 129
+    .RAISE_VARARGS, // 130
+    .CALL_FUNCTION, // 131
+    .MAKE_FUNCTION, // 132
+    .BUILD_SLICE, // 133
+    .MAKE_CLOSURE, // 134
+    .LOAD_CLOSURE, // 135
+    .LOAD_DEREF, // 136
+    .STORE_DEREF, // 137
+    null, // 138
+    null, // 139
+    .CALL_FUNCTION_VAR, // 140
+    .CALL_FUNCTION_KW, // 141
+    .CALL_FUNCTION_VAR_KW, // 142
+    .EXTENDED_ARG, // 143
+};
+
 /// Get the opcode table for a Python version.
 pub fn getOpcodeTable(ver: Version) []const ?Opcode {
     if (ver.gte(3, 14)) return &opcode_table_3_14;
@@ -2436,6 +2587,7 @@ pub fn getOpcodeTable(ver: Version) []const ?Opcode {
     if (ver.gte(3, 8)) return &opcode_table_3_8;
     if (ver.gte(3, 7)) return &opcode_table_3_7;
     if (ver.gte(3, 6)) return &opcode_table_3_6;
+    if (ver.major == 3) return &opcode_table_3_0; // Python 3.0-3.5 use similar opcodes
     if (ver.major == 2) return &opcode_table_2_7;
     std.debug.panic("unsupported Python version {d}.{d}", .{ ver.major, ver.minor });
 }

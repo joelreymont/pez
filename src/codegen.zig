@@ -5,6 +5,7 @@
 const std = @import("std");
 const ast = @import("ast.zig");
 const pyc = @import("pyc.zig");
+const stack = @import("stack.zig");
 
 pub const Expr = ast.Expr;
 pub const Stmt = ast.Stmt;
@@ -457,6 +458,10 @@ pub const Writer = struct {
             if (!first) try self.write(allocator, ", ");
             first = false;
             try self.write(allocator, arg.arg);
+            if (arg.annotation) |ann| {
+                try self.write(allocator, ": ");
+                try self.writeExpr(allocator, ann);
+            }
         }
 
         if (args.posonlyargs.len > 0) {
@@ -470,9 +475,13 @@ pub const Writer = struct {
             if (!first) try self.write(allocator, ", ");
             first = false;
             try self.write(allocator, arg.arg);
+            if (arg.annotation) |ann| {
+                try self.write(allocator, ": ");
+                try self.writeExpr(allocator, ann);
+            }
             if (n_defaults > 0 and i >= n_args - n_defaults) {
                 const default_idx = i - (n_args - n_defaults);
-                try self.write(allocator, "=");
+                try self.write(allocator, " = ");
                 try self.writeExpr(allocator, args.defaults[default_idx]);
             }
         }
@@ -483,6 +492,10 @@ pub const Writer = struct {
             first = false;
             try self.write(allocator, "*");
             try self.write(allocator, va.arg);
+            if (va.annotation) |ann| {
+                try self.write(allocator, ": ");
+                try self.writeExpr(allocator, ann);
+            }
         }
 
         // Write keyword-only args with defaults
@@ -490,9 +503,13 @@ pub const Writer = struct {
             if (!first) try self.write(allocator, ", ");
             first = false;
             try self.write(allocator, arg.arg);
+            if (arg.annotation) |ann| {
+                try self.write(allocator, ": ");
+                try self.writeExpr(allocator, ann);
+            }
             if (i < args.kw_defaults.len) {
                 if (args.kw_defaults[i]) |default| {
-                    try self.write(allocator, "=");
+                    try self.write(allocator, " = ");
                     try self.writeExpr(allocator, default);
                 }
             }
@@ -503,6 +520,10 @@ pub const Writer = struct {
             if (!first) try self.write(allocator, ", ");
             try self.write(allocator, "**");
             try self.write(allocator, kw.arg);
+            if (kw.annotation) |ann| {
+                try self.write(allocator, ": ");
+                try self.writeExpr(allocator, ann);
+            }
         }
     }
 
@@ -1735,9 +1756,27 @@ pub const DebugPrinter = struct {
 
 /// Extract function signature from a code object.
 /// Returns an Arguments structure suitable for AST function definition.
-pub fn extractFunctionSignature(allocator: std.mem.Allocator, code: *const pyc.Code, defaults: []const *ast.Expr, kw_defaults: []const ?*ast.Expr) !*ast.Arguments {
+pub fn extractFunctionSignature(
+    allocator: std.mem.Allocator,
+    code: *const pyc.Code,
+    defaults: []const *ast.Expr,
+    kw_defaults: []const ?*ast.Expr,
+    annotations: []const stack.Annotation,
+) !*ast.Arguments {
     const args = try allocator.create(ast.Arguments);
     errdefer allocator.destroy(args);
+
+    // Helper to find annotation for a parameter name
+    const findAnnotation = struct {
+        fn find(anns: []const stack.Annotation, name: []const u8) ?*ast.Expr {
+            for (anns) |ann| {
+                if (std.mem.eql(u8, ann.name, name)) {
+                    return ann.value;
+                }
+            }
+            return null;
+        }
+    }.find;
 
     // Calculate argument positions
     const argcount = code.argcount;
@@ -1749,7 +1788,7 @@ pub fn extractFunctionSignature(allocator: std.mem.Allocator, code: *const pyc.C
     if (posonlyargcount > 0 and code.varnames.len >= posonlyargcount) {
         posonly_args = try allocator.alloc(ast.Arg, posonlyargcount);
         for (code.varnames[0..posonlyargcount], 0..) |name, i| {
-            posonly_args[i] = .{ .arg = name, .annotation = null, .type_comment = null };
+            posonly_args[i] = .{ .arg = name, .annotation = findAnnotation(annotations, name), .type_comment = null };
         }
     }
 
@@ -1760,7 +1799,7 @@ pub fn extractFunctionSignature(allocator: std.mem.Allocator, code: *const pyc.C
     if (regular_end > regular_start and code.varnames.len >= regular_end) {
         regular_args = try allocator.alloc(ast.Arg, regular_end - regular_start);
         for (code.varnames[regular_start..regular_end], 0..) |name, i| {
-            regular_args[i] = .{ .arg = name, .annotation = null, .type_comment = null };
+            regular_args[i] = .{ .arg = name, .annotation = findAnnotation(annotations, name), .type_comment = null };
         }
     }
 
@@ -1771,7 +1810,7 @@ pub fn extractFunctionSignature(allocator: std.mem.Allocator, code: *const pyc.C
     if (kwonlyargcount > 0 and code.varnames.len >= kwonly_end) {
         kwonly_args = try allocator.alloc(ast.Arg, kwonlyargcount);
         for (code.varnames[kwonly_start..kwonly_end], 0..) |name, i| {
-            kwonly_args[i] = .{ .arg = name, .annotation = null, .type_comment = null };
+            kwonly_args[i] = .{ .arg = name, .annotation = findAnnotation(annotations, name), .type_comment = null };
         }
     }
 
@@ -1780,9 +1819,10 @@ pub fn extractFunctionSignature(allocator: std.mem.Allocator, code: *const pyc.C
     var vararg: ?ast.Arg = null;
     if ((code.flags & pyc.Code.CO_VARARGS) != 0) {
         if (next_arg_idx < code.varnames.len) {
+            const name = code.varnames[next_arg_idx];
             vararg = .{
-                .arg = code.varnames[next_arg_idx],
-                .annotation = null,
+                .arg = name,
+                .annotation = findAnnotation(annotations, name),
                 .type_comment = null,
             };
             next_arg_idx += 1;
@@ -1792,9 +1832,10 @@ pub fn extractFunctionSignature(allocator: std.mem.Allocator, code: *const pyc.C
     var kwarg: ?ast.Arg = null;
     if ((code.flags & pyc.Code.CO_VARKEYWORDS) != 0) {
         if (next_arg_idx < code.varnames.len) {
+            const name = code.varnames[next_arg_idx];
             kwarg = .{
-                .arg = code.varnames[next_arg_idx],
-                .annotation = null,
+                .arg = name,
+                .annotation = findAnnotation(annotations, name),
                 .type_comment = null,
             };
         }
