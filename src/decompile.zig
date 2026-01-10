@@ -1159,7 +1159,8 @@ pub const Decompiler = struct {
         stop_at_jump: bool,
         loop_header: ?u32,
     ) DecompileError!void {
-        var sim = SimContext.init(self.arena.allocator(), self.code, self.version);
+        const a = self.arena.allocator();
+        var sim = SimContext.init(a, self.code, self.version);
         defer sim.deinit();
 
         for (block.instructions) |inst| {
@@ -1172,7 +1173,7 @@ pub const Decompiler = struct {
                     const name = sim.getLocal(inst.arg) orelse "<unknown>";
                     const value = sim.stack.pop() orelse return error.StackUnderflow;
                     if (try self.handleStoreValue(name, value)) |stmt| {
-                        try stmts.append(self.allocator, stmt);
+                        try stmts.append(a, stmt);
                     }
                 },
                 .STORE_NAME, .STORE_GLOBAL => {
@@ -1184,7 +1185,7 @@ pub const Decompiler = struct {
                     const name = sim.getName(inst.arg) orelse "<unknown>";
                     const value = sim.stack.pop() orelse return error.StackUnderflow;
                     if (try self.handleStoreValue(name, value)) |stmt| {
-                        try stmts.append(self.allocator, stmt);
+                        try stmts.append(a, stmt);
                     }
                 },
                 .JUMP_FORWARD, .JUMP_BACKWARD, .JUMP_BACKWARD_NO_INTERRUPT, .JUMP_ABSOLUTE => {
@@ -1193,12 +1194,12 @@ pub const Decompiler = struct {
                         switch (exit) {
                             .break_stmt => {
                                 const stmt = try self.makeBreak();
-                                try stmts.append(self.allocator, stmt);
+                                try stmts.append(a, stmt);
                                 return;
                             },
                             .continue_stmt => {
                                 const stmt = try self.makeContinue();
-                                try stmts.append(self.allocator, stmt);
+                                try stmts.append(a, stmt);
                                 return;
                             },
                             else => {},
@@ -1209,19 +1210,19 @@ pub const Decompiler = struct {
                 .RETURN_VALUE => {
                     const value = try sim.stack.popExpr();
                     const stmt = try self.makeReturn(value);
-                    try stmts.append(self.allocator, stmt);
+                    try stmts.append(a, stmt);
                 },
                 .RETURN_CONST => {
                     if (sim.getConst(inst.arg)) |obj| {
                         const value = try sim.objToExpr(obj);
                         const stmt = try self.makeReturn(value);
-                        try stmts.append(self.allocator, stmt);
+                        try stmts.append(a, stmt);
                     }
                 },
                 .POP_TOP => {
                     const value = try sim.stack.popExpr();
                     const stmt = try self.makeExprStmt(value);
-                    try stmts.append(self.allocator, stmt);
+                    try stmts.append(a, stmt);
                 },
                 else => {
                     try sim.simulate(inst);
