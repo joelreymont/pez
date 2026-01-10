@@ -32,6 +32,8 @@ pub const SimError = Allocator.Error || error{
 pub const FunctionValue = struct {
     code: *const pyc.Code,
     decorators: std.ArrayList(*Expr),
+    defaults: []const *Expr = &.{},
+    kw_defaults: []const ?*Expr = &.{},
 
     pub fn deinit(self: *FunctionValue, allocator: Allocator) void {
         for (self.decorators.items) |decorator| {
@@ -143,6 +145,12 @@ const CompBuilder = struct {
     }
 };
 
+/// Import module tracker.
+pub const ImportModule = struct {
+    module: []const u8,
+    fromlist: []const []const u8,
+};
+
 /// A value on the simulated stack.
 pub const StackValue = union(enum) {
     /// An AST expression.
@@ -157,6 +165,8 @@ pub const StackValue = union(enum) {
     comp_obj: CompObject,
     /// A code object constant (non-owning).
     code_obj: *const pyc.Code,
+    /// An import module (for IMPORT_NAME).
+    import_module: ImportModule,
     /// A NULL marker (for PUSH_NULL).
     null_marker,
     /// A saved local (for LOAD_FAST_AND_CLEAR).
@@ -831,6 +841,7 @@ pub const SimContext = struct {
             .comp_builder => |builder| .{ .comp_builder = try self.cloneCompBuilder(builder) },
             .comp_obj => |comp| .{ .comp_obj = comp },
             .code_obj => |code| .{ .code_obj = code },
+            .import_module => |imp| .{ .import_module = imp },
             .null_marker => .null_marker,
             .saved_local => |name| .{ .saved_local = name },
             .unknown => .unknown,
@@ -1851,19 +1862,43 @@ pub const SimContext = struct {
 
             .SET_FUNCTION_ATTRIBUTE => {
                 // SET_FUNCTION_ATTRIBUTE flag - sets closure, defaults, annotations, etc.
-                // Stack: func, value -> func
+                // Stack: value, func -> func
                 // The flag in inst.arg determines which attribute to set:
                 //   1: defaults
                 //   2: kwdefaults
                 //   4: annotations
                 //   8: closure
-                //
-                // For now, we just pop the attribute value and keep the function
-                if (self.stack.pop()) |attr_val| {
-                    var val = attr_val;
-                    val.deinit(self.allocator);
+                const func_val = self.stack.pop() orelse return error.StackUnderflow;
+                const attr_val = self.stack.pop() orelse return error.StackUnderflow;
+
+                if (func_val != .function_obj) {
+                    attr_val.deinit(self.allocator);
+                    func_val.deinit(self.allocator);
+                    return error.NotAnExpression;
                 }
-                // Function stays on stack (already there from MAKE_FUNCTION)
+
+                const flag = inst.arg;
+                switch (flag) {
+                    1 => { // defaults
+                        if (attr_val == .expr and attr_val.expr.* == .tuple) {
+                            func_val.function_obj.defaults = attr_val.expr.tuple.elts;
+                        } else {
+                            attr_val.deinit(self.allocator);
+                        }
+                    },
+                    2 => { // kwdefaults
+                        // kwdefaults is a dict - need to extract to []?*Expr
+                        attr_val.deinit(self.allocator);
+                    },
+                    4, 8 => { // annotations, closure - ignore
+                        attr_val.deinit(self.allocator);
+                    },
+                    else => {
+                        attr_val.deinit(self.allocator);
+                    },
+                }
+
+                try self.stack.push(func_val);
             },
 
             .COPY_FREE_VARS => {
@@ -2079,21 +2114,29 @@ pub const SimContext = struct {
             .IMPORT_NAME => {
                 // IMPORT_NAME namei - imports module names[namei]
                 // Stack: fromlist, level -> module
-                if (self.stack.pop()) |v| {
-                    var val = v;
-                    val.deinit(self.allocator);
-                } else {
-                    return error.StackUnderflow;
+                const level = self.stack.pop() orelse return error.StackUnderflow;
+                defer level.deinit(self.allocator);
+                const fromlist_val = self.stack.pop() orelse return error.StackUnderflow;
+                defer fromlist_val.deinit(self.allocator);
+
+                // Extract fromlist tuple if available
+                var fromlist: []const []const u8 = &.{};
+                if (fromlist_val == .expr and fromlist_val.expr.* == .tuple) {
+                    const tuple_elts = fromlist_val.expr.tuple.elts;
+                    var names: std.ArrayList([]const u8) = .{};
+                    for (tuple_elts) |elt| {
+                        if (elt.* == .constant and elt.constant == .string) {
+                            try names.append(self.allocator, elt.constant.string);
+                        }
+                    }
+                    fromlist = try names.toOwnedSlice(self.allocator);
                 }
-                if (self.stack.pop()) |v| {
-                    var val = v;
-                    val.deinit(self.allocator);
-                } else {
-                    return error.StackUnderflow;
-                }
-                if (self.getName(inst.arg)) |name| {
-                    const expr = try ast.makeName(self.allocator, name, .load);
-                    try self.stack.push(.{ .expr = expr });
+
+                if (self.getName(inst.arg)) |module_name| {
+                    try self.stack.push(.{ .import_module = .{
+                        .module = module_name,
+                        .fromlist = fromlist,
+                    } });
                 } else {
                     try self.stack.push(.unknown);
                 }
@@ -2791,7 +2834,7 @@ pub fn buildLambdaExpr(allocator: Allocator, code: *const pyc.Code, version: Ver
         allocator.destroy(body);
     }
 
-    const args = try codegen.extractFunctionSignature(allocator, code);
+    const args = try codegen.extractFunctionSignature(allocator, code, &.{}, &.{});
     errdefer {
         args.deinit(allocator);
         allocator.destroy(args);

@@ -28,6 +28,7 @@ pub const DecompileError = stack_mod.SimError || error{ UnexpectedEmptyWorklist,
 /// Decompiler state for a single code object.
 pub const Decompiler = struct {
     allocator: Allocator,
+    arena: std.heap.ArenaAllocator,
     code: *const pyc.Code,
     version: Version,
     cfg: *CFG,
@@ -38,24 +39,29 @@ pub const Decompiler = struct {
     statements: std.ArrayList(*Stmt),
 
     pub fn init(allocator: Allocator, code: *const pyc.Code, version: Version) DecompileError!Decompiler {
+        var arena = std.heap.ArenaAllocator.init(allocator);
+        errdefer arena.deinit();
+
+        const a = arena.allocator();
+
         // Allocate CFG on heap so pointer stays valid
-        const cfg = try allocator.create(CFG);
-        errdefer allocator.destroy(cfg);
+        const cfg = try a.create(CFG);
 
         cfg.* = if (version.gte(3, 11) and code.exceptiontable.len > 0)
-            try cfg_mod.buildCFGWithExceptions(allocator, code.code, code.exceptiontable, version)
+            try cfg_mod.buildCFGWithExceptions(a, code.code, code.exceptiontable, version)
         else
-            try cfg_mod.buildCFG(allocator, code.code, version);
+            try cfg_mod.buildCFG(a, code.code, version);
         errdefer cfg.deinit();
 
-        var analyzer = try Analyzer.init(allocator, cfg);
+        var analyzer = try Analyzer.init(a, cfg);
         errdefer analyzer.deinit();
 
-        var dom = try dom_mod.DomTree.init(allocator, cfg);
+        var dom = try dom_mod.DomTree.init(a, cfg);
         errdefer dom.deinit();
 
         return .{
             .allocator = allocator,
+            .arena = arena,
             .code = code,
             .version = version,
             .cfg = cfg,
@@ -66,14 +72,7 @@ pub const Decompiler = struct {
     }
 
     pub fn deinit(self: *Decompiler) void {
-        self.dom.deinit();
-        self.analyzer.deinit();
-        self.cfg.deinit();
-        self.allocator.destroy(self.cfg);
-        for (self.statements.items) |stmt| {
-            stmt.deinit(self.allocator);
-            self.allocator.destroy(stmt);
-        }
+        self.arena.deinit();
         self.statements.deinit(self.allocator);
     }
 
@@ -205,7 +204,7 @@ pub const Decompiler = struct {
         if (block_id >= self.cfg.blocks.len) return null;
         const block = &self.cfg.blocks[block_id];
 
-        var sim = SimContext.init(self.allocator, self.code, self.version);
+        var sim = SimContext.init(self.arena.allocator(), self.code, self.version);
         defer sim.deinit();
 
         for (base_vals) |val| {
@@ -271,7 +270,7 @@ pub const Decompiler = struct {
         }
 
         const cond_block = &self.cfg.blocks[pattern.condition_block];
-        var cond_sim = SimContext.init(self.allocator, self.code, self.version);
+        var cond_sim = SimContext.init(self.arena.allocator(), self.code, self.version);
         defer cond_sim.deinit();
 
         for (cond_block.instructions) |inst| {
@@ -296,7 +295,8 @@ pub const Decompiler = struct {
         false_expr = false_opt.?;
         false_owned = true;
 
-        if_expr = try self.allocator.create(Expr);
+        const a = self.arena.allocator();
+        if_expr = try a.create(Expr);
         if_owned = true;
         if_expr.* = .{ .if_exp = .{
             .condition = condition,
@@ -308,7 +308,7 @@ pub const Decompiler = struct {
         true_owned = false;
         false_owned = false;
 
-        var merge_sim = SimContext.init(self.allocator, self.code, self.version);
+        var merge_sim = SimContext.init(self.arena.allocator(), self.code, self.version);
         defer merge_sim.deinit();
 
         base_owned = false;
@@ -427,7 +427,7 @@ pub const Decompiler = struct {
         if (block_id >= self.cfg.blocks.len) return;
         const block = &self.cfg.blocks[block_id];
 
-        var sim = SimContext.init(self.allocator, self.code, self.version);
+        var sim = SimContext.init(self.arena.allocator(), self.code, self.version);
         defer sim.deinit();
         try self.processBlockWithSim(block, &sim, &self.statements);
     }
@@ -459,7 +459,7 @@ pub const Decompiler = struct {
         if (block_id >= self.cfg.blocks.len) return;
         const block = &self.cfg.blocks[block_id];
 
-        var sim = SimContext.init(self.allocator, self.code, self.version);
+        var sim = SimContext.init(self.arena.allocator(), self.code, self.version);
         defer sim.deinit();
         try self.processBlockWithSim(block, &sim, stmts);
     }
@@ -469,7 +469,7 @@ pub const Decompiler = struct {
         const cond_block = &self.cfg.blocks[pattern.condition_block];
 
         // Get the condition expression from the last instruction before the jump
-        var sim = SimContext.init(self.allocator, self.code, self.version);
+        var sim = SimContext.init(self.arena.allocator(), self.code, self.version);
         defer sim.deinit();
 
         // Simulate up to but not including the conditional jump
@@ -504,7 +504,8 @@ pub const Decompiler = struct {
         } else &[_]*Stmt{};
 
         // Create if statement
-        const stmt = try self.allocator.create(Stmt);
+        const a = self.arena.allocator();
+        const stmt = try a.create(Stmt);
         stmt.* = .{ .if_stmt = .{
             .condition = condition,
             .body = then_body,
@@ -519,7 +520,7 @@ pub const Decompiler = struct {
         const header = &self.cfg.blocks[pattern.header_block];
 
         // Get the condition expression
-        var sim = SimContext.init(self.allocator, self.code, self.version);
+        var sim = SimContext.init(self.arena.allocator(), self.code, self.version);
         defer sim.deinit();
 
         for (header.instructions) |inst| {
@@ -541,7 +542,8 @@ pub const Decompiler = struct {
             null,
         );
 
-        const stmt = try self.allocator.create(Stmt);
+        const a = self.arena.allocator();
+        const stmt = try a.create(Stmt);
         stmt.* = .{
             .while_stmt = .{
                 .condition = condition,
@@ -735,7 +737,8 @@ pub const Decompiler = struct {
         //             };
         //         }
         //
-        //         const stmt = try self.allocator.create(Stmt);
+        //         const a = self.arena.allocator();
+        //         const stmt = try a.create(Stmt);
         //         stmt.* = .{
         //             .try_stmt = .{
         //                 .body = try_body,
@@ -767,7 +770,7 @@ pub const Decompiler = struct {
 
     fn decompileWith(self: *Decompiler, pattern: ctrl.WithPattern) DecompileError!PatternResult {
         const setup = &self.cfg.blocks[pattern.setup_block];
-        var sim = SimContext.init(self.allocator, self.code, self.version);
+        var sim = SimContext.init(self.arena.allocator(), self.code, self.version);
         defer sim.deinit();
 
         var after_before_with = false;
@@ -814,7 +817,8 @@ pub const Decompiler = struct {
 
         const body = try self.decompileStructuredRange(pattern.body_block, pattern.cleanup_block);
 
-        const stmt = try self.allocator.create(Stmt);
+        const a = self.arena.allocator();
+        const stmt = try a.create(Stmt);
         stmt.* = .{
             .with_stmt = .{
                 .items = item,
@@ -895,7 +899,7 @@ pub const Decompiler = struct {
     fn extractHandlerHeader(self: *Decompiler, handler_block: u32) DecompileError!HandlerHeader {
         if (handler_block >= self.cfg.blocks.len) return error.InvalidBlock;
         const block = &self.cfg.blocks[handler_block];
-        var sim = SimContext.init(self.allocator, self.code, self.version);
+        var sim = SimContext.init(self.arena.allocator(), self.code, self.version);
         defer sim.deinit();
 
         var exc_type: ?*Expr = null;
@@ -1018,7 +1022,7 @@ pub const Decompiler = struct {
         // The expression before GET_ITER is the iterator
         const setup = &self.cfg.blocks[pattern.setup_block];
 
-        var iter_sim = SimContext.init(self.allocator, self.code, self.version);
+        var iter_sim = SimContext.init(self.arena.allocator(), self.code, self.version);
         defer iter_sim.deinit();
 
         for (setup.instructions) |inst| {
@@ -1046,7 +1050,8 @@ pub const Decompiler = struct {
         // Decompile the body (skip the first STORE_FAST which is the target)
         const body_stmts = try self.decompileForBody(pattern.body_block, pattern.header_block);
 
-        const stmt = try self.allocator.create(Stmt);
+        const a = self.arena.allocator();
+        const stmt = try a.create(Stmt);
         stmt.* = .{ .for_stmt = .{
             .target = target,
             .iter = iter_expr,
@@ -1139,7 +1144,7 @@ pub const Decompiler = struct {
         stop_at_jump: bool,
         loop_header: ?u32,
     ) DecompileError!void {
-        var sim = SimContext.init(self.allocator, self.code, self.version);
+        var sim = SimContext.init(self.arena.allocator(), self.code, self.version);
         defer sim.deinit();
 
         for (block.instructions) |inst| {
@@ -1217,7 +1222,7 @@ pub const Decompiler = struct {
         stmts: *std.ArrayList(*Stmt),
         skip_first_store: *bool,
     ) DecompileError!void {
-        var sim = SimContext.init(self.allocator, self.code, self.version);
+        var sim = SimContext.init(self.arena.allocator(), self.code, self.version);
         defer sim.deinit();
 
         for (block.instructions) |inst| {
@@ -1254,7 +1259,7 @@ pub const Decompiler = struct {
         const cond_block = &self.cfg.blocks[pattern.condition_block];
 
         // Get the condition expression
-        var sim = SimContext.init(self.allocator, self.code, self.version);
+        var sim = SimContext.init(self.arena.allocator(), self.code, self.version);
         defer sim.deinit();
 
         for (cond_block.instructions) |inst| {
@@ -1309,7 +1314,8 @@ pub const Decompiler = struct {
             );
         } else &[_]*Stmt{};
 
-        const stmt = try self.allocator.create(Stmt);
+        const a = self.arena.allocator();
+        const stmt = try a.create(Stmt);
         stmt.* = .{ .if_stmt = .{
             .condition = condition,
             .body = then_body,
@@ -1405,19 +1411,13 @@ pub const Decompiler = struct {
     }
 
     fn deinitExprSlice(self: *Decompiler, items: []const *Expr) void {
-        for (items) |expr| {
-            expr.deinit(self.allocator);
-            self.allocator.destroy(expr);
-        }
-        if (items.len > 0) self.allocator.free(items);
+        _ = self;
+        _ = items;
     }
 
     fn deinitStmtSlice(self: *Decompiler, items: []const *Stmt) void {
-        for (items) |stmt| {
-            stmt.deinit(self.allocator);
-            self.allocator.destroy(stmt);
-        }
-        if (items.len > 0) self.allocator.free(items);
+        _ = self;
+        _ = items;
     }
 
     fn trimTrailingReturnNone(self: *Decompiler, items: []const *Stmt) DecompileError![]const *Stmt {
@@ -1425,33 +1425,27 @@ pub const Decompiler = struct {
 
         var end = items.len;
         while (end > 0 and Decompiler.isReturnNone(items[end - 1])) {
-            const stmt = items[end - 1];
-            stmt.deinit(self.allocator);
-            self.allocator.destroy(stmt);
             end -= 1;
         }
 
         if (end == items.len) return items;
-        if (end == 0) {
-            self.allocator.free(items);
-            return &.{};
-        }
+        if (end == 0) return &.{};
 
-        const trimmed = try self.allocator.alloc(*Stmt, end);
+        const a = self.arena.allocator();
+        const trimmed = try a.alloc(*Stmt, end);
         @memcpy(trimmed, items[0..end]);
-        self.allocator.free(items);
         return trimmed;
     }
 
     fn takeDecorators(self: *Decompiler, decorators: *std.ArrayList(*Expr)) DecompileError![]const *Expr {
         if (decorators.items.len == 0) return &.{};
         const count = decorators.items.len;
-        const out = try self.allocator.alloc(*Expr, count);
+        const a = self.arena.allocator();
+        const out = try a.alloc(*Expr, count);
         var i: usize = 0;
         while (i < count) : (i += 1) {
             out[i] = decorators.items[count - 1 - i];
         }
-        decorators.deinit(self.allocator);
         decorators.* = .{};
         return out;
     }
@@ -1460,7 +1454,8 @@ pub const Decompiler = struct {
         var nested = try Decompiler.init(self.allocator, code, self.version);
         defer nested.deinit();
         _ = try nested.decompile();
-        const body = try self.allocator.dupe(*Stmt, nested.statements.items);
+        const a = self.arena.allocator();
+        const body = try a.dupe(*Stmt, nested.statements.items);
         nested.statements.items.len = 0;
         return body;
     }
@@ -1469,24 +1464,38 @@ pub const Decompiler = struct {
         var cleanup_func = true;
         errdefer if (cleanup_func) func.deinit(self.allocator);
 
+        const a = self.arena.allocator();
+
         var body = try self.decompileNestedBody(func.code);
-        errdefer self.deinitStmtSlice(body);
         body = try self.trimTrailingReturnNone(body);
 
-        const args = try codegen.extractFunctionSignature(self.allocator, func.code);
-        errdefer args.deinit(self.allocator);
+        // Extract docstring from consts[0] if it's a string
+        if (func.code.consts.len > 0) {
+            const first_const = &func.code.consts[0];
+            if (first_const.* == .string) {
+                const docstring = first_const.string;
+                const doc_const = ast.Constant{ .string = docstring };
+                const doc_expr = try ast.makeConstant(a, doc_const);
+                const doc_stmt = try a.create(ast.Stmt);
+                doc_stmt.* = .{ .expr_stmt = .{ .value = doc_expr } };
+
+                // Prepend docstring to body
+                const new_body = try a.alloc(*ast.Stmt, body.len + 1);
+                new_body[0] = doc_stmt;
+                @memcpy(new_body[1..], body);
+                body = new_body;
+            }
+        }
+
+        const args = try codegen.extractFunctionSignature(a, func.code, func.defaults, func.kw_defaults);
 
         const decorator_list = try self.takeDecorators(&func.decorators);
-        errdefer self.deinitExprSlice(decorator_list);
 
         cleanup_func = false;
-        errdefer self.allocator.destroy(func);
 
-        const name_copy = try self.allocator.dupe(u8, name);
-        errdefer self.allocator.free(name_copy);
+        const name_copy = try a.dupe(u8, name);
 
-        const stmt = try self.allocator.create(Stmt);
-        errdefer self.allocator.destroy(stmt);
+        const stmt = try a.create(Stmt);
 
         stmt.* = .{ .function_def = .{
             .name = name_copy,
@@ -1498,7 +1507,6 @@ pub const Decompiler = struct {
             .is_async = codegen.isCoroutine(func.code) or codegen.isAsyncGenerator(func.code),
         } };
 
-        self.allocator.destroy(func);
         return stmt;
     }
 
@@ -1506,31 +1514,45 @@ pub const Decompiler = struct {
         var cleanup_cls = true;
         errdefer if (cleanup_cls) cls.deinit(self.allocator);
 
+        const a = self.arena.allocator();
+
         var body = try self.decompileNestedBody(cls.code);
-        errdefer self.deinitStmtSlice(body);
         body = try self.trimTrailingReturnNone(body);
 
+        // Extract class docstring from consts[1] if it's a string
+        if (cls.code.consts.len > 1) {
+            const second_const = &cls.code.consts[1];
+            if (second_const.* == .string) {
+                const docstring = second_const.string;
+                const doc_const = ast.Constant{ .string = docstring };
+                const doc_expr = try ast.makeConstant(a, doc_const);
+                const doc_stmt = try a.create(ast.Stmt);
+                doc_stmt.* = .{ .expr_stmt = .{ .value = doc_expr } };
+
+                // Prepend docstring to body
+                const new_body = try a.alloc(*ast.Stmt, body.len + 1);
+                new_body[0] = doc_stmt;
+                @memcpy(new_body[1..], body);
+                body = new_body;
+            }
+        }
+
         const decorator_list = try self.takeDecorators(&cls.decorators);
-        errdefer self.deinitExprSlice(decorator_list);
 
         const bases = cls.bases;
         cls.bases = &.{};
-        errdefer self.deinitExprSlice(bases);
 
         var class_name = name;
         if (cls.name.len > 0) {
             class_name = cls.name;
             cls.name = &.{};
         } else {
-            class_name = try self.allocator.dupe(u8, name);
+            class_name = try a.dupe(u8, name);
         }
-        errdefer if (class_name.len > 0) self.allocator.free(class_name);
 
         cleanup_cls = false;
-        errdefer self.allocator.destroy(cls);
 
-        const stmt = try self.allocator.create(Stmt);
-        errdefer self.allocator.destroy(stmt);
+        const stmt = try a.create(Stmt);
         stmt.* = .{ .class_def = .{
             .name = class_name,
             .bases = bases,
@@ -1539,18 +1561,19 @@ pub const Decompiler = struct {
             .decorator_list = decorator_list,
         } };
 
-        self.allocator.destroy(cls);
         return stmt;
     }
 
     fn handleStoreValue(self: *Decompiler, name: []const u8, value: stack_mod.StackValue) DecompileError!?*Stmt {
+        const a = self.arena.allocator();
         return switch (value) {
             .expr => |expr| blk: {
-                const target = try ast.makeName(self.allocator, name, .store);
+                const target = try ast.makeName(a, name, .store);
                 break :blk try self.makeAssign(target, expr);
             },
             .function_obj => |func| try self.makeFunctionDef(name, func),
             .class_obj => |cls| try self.makeClassDef(name, cls),
+            .import_module => |imp| try self.makeImport(name, imp),
             .saved_local => null,
             else => blk: {
                 var tmp = value;
@@ -1560,12 +1583,40 @@ pub const Decompiler = struct {
         };
     }
 
+    fn makeImport(self: *Decompiler, alias_name: []const u8, imp: stack_mod.ImportModule) DecompileError!*Stmt {
+        const a = self.arena.allocator();
+        const stmt = try a.create(ast.Stmt);
+
+        if (imp.fromlist.len == 0) {
+            // import module or import module as alias
+            const asname = if (std.mem.eql(u8, alias_name, imp.module)) null else alias_name;
+            const aliases = try a.alloc(ast.Alias, 1);
+            aliases[0] = .{ .name = imp.module, .asname = asname };
+            stmt.* = .{ .import_stmt = .{ .names = aliases } };
+        } else {
+            // from module import names
+            const aliases = try a.alloc(ast.Alias, imp.fromlist.len);
+            for (imp.fromlist, 0..) |from_name, i| {
+                const asname = if (i == 0 and !std.mem.eql(u8, alias_name, from_name)) alias_name else null;
+                aliases[i] = .{ .name = from_name, .asname = asname };
+            }
+            stmt.* = .{ .import_from = .{
+                .module = imp.module,
+                .names = aliases,
+                .level = 0,
+            } };
+        }
+
+        return stmt;
+    }
+
     /// Create an assignment statement.
     fn makeAssign(self: *Decompiler, target: *Expr, value: *Expr) DecompileError!*Stmt {
-        const targets = try self.allocator.alloc(*Expr, 1);
+        const a = self.arena.allocator();
+        const targets = try a.alloc(*Expr, 1);
         targets[0] = target;
 
-        const stmt = try self.allocator.create(Stmt);
+        const stmt = try a.create(Stmt);
         stmt.* = .{ .assign = .{
             .targets = targets,
             .value = value,
@@ -1576,21 +1627,24 @@ pub const Decompiler = struct {
 
     /// Create a break statement.
     fn makeBreak(self: *Decompiler) DecompileError!*Stmt {
-        const stmt = try self.allocator.create(Stmt);
+        const a = self.arena.allocator();
+        const stmt = try a.create(Stmt);
         stmt.* = .break_stmt;
         return stmt;
     }
 
     /// Create a continue statement.
     fn makeContinue(self: *Decompiler) DecompileError!*Stmt {
-        const stmt = try self.allocator.create(Stmt);
+        const a = self.arena.allocator();
+        const stmt = try a.create(Stmt);
         stmt.* = .continue_stmt;
         return stmt;
     }
 
     /// Create a return statement.
     fn makeReturn(self: *Decompiler, value: *Expr) DecompileError!*Stmt {
-        const stmt = try self.allocator.create(Stmt);
+        const a = self.arena.allocator();
+        const stmt = try a.create(Stmt);
         stmt.* = .{ .return_stmt = .{
             .value = value,
         } };
@@ -1599,7 +1653,8 @@ pub const Decompiler = struct {
 
     /// Create an expression statement.
     fn makeExprStmt(self: *Decompiler, value: *Expr) DecompileError!*Stmt {
-        const stmt = try self.allocator.create(Stmt);
+        const a = self.arena.allocator();
+        const stmt = try a.create(Stmt);
         stmt.* = .{ .expr_stmt = .{
             .value = value,
         } };

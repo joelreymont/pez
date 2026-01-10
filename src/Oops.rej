@@ -1,0 +1,21 @@
+***************
+*** 394,399
+-         // Write regular args
+-         for (args.args) |arg| {
+-             if (!first) try self.write(allocator, ", ");
+-             first = false;
+-             try self.write(allocator, arg.arg);
+-         }
+--- 394,405 -----
++         // Write regular args with defaults
++         const n_defaults = args.defaults.len;
++         const n_args = args.args.len;
++         for (args.args, 0..) |arg, i| {
++             if (!first) try self.write(allocator, ", ");
++             first = false;
++             try self.write(allocator, arg.arg);
++             // Defaults apply to the last n_defaults args
++             if (n_defaults > 0 and i >= n_args - n_defaults) {
++                 const default_idx = i - (n_args - n_defaults);
++                 try self.write(allocator, "=");
++                 try self.writeExpr(allocator, args.defaults[default_idx]);

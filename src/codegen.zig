@@ -391,11 +391,18 @@ pub const Writer = struct {
             try self.write(allocator, ", /");
         }
 
-        // Write regular args
-        for (args.args) |arg| {
+        // Write regular args with defaults
+        const n_defaults = args.defaults.len;
+        const n_args = args.args.len;
+        for (args.args, 0..) |arg, i| {
             if (!first) try self.write(allocator, ", ");
             first = false;
             try self.write(allocator, arg.arg);
+            if (n_defaults > 0 and i >= n_args - n_defaults) {
+                const default_idx = i - (n_args - n_defaults);
+                try self.write(allocator, "=");
+                try self.writeExpr(allocator, args.defaults[default_idx]);
+            }
         }
 
         // Write *args
@@ -406,11 +413,17 @@ pub const Writer = struct {
             try self.write(allocator, va.arg);
         }
 
-        // Write keyword-only args
-        for (args.kwonlyargs) |arg| {
+        // Write keyword-only args with defaults
+        for (args.kwonlyargs, 0..) |arg, i| {
             if (!first) try self.write(allocator, ", ");
             first = false;
             try self.write(allocator, arg.arg);
+            if (i < args.kw_defaults.len) {
+                if (args.kw_defaults[i]) |default| {
+                    try self.write(allocator, "=");
+                    try self.writeExpr(allocator, default);
+                }
+            }
         }
 
         // Write **kwargs
@@ -567,7 +580,18 @@ pub const Writer = struct {
                     try self.writeIndent(allocator);
                     try self.write(allocator, "pass\n");
                 } else {
-                    for (f.body) |s| {
+                    for (f.body, 0..) |s, i| {
+                        // First statement might be docstring
+                        if (i == 0 and s.* == .expr_stmt) {
+                            const expr = s.expr_stmt.value;
+                            if (expr.* == .constant and expr.constant == .string) {
+                                try self.writeIndent(allocator);
+                                try self.write(allocator, "\"\"\"");
+                                try self.writeStringContents(allocator, expr.constant.string);
+                                try self.write(allocator, "\"\"\"\n");
+                                continue;
+                            }
+                        }
                         try self.writeStmt(allocator, s);
                     }
                 }
@@ -604,7 +628,28 @@ pub const Writer = struct {
                     try self.writeIndent(allocator);
                     try self.write(allocator, "pass\n");
                 } else {
-                    for (c.body) |s| {
+                    for (c.body, 0..) |s, i| {
+                        // First statement might be docstring
+                        if (i == 0 and s.* == .expr_stmt) {
+                            const expr = s.expr_stmt.value;
+                            if (expr.* == .constant and expr.constant == .string) {
+                                try self.writeIndent(allocator);
+                                try self.write(allocator, "\"\"\"");
+                                try self.writeStringContents(allocator, expr.constant.string);
+                                try self.write(allocator, "\"\"\"\n");
+                                continue;
+                            }
+                        }
+                        // Skip __doc__ assignment (it's the docstring)
+                        if (s.* == .assign) {
+                            const assign = s.assign;
+                            if (assign.targets.len == 1) {
+                                const target = assign.targets[0];
+                                if (target.* == .name and std.mem.eql(u8, target.name.id, "__doc__")) {
+                                    continue;
+                                }
+                            }
+                        }
                         try self.writeStmt(allocator, s);
                     }
                 }
@@ -1576,7 +1621,7 @@ pub const DebugPrinter = struct {
 
 /// Extract function signature from a code object.
 /// Returns an Arguments structure suitable for AST function definition.
-pub fn extractFunctionSignature(allocator: std.mem.Allocator, code: *const pyc.Code) !*ast.Arguments {
+pub fn extractFunctionSignature(allocator: std.mem.Allocator, code: *const pyc.Code, defaults: []const *ast.Expr, kw_defaults: []const ?*ast.Expr) !*ast.Arguments {
     const args = try allocator.create(ast.Arguments);
     errdefer allocator.destroy(args);
 
@@ -1646,9 +1691,9 @@ pub fn extractFunctionSignature(allocator: std.mem.Allocator, code: *const pyc.C
         .args = regular_args,
         .vararg = vararg,
         .kwonlyargs = kwonly_args,
-        .kw_defaults = &.{},
+        .kw_defaults = kw_defaults,
         .kwarg = kwarg,
-        .defaults = &.{}, // TODO: extract from consts
+        .defaults = defaults,
     };
 
     return args;
