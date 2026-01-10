@@ -1565,7 +1565,23 @@ pub const SimContext = struct {
                     const expr = try ast.makeTuple(self.allocator, &.{}, .load);
                     try self.stack.push(.{ .expr = expr });
                 } else {
-                    const elts = try self.stack.popNExprs(count);
+                    // Try to pop as expressions; if any are unknown (e.g., closure cells),
+                    // push unknown since this is likely a closure tuple for MAKE_CLOSURE
+                    const elts = self.stack.popNExprs(count) catch |err| {
+                        if (err == error.NotAnExpression) {
+                            // Pop the non-expression values and push unknown
+                            var i: u32 = 0;
+                            while (i < count) : (i += 1) {
+                                if (self.stack.pop()) |v| {
+                                    var val = v;
+                                    val.deinit(self.allocator);
+                                }
+                            }
+                            try self.stack.push(.unknown);
+                            return;
+                        }
+                        return err;
+                    };
                     const expr = try ast.makeTuple(self.allocator, elts, .load);
                     try self.stack.push(.{ .expr = expr });
                 }
@@ -2112,6 +2128,80 @@ pub const SimContext = struct {
                         };
 
                         const expr = try ast.makeName(self.allocator, func_name, .load);
+                        try self.stack.push(.{ .expr = expr });
+                    },
+                }
+            },
+
+            .MAKE_CLOSURE => {
+                // MAKE_CLOSURE - Python 2/3.0-3.3 version of MAKE_FUNCTION with closure
+                // Stack: defaults... code closure -> function
+                // In Python 3.3+, qualname is also on stack between code and defaults
+
+                // Pop qualname for Python 3.3+
+                if (self.version.gte(3, 3)) {
+                    if (self.stack.pop()) |qualname| {
+                        var val = qualname;
+                        val.deinit(self.allocator);
+                    } else {
+                        return error.StackUnderflow;
+                    }
+                }
+
+                // Pop code object
+                const code_val = self.stack.pop() orelse return error.StackUnderflow;
+
+                // Pop closure tuple (already consumed by BUILD_TUPLE which pushed unknown)
+                if (self.stack.pop()) |closure| {
+                    var val = closure;
+                    val.deinit(self.allocator);
+                } else {
+                    return error.StackUnderflow;
+                }
+
+                // Parse defaults if arg > 0 (number of defaults)
+                var defaults: []const *Expr = &.{};
+                const defaults_count = inst.arg;
+                if (defaults_count > 0) {
+                    var default_list: std.ArrayListUnmanaged(*Expr) = .empty;
+                    var i: u32 = 0;
+                    while (i < defaults_count) : (i += 1) {
+                        if (self.stack.pop()) |def_val| {
+                            if (def_val == .expr) {
+                                default_list.append(self.allocator, def_val.expr) catch {};
+                            } else {
+                                var val = def_val;
+                                val.deinit(self.allocator);
+                            }
+                        }
+                    }
+                    defaults = default_list.items;
+                }
+
+                switch (code_val) {
+                    .code_obj => |code| {
+                        if (compKindFromName(code.name)) |kind| {
+                            try self.stack.push(.{ .comp_obj = .{ .code = code, .kind = kind } });
+                            return;
+                        }
+                        if (std.mem.eql(u8, code.name, "<lambda>")) {
+                            const expr = try buildLambdaExpr(self.allocator, code, self.version);
+                            try self.stack.push(.{ .expr = expr });
+                            return;
+                        }
+
+                        const func = try self.allocator.create(FunctionValue);
+                        func.* = .{
+                            .code = code,
+                            .decorators = .{},
+                            .defaults = defaults,
+                            .kw_defaults = &.{},
+                            .annotations = &.{},
+                        };
+                        try self.stack.push(.{ .function_obj = func });
+                    },
+                    else => {
+                        const expr = try ast.makeName(self.allocator, "<closure>", .load);
                         try self.stack.push(.{ .expr = expr });
                     },
                 }
@@ -2969,12 +3059,11 @@ pub const SimContext = struct {
             },
 
             .GEN_START => {
-                // GEN_START - pop None placeholder
+                // GEN_START - pops the sent value (None on first call)
+                // In decompilation, we start with empty stack, so just ignore
                 if (self.stack.pop()) |v| {
                     var val = v;
                     val.deinit(self.allocator);
-                } else {
-                    return error.StackUnderflow;
                 }
             },
 

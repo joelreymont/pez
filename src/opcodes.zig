@@ -2580,6 +2580,7 @@ const opcode_table_3_1 = [_]?Opcode{
     .LIST_APPEND, // 145 - new position in 3.1+
     .SET_ADD, // 146 - new position in 3.1+
     .MAP_ADD, // 147 - new in 3.1+
+    .LOAD_CLASSDEREF, // 148 - new in 3.4
 };
 
 /// Python 3.5 opcode byte values (adds BINARY_MATRIX_MULTIPLY and INPLACE_MATRIX_MULTIPLY)
