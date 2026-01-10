@@ -528,6 +528,21 @@ pub const Writer = struct {
                 try self.writeExpr(allocator, e.value);
                 try self.writeByte(allocator, '\n');
             },
+            .print_stmt => |p| {
+                try self.write(allocator, "print");
+                if (p.dest) |dest| {
+                    try self.write(allocator, " >>");
+                    try self.writeExpr(allocator, dest);
+                    if (p.values.len > 0) try self.writeByte(allocator, ',');
+                }
+                for (p.values, 0..) |val, i| {
+                    try self.writeByte(allocator, ' ');
+                    try self.writeExpr(allocator, val);
+                    if (i + 1 < p.values.len) try self.writeByte(allocator, ',');
+                }
+                if (!p.nl and p.values.len > 0) try self.writeByte(allocator, ',');
+                try self.writeByte(allocator, '\n');
+            },
             .return_stmt => |r| {
                 try self.write(allocator, "return");
                 if (r.value) |v| {

@@ -2947,6 +2947,42 @@ pub const SimContext = struct {
                 try self.stack.push(.unknown);
             },
 
+            // Python 2.x print statement opcodes
+            .PRINT_ITEM => {
+                // Pop and print value - handled at decompile level
+                if (self.stack.pop()) |v| {
+                    var val = v;
+                    val.deinit(self.allocator);
+                } else {
+                    return error.StackUnderflow;
+                }
+            },
+
+            .PRINT_NEWLINE => {
+                // Print newline - no stack effect
+            },
+
+            .PRINT_ITEM_TO => {
+                // Pop value and file object, print value to file
+                if (self.stack.pop()) |v| {
+                    var val = v;
+                    val.deinit(self.allocator);
+                } else {
+                    return error.StackUnderflow;
+                }
+                // Note: file object should already be on stack from earlier LOAD
+            },
+
+            .PRINT_NEWLINE_TO => {
+                // Pop file object, print newline to it
+                if (self.stack.pop()) |v| {
+                    var val = v;
+                    val.deinit(self.allocator);
+                } else {
+                    return error.StackUnderflow;
+                }
+            },
+
             else => {
                 // Unhandled opcode - push unknown for each value it would produce
                 // For now, just push unknown

@@ -41,6 +41,10 @@ pub const Decompiler = struct {
     nested_decompilers: std.ArrayList(*Decompiler),
     /// Next block after chained comparison (set by tryDecompileChainedComparison).
     chained_cmp_next_block: ?u32 = null,
+    /// Accumulated print items for Python 2.x PRINT_ITEM/PRINT_NEWLINE.
+    print_items: std.ArrayList(*Expr),
+    /// Print destination for PRINT_ITEM_TO.
+    print_dest: ?*Expr = null,
 
     pub fn init(allocator: Allocator, code: *const pyc.Code, version: Version) DecompileError!Decompiler {
         var arena = std.heap.ArenaAllocator.init(allocator);
@@ -73,6 +77,7 @@ pub const Decompiler = struct {
             .dom = dom,
             .statements = .{},
             .nested_decompilers = .{},
+            .print_items = .{},
         };
     }
 
@@ -82,6 +87,7 @@ pub const Decompiler = struct {
             self.allocator.destroy(nested);
         }
         self.nested_decompilers.deinit(self.allocator);
+        self.print_items.deinit(self.allocator);
         self.analyzer.deinit();
         self.dom.deinit();
         self.arena.deinit();
@@ -209,6 +215,37 @@ pub const Decompiler = struct {
                 },
                 .END_FOR, .POP_ITER => {
                     // Loop cleanup opcodes - skip in non-loop context
+                },
+                .PRINT_ITEM => {
+                    // Collect print item - will be emitted with PRINT_NEWLINE
+                    const val = try sim.stack.popExpr();
+                    try self.print_items.append(self.allocator, val);
+                },
+                .PRINT_NEWLINE => {
+                    // Emit print statement with collected items
+                    const stmt = try self.makePrintStmt(null, true);
+                    try stmts.append(self.allocator, stmt);
+                },
+                .PRINT_ITEM_TO => {
+                    // Stack: [..., file, value, file] after ROT_TWO
+                    // Pop file (TOS), then value (TOS1)
+                    const file = try sim.stack.popExpr();
+                    const val = try sim.stack.popExpr();
+                    // Save file for PRINT_NEWLINE_TO (arena-allocated, no manual free)
+                    if (self.print_dest == null) {
+                        self.print_dest = file;
+                    }
+                    // Duplicate file refs are fine - arena will free all
+                    try self.print_items.append(self.allocator, val);
+                },
+                .PRINT_NEWLINE_TO => {
+                    // Pop file (it's still on stack after last PRINT_ITEM_TO or just loaded)
+                    const file = try sim.stack.popExpr();
+                    // Use saved dest if available (from PRINT_ITEM_TO), otherwise use popped file
+                    const dest = self.print_dest orelse file;
+                    self.print_dest = null;
+                    const stmt = try self.makePrintStmt(dest, true);
+                    try stmts.append(self.allocator, stmt);
                 },
                 else => {
                     try sim.simulate(inst);
@@ -2174,6 +2211,22 @@ pub const Decompiler = struct {
         const stmt = try a.create(Stmt);
         stmt.* = .{ .return_stmt = .{
             .value = value,
+        } };
+        return stmt;
+    }
+
+    /// Create a print statement (Python 2.x).
+    fn makePrintStmt(self: *Decompiler, dest: ?*Expr, nl: bool) DecompileError!*Stmt {
+        const a = self.arena.allocator();
+        const values = try a.alloc(*Expr, self.print_items.items.len);
+        @memcpy(values, self.print_items.items);
+        self.print_items.clearRetainingCapacity();
+
+        const stmt = try a.create(Stmt);
+        stmt.* = .{ .print_stmt = .{
+            .values = values,
+            .dest = dest,
+            .nl = nl,
         } };
         return stmt;
     }

@@ -1251,6 +1251,13 @@ pub const Stmt = union(enum) {
     /// Continue statement
     continue_stmt,
 
+    /// Python 2.x print statement
+    print_stmt: struct {
+        values: []const *Expr,
+        dest: ?*Expr, // file object for >> syntax
+        nl: bool, // whether to print newline
+    },
+
     pub fn deinit(self: *Stmt, allocator: Allocator) void {
         switch (self.*) {
             .function_def => |v| {
@@ -1368,6 +1375,13 @@ pub const Stmt = union(enum) {
             .expr_stmt => |v| {
                 v.value.deinit(allocator);
                 allocator.destroy(v.value);
+            },
+            .print_stmt => |v| {
+                deinitExprSlice(allocator, v.values);
+                if (v.dest) |d| {
+                    d.deinit(allocator);
+                    allocator.destroy(d);
+                }
             },
             .pass, .break_stmt, .continue_stmt => {},
         }
