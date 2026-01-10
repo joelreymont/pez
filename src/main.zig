@@ -101,7 +101,7 @@ pub fn main() !void {
             try stdout.print("# Python {d}.{d}\n", .{ module.major_ver, module.minor_ver });
             try stdout.print("# Decompiled by pez\n\n", .{});
             if (module.code) |code| {
-                try decompile.decompileToSource(allocator, code, version, stdout);
+                try decompile.decompileToSourceWithContext(allocator, code, version, stdout, std.fs.File.stderr());
             }
         },
         .test_suite, .golden => unreachable, // Handled earlier

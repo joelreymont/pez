@@ -25,6 +25,14 @@ const StackValue = stack_mod.StackValue;
 const Opcode = decoder.Opcode;
 pub const DecompileError = stack_mod.SimError || error{ UnexpectedEmptyWorklist, InvalidBlock };
 
+/// Error context for debugging.
+pub const ErrorContext = struct {
+    code_name: []const u8,
+    block_id: u32,
+    offset: u32,
+    opcode: []const u8,
+};
+
 /// Decompiler state for a single code object.
 pub const Decompiler = struct {
     allocator: Allocator,
@@ -45,6 +53,8 @@ pub const Decompiler = struct {
     print_items: std.ArrayList(*Expr),
     /// Print destination for PRINT_ITEM_TO.
     print_dest: ?*Expr = null,
+    /// Error context for debugging.
+    last_error_ctx: ?ErrorContext = null,
 
     pub fn init(allocator: Allocator, code: *const pyc.Code, version: Version) DecompileError!Decompiler {
         var arena = std.heap.ArenaAllocator.init(allocator);
@@ -175,6 +185,12 @@ pub const Decompiler = struct {
         stmts: *std.ArrayList(*Stmt),
     ) DecompileError!void {
         for (block.instructions) |inst| {
+            errdefer self.last_error_ctx = .{
+                .code_name = self.code.name,
+                .block_id = block.id,
+                .offset = inst.offset,
+                .opcode = inst.opcode.name(),
+            };
             switch (inst.opcode) {
                 .STORE_NAME, .STORE_FAST, .STORE_GLOBAL => {
                     const name = switch (inst.opcode) {
@@ -2256,12 +2272,37 @@ pub const Decompiler = struct {
 
 /// Decompile a code object and write Python source to writer.
 pub fn decompileToSource(allocator: Allocator, code: *const pyc.Code, version: Version, writer: anytype) !void {
+    return decompileToSourceWithContext(allocator, code, version, writer, null);
+}
+
+/// Decompile with error context output.
+pub fn decompileToSourceWithContext(
+    allocator: Allocator,
+    code: *const pyc.Code,
+    version: Version,
+    writer: anytype,
+    err_writer: ?std.fs.File,
+) !void {
     // Handle module-level code
     if (std.mem.eql(u8, code.name, "<module>")) {
         var decompiler = try Decompiler.init(allocator, code, version);
         defer decompiler.deinit();
 
-        const stmts = try decompiler.decompile();
+        const stmts = decompiler.decompile() catch |err| {
+            if (err_writer) |ew| {
+                if (decompiler.last_error_ctx) |ctx| {
+                    var buf: [256]u8 = undefined;
+                    const msg = std.fmt.bufPrint(&buf, "Error in {s} at offset {d} ({s}): {s}\n", .{
+                        ctx.code_name,
+                        ctx.offset,
+                        ctx.opcode,
+                        @errorName(err),
+                    }) catch "Error context unavailable\n";
+                    _ = ew.write(msg) catch {};
+                }
+            }
+            return err;
+        };
         var effective_stmts = stmts;
         while (effective_stmts.len > 0 and Decompiler.isReturnNone(effective_stmts[effective_stmts.len - 1])) {
             effective_stmts = effective_stmts[0 .. effective_stmts.len - 1];
