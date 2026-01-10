@@ -37,6 +37,8 @@ pub const Decompiler = struct {
 
     /// Accumulated statements.
     statements: std.ArrayList(*Stmt),
+    /// Nested decompilers (kept alive for arena lifetime).
+    nested_decompilers: std.ArrayList(*Decompiler),
 
     pub fn init(allocator: Allocator, code: *const pyc.Code, version: Version) DecompileError!Decompiler {
         var arena = std.heap.ArenaAllocator.init(allocator);
@@ -53,10 +55,10 @@ pub const Decompiler = struct {
             try cfg_mod.buildCFG(a, code.code, version);
         errdefer cfg.deinit();
 
-        var analyzer = try Analyzer.init(a, cfg);
+        var analyzer = try Analyzer.init(allocator, cfg);
         errdefer analyzer.deinit();
 
-        var dom = try dom_mod.DomTree.init(a, cfg);
+        var dom = try dom_mod.DomTree.init(allocator, cfg);
         errdefer dom.deinit();
 
         return .{
@@ -68,10 +70,18 @@ pub const Decompiler = struct {
             .analyzer = analyzer,
             .dom = dom,
             .statements = .{},
+            .nested_decompilers = .{},
         };
     }
 
     pub fn deinit(self: *Decompiler) void {
+        for (self.nested_decompilers.items) |nested| {
+            nested.deinit();
+            self.allocator.destroy(nested);
+        }
+        self.nested_decompilers.deinit(self.allocator);
+        self.analyzer.deinit();
+        self.dom.deinit();
         self.arena.deinit();
         self.statements.deinit(self.allocator);
     }
@@ -482,7 +492,10 @@ pub const Decompiler = struct {
 
         // Decompile the then body
         const then_end = pattern.else_block orelse pattern.merge_block;
-        const then_body = try self.decompileBlockRange(pattern.then_block, then_end);
+        const then_body_tmp = try self.decompileBlockRange(pattern.then_block, then_end);
+        defer self.allocator.free(then_body_tmp);
+        const a = self.arena.allocator();
+        const then_body = try a.dupe(*Stmt, then_body_tmp);
 
         // Decompile the else body
         const else_body = if (pattern.else_block) |else_id| blk: {
@@ -493,18 +506,19 @@ pub const Decompiler = struct {
                 if (else_pattern == .if_stmt) {
                     const elif_stmt = try self.decompileIf(else_pattern.if_stmt);
                     if (elif_stmt) |s| {
-                        const body = try self.allocator.alloc(*Stmt, 1);
+                        const body = try a.alloc(*Stmt, 1);
                         body[0] = s;
                         break :blk body;
                     }
                 }
             }
             // Regular else
-            break :blk try self.decompileBlockRange(else_id, pattern.merge_block);
+            const else_body_tmp = try self.decompileBlockRange(else_id, pattern.merge_block);
+            defer self.allocator.free(else_body_tmp);
+            break :blk try a.dupe(*Stmt, else_body_tmp);
         } else &[_]*Stmt{};
 
         // Create if statement
-        const a = self.arena.allocator();
         const stmt = try a.create(Stmt);
         stmt.* = .{ .if_stmt = .{
             .condition = condition,
@@ -1451,12 +1465,15 @@ pub const Decompiler = struct {
     }
 
     fn decompileNestedBody(self: *Decompiler, code: *const pyc.Code) DecompileError![]const *Stmt {
-        var nested = try Decompiler.init(self.allocator, code, self.version);
-        defer nested.deinit();
-        _ = try nested.decompile();
+        const nested_ptr = try self.allocator.create(Decompiler);
+        errdefer self.allocator.destroy(nested_ptr);
+
+        nested_ptr.* = try Decompiler.init(self.allocator, code, self.version);
+        try self.nested_decompilers.append(self.allocator, nested_ptr);
+
+        _ = try nested_ptr.decompile();
         const a = self.arena.allocator();
-        const body = try a.dupe(*Stmt, nested.statements.items);
-        nested.statements.items.len = 0;
+        const body = try a.dupe(*Stmt, nested_ptr.statements.items);
         return body;
     }
 
