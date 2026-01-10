@@ -1060,12 +1060,11 @@ pub const Decompiler = struct {
             }
         }
 
-        const target = try ast.makeName(self.allocator, target_name, .store);
+        const a = self.arena.allocator();
+        const target = try ast.makeName(a, target_name, .store);
 
         // Decompile the body (skip the first STORE_FAST which is the target)
         const body_stmts = try self.decompileForBody(pattern.body_block, pattern.header_block);
-
-        const a = self.arena.allocator();
         const stmt = try a.create(Stmt);
         stmt.* = .{ .for_stmt = .{
             .target = target,
@@ -1081,8 +1080,9 @@ pub const Decompiler = struct {
 
     /// Decompile a for loop body using dominator-based loop membership.
     fn decompileForBody(self: *Decompiler, body_block_id: u32, header_block_id: u32) DecompileError![]const *Stmt {
+        const a = self.arena.allocator();
         var stmts: std.ArrayList(*Stmt) = .{};
-        errdefer stmts.deinit(self.allocator);
+        errdefer stmts.deinit(a);
 
         var visited = try std.DynamicBitSet.initEmpty(self.allocator, self.cfg.blocks.len);
         defer visited.deinit();
@@ -1113,7 +1113,7 @@ pub const Decompiler = struct {
                     // Handle nested if
                     const if_stmt = try self.decompileLoopIf(p, header_block_id, &visited);
                     if (if_stmt) |s| {
-                        try stmts.append(self.allocator, s);
+                        try stmts.append(a, s);
                     }
                     block_idx += 1;
                     continue;
@@ -1135,7 +1135,7 @@ pub const Decompiler = struct {
             }
         }
 
-        return stmts.toOwnedSlice(self.allocator);
+        return stmts.toOwnedSlice(a);
     }
 
     /// Check if a block has a back edge to the loop header.
@@ -1313,7 +1313,7 @@ pub const Decompiler = struct {
                 if (else_pattern == .if_stmt) {
                     const elif_stmt = try self.decompileLoopIf(else_pattern.if_stmt, loop_header, visited);
                     if (elif_stmt) |s| {
-                        const body = try self.allocator.alloc(*Stmt, 1);
+                        const body = try self.arena.allocator().alloc(*Stmt, 1);
                         body[0] = s;
                         break :blk body;
                     }
@@ -1349,8 +1349,9 @@ pub const Decompiler = struct {
         visited: *std.DynamicBitSet,
         stop_block: ?u32,
     ) DecompileError![]const *Stmt {
+        const a = self.arena.allocator();
         var stmts: std.ArrayList(*Stmt) = .{};
-        errdefer stmts.deinit(self.allocator);
+        errdefer stmts.deinit(a);
 
         var block_idx = start_block;
 
@@ -1373,7 +1374,7 @@ pub const Decompiler = struct {
 
                     const if_stmt = try self.decompileLoopIf(p, loop_header, visited);
                     if (if_stmt) |s| {
-                        try stmts.append(self.allocator, s);
+                        try stmts.append(a, s);
                     }
 
                     if (p.merge_block) |merge_id| {
@@ -1422,7 +1423,7 @@ pub const Decompiler = struct {
             }
         }
 
-        return stmts.toOwnedSlice(self.allocator);
+        return stmts.toOwnedSlice(a);
     }
 
     fn deinitExprSlice(self: *Decompiler, items: []const *Expr) void {
