@@ -1486,6 +1486,47 @@ pub const SimContext = struct {
                 try self.stack.push(.{ .expr = expr });
             },
 
+            // Python 3.9+ identity and membership operators
+            .IS_OP => {
+                const right = try self.stack.popExpr();
+                const left = try self.stack.popExpr();
+
+                const comparators = try self.allocator.alloc(*Expr, 1);
+                comparators[0] = right;
+                const ops = try self.allocator.alloc(ast.CmpOp, 1);
+                // IS_OP 0 = is, IS_OP 1 = is not
+                ops[0] = if (inst.arg == 0) .is else .is_not;
+
+                const expr = try self.allocator.create(Expr);
+                expr.* = .{ .compare = .{
+                    .left = left,
+                    .ops = ops,
+                    .comparators = comparators,
+                } };
+                try self.stack.push(.{ .expr = expr });
+            },
+
+            .CONTAINS_OP => {
+                // Stack: [..., sequence, item] -> [..., result]
+                // CONTAINS_OP 0 = item in sequence
+                // CONTAINS_OP 1 = item not in sequence
+                const sequence = try self.stack.popExpr();
+                const item = try self.stack.popExpr();
+
+                const comparators = try self.allocator.alloc(*Expr, 1);
+                comparators[0] = sequence;
+                const ops = try self.allocator.alloc(ast.CmpOp, 1);
+                ops[0] = if (inst.arg == 0) .in_ else .not_in;
+
+                const expr = try self.allocator.create(Expr);
+                expr.* = .{ .compare = .{
+                    .left = item,
+                    .ops = ops,
+                    .comparators = comparators,
+                } };
+                try self.stack.push(.{ .expr = expr });
+            },
+
             .BUILD_LIST => {
                 const count = inst.arg;
                 if (count == 0) {
