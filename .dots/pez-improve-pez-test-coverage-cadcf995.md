@@ -3,7 +3,7 @@ title: Improve pez test coverage
 status: active
 priority: 2
 issue-type: task
-created-at: "\"2026-01-10T18:08:37.052345+02:00\""
+created-at: "\"\\\"2026-01-10T18:08:37.052345+02:00\\\"\""
 ---
 
 Working on improving decompiler test pass rate. Current: 149/190 passing.

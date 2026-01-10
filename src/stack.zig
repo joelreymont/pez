@@ -2565,11 +2565,11 @@ pub const SimContext = struct {
             // Import opcodes
             .IMPORT_NAME => {
                 // IMPORT_NAME namei - imports module names[namei]
-                // Stack: fromlist, level -> module
-                const level = self.stack.pop() orelse return error.StackUnderflow;
-                defer level.deinit(self.allocator);
+                // Stack: level, fromlist -> module (TOS is fromlist)
                 const fromlist_val = self.stack.pop() orelse return error.StackUnderflow;
                 defer fromlist_val.deinit(self.allocator);
+                const level = self.stack.pop() orelse return error.StackUnderflow;
+                defer level.deinit(self.allocator);
 
                 // Extract fromlist tuple if available
                 var fromlist: []const []const u8 = &.{};

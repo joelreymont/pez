@@ -2383,18 +2383,18 @@ const opcode_table_2_6 = [_]?Opcode{
     .LOAD_NAME, // 101
     .BUILD_TUPLE, // 102
     .BUILD_LIST, // 103
-    .BUILD_SET, // 104 - maps to BUILD_MAP for 2.6 and earlier
-    .BUILD_MAP, // 105
-    .LOAD_ATTR, // 106
-    .COMPARE_OP, // 107
-    .IMPORT_NAME, // 108
-    .IMPORT_FROM, // 109
+    .BUILD_MAP, // 104 - Python 2.5/2.6 BUILD_MAP is at 104
+    .LOAD_ATTR, // 105
+    .COMPARE_OP, // 106
+    .IMPORT_NAME, // 107
+    .IMPORT_FROM, // 108
+    null, // 109
     .JUMP_FORWARD, // 110
-    .JUMP_IF_FALSE_OR_POP, // 111
-    .JUMP_IF_TRUE_OR_POP, // 112
+    .JUMP_IF_FALSE, // 111 - Python 2.5/2.6: JUMP_IF_FALSE (not OR_POP variant)
+    .JUMP_IF_TRUE, // 112 - Python 2.5/2.6: JUMP_IF_TRUE (not OR_POP variant)
     .JUMP_ABSOLUTE, // 113
-    .POP_JUMP_IF_FALSE, // 114
-    .POP_JUMP_IF_TRUE, // 115
+    null, // 114 - POP_JUMP_IF_FALSE is Python 2.7+
+    null, // 115 - POP_JUMP_IF_TRUE is Python 2.7+
     .LOAD_GLOBAL, // 116
     null, // 117
     null, // 118
