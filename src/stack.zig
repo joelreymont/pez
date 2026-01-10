@@ -1654,28 +1654,40 @@ pub const SimContext = struct {
             },
 
             .CALL => {
-                // In 3.11+: CALL argc with optional NULL marker.
+                // In 3.11+: CALL argc with stack layout [NULL/self, callable, args...]
                 const argc = inst.arg;
                 const args_vals = try self.stack.popN(argc);
 
-                const maybe_null = self.stack.pop() orelse {
+                // Pop callable
+                const callable_val = self.stack.pop() orelse {
                     self.deinitStackValues(args_vals);
                     return error.StackUnderflow;
                 };
-                var callable = maybe_null;
+                var callable = callable_val;
                 var iter_expr_from_stack: ?*Expr = null;
-                if (maybe_null == .null_marker) {
-                    callable = self.stack.pop() orelse {
-                        self.deinitStackValues(args_vals);
-                        return error.StackUnderflow;
-                    };
-                } else if (argc == 0 and maybe_null == .expr) {
-                    if (self.stack.peek()) |peek| {
-                        if (peek == .comp_obj) {
-                            iter_expr_from_stack = maybe_null.expr;
-                            callable = self.stack.pop().?;
-                        }
+
+                // Pop NULL marker (or self for method calls)
+                const null_or_self = self.stack.pop() orelse {
+                    callable_val.deinit(self.allocator);
+                    self.deinitStackValues(args_vals);
+                    return error.StackUnderflow;
+                };
+
+                // Handle the NULL/self marker
+                if (null_or_self == .null_marker) {
+                    // Function call - discard NULL marker
+                } else if (argc == 0 and callable_val == .expr) {
+                    // Could be a comprehension call like iter_func(iter_expr)
+                    if (null_or_self == .comp_obj) {
+                        iter_expr_from_stack = callable_val.expr;
+                        callable = null_or_self;
+                    } else {
+                        // Method call or some other case - discard the extra value
+                        null_or_self.deinit(self.allocator);
                     }
+                } else {
+                    // Method call - discard self
+                    null_or_self.deinit(self.allocator);
                 }
 
                 // Check if KW_NAMES set up keyword argument names
