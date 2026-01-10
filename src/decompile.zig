@@ -236,7 +236,10 @@ pub const Decompiler = struct {
             self.pending_ternary_expr = null;
         }
 
-        for (block.instructions[skip_first..]) |inst| {
+        const instructions = block.instructions[skip_first..];
+        var i: usize = 0;
+        while (i < instructions.len) : (i += 1) {
+            const inst = instructions[i];
             errdefer self.last_error_ctx = .{
                 .code_name = self.code.name,
                 .block_id = block.id,
@@ -244,6 +247,43 @@ pub const Decompiler = struct {
                 .opcode = inst.opcode.name(),
             };
             switch (inst.opcode) {
+                .UNPACK_SEQUENCE => {
+                    // Look ahead for N STORE_* instructions to generate unpacking assignment
+                    const count = inst.arg;
+                    const seq_expr = try sim.stack.popExpr();
+                    const arena = self.arena.allocator();
+
+                    // Collect target names from following STORE_* instructions
+                    var targets = try std.ArrayList([]const u8).initCapacity(arena, count);
+
+                    var j: usize = 0;
+                    while (j < count and i + 1 + j < instructions.len) : (j += 1) {
+                        const store_inst = instructions[i + 1 + j];
+                        const name: ?[]const u8 = switch (store_inst.opcode) {
+                            .STORE_NAME, .STORE_GLOBAL => sim.getName(store_inst.arg),
+                            .STORE_FAST => sim.getLocal(store_inst.arg),
+                            else => null,
+                        };
+                        if (name) |n| {
+                            try targets.append(arena, n);
+                        } else {
+                            break;
+                        }
+                    }
+
+                    if (targets.items.len == count) {
+                        // Generate unpacking assignment: a, b, c = expr
+                        const stmt = try self.makeUnpackAssign(targets.items, seq_expr);
+                        try stmts.append(self.allocator, stmt);
+                        i += count; // Skip the STORE instructions
+                    } else {
+                        // Fallback: push unknown for each element
+                        var k: u32 = 0;
+                        while (k < count) : (k += 1) {
+                            try sim.stack.push(.unknown);
+                        }
+                    }
+                },
                 .STORE_NAME, .STORE_FAST, .STORE_GLOBAL => {
                     const name = switch (inst.opcode) {
                         .STORE_NAME, .STORE_GLOBAL => sim.getName(inst.arg) orelse "<unknown>",
@@ -1675,21 +1715,61 @@ pub const Decompiler = struct {
 
         const iter_expr = try iter_sim.stack.popExpr();
 
-        // Get the loop target from the body block's first STORE_FAST
+        // Get the loop target from the body block's first STORE_* or UNPACK_SEQUENCE
         const body = &self.cfg.blocks[pattern.body_block];
-        var target_name: []const u8 = "_";
+        const a = self.arena.allocator();
+        var target: *Expr = undefined;
+        var found_target = false;
 
         for (body.instructions) |inst| {
-            if (inst.opcode == .STORE_FAST) {
-                if (self.code.varnames.len > inst.arg) {
-                    target_name = self.code.varnames[inst.arg];
-                }
-                break;
+            switch (inst.opcode) {
+                .STORE_FAST => {
+                    const name = if (self.code.varnames.len > inst.arg)
+                        self.code.varnames[inst.arg]
+                    else
+                        "_";
+                    target = try ast.makeName(a, name, .store);
+                    found_target = true;
+                    break;
+                },
+                .STORE_NAME, .STORE_GLOBAL => {
+                    const name = if (self.code.names.len > inst.arg)
+                        self.code.names[inst.arg]
+                    else
+                        "_";
+                    target = try ast.makeName(a, name, .store);
+                    found_target = true;
+                    break;
+                },
+                .UNPACK_SEQUENCE => {
+                    // Unpacking target - create tuple with N elements
+                    const count = inst.arg;
+                    if (count == 0) {
+                        // Empty unpacking: for [] in x
+                        target = try a.create(Expr);
+                        target.* = .{ .tuple = .{ .elts = &.{}, .ctx = .store } };
+                    } else {
+                        // Need to look at subsequent STORE instructions
+                        // For now, create placeholder names
+                        var elts = try a.alloc(*Expr, count);
+                        for (0..count) |idx| {
+                            const placeholder = try a.create(Expr);
+                            placeholder.* = .{ .name = .{ .id = "_", .ctx = .store } };
+                            elts[idx] = placeholder;
+                        }
+                        target = try a.create(Expr);
+                        target.* = .{ .tuple = .{ .elts = elts, .ctx = .store } };
+                    }
+                    found_target = true;
+                    break;
+                },
+                else => {},
             }
         }
 
-        const a = self.arena.allocator();
-        const target = try ast.makeName(a, target_name, .store);
+        if (!found_target) {
+            target = try ast.makeName(a, "_", .store);
+        }
 
         // Decompile the body (skip the first STORE_FAST which is the target)
         const body_stmts = try self.decompileForBody(pattern.body_block, pattern.header_block);
@@ -1793,6 +1873,18 @@ pub const Decompiler = struct {
 
         for (block.instructions) |inst| {
             switch (inst.opcode) {
+                .UNPACK_SEQUENCE => {
+                    // Handle empty unpacking (count=0) in for loop targets
+                    const count = inst.arg;
+                    if (count == 0 and skip_first_store.*) {
+                        // Empty unpack as for loop target - just consume the value
+                        skip_first_store.* = false;
+                        _ = sim.stack.pop(); // Consume iteration value
+                        continue;
+                    }
+                    // Otherwise let it fall through to simulate
+                    try sim.simulate(inst);
+                },
                 .STORE_FAST => {
                     if (skip_first_store.*) {
                         skip_first_store.* = false;
@@ -2329,6 +2421,36 @@ pub const Decompiler = struct {
         const stmt = try a.create(Stmt);
         stmt.* = .{ .expr_stmt = .{
             .value = value,
+        } };
+        return stmt;
+    }
+
+    /// Create unpacking assignment: a, b, c = expr
+    fn makeUnpackAssign(self: *Decompiler, names: []const []const u8, value: *Expr) DecompileError!*Stmt {
+        const a = self.arena.allocator();
+
+        // Create tuple of Name expressions for targets
+        var target_exprs = try std.ArrayList(*Expr).initCapacity(a, names.len);
+        for (names) |name| {
+            const name_expr = try a.create(Expr);
+            name_expr.* = .{ .name = .{ .id = name, .ctx = .store } };
+            try target_exprs.append(a, name_expr);
+        }
+
+        const tuple_expr = try a.create(Expr);
+        tuple_expr.* = .{ .tuple = .{
+            .elts = try target_exprs.toOwnedSlice(a),
+            .ctx = .store,
+        } };
+
+        const targets = try a.alloc(*Expr, 1);
+        targets[0] = tuple_expr;
+
+        const stmt = try a.create(Stmt);
+        stmt.* = .{ .assign = .{
+            .targets = targets,
+            .value = value,
+            .type_comment = null,
         } };
         return stmt;
     }

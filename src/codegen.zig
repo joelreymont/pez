@@ -280,13 +280,22 @@ pub const Writer = struct {
                 try self.writeByte(allocator, ']');
             },
             .tuple => |t| {
-                try self.writeByte(allocator, '(');
-                for (t.elts, 0..) |e, i| {
-                    if (i > 0) try self.write(allocator, ", ");
-                    try self.writeExpr(allocator, e);
+                // For store context (unpacking targets):
+                // - Empty tuple must use [] syntax since bare () is ambiguous
+                // - Single element needs trailing comma: a,
+                // - Multiple elements: a, b, c (no parens)
+                if (t.ctx == .store and t.elts.len == 0) {
+                    try self.write(allocator, "[]");
+                } else {
+                    const need_parens = t.ctx != .store;
+                    if (need_parens) try self.writeByte(allocator, '(');
+                    for (t.elts, 0..) |e, i| {
+                        if (i > 0) try self.write(allocator, ", ");
+                        try self.writeExpr(allocator, e);
+                    }
+                    if (t.elts.len == 1) try self.writeByte(allocator, ',');
+                    if (need_parens) try self.writeByte(allocator, ')');
                 }
-                if (t.elts.len == 1) try self.writeByte(allocator, ',');
-                try self.writeByte(allocator, ')');
             },
             .set => |s| {
                 try self.writeByte(allocator, '{');

@@ -3096,22 +3096,6 @@ pub const SimContext = struct {
                 }
             },
 
-            // Unpacking
-            .UNPACK_SEQUENCE => {
-                // UNPACK_SEQUENCE count - unpack TOS into count values
-                const count = inst.arg;
-                if (self.stack.pop()) |v| {
-                    var val = v;
-                    val.deinit(self.allocator);
-                } else {
-                    return error.StackUnderflow;
-                }
-                var i: u32 = 0;
-                while (i < count) : (i += 1) {
-                    try self.stack.push(.unknown);
-                }
-            },
-
             .UNPACK_EX => {
                 // UNPACK_EX - unpack with *rest
                 // Low byte: before star, high byte: after star
@@ -3214,6 +3198,19 @@ pub const SimContext = struct {
                     val.deinit(self.allocator);
                 } else {
                     return error.StackUnderflow;
+                }
+            },
+
+            .UNPACK_SEQUENCE => {
+                // Pop sequence, push N elements as unpack markers
+                // Handled at decompile level to detect unpacking pattern
+                const seq = self.stack.pop() orelse return error.StackUnderflow;
+                _ = seq;
+
+                const count = inst.arg;
+                var i: u32 = 0;
+                while (i < count) : (i += 1) {
+                    try self.stack.push(.unknown);
                 }
             },
 
