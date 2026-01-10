@@ -1589,3 +1589,466 @@ test "BigInt toI128 conversion" {
     const expected: i128 = 0x7FFF + @as(i128, 0x7FFF) * (1 << 15);
     try testing.expectEqual(@as(?i128, expected), big.toI128());
 }
+
+test "marshal TYPE_NONE" {
+    const testing = std.testing;
+    const allocator = testing.allocator;
+
+    const data = [_]u8{'N'};
+    var reader = BufferReader{ .data = &data };
+
+    var module = Module.init(allocator);
+    defer module.deinit();
+    module.major_ver = 3;
+    module.minor_ver = 11;
+
+    var obj = try module.readAnyObject(&reader);
+    defer obj.deinit(allocator);
+
+    try testing.expectEqual(Object.none, obj);
+}
+
+test "marshal TYPE_TRUE and TYPE_FALSE" {
+    const testing = std.testing;
+    const allocator = testing.allocator;
+
+    const true_data = [_]u8{'T'};
+    var reader = BufferReader{ .data = &true_data };
+
+    var module = Module.init(allocator);
+    defer module.deinit();
+    module.major_ver = 3;
+    module.minor_ver = 11;
+
+    var obj = try module.readAnyObject(&reader);
+    defer obj.deinit(allocator);
+    try testing.expectEqual(Object.true_val, obj);
+
+    const false_data = [_]u8{'F'};
+    reader = BufferReader{ .data = &false_data };
+    var obj2 = try module.readAnyObject(&reader);
+    defer obj2.deinit(allocator);
+    try testing.expectEqual(Object.false_val, obj2);
+}
+
+test "marshal TYPE_ELLIPSIS" {
+    const testing = std.testing;
+    const allocator = testing.allocator;
+
+    const data = [_]u8{'.'};
+    var reader = BufferReader{ .data = &data };
+
+    var module = Module.init(allocator);
+    defer module.deinit();
+    module.major_ver = 3;
+    module.minor_ver = 11;
+
+    var obj = try module.readAnyObject(&reader);
+    defer obj.deinit(allocator);
+
+    try testing.expectEqual(Object.ellipsis, obj);
+}
+
+test "marshal TYPE_STOPITER" {
+    const testing = std.testing;
+    const allocator = testing.allocator;
+
+    const data = [_]u8{'S'};
+    var reader = BufferReader{ .data = &data };
+
+    var module = Module.init(allocator);
+    defer module.deinit();
+    module.major_ver = 3;
+    module.minor_ver = 11;
+
+    var obj = try module.readAnyObject(&reader);
+    defer obj.deinit(allocator);
+
+    try testing.expectEqual(Object.stop_iteration, obj);
+}
+
+test "marshal TYPE_INT" {
+    const testing = std.testing;
+    const allocator = testing.allocator;
+
+    const val_bytes = @as([4]u8, @bitCast(@as(i32, 42)));
+    const data = [_]u8{'i'} ++ val_bytes;
+    var reader = BufferReader{ .data = &data };
+
+    var module = Module.init(allocator);
+    defer module.deinit();
+    module.major_ver = 3;
+    module.minor_ver = 11;
+
+    var obj = try module.readAnyObject(&reader);
+    defer obj.deinit(allocator);
+
+    try testing.expectEqual(Object.int, std.meta.activeTag(obj));
+    try testing.expectEqual(Int.small, std.meta.activeTag(obj.int));
+    try testing.expectEqual(@as(i64, 42), obj.int.small);
+}
+
+test "marshal TYPE_INT64" {
+    const testing = std.testing;
+    const allocator = testing.allocator;
+
+    const val_bytes = @as([8]u8, @bitCast(@as(i64, 9223372036854775807)));
+    const data = [_]u8{'I'} ++ val_bytes;
+    var reader = BufferReader{ .data = &data };
+
+    var module = Module.init(allocator);
+    defer module.deinit();
+    module.major_ver = 3;
+    module.minor_ver = 11;
+
+    var obj = try module.readAnyObject(&reader);
+    defer obj.deinit(allocator);
+
+    try testing.expectEqual(Object.int, std.meta.activeTag(obj));
+    try testing.expectEqual(Int.small, std.meta.activeTag(obj.int));
+    try testing.expectEqual(@as(i64, 9223372036854775807), obj.int.small);
+}
+
+test "marshal TYPE_BINARY_FLOAT" {
+    const testing = std.testing;
+    const allocator = testing.allocator;
+
+    const val: f64 = 3.14159;
+    const val_bytes = @as([8]u8, @bitCast(val));
+    const data = [_]u8{'g'} ++ val_bytes;
+    var reader = BufferReader{ .data = &data };
+
+    var module = Module.init(allocator);
+    defer module.deinit();
+    module.major_ver = 3;
+    module.minor_ver = 11;
+
+    var obj = try module.readAnyObject(&reader);
+    defer obj.deinit(allocator);
+
+    try testing.expectEqual(Object.float, std.meta.activeTag(obj));
+    try testing.expectEqual(val, obj.float);
+}
+
+test "marshal TYPE_FLOAT text format" {
+    const testing = std.testing;
+    const allocator = testing.allocator;
+
+    const str = "3.14159";
+    const data = [_]u8{'f'} ++ [_]u8{str.len} ++ str.*;
+    var reader = BufferReader{ .data = &data };
+
+    var module = Module.init(allocator);
+    defer module.deinit();
+    module.major_ver = 3;
+    module.minor_ver = 11;
+
+    var obj = try module.readAnyObject(&reader);
+    defer obj.deinit(allocator);
+
+    try testing.expectEqual(Object.float, std.meta.activeTag(obj));
+    try testing.expectApproxEqRel(@as(f64, 3.14159), obj.float, 0.00001);
+}
+
+test "marshal TYPE_BINARY_COMPLEX" {
+    const testing = std.testing;
+    const allocator = testing.allocator;
+
+    const real: f64 = 1.5;
+    const imag: f64 = 2.5;
+    const real_bytes = @as([8]u8, @bitCast(real));
+    const imag_bytes = @as([8]u8, @bitCast(imag));
+    const data = [_]u8{'y'} ++ real_bytes ++ imag_bytes;
+    var reader = BufferReader{ .data = &data };
+
+    var module = Module.init(allocator);
+    defer module.deinit();
+    module.major_ver = 3;
+    module.minor_ver = 11;
+
+    var obj = try module.readAnyObject(&reader);
+    defer obj.deinit(allocator);
+
+    try testing.expectEqual(Object.complex, std.meta.activeTag(obj));
+    try testing.expectEqual(real, obj.complex.real);
+    try testing.expectEqual(imag, obj.complex.imag);
+}
+
+test "marshal TYPE_STRING" {
+    const testing = std.testing;
+    const allocator = testing.allocator;
+
+    const str = "hello";
+    const len_bytes = @as([4]u8, @bitCast(@as(u32, str.len)));
+    const data = [_]u8{'s'} ++ len_bytes ++ str.*;
+    var reader = BufferReader{ .data = &data };
+
+    var module = Module.init(allocator);
+    defer module.deinit();
+    module.major_ver = 3;
+    module.minor_ver = 11;
+
+    var obj = try module.readAnyObject(&reader);
+    defer obj.deinit(allocator);
+
+    try testing.expectEqual(Object.string, std.meta.activeTag(obj));
+    try testing.expectEqualStrings("hello", obj.string);
+}
+
+test "marshal TYPE_ASCII" {
+    const testing = std.testing;
+    const allocator = testing.allocator;
+
+    const str = "world";
+    const len_bytes = @as([4]u8, @bitCast(@as(u32, str.len)));
+    const data = [_]u8{'a'} ++ len_bytes ++ str.*;
+    var reader = BufferReader{ .data = &data };
+
+    var module = Module.init(allocator);
+    defer module.deinit();
+    module.major_ver = 3;
+    module.minor_ver = 11;
+
+    var obj = try module.readAnyObject(&reader);
+    defer obj.deinit(allocator);
+
+    try testing.expectEqual(Object.string, std.meta.activeTag(obj));
+    try testing.expectEqualStrings("world", obj.string);
+}
+
+test "marshal TYPE_SHORT_ASCII" {
+    const testing = std.testing;
+    const allocator = testing.allocator;
+
+    const str = "abc";
+    const data = [_]u8{ 'z', str.len } ++ str.*;
+    var reader = BufferReader{ .data = &data };
+
+    var module = Module.init(allocator);
+    defer module.deinit();
+    module.major_ver = 3;
+    module.minor_ver = 11;
+
+    var obj = try module.readAnyObject(&reader);
+    defer obj.deinit(allocator);
+
+    try testing.expectEqual(Object.string, std.meta.activeTag(obj));
+    try testing.expectEqualStrings("abc", obj.string);
+}
+
+test "marshal TYPE_INTERNED" {
+    const testing = std.testing;
+    const allocator = testing.allocator;
+
+    const str = "interned";
+    const len_bytes = @as([4]u8, @bitCast(@as(u32, str.len)));
+    const data = [_]u8{'t'} ++ len_bytes ++ str.*;
+    var reader = BufferReader{ .data = &data };
+
+    var module = Module.init(allocator);
+    defer module.deinit();
+    module.major_ver = 3;
+    module.minor_ver = 11;
+
+    var obj = try module.readAnyObject(&reader);
+    defer obj.deinit(allocator);
+
+    try testing.expectEqual(Object.string, std.meta.activeTag(obj));
+    try testing.expectEqualStrings("interned", obj.string);
+    try testing.expectEqual(@as(usize, 1), module.interns.items.len);
+    try testing.expectEqualStrings("interned", module.interns.items[0]);
+}
+
+test "marshal TYPE_STRINGREF" {
+    const testing = std.testing;
+    const allocator = testing.allocator;
+
+    var module = Module.init(allocator);
+    defer module.deinit();
+    module.major_ver = 2;
+    module.minor_ver = 7;
+
+    const test_str = try allocator.dupe(u8, "cached");
+    try module.interns.append(allocator, test_str);
+
+    const idx_bytes = @as([4]u8, @bitCast(@as(u32, 0)));
+    const data = [_]u8{'R'} ++ idx_bytes;
+    var reader = BufferReader{ .data = &data };
+
+    var obj = try module.readAnyObject(&reader);
+    defer obj.deinit(allocator);
+
+    try testing.expectEqual(Object.string, std.meta.activeTag(obj));
+    try testing.expectEqualStrings("cached", obj.string);
+}
+
+test "marshal TYPE_TUPLE" {
+    const testing = std.testing;
+    const allocator = testing.allocator;
+
+    const count_bytes = @as([4]u8, @bitCast(@as(u32, 2)));
+    const val1_bytes = @as([4]u8, @bitCast(@as(i32, 10)));
+    const val2_bytes = @as([4]u8, @bitCast(@as(i32, 20)));
+    const data = [_]u8{'('} ++ count_bytes ++ [_]u8{'i'} ++ val1_bytes ++ [_]u8{'i'} ++ val2_bytes;
+    var reader = BufferReader{ .data = &data };
+
+    var module = Module.init(allocator);
+    defer module.deinit();
+    module.major_ver = 3;
+    module.minor_ver = 11;
+
+    var obj = try module.readAnyObject(&reader);
+    defer obj.deinit(allocator);
+
+    try testing.expectEqual(Object.tuple, std.meta.activeTag(obj));
+    try testing.expectEqual(@as(usize, 2), obj.tuple.len);
+    try testing.expectEqual(Object.int, std.meta.activeTag(obj.tuple[0]));
+    try testing.expectEqual(@as(i64, 10), obj.tuple[0].int.small);
+    try testing.expectEqual(@as(i64, 20), obj.tuple[1].int.small);
+}
+
+test "marshal TYPE_SMALL_TUPLE" {
+    const testing = std.testing;
+    const allocator = testing.allocator;
+
+    const data = [_]u8{ ')', 3, 'N', 'T', 'F' };
+    var reader = BufferReader{ .data = &data };
+
+    var module = Module.init(allocator);
+    defer module.deinit();
+    module.major_ver = 3;
+    module.minor_ver = 11;
+
+    var obj = try module.readAnyObject(&reader);
+    defer obj.deinit(allocator);
+
+    try testing.expectEqual(Object.tuple, std.meta.activeTag(obj));
+    try testing.expectEqual(@as(usize, 3), obj.tuple.len);
+    try testing.expectEqual(Object.none, obj.tuple[0]);
+    try testing.expectEqual(Object.true_val, obj.tuple[1]);
+    try testing.expectEqual(Object.false_val, obj.tuple[2]);
+}
+
+test "marshal TYPE_LIST" {
+    const testing = std.testing;
+    const allocator = testing.allocator;
+
+    const count_bytes = @as([4]u8, @bitCast(@as(u32, 2)));
+    const val1_bytes = @as([4]u8, @bitCast(@as(i32, 1)));
+    const val2_bytes = @as([4]u8, @bitCast(@as(i32, 2)));
+    const data = [_]u8{'['} ++ count_bytes ++ [_]u8{'i'} ++ val1_bytes ++ [_]u8{'i'} ++ val2_bytes;
+    var reader = BufferReader{ .data = &data };
+
+    var module = Module.init(allocator);
+    defer module.deinit();
+    module.major_ver = 3;
+    module.minor_ver = 11;
+
+    var obj = try module.readAnyObject(&reader);
+    defer obj.deinit(allocator);
+
+    try testing.expectEqual(Object.list, std.meta.activeTag(obj));
+    try testing.expectEqual(@as(usize, 2), obj.list.len);
+    try testing.expectEqual(@as(i64, 1), obj.list[0].int.small);
+    try testing.expectEqual(@as(i64, 2), obj.list[1].int.small);
+}
+
+test "marshal TYPE_SET" {
+    const testing = std.testing;
+    const allocator = testing.allocator;
+
+    const count_bytes = @as([4]u8, @bitCast(@as(u32, 2)));
+    const val1_bytes = @as([4]u8, @bitCast(@as(i32, 5)));
+    const val2_bytes = @as([4]u8, @bitCast(@as(i32, 10)));
+    const data = [_]u8{'<'} ++ count_bytes ++ [_]u8{'i'} ++ val1_bytes ++ [_]u8{'i'} ++ val2_bytes;
+    var reader = BufferReader{ .data = &data };
+
+    var module = Module.init(allocator);
+    defer module.deinit();
+    module.major_ver = 3;
+    module.minor_ver = 11;
+
+    var obj = try module.readAnyObject(&reader);
+    defer obj.deinit(allocator);
+
+    try testing.expectEqual(Object.set, std.meta.activeTag(obj));
+    try testing.expectEqual(@as(usize, 2), obj.set.len);
+}
+
+test "marshal TYPE_FROZENSET" {
+    const testing = std.testing;
+    const allocator = testing.allocator;
+
+    const count_bytes = @as([4]u8, @bitCast(@as(u32, 1)));
+    const val_bytes = @as([4]u8, @bitCast(@as(i32, 99)));
+    const data = [_]u8{'>'} ++ count_bytes ++ [_]u8{'i'} ++ val_bytes;
+    var reader = BufferReader{ .data = &data };
+
+    var module = Module.init(allocator);
+    defer module.deinit();
+    module.major_ver = 3;
+    module.minor_ver = 11;
+
+    var obj = try module.readAnyObject(&reader);
+    defer obj.deinit(allocator);
+
+    try testing.expectEqual(Object.frozenset, std.meta.activeTag(obj));
+    try testing.expectEqual(@as(usize, 1), obj.frozenset.len);
+    try testing.expectEqual(@as(i64, 99), obj.frozenset[0].int.small);
+}
+
+test "marshal TYPE_DICT" {
+    const testing = std.testing;
+    const allocator = testing.allocator;
+
+    const str1 = "key1";
+    const str2 = "key2";
+    const len1 = @as([4]u8, @bitCast(@as(u32, str1.len)));
+    const len2 = @as([4]u8, @bitCast(@as(u32, str2.len)));
+    const val1 = @as([4]u8, @bitCast(@as(i32, 100)));
+    const val2 = @as([4]u8, @bitCast(@as(i32, 200)));
+
+    const data = [_]u8{'{'} ++
+        [_]u8{'a'} ++ len1 ++ str1.* ++
+        [_]u8{'i'} ++ val1 ++
+        [_]u8{'a'} ++ len2 ++ str2.* ++
+        [_]u8{'i'} ++ val2 ++
+        [_]u8{'0'};
+    var reader = BufferReader{ .data = &data };
+
+    var module = Module.init(allocator);
+    defer module.deinit();
+    module.major_ver = 3;
+    module.minor_ver = 11;
+
+    var obj = try module.readAnyObject(&reader);
+    defer obj.deinit(allocator);
+
+    try testing.expectEqual(Object.dict, std.meta.activeTag(obj));
+    try testing.expectEqual(@as(usize, 2), obj.dict.len);
+    try testing.expectEqualStrings("key1", obj.dict[0].key.string);
+    try testing.expectEqual(@as(i64, 100), obj.dict[0].value.int.small);
+    try testing.expectEqualStrings("key2", obj.dict[1].key.string);
+    try testing.expectEqual(@as(i64, 200), obj.dict[1].value.int.small);
+}
+
+test "marshal FLAG_REF with simple object" {
+    const testing = std.testing;
+    const allocator = testing.allocator;
+
+    const val_bytes = @as([4]u8, @bitCast(@as(i32, 42)));
+    const data = [_]u8{'i' | 0x80} ++ val_bytes;
+    var reader = BufferReader{ .data = &data };
+
+    var module = Module.init(allocator);
+    defer module.deinit();
+    module.major_ver = 3;
+    module.minor_ver = 11;
+
+    var obj = try module.readAnyObject(&reader);
+    defer obj.deinit(allocator);
+
+    try testing.expectEqual(@as(i64, 42), obj.int.small);
+    try testing.expectEqual(@as(usize, 1), module.refs.items.len);
+    try testing.expectEqual(@as(i64, 42), module.refs.items[0].int.small);
+}
