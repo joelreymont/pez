@@ -6,6 +6,7 @@ const ctrl = @import("ctrl.zig");
 const decoder = @import("decoder.zig");
 const codegen = @import("codegen.zig");
 const decompile = @import("decompile.zig");
+const test_harness = @import("test_harness.zig");
 
 pub fn main() !void {
     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
@@ -24,7 +25,7 @@ pub fn main() !void {
     const stderr = &stderr_writer.interface;
 
     // Parse command line
-    var mode: enum { disasm, decompile, cfgdump } = .decompile;
+    var mode: enum { disasm, decompile, cfgdump, test_suite } = .decompile;
     var filename: ?[]const u8 = null;
 
     for (args[1..]) |arg| {
@@ -32,15 +33,27 @@ pub fn main() !void {
             mode = .disasm;
         } else if (std.mem.eql(u8, arg, "--cfg")) {
             mode = .cfgdump;
+        } else if (std.mem.eql(u8, arg, "--test")) {
+            mode = .test_suite;
         } else if (arg[0] != '-') {
             filename = arg;
         }
     }
 
+    // Test suite mode
+    if (mode == .test_suite) {
+        const test_dir = filename orelse "refs/pycdc/tests/compiled";
+        const stats = try test_harness.runAllTests(allocator, test_dir, stdout);
+        try stdout.flush();
+        if (stats.failed > 0) std.process.exit(1);
+        return;
+    }
+
     if (filename == null) {
-        try stderr.print("Usage: {s} [-d|--disasm|--cfg] <file.pyc>\n", .{args[0]});
+        try stderr.print("Usage: {s} [-d|--disasm|--cfg|--test] <file.pyc>\n", .{args[0]});
         try stderr.print("  -d, --disasm  Disassemble only\n", .{});
         try stderr.print("  --cfg         Dump CFG analysis\n", .{});
+        try stderr.print("  --test        Run test suite\n", .{});
         try stderr.flush();
         std.process.exit(1);
     }
@@ -75,6 +88,7 @@ pub fn main() !void {
                 try decompile.decompileToSource(allocator, code, version, stdout);
             }
         },
+        .test_suite => unreachable, // Handled earlier
     }
     try stdout.flush();
 }

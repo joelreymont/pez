@@ -703,7 +703,9 @@ pub const Module = struct {
         // Read entire file into memory
         const stat = try file.stat();
         const data = try self.allocator.alloc(u8, stat.size);
-        errdefer self.allocator.free(data);
+        errdefer {
+            if (self.file_data == null) self.allocator.free(data);
+        }
 
         const bytes_read = try file.readAll(data);
         if (bytes_read != stat.size) return error.UnexpectedEndOfFile;
