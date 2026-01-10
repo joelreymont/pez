@@ -39,6 +39,8 @@ pub const Decompiler = struct {
     statements: std.ArrayList(*Stmt),
     /// Nested decompilers (kept alive for arena lifetime).
     nested_decompilers: std.ArrayList(*Decompiler),
+    /// Next block after chained comparison (set by tryDecompileChainedComparison).
+    chained_cmp_next_block: ?u32 = null,
 
     pub fn init(allocator: Allocator, code: *const pyc.Code, version: Version) DecompileError!Decompiler {
         var arena = std.heap.ArenaAllocator.init(allocator);
@@ -535,8 +537,13 @@ pub const Decompiler = struct {
                     if (stmt) |s| {
                         try self.statements.append(self.allocator, s);
                     }
-                    // Skip all processed blocks
-                    block_idx = try self.findIfChainEnd(p);
+                    // Skip all processed blocks - use chained comparison override if set
+                    if (self.chained_cmp_next_block) |chain_next| {
+                        block_idx = chain_next;
+                        self.chained_cmp_next_block = null;
+                    } else {
+                        block_idx = try self.findIfChainEnd(p);
+                    }
                 },
                 .while_loop => |p| {
                     const stmt = try self.decompileWhile(p);
@@ -659,106 +666,142 @@ pub const Decompiler = struct {
         try self.processBlockWithSim(block, &sim, stmts);
     }
 
-    /// Try to decompile a chained comparison (e.g., a < b < c).
+    const ChainResult = struct {
+        stmt: *Stmt,
+        next_block: u32,
+    };
+
+    /// Try to decompile a chained comparison (e.g., a < b < c < d).
     /// Returns null if this is not a chained comparison.
     fn tryDecompileChainedComparison(
         self: *Decompiler,
         pattern: ctrl.IfPattern,
         first_cmp: *Expr,
         sim: *SimContext,
-    ) DecompileError!?*Stmt {
+    ) DecompileError!?ChainResult {
         // Pattern: condition is a Compare, stack has values, then-block does POP_TOP + LOAD + COMPARE
         if (first_cmp.* != .compare) return null;
         if (sim.stack.len() == 0) return null;
         if (pattern.then_block >= self.cfg.blocks.len) return null;
 
-        const then_block = &self.cfg.blocks[pattern.then_block];
-        if (then_block.instructions.len < 3) return null;
+        // Build the chain recursively
+        var ops_list: std.ArrayListUnmanaged(ast.CmpOp) = .{};
+        var comparators_list: std.ArrayListUnmanaged(*Expr) = .{};
 
-        // Check for POP_TOP, LOAD, COMPARE_OP pattern
-        if (then_block.instructions[0].opcode != .NOT_TAKEN and
-            then_block.instructions[0].opcode != .POP_TOP) return null;
+        // Start with the first comparison's data
+        try ops_list.append(self.allocator, first_cmp.compare.ops[0]);
+        try comparators_list.append(self.allocator, first_cmp.compare.comparators[0]);
 
-        var idx: usize = 0;
-        if (then_block.instructions[0].opcode == .NOT_TAKEN) {
-            if (then_block.instructions.len < 4) return null;
-            idx = 1;
-        }
-
-        if (then_block.instructions[idx].opcode != .POP_TOP) return null;
-        const load_inst = then_block.instructions[idx + 1];
-        const cmp_inst = then_block.instructions[idx + 2];
-
-        if (cmp_inst.opcode != .COMPARE_OP) return null;
-        if (load_inst.opcode != .LOAD_NAME and
-            load_inst.opcode != .LOAD_FAST and
-            load_inst.opcode != .LOAD_FAST_BORROW and
-            load_inst.opcode != .LOAD_GLOBAL) return null;
-
-        // This is a chained comparison!
-        // Stack has the middle value, we need to build a<b<c from a<b and b<c
-        const mid = try sim.stack.popExpr();
-        errdefer {
-            mid.deinit(self.allocator);
-            self.allocator.destroy(mid);
-        }
-
-        // Simulate loading the right value
-        var then_sim = SimContext.init(self.arena.allocator(), self.code, self.version);
-        defer then_sim.deinit();
-        try then_sim.stack.push(.{ .expr = mid });
-        try then_sim.simulate(load_inst);
-        try then_sim.simulate(cmp_inst);
-
-        const second_cmp = try then_sim.stack.popExpr();
-        errdefer {
-            second_cmp.deinit(self.allocator);
-            self.allocator.destroy(second_cmp);
-        }
-
-        if (second_cmp.* != .compare) {
-            second_cmp.deinit(self.allocator);
-            self.allocator.destroy(second_cmp);
-            return null;
-        }
-
-        // Merge the two comparisons: a<b and b<c → a<b<c
-        const a = self.arena.allocator();
-        const new_comparators = try a.alloc(*Expr, 2);
-        new_comparators[0] = first_cmp.compare.comparators[0];
-        new_comparators[1] = second_cmp.compare.comparators[0];
-
-        const new_ops = try a.alloc(ast.CmpOp, 2);
-        new_ops[0] = first_cmp.compare.ops[0];
-        new_ops[1] = second_cmp.compare.ops[0];
-
-        // Transfer ownership of left and first comparator from first_cmp
         const left = first_cmp.compare.left;
-        // old first_cmp arrays will remain in arena, no explicit free needed
+        var current_block_id = pattern.then_block;
+        var current_mid = try sim.stack.popExpr();
 
-        const chain_expr = try a.create(Expr);
-        chain_expr.* = .{ .compare = .{
-            .left = left,
-            .ops = new_ops,
-            .comparators = new_comparators,
-        } };
+        // Iterate through the chain
+        while (current_block_id < self.cfg.blocks.len) {
+            const blk = &self.cfg.blocks[current_block_id];
+            if (blk.instructions.len < 3) break;
 
-        // Determine if this should be a return or expression statement
-        // Check what comes after the second COMPARE_OP in then-block
-        const has_return = blk: {
-            if (idx + 3 < then_block.instructions.len) {
-                if (then_block.instructions[idx + 3].opcode == .RETURN_VALUE) break :blk true;
+            // Check for POP_TOP pattern
+            var idx: usize = 0;
+            if (blk.instructions[0].opcode == .NOT_TAKEN) {
+                if (blk.instructions.len < 4) break;
+                idx = 1;
             }
-            break :blk false;
-        };
+            if (blk.instructions[idx].opcode != .POP_TOP) break;
 
-        const stmt = try a.create(Stmt);
-        if (has_return) {
-            stmt.* = .{ .return_stmt = .{ .value = chain_expr } };
-        } else {
-            stmt.* = .{ .expr_stmt = .{ .value = chain_expr } };
+            // Find COMPARE_OP - scan forward from POP_TOP
+            var cmp_idx: usize = idx + 1;
+            while (cmp_idx < blk.instructions.len) {
+                if (blk.instructions[cmp_idx].opcode == .COMPARE_OP) break;
+                cmp_idx += 1;
+            }
+            if (cmp_idx >= blk.instructions.len) break;
+
+            // Determine start of simulation (after POP_TOP)
+            const sim_start = idx + 1;
+
+            // Simulate to get the comparison
+            var then_sim = SimContext.init(self.arena.allocator(), self.code, self.version);
+            defer then_sim.deinit();
+            try then_sim.stack.push(.{ .expr = current_mid });
+
+            // Simulate instructions from after POP_TOP to compare (inclusive)
+            for (blk.instructions[sim_start .. cmp_idx + 1]) |inst| {
+                try then_sim.simulate(inst);
+            }
+
+            const cmp_expr = then_sim.stack.popExpr() catch break;
+            if (cmp_expr.* != .compare) {
+                cmp_expr.deinit(self.allocator);
+                self.allocator.destroy(cmp_expr);
+                break;
+            }
+
+            // Add to chain
+            try ops_list.append(self.allocator, cmp_expr.compare.ops[0]);
+            try comparators_list.append(self.allocator, cmp_expr.compare.comparators[0]);
+
+            // Check if there's another link (COPY, TO_BOOL, POP_JUMP after COMPARE)
+            if (cmp_idx + 3 < blk.instructions.len and
+                blk.instructions[cmp_idx + 1].opcode == .COPY and
+                blk.instructions[cmp_idx + 2].opcode == .TO_BOOL and
+                ctrl.Analyzer.isConditionalJump(undefined, blk.instructions[cmp_idx + 3].opcode))
+            {
+                // More chain - get the next middle value from stack
+                current_mid = then_sim.stack.popExpr() catch break;
+                // Next block is the fallthrough
+                var found_next = false;
+                for (blk.successors) |edge| {
+                    if (edge.edge_type == .conditional_true or edge.edge_type == .normal) {
+                        current_block_id = edge.target;
+                        found_next = true;
+                        break;
+                    }
+                }
+                if (!found_next) break;
+                continue;
+            } else {
+                // End of chain - check for RETURN_VALUE
+                const has_return = cmp_idx + 1 < blk.instructions.len and
+                    blk.instructions[cmp_idx + 1].opcode == .RETURN_VALUE;
+
+                const a = self.arena.allocator();
+                const ops = try a.dupe(ast.CmpOp, ops_list.items);
+                const comparators = try a.dupe(*Expr, comparators_list.items);
+                ops_list.deinit(self.allocator);
+                comparators_list.deinit(self.allocator);
+
+                const chain_expr = try a.create(Expr);
+                chain_expr.* = .{ .compare = .{
+                    .left = left,
+                    .ops = ops,
+                    .comparators = comparators,
+                } };
+
+                const stmt = try a.create(Stmt);
+                if (has_return) {
+                    stmt.* = .{ .return_stmt = .{ .value = chain_expr } };
+                } else {
+                    stmt.* = .{ .expr_stmt = .{ .value = chain_expr } };
+                }
+                // Skip to after the short-circuit block (which is else_block or merge_block)
+                const short_circuit_block = pattern.else_block orelse pattern.merge_block orelse current_block_id;
+                const next_block = @max(current_block_id + 1, short_circuit_block + 1);
+                return .{ .stmt = stmt, .next_block = next_block };
+            }
         }
-        return stmt;
+
+        // Cleanup on failure
+        ops_list.deinit(self.allocator);
+        comparators_list.deinit(self.allocator);
+        return null;
+    }
+
+    fn isLoadOpcode(op: Opcode) bool {
+        return switch (op) {
+            .LOAD_NAME, .LOAD_FAST, .LOAD_FAST_BORROW, .LOAD_GLOBAL, .SWAP, .COPY => true,
+            else => false,
+        };
     }
 
     /// Decompile an if statement pattern.
@@ -778,10 +821,12 @@ pub const Decompiler = struct {
         const condition = try sim.stack.popExpr();
 
         // Check for chained comparison pattern (Python 3.14+)
-        if (try self.tryDecompileChainedComparison(pattern, condition, &sim)) |chain_expr| {
-            // condition's parts have been transferred to chain_expr, don't deinit
-            return chain_expr;
+        if (try self.tryDecompileChainedComparison(pattern, condition, &sim)) |chain_result| {
+            // condition's parts have been transferred to chain_result.stmt, don't deinit
+            self.chained_cmp_next_block = chain_result.next_block;
+            return chain_result.stmt;
         }
+        self.chained_cmp_next_block = null;
 
         // Save remaining stack values to transfer to branches
         const base_vals = try self.allocator.alloc(StackValue, sim.stack.len());
