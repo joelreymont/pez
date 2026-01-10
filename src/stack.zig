@@ -1233,7 +1233,9 @@ pub const SimContext = struct {
     /// Simulate a single instruction.
     pub fn simulate(self: *SimContext, inst: Instruction) SimError!void {
         switch (inst.opcode) {
-            .NOP, .RESUME, .CACHE, .EXTENDED_ARG, .NOT_TAKEN => {
+            .NOP, .RESUME, .CACHE, .EXTENDED_ARG, .NOT_TAKEN,
+            .SETUP_LOOP, .SETUP_EXCEPT, .POP_BLOCK,
+            => {
                 // No stack effect
             },
 
