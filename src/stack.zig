@@ -1781,24 +1781,30 @@ pub const SimContext = struct {
             },
 
             .CALL_METHOD => {
-                // 3.7-3.10: CALL_METHOD argc (expects extra self/NULL slot)
+                // 3.7-3.10: CALL_METHOD argc
+                // Stack: NULL/self, method, args... -> result
                 const argc = inst.arg;
                 var args_vals = try self.stack.popN(argc);
-                const marker = self.stack.pop() orelse {
+                // Pop method (callable)
+                const callable = self.stack.pop() orelse {
                     self.deinitStackValues(args_vals);
                     return error.StackUnderflow;
                 };
-                var marker_expr: ?*Expr = null;
-                if (marker == .expr) {
-                    marker_expr = marker.expr;
-                } else if (marker != .null_marker) {
-                    var val = marker;
+                // Pop NULL/self marker
+                const marker = self.stack.pop() orelse {
+                    var val = callable;
                     val.deinit(self.allocator);
-                }
-                if (marker_expr) |expr| {
+                    self.deinitStackValues(args_vals);
+                    return error.StackUnderflow;
+                };
+                // If marker is self (an expr), prepend it to args
+                if (marker == .expr) {
+                    const expr = marker.expr;
                     const args_with_self = self.allocator.alloc(StackValue, args_vals.len + 1) catch |err| {
                         expr.deinit(self.allocator);
                         self.allocator.destroy(expr);
+                        var val = callable;
+                        val.deinit(self.allocator);
                         self.deinitStackValues(args_vals);
                         return err;
                     };
@@ -1806,11 +1812,10 @@ pub const SimContext = struct {
                     @memcpy(args_with_self[1..], args_vals);
                     self.allocator.free(args_vals);
                     args_vals = args_with_self;
+                } else if (marker != .null_marker) {
+                    var val = marker;
+                    val.deinit(self.allocator);
                 }
-                const callable = self.stack.pop() orelse {
-                    self.deinitStackValues(args_vals);
-                    return error.StackUnderflow;
-                };
                 try self.handleCall(callable, args_vals, &[_]ast.Keyword{}, null);
             },
 
@@ -2627,6 +2632,7 @@ pub const SimContext = struct {
 
             .LOAD_METHOD => {
                 // LOAD_METHOD namei - prepare method call with optional self slot
+                // Pushes (NULL/self, method) for use by CALL
                 const obj = try self.stack.popExpr();
                 errdefer {
                     obj.deinit(self.allocator);
@@ -2634,14 +2640,16 @@ pub const SimContext = struct {
                 }
                 const name_idx = if (self.version.gte(3, 11)) inst.arg >> 1 else inst.arg;
                 if (self.getName(name_idx)) |attr_name| {
+                    // Push NULL marker (or self in real execution, but we use NULL for simulation)
+                    try self.stack.push(.null_marker);
                     const attr = try ast.makeAttribute(self.allocator, obj, attr_name, .load);
                     try self.stack.push(.{ .expr = attr });
                 } else {
                     obj.deinit(self.allocator);
                     self.allocator.destroy(obj);
+                    try self.stack.push(.null_marker);
                     try self.stack.push(.unknown);
                 }
-                try self.stack.push(.null_marker);
             },
 
             .STORE_ATTR => {
