@@ -778,17 +778,32 @@ pub const Analyzer = struct {
     }
 
     /// Check if block looks like start of a match statement.
-    /// Match starts with subject load, then COPY before pattern tests.
+    /// Match starts with subject load, then MATCH_* or COPY+pattern in current or successor.
     fn isMatchSubjectBlock(self: *const Analyzer, block: *const BasicBlock) bool {
-        // Look for COPY in successor block followed by MATCH_* or COMPARE_OP
-        if (block.successors.len == 0) return false;
+        // Check if current block has MATCH_* opcode
+        if (self.hasMatchOpcode(block)) return true;
 
+        // Check if successor block starts with MATCH_* or COPY+MATCH
+        if (block.successors.len == 0) return false;
         const succ_id = block.successors[0].target;
         if (succ_id >= self.cfg.blocks.len) return false;
         const succ = &self.cfg.blocks[succ_id];
 
-        // Check if successor block starts match pattern
-        return self.hasMatchPattern(succ);
+        return self.hasMatchOpcode(succ) or self.hasMatchPattern(succ);
+    }
+
+    /// Check if block has a MATCH_* opcode.
+    fn hasMatchOpcode(self: *const Analyzer, block: *const BasicBlock) bool {
+        _ = self;
+        for (block.instructions) |inst| {
+            if (inst.opcode == .MATCH_SEQUENCE or
+                inst.opcode == .MATCH_MAPPING or
+                inst.opcode == .MATCH_CLASS)
+            {
+                return true;
+            }
+        }
+        return false;
     }
 
     /// Check if block has a match pattern (COPY followed by MATCH_* or literal compare).
@@ -815,14 +830,19 @@ pub const Analyzer = struct {
 
     /// Detect match statement pattern.
     fn detectMatchPattern(self: *Analyzer, block_id: u32) !?MatchPattern {
-        // Block should be subject loading block; first case is in successor
         const block = &self.cfg.blocks[block_id];
-        if (block.successors.len == 0) return null;
 
         var case_blocks: std.ArrayList(u32) = .{};
         defer case_blocks.deinit(self.allocator);
 
-        var current: u32 = block.successors[0].target;
+        // If current block has MATCH_*, it's both subject and first case
+        var current: u32 = if (self.hasMatchOpcode(block))
+            block_id
+        else if (block.successors.len > 0)
+            block.successors[0].target
+        else
+            return null;
+
         var exit_block: ?u32 = null;
 
         // Follow the chain of case blocks
@@ -830,7 +850,7 @@ pub const Analyzer = struct {
             const cur_block = &self.cfg.blocks[current];
 
             // Check if this is a case pattern block
-            if (!self.hasMatchPattern(cur_block) and !self.isWildcardCase(cur_block)) {
+            if (!self.hasMatchOpcode(cur_block) and !self.hasMatchPattern(cur_block) and !self.isWildcardCase(cur_block)) {
                 // Not a case block - this might be exit
                 exit_block = current;
                 break;

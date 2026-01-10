@@ -573,6 +573,13 @@ pub const Decompiler = struct {
                     }
                     block_idx = result.next_block;
                 },
+                .match_stmt => |p| {
+                    const result = try self.decompileMatch(p);
+                    if (result.stmt) |s| {
+                        try self.statements.append(self.allocator, s);
+                    }
+                    block_idx = result.next_block;
+                },
                 else => {
                     const block = &self.cfg.blocks[block_idx];
                     // Skip exception handler blocks - they're decompiled as part of try/except
@@ -1212,6 +1219,134 @@ pub const Decompiler = struct {
         return .{ .stmt = stmt, .next_block = pattern.exit_block };
     }
 
+    fn decompileMatch(self: *Decompiler, pattern: ctrl.MatchPattern) DecompileError!PatternResult {
+        // Get subject from subject block - simulate only until MATCH_* or COPY
+        const subj_block = &self.cfg.blocks[pattern.subject_block];
+        var sim = SimContext.init(self.allocator, self.code, self.version);
+        defer sim.deinit();
+
+        for (subj_block.instructions) |inst| {
+            // Stop before MATCH_* opcodes - subject is on stack now
+            if (inst.opcode == .MATCH_SEQUENCE or inst.opcode == .MATCH_MAPPING or
+                inst.opcode == .MATCH_CLASS or inst.opcode == .COPY)
+            {
+                break;
+            }
+            sim.simulate(inst) catch {};
+        }
+
+        const subject = sim.stack.popExpr() catch {
+            // Fallback: create unknown expression
+            const expr = try self.allocator.create(Expr);
+            expr.* = .{ .name = .{ .id = "<unknown>", .ctx = .load } };
+            return .{ .stmt = null, .next_block = pattern.exit_block orelse pattern.subject_block + 1 };
+        };
+
+        // Decompile each case
+        var cases: std.ArrayList(ast.MatchCase) = .{};
+        errdefer cases.deinit(self.allocator);
+
+        for (pattern.case_blocks) |case_block_id| {
+            const case = try self.decompileMatchCase(case_block_id);
+            try cases.append(self.allocator, case);
+        }
+
+        const stmt = try self.allocator.create(Stmt);
+        stmt.* = .{
+            .match_stmt = .{
+                .subject = subject,
+                .cases = try cases.toOwnedSlice(self.allocator),
+            },
+        };
+
+        return .{ .stmt = stmt, .next_block = pattern.exit_block orelse pattern.subject_block + 1 };
+    }
+
+    fn decompileMatchCase(self: *Decompiler, block_id: u32) DecompileError!ast.MatchCase {
+        const block = &self.cfg.blocks[block_id];
+
+        // Extract pattern from bytecode
+        const pat = try self.extractMatchPattern(block);
+
+        // Find body block (true branch of conditional)
+        var body_block: ?u32 = null;
+        for (block.successors) |edge| {
+            if (edge.edge_type == .conditional_true or edge.edge_type == .normal) {
+                body_block = edge.target;
+                break;
+            }
+        }
+
+        // Find end of body (next case or exit)
+        var body_end: u32 = block_id + 1;
+        for (block.successors) |edge| {
+            if (edge.edge_type == .conditional_false) {
+                body_end = edge.target;
+                break;
+            }
+        }
+
+        // Decompile body
+        var body: []const *Stmt = &.{};
+        if (body_block) |bid| {
+            if (bid < body_end) {
+                body = try self.decompileStructuredRange(bid, body_end);
+            }
+        }
+
+        return ast.MatchCase{
+            .pattern = pat,
+            .guard = null, // TODO: detect guards
+            .body = body,
+        };
+    }
+
+    fn extractMatchPattern(self: *Decompiler, block: *const cfg_mod.BasicBlock) DecompileError!*ast.Pattern {
+        var sim = SimContext.init(self.allocator, self.code, self.version);
+        defer sim.deinit();
+
+        var has_match_seq = false;
+        var has_match_map = false;
+        var literal_val: ?*Expr = null;
+
+        for (block.instructions) |inst| {
+            switch (inst.opcode) {
+                .MATCH_SEQUENCE => has_match_seq = true,
+                .MATCH_MAPPING => has_match_map = true,
+                .LOAD_CONST, .LOAD_SMALL_INT => {
+                    try sim.simulate(inst);
+                    literal_val = sim.stack.popExpr() catch null;
+                },
+                .COMPARE_OP => {
+                    // Literal match - use the constant
+                    if (literal_val) |val| {
+                        const pat = try self.allocator.create(ast.Pattern);
+                        pat.* = .{ .match_value = val };
+                        return pat;
+                    }
+                },
+                .NOP => {
+                    // Wildcard pattern
+                    const pat = try self.allocator.create(ast.Pattern);
+                    pat.* = .{ .match_as = .{ .pattern = null, .name = null } };
+                    return pat;
+                },
+                else => try sim.simulate(inst),
+            }
+        }
+
+        // Default to wildcard if we can't determine pattern
+        const pat = try self.allocator.create(ast.Pattern);
+        if (has_match_seq) {
+            pat.* = .{ .match_sequence = &.{} };
+        } else if (has_match_map) {
+            pat.* = .{ .match_mapping = .{ .keys = &.{}, .patterns = &.{}, .rest = null } };
+        } else {
+            pat.* = .{ .match_as = .{ .pattern = null, .name = null } };
+        }
+        return pat;
+    }
+
     fn decompileStructuredRange(self: *Decompiler, start: u32, end: u32) DecompileError![]const *Stmt {
         // Handle empty range (start == end)
         if (start >= end) return &[_]*Stmt{};
@@ -1256,6 +1391,13 @@ pub const Decompiler = struct {
                 },
                 .with_stmt => |p| {
                     const result = try self.decompileWith(p);
+                    if (result.stmt) |s| {
+                        try stmts.append(self.allocator, s);
+                    }
+                    block_idx = result.next_block;
+                },
+                .match_stmt => |p| {
+                    const result = try self.decompileMatch(p);
                     if (result.stmt) |s| {
                         try stmts.append(self.allocator, s);
                     }

@@ -105,6 +105,72 @@ pub const Writer = struct {
         try self.writeExprPrec(allocator, expr, 0);
     }
 
+    /// Write a match pattern.
+    pub fn writePattern(self: *Writer, allocator: std.mem.Allocator, pat: *const ast.Pattern) WriteError!void {
+        switch (pat.*) {
+            .match_value => |v| try self.writeExpr(allocator, v),
+            .match_singleton => |v| try self.writeConstant(allocator, v),
+            .match_sequence => |items| {
+                try self.writeByte(allocator, '[');
+                for (items, 0..) |item, i| {
+                    if (i > 0) try self.write(allocator, ", ");
+                    try self.writePattern(allocator, item);
+                }
+                try self.writeByte(allocator, ']');
+            },
+            .match_mapping => |m| {
+                try self.writeByte(allocator, '{');
+                for (m.keys, m.patterns, 0..) |key, pattern, i| {
+                    if (i > 0) try self.write(allocator, ", ");
+                    try self.writeExpr(allocator, key);
+                    try self.write(allocator, ": ");
+                    try self.writePattern(allocator, pattern);
+                }
+                if (m.rest) |rest| {
+                    if (m.keys.len > 0) try self.write(allocator, ", ");
+                    try self.write(allocator, "**");
+                    try self.write(allocator, rest);
+                }
+                try self.writeByte(allocator, '}');
+            },
+            .match_class => |c| {
+                try self.writeExpr(allocator, c.cls);
+                try self.writeByte(allocator, '(');
+                var first = true;
+                for (c.patterns) |p| {
+                    if (!first) try self.write(allocator, ", ");
+                    first = false;
+                    try self.writePattern(allocator, p);
+                }
+                for (c.kwd_attrs, c.kwd_patterns) |attr, p| {
+                    if (!first) try self.write(allocator, ", ");
+                    first = false;
+                    try self.write(allocator, attr);
+                    try self.write(allocator, "=");
+                    try self.writePattern(allocator, p);
+                }
+                try self.writeByte(allocator, ')');
+            },
+            .match_star => |s| {
+                try self.writeByte(allocator, '*');
+                try self.write(allocator, s orelse "_");
+            },
+            .match_as => |a| {
+                if (a.pattern) |p| {
+                    try self.writePattern(allocator, p);
+                    try self.write(allocator, " as ");
+                }
+                try self.write(allocator, a.name orelse "_");
+            },
+            .match_or => |items| {
+                for (items, 0..) |item, i| {
+                    if (i > 0) try self.write(allocator, " | ");
+                    try self.writePattern(allocator, item);
+                }
+            },
+        }
+    }
+
     /// Write an expression, adding parentheses if needed based on precedence.
     fn writeExprPrec(self: *Writer, allocator: std.mem.Allocator, expr: *const Expr, parent_prec: u8) WriteError!void {
         switch (expr.*) {
@@ -551,6 +617,33 @@ pub const Writer = struct {
                     for (w.body) |s| {
                         try self.writeStmt(allocator, s);
                     }
+                }
+                self.indent_level -= 1;
+            },
+            .match_stmt => |m| {
+                try self.write(allocator, "match ");
+                try self.writeExpr(allocator, m.subject);
+                try self.write(allocator, ":\n");
+                self.indent_level += 1;
+                for (m.cases) |case| {
+                    try self.writeIndent(allocator);
+                    try self.write(allocator, "case ");
+                    try self.writePattern(allocator, case.pattern);
+                    if (case.guard) |guard| {
+                        try self.write(allocator, " if ");
+                        try self.writeExpr(allocator, guard);
+                    }
+                    try self.write(allocator, ":\n");
+                    self.indent_level += 1;
+                    if (case.body.len == 0) {
+                        try self.writeIndent(allocator);
+                        try self.write(allocator, "pass\n");
+                    } else {
+                        for (case.body) |s| {
+                            try self.writeStmt(allocator, s);
+                        }
+                    }
+                    self.indent_level -= 1;
                 }
                 self.indent_level -= 1;
             },
