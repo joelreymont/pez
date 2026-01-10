@@ -1424,6 +1424,21 @@ pub const SimContext = struct {
             .BINARY_XOR,
             .BINARY_OR,
             .BINARY_MATRIX_MULTIPLY,
+            // Inplace variants (for augmented assignment)
+            .INPLACE_ADD,
+            .INPLACE_SUBTRACT,
+            .INPLACE_MULTIPLY,
+            .INPLACE_MODULO,
+            .INPLACE_POWER,
+            .INPLACE_TRUE_DIVIDE,
+            .INPLACE_FLOOR_DIVIDE,
+            .INPLACE_LSHIFT,
+            .INPLACE_RSHIFT,
+            .INPLACE_AND,
+            .INPLACE_XOR,
+            .INPLACE_OR,
+            .INPLACE_MATRIX_MULTIPLY,
+            .INPLACE_DIVIDE,
             => {
                 const right = try self.stack.popExpr();
                 errdefer {
@@ -1436,19 +1451,20 @@ pub const SimContext = struct {
                     self.allocator.destroy(left);
                 }
                 const op: ast.BinOp = switch (inst.opcode) {
-                    .BINARY_ADD => .add,
-                    .BINARY_SUBTRACT => .sub,
-                    .BINARY_MULTIPLY => .mult,
-                    .BINARY_MODULO => .mod,
-                    .BINARY_POWER => .pow,
-                    .BINARY_TRUE_DIVIDE => .div,
-                    .BINARY_FLOOR_DIVIDE => .floordiv,
-                    .BINARY_LSHIFT => .lshift,
-                    .BINARY_RSHIFT => .rshift,
-                    .BINARY_AND => .bitand,
-                    .BINARY_XOR => .bitxor,
-                    .BINARY_OR => .bitor,
-                    .BINARY_MATRIX_MULTIPLY => .matmult,
+                    .BINARY_ADD, .INPLACE_ADD => .add,
+                    .BINARY_SUBTRACT, .INPLACE_SUBTRACT => .sub,
+                    .BINARY_MULTIPLY, .INPLACE_MULTIPLY => .mult,
+                    .BINARY_MODULO, .INPLACE_MODULO => .mod,
+                    .BINARY_POWER, .INPLACE_POWER => .pow,
+                    .BINARY_TRUE_DIVIDE, .INPLACE_TRUE_DIVIDE => .div,
+                    .BINARY_FLOOR_DIVIDE, .INPLACE_FLOOR_DIVIDE => .floordiv,
+                    .BINARY_LSHIFT, .INPLACE_LSHIFT => .lshift,
+                    .BINARY_RSHIFT, .INPLACE_RSHIFT => .rshift,
+                    .BINARY_AND, .INPLACE_AND => .bitand,
+                    .BINARY_XOR, .INPLACE_XOR => .bitxor,
+                    .BINARY_OR, .INPLACE_OR => .bitor,
+                    .BINARY_MATRIX_MULTIPLY, .INPLACE_MATRIX_MULTIPLY => .matmult,
+                    .INPLACE_DIVIDE => .div,
                     else => unreachable,
                 };
                 const expr = try ast.makeBinOp(self.allocator, left, op, right);
@@ -3078,24 +3094,53 @@ pub const SimContext = struct {
                 // Pattern: BUILD_LIST 0 + LOAD_CONST(tuple) + LIST_EXTEND 1 → [elements...]
                 const items = self.stack.pop() orelse return error.StackUnderflow;
 
-                // Check if extending empty list with tuple expression
-                if (inst.arg == 1 and self.stack.len() >= 1) {
-                    if (self.stack.peek()) |list_val| {
-                        if (list_val == .expr) {
-                            const list_expr = list_val.expr;
-                            if (list_expr.* == .list and list_expr.list.elts.len == 0) {
-                                // Check if items is a tuple expression
-                                if (items == .expr and items.expr.* == .tuple) {
-                                    const tuple_elts = items.expr.tuple.elts;
-                                    // Replace empty list with list containing tuple elements
-                                    list_expr.* = .{ .list = .{ .elts = tuple_elts, .ctx = .load } };
-                                    return;
-                                }
-                            }
-                        }
-                    }
+                const list_idx = try self.stackIndexFromDepth(inst.arg);
+                const list_val = self.stack.items.items[list_idx];
+                if (list_val != .expr or list_val.expr.* != .list) {
+                    return error.NotAnExpression;
                 }
-                // Default: just consume items (used for [*items] unpacking)
+                const list_expr = list_val.expr;
+
+                if (items == .expr and items.expr.* == .tuple) {
+                    const tuple_expr = items.expr;
+                    const tuple_elts = tuple_expr.tuple.elts;
+                    tuple_expr.tuple.elts = &.{};
+                    defer {
+                        tuple_expr.deinit(self.allocator);
+                        self.allocator.destroy(tuple_expr);
+                    }
+
+                    if (tuple_elts.len == 0) return;
+
+                    const old_len = list_expr.list.elts.len;
+                    if (old_len == 0) {
+                        list_expr.list.elts = tuple_elts;
+                        return;
+                    }
+
+                    const new_elts = try self.allocator.alloc(*Expr, old_len + tuple_elts.len);
+                    @memcpy(new_elts[0..old_len], list_expr.list.elts);
+                    @memcpy(new_elts[old_len..], tuple_elts);
+                    self.allocator.free(list_expr.list.elts);
+                    if (tuple_elts.len > 0) self.allocator.free(tuple_elts);
+                    list_expr.list.elts = new_elts;
+                    return;
+                }
+
+                const item_expr = switch (items) {
+                    .expr => |expr| expr,
+                    else => return error.NotAnExpression,
+                };
+
+                const starred = try ast.makeStarred(self.allocator, item_expr, .load);
+                const old_len = list_expr.list.elts.len;
+                const new_elts = try self.allocator.alloc(*Expr, old_len + 1);
+                if (old_len > 0) {
+                    @memcpy(new_elts[0..old_len], list_expr.list.elts);
+                    self.allocator.free(list_expr.list.elts);
+                }
+                new_elts[old_len] = starred;
+                list_expr.list.elts = new_elts;
             },
 
             .SET_UPDATE => {
