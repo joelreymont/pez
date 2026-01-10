@@ -175,6 +175,7 @@ pub const Decompiler = struct {
                         else => "<unknown>",
                     };
                     const value = sim.stack.pop() orelse return error.StackUnderflow;
+                    errdefer value.deinit(self.allocator);
                     if (try self.handleStoreValue(name, value)) |stmt| {
                         try stmts.append(self.allocator, stmt);
                     }
@@ -1592,11 +1593,7 @@ pub const Decompiler = struct {
             .class_obj => |cls| try self.makeClassDef(name, cls),
             .import_module => |imp| try self.makeImport(name, imp),
             .saved_local => null,
-            else => blk: {
-                var tmp = value;
-                tmp.deinit(self.allocator);
-                break :blk error.NotAnExpression;
-            },
+            else => error.NotAnExpression,
         };
     }
 

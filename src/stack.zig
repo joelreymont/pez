@@ -36,12 +36,9 @@ pub const FunctionValue = struct {
     kw_defaults: []const ?*Expr = &.{},
 
     pub fn deinit(self: *FunctionValue, allocator: Allocator) void {
-        for (self.decorators.items) |decorator| {
-            decorator.deinit(allocator);
-            allocator.destroy(decorator);
-        }
-        self.decorators.deinit(allocator);
-        allocator.destroy(self);
+        // Arena-allocated, no cleanup needed
+        _ = self;
+        _ = allocator;
     }
 };
 
@@ -52,18 +49,9 @@ pub const ClassValue = struct {
     decorators: std.ArrayList(*Expr),
 
     pub fn deinit(self: *ClassValue, allocator: Allocator) void {
-        if (self.name.len > 0) allocator.free(self.name);
-        for (self.bases) |base| {
-            @constCast(base).deinit(allocator);
-            allocator.destroy(base);
-        }
-        if (self.bases.len > 0) allocator.free(self.bases);
-        for (self.decorators.items) |decorator| {
-            decorator.deinit(allocator);
-            allocator.destroy(decorator);
-        }
-        self.decorators.deinit(allocator);
-        allocator.destroy(self);
+        // Arena-allocated, no cleanup needed
+        _ = self;
+        _ = allocator;
     }
 };
 
@@ -124,24 +112,9 @@ const CompBuilder = struct {
     }
 
     fn deinit(self: *CompBuilder, allocator: Allocator) void {
-        for (self.generators.items) |*gen| {
-            gen.deinit(allocator);
-        }
-        self.generators.deinit(allocator);
-        self.loop_stack.deinit(allocator);
-        if (self.elt) |elt| {
-            elt.deinit(allocator);
-            allocator.destroy(elt);
-        }
-        if (self.key) |key| {
-            key.deinit(allocator);
-            allocator.destroy(key);
-        }
-        if (self.value) |value| {
-            value.deinit(allocator);
-            allocator.destroy(value);
-        }
-        allocator.destroy(self);
+        // Arena-allocated, no cleanup needed
+        _ = self;
+        _ = allocator;
     }
 };
 
@@ -175,16 +148,9 @@ pub const StackValue = union(enum) {
     unknown,
 
     pub fn deinit(self: StackValue, allocator: Allocator) void {
-        switch (self) {
-            .expr => |e| {
-                e.deinit(allocator);
-                allocator.destroy(e);
-            },
-            .function_obj => |f| f.deinit(allocator),
-            .class_obj => |c| c.deinit(allocator),
-            .comp_builder => |b| b.deinit(allocator),
-            else => {},
-        }
+        // All values arena-allocated in SimContext, no manual cleanup needed
+        _ = self;
+        _ = allocator;
     }
 };
 
