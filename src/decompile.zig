@@ -193,9 +193,17 @@ pub const Decompiler = struct {
                     }
                 },
                 .POP_TOP => {
-                    const value = try sim.stack.popExpr();
-                    const stmt = try self.makeExprStmt(value);
-                    try stmts.append(self.allocator, stmt);
+                    const val = sim.stack.pop() orelse return error.StackUnderflow;
+                    switch (val) {
+                        .expr => |e| {
+                            const stmt = try self.makeExprStmt(e);
+                            try stmts.append(self.allocator, stmt);
+                        },
+                        else => {
+                            // Discard non-expression values (e.g., intermediate stack values)
+                            val.deinit(self.allocator);
+                        },
+                    }
                 },
                 .END_FOR, .POP_ITER => {
                     // Loop cleanup opcodes - skip in non-loop context
@@ -446,6 +454,16 @@ pub const Decompiler = struct {
     /// Decompile a range of blocks into a statement list.
     /// Returns statements from start_block up to (but not including) end_block.
     fn decompileBlockRange(self: *Decompiler, start_block: u32, end_block: ?u32) DecompileError![]const *Stmt {
+        return self.decompileBlockRangeWithStack(start_block, end_block, &.{});
+    }
+
+    /// Decompile a range of blocks with initial stack values.
+    fn decompileBlockRangeWithStack(
+        self: *Decompiler,
+        start_block: u32,
+        end_block: ?u32,
+        init_stack: []const StackValue,
+    ) DecompileError![]const *Stmt {
         var stmts: std.ArrayList(*Stmt) = .{};
         errdefer stmts.deinit(self.allocator);
 
@@ -458,7 +476,12 @@ pub const Decompiler = struct {
                 block_idx = next_block;
                 continue;
             }
-            try self.decompileBlockInto(block_idx, &stmts);
+            // First block gets the initial stack
+            if (block_idx == start_block and init_stack.len > 0) {
+                try self.decompileBlockIntoWithStack(block_idx, &stmts, init_stack);
+            } else {
+                try self.decompileBlockInto(block_idx, &stmts);
+            }
             block_idx += 1;
         }
 
@@ -467,12 +490,132 @@ pub const Decompiler = struct {
 
     /// Decompile a single block's statements into the provided list.
     fn decompileBlockInto(self: *Decompiler, block_id: u32, stmts: *std.ArrayList(*Stmt)) DecompileError!void {
+        return self.decompileBlockIntoWithStack(block_id, stmts, &.{});
+    }
+
+    /// Decompile a single block with initial stack values.
+    fn decompileBlockIntoWithStack(
+        self: *Decompiler,
+        block_id: u32,
+        stmts: *std.ArrayList(*Stmt),
+        init_stack: []const StackValue,
+    ) DecompileError!void {
         if (block_id >= self.cfg.blocks.len) return;
         const block = &self.cfg.blocks[block_id];
 
         var sim = SimContext.init(self.arena.allocator(), self.code, self.version);
         defer sim.deinit();
+
+        // Initialize stack with provided values
+        if (init_stack.len > 0) {
+            for (init_stack) |val| {
+                const cloned = try sim.cloneStackValue(val);
+                try sim.stack.push(cloned);
+            }
+        }
+
         try self.processBlockWithSim(block, &sim, stmts);
+    }
+
+    /// Try to decompile a chained comparison (e.g., a < b < c).
+    /// Returns null if this is not a chained comparison.
+    fn tryDecompileChainedComparison(
+        self: *Decompiler,
+        pattern: ctrl.IfPattern,
+        first_cmp: *Expr,
+        sim: *SimContext,
+    ) DecompileError!?*Stmt {
+        // Pattern: condition is a Compare, stack has values, then-block does POP_TOP + LOAD + COMPARE
+        if (first_cmp.* != .compare) return null;
+        if (sim.stack.len() == 0) return null;
+        if (pattern.then_block >= self.cfg.blocks.len) return null;
+
+        const then_block = &self.cfg.blocks[pattern.then_block];
+        if (then_block.instructions.len < 3) return null;
+
+        // Check for POP_TOP, LOAD, COMPARE_OP pattern
+        if (then_block.instructions[0].opcode != .NOT_TAKEN and
+            then_block.instructions[0].opcode != .POP_TOP) return null;
+
+        var idx: usize = 0;
+        if (then_block.instructions[0].opcode == .NOT_TAKEN) {
+            if (then_block.instructions.len < 4) return null;
+            idx = 1;
+        }
+
+        if (then_block.instructions[idx].opcode != .POP_TOP) return null;
+        const load_inst = then_block.instructions[idx + 1];
+        const cmp_inst = then_block.instructions[idx + 2];
+
+        if (cmp_inst.opcode != .COMPARE_OP) return null;
+        if (load_inst.opcode != .LOAD_NAME and
+            load_inst.opcode != .LOAD_FAST and
+            load_inst.opcode != .LOAD_GLOBAL) return null;
+
+        // This is a chained comparison!
+        // Stack has the middle value, we need to build a<b<c from a<b and b<c
+        const mid = try sim.stack.popExpr();
+        errdefer {
+            mid.deinit(self.allocator);
+            self.allocator.destroy(mid);
+        }
+
+        // Simulate loading the right value
+        var then_sim = SimContext.init(self.arena.allocator(), self.code, self.version);
+        defer then_sim.deinit();
+        try then_sim.stack.push(.{ .expr = mid });
+        try then_sim.simulate(load_inst);
+        try then_sim.simulate(cmp_inst);
+
+        const second_cmp = try then_sim.stack.popExpr();
+        errdefer {
+            second_cmp.deinit(self.allocator);
+            self.allocator.destroy(second_cmp);
+        }
+
+        if (second_cmp.* != .compare) {
+            second_cmp.deinit(self.allocator);
+            self.allocator.destroy(second_cmp);
+            return null;
+        }
+
+        // Merge the two comparisons: a<b and b<c → a<b<c
+        const a = self.arena.allocator();
+        const new_comparators = try a.alloc(*Expr, 2);
+        new_comparators[0] = first_cmp.compare.comparators[0];
+        new_comparators[1] = second_cmp.compare.comparators[0];
+
+        const new_ops = try a.alloc(ast.CmpOp, 2);
+        new_ops[0] = first_cmp.compare.ops[0];
+        new_ops[1] = second_cmp.compare.ops[0];
+
+        // Transfer ownership of left and first comparator from first_cmp
+        const left = first_cmp.compare.left;
+        // old first_cmp arrays will remain in arena, no explicit free needed
+
+        const chain_expr = try a.create(Expr);
+        chain_expr.* = .{ .compare = .{
+            .left = left,
+            .ops = new_ops,
+            .comparators = new_comparators,
+        } };
+
+        // Determine if this should be a return or expression statement
+        // Check what comes after the second COMPARE_OP in then-block
+        const has_return = blk: {
+            if (idx + 3 < then_block.instructions.len) {
+                if (then_block.instructions[idx + 3].opcode == .RETURN_VALUE) break :blk true;
+            }
+            break :blk false;
+        };
+
+        const stmt = try a.create(Stmt);
+        if (has_return) {
+            stmt.* = .{ .return_stmt = .{ .value = chain_expr } };
+        } else {
+            stmt.* = .{ .expr_stmt = .{ .value = chain_expr } };
+        }
+        return stmt;
     }
 
     /// Decompile an if statement pattern.
@@ -491,9 +634,30 @@ pub const Decompiler = struct {
 
         const condition = try sim.stack.popExpr();
 
-        // Decompile the then body
+        // Check for chained comparison pattern (Python 3.14+)
+        if (try self.tryDecompileChainedComparison(pattern, condition, &sim)) |chain_expr| {
+            // condition's parts have been transferred to chain_expr, don't deinit
+            return chain_expr;
+        }
+
+        // Save remaining stack values to transfer to branches
+        const base_vals = try self.allocator.alloc(StackValue, sim.stack.len());
+        var saved: usize = 0;
+        errdefer {
+            for (base_vals[0..saved]) |val| {
+                val.deinit(self.allocator);
+            }
+            self.allocator.free(base_vals);
+        }
+        for (0..sim.stack.len()) |i| {
+            const val = sim.stack.items.items[i];
+            base_vals[i] = try sim.cloneStackValue(val);
+            saved += 1;
+        }
+
+        // Decompile the then body with inherited stack
         const then_end = pattern.else_block orelse pattern.merge_block;
-        const then_body_tmp = try self.decompileBlockRange(pattern.then_block, then_end);
+        const then_body_tmp = try self.decompileBlockRangeWithStack(pattern.then_block, then_end, base_vals);
         defer self.allocator.free(then_body_tmp);
         const a = self.arena.allocator();
         const then_body = try a.dupe(*Stmt, then_body_tmp);
@@ -502,6 +666,10 @@ pub const Decompiler = struct {
         const else_body = if (pattern.else_block) |else_id| blk: {
             // Check if else is an elif
             if (pattern.is_elif) {
+                // Elif needs to start with fresh stack
+                for (base_vals) |val| val.deinit(self.allocator);
+                self.allocator.free(base_vals);
+
                 // The else block is another if statement - recurse
                 const else_pattern = try self.analyzer.detectPattern(else_id);
                 if (else_pattern == .if_stmt) {
@@ -512,12 +680,22 @@ pub const Decompiler = struct {
                         break :blk body;
                     }
                 }
+                break :blk &[_]*Stmt{};
             }
-            // Regular else
-            const else_body_tmp = try self.decompileBlockRange(else_id, pattern.merge_block);
+            // Regular else with inherited stack
+            defer {
+                for (base_vals) |val| val.deinit(self.allocator);
+                self.allocator.free(base_vals);
+            }
+            const else_body_tmp = try self.decompileBlockRangeWithStack(else_id, pattern.merge_block, base_vals);
             defer self.allocator.free(else_body_tmp);
             break :blk try a.dupe(*Stmt, else_body_tmp);
-        } else &[_]*Stmt{};
+        } else blk: {
+            // No else block - clean up base_vals
+            for (base_vals) |val| val.deinit(self.allocator);
+            self.allocator.free(base_vals);
+            break :blk &[_]*Stmt{};
+        };
 
         // Create if statement
         const stmt = try a.create(Stmt);
