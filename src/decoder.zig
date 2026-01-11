@@ -122,9 +122,9 @@ pub const Instruction = struct {
         // Next instruction offset
         const next_offset = self.offset + self.size;
 
-        // In Python 3.11+, jump args are instruction offsets (word units).
-        // In Python <= 3.10, jump args are byte offsets.
-        const multiplier: u32 = if (ver.gte(3, 11)) 2 else 1;
+        // In Python 3.10+, jump args are instruction offsets (word units).
+        // In Python <= 3.9, jump args are byte offsets.
+        const multiplier: u32 = if (ver.gte(3, 10)) 2 else 1;
 
         return switch (self.opcode) {
             .JUMP_FORWARD => next_offset + self.arg * multiplier,
@@ -136,16 +136,9 @@ pub const Instruction = struct {
             .POP_JUMP_IF_NONE,
             .POP_JUMP_IF_NOT_NONE,
             => blk: {
-                // Python 3.14+: relative offsets from next instruction
-                // Python 3.12-3.13: absolute offsets in word units
-                // Python 3.11: split into forward/backward variants (handled by opcode)
+                // Python 3.11+: relative offsets from next instruction
                 // Python <= 3.10: absolute offsets in bytes
-                if (ver.gte(3, 14)) {
-                    break :blk next_offset + self.arg * multiplier;
-                } else if (ver.gte(3, 12)) {
-                    break :blk self.arg * multiplier;
-                } else if (ver.gte(3, 11)) {
-                    // Forward/backward variants are normalized to POP_JUMP_IF_*.
+                if (ver.gte(3, 11)) {
                     break :blk next_offset + self.arg * multiplier;
                 }
                 break :blk self.arg * multiplier;
@@ -418,6 +411,34 @@ test "jump target pop jump 3.11" {
         .cache_entries = 0,
     };
     try testing.expectEqual(@as(u32, 8), backward.jumpTarget(v311).?);
+}
+
+test "jump target pop jump 3.10 wordcode" {
+    const testing = std.testing;
+    const v310 = Version.init(3, 10);
+
+    const inst = Instruction{
+        .opcode = .POP_JUMP_IF_FALSE,
+        .arg = 10,
+        .offset = 10,
+        .size = 2,
+        .cache_entries = 0,
+    };
+    try testing.expectEqual(@as(u32, 20), inst.jumpTarget(v310).?);
+}
+
+test "jump target pop jump 3.12 relative" {
+    const testing = std.testing;
+    const v312 = Version.init(3, 12);
+
+    const inst = Instruction{
+        .opcode = .POP_JUMP_IF_FALSE,
+        .arg = 11,
+        .offset = 34,
+        .size = 2,
+        .cache_entries = 0,
+    };
+    try testing.expectEqual(@as(u32, 58), inst.jumpTarget(v312).?);
 }
 
 // ============================================================================

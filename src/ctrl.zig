@@ -185,6 +185,11 @@ pub const TernaryChainPattern = struct {
 };
 
 /// Pattern for short-circuit boolean expressions (x and y, x or y).
+pub const BoolOpKind = enum {
+    pop_top,
+    or_pop,
+};
+
 pub const BoolOpPattern = struct {
     /// Block containing first operand and condition test.
     condition_block: u32,
@@ -194,6 +199,8 @@ pub const BoolOpPattern = struct {
     merge_block: u32,
     /// True for 'and', false for 'or'.
     is_and: bool,
+    /// Pattern kind.
+    kind: BoolOpKind,
 };
 
 /// Control flow analyzer.
@@ -236,6 +243,13 @@ pub const Analyzer = struct {
             }
         }
 
+        // Check for loop header (while loop pattern) before generic if.
+        if (block.is_loop_header) {
+            if (self.detectWhilePattern(block_id)) |pattern| {
+                return .{ .while_loop = pattern };
+            }
+        }
+
         // Check for conditional jump (if statement pattern)
         if (self.isConditionalJump(term.opcode)) {
             if (try self.detectIfPattern(block_id)) |pattern| {
@@ -247,13 +261,6 @@ pub const Analyzer = struct {
         if (term.opcode == .FOR_ITER) {
             if (self.detectForPattern(block_id)) |pattern| {
                 return .{ .for_loop = pattern };
-            }
-        }
-
-        // Check for loop header (while loop pattern)
-        if (block.is_loop_header) {
-            if (self.detectWhilePattern(block_id)) |pattern| {
-                return .{ .while_loop = pattern };
             }
         }
 
@@ -295,10 +302,21 @@ pub const Analyzer = struct {
     /// Check if block has CHECK_EXC_MATCH (exception handler).
     fn hasCheckExcMatch(self: *const Analyzer, block: *const BasicBlock) bool {
         _ = self;
+        var has_dup = false;
+        var has_exc_cmp = false;
+        var has_jump = false;
         for (block.instructions) |inst| {
-            if (inst.opcode == .CHECK_EXC_MATCH or inst.opcode == .PUSH_EXC_INFO) return true;
+            switch (inst.opcode) {
+                .CHECK_EXC_MATCH, .PUSH_EXC_INFO => return true,
+                .DUP_TOP => has_dup = true,
+                .COMPARE_OP => {
+                    if (inst.arg == 10) has_exc_cmp = true;
+                },
+                .JUMP_IF_FALSE, .POP_JUMP_IF_FALSE => has_jump = true,
+                else => {},
+            }
         }
-        return false;
+        return has_dup and has_exc_cmp and has_jump;
     }
 
     /// Detect ternary expression pattern.
@@ -510,30 +528,47 @@ pub const Analyzer = struct {
 
         // Check for COPY, TO_BOOL, POP_JUMP pattern at end of block
         const insts = block.instructions;
-        if (insts.len < 3) return null;
+        if (insts.len < 2) return null;
 
         const term = block.terminator() orelse return null;
 
-        // Determine if this is 'and' or 'or' based on jump type
+        var kind: BoolOpKind = undefined;
         const is_and = switch (term.opcode) {
-            .POP_JUMP_IF_FALSE, .POP_JUMP_FORWARD_IF_FALSE, .POP_JUMP_BACKWARD_IF_FALSE => true,
-            .POP_JUMP_IF_TRUE, .POP_JUMP_FORWARD_IF_TRUE, .POP_JUMP_BACKWARD_IF_TRUE => false,
+            .POP_JUMP_IF_FALSE, .POP_JUMP_FORWARD_IF_FALSE, .POP_JUMP_BACKWARD_IF_FALSE => blk: {
+                kind = .pop_top;
+                break :blk true;
+            },
+            .POP_JUMP_IF_TRUE, .POP_JUMP_FORWARD_IF_TRUE, .POP_JUMP_BACKWARD_IF_TRUE => blk: {
+                kind = .pop_top;
+                break :blk false;
+            },
+            .JUMP_IF_FALSE_OR_POP => blk: {
+                kind = .or_pop;
+                break :blk true;
+            },
+            .JUMP_IF_TRUE_OR_POP => blk: {
+                kind = .or_pop;
+                break :blk false;
+            },
             else => return null,
         };
 
-        // Check for TO_BOOL before the jump
-        const to_bool_idx = insts.len - 2;
-        if (insts[to_bool_idx].opcode != .TO_BOOL) return null;
+        if (kind == .pop_top) {
+            if (insts.len < 3) return null;
+            // Check for TO_BOOL before the jump
+            const to_bool_idx = insts.len - 2;
+            if (insts[to_bool_idx].opcode != .TO_BOOL) return null;
 
-        // Check for COPY before TO_BOOL
-        const copy_idx = insts.len - 3;
-        if (insts[copy_idx].opcode != .COPY) return null;
-        if (insts[copy_idx].arg != 1) return null;
+            // Check for COPY before TO_BOOL
+            const copy_idx = insts.len - 3;
+            if (insts[copy_idx].opcode != .COPY) return null;
+            if (insts[copy_idx].arg != 1) return null;
 
-        // Exclude chained comparison pattern: COMPARE_OP, COPY, TO_BOOL, POP_JUMP
-        if (copy_idx >= 1) {
-            const prev_op = insts[copy_idx - 1].opcode;
-            if (prev_op == .COMPARE_OP) return null;
+            // Exclude chained comparison pattern: COMPARE_OP, COPY, TO_BOOL, POP_JUMP
+            if (copy_idx >= 1) {
+                const prev_op = insts[copy_idx - 1].opcode;
+                if (prev_op == .COMPARE_OP) return null;
+            }
         }
 
         // Find the fallthrough (second operand) and jump target blocks
@@ -573,16 +608,18 @@ pub const Analyzer = struct {
         const sec_id = second_block orelse return null;
         const short_id = short_circuit_block orelse return null;
 
-        // Verify second block starts with POP_TOP (or NOT_TAKEN + POP_TOP)
+        // Verify second block starts with POP_TOP (or NOT_TAKEN + POP_TOP) for pop_top kind
         const sec_blk = &self.cfg.blocks[sec_id];
         if (sec_blk.instructions.len < 1) return null;
 
-        var pop_idx: usize = 0;
-        if (sec_blk.instructions[0].opcode == .NOT_TAKEN) {
-            if (sec_blk.instructions.len < 2) return null;
-            pop_idx = 1;
+        if (kind == .pop_top) {
+            var pop_idx: usize = 0;
+            if (sec_blk.instructions[0].opcode == .NOT_TAKEN) {
+                if (sec_blk.instructions.len < 2) return null;
+                pop_idx = 1;
+            }
+            if (sec_blk.instructions[pop_idx].opcode != .POP_TOP) return null;
         }
-        if (sec_blk.instructions[pop_idx].opcode != .POP_TOP) return null;
 
         // Both paths should merge at the same point
         const sec_merge = blk: {
@@ -610,6 +647,7 @@ pub const Analyzer = struct {
             .second_block = sec_id,
             .merge_block = short_id,
             .is_and = is_and,
+            .kind = kind,
         };
     }
 
@@ -785,6 +823,17 @@ pub const Analyzer = struct {
         const block = &self.cfg.blocks[block_id];
         if (block.is_exception_handler) return null;
 
+        if (!self.cfg.version.gte(3, 11)) {
+            var has_setup = false;
+            for (block.instructions) |inst| {
+                if (inst.opcode == .SETUP_EXCEPT or inst.opcode == .SETUP_FINALLY) {
+                    has_setup = true;
+                    break;
+                }
+            }
+            if (!has_setup) return null;
+        }
+
         var handler_targets: std.ArrayList(u32) = .{};
         defer handler_targets.deinit(self.allocator);
 
@@ -871,6 +920,7 @@ pub const Analyzer = struct {
         _ = self;
         for (block.instructions) |inst| {
             if (inst.opcode == .CHECK_EXC_MATCH) return true;
+            if (inst.opcode == .COMPARE_OP and inst.arg == 10) return true;
         }
         return false;
     }

@@ -10,166 +10,19 @@ const pyc = @import("pyc.zig");
 const stack = @import("stack.zig");
 const codegen = @import("codegen.zig");
 const decompile = @import("decompile.zig");
+const tu = @import("test_utils.zig");
 
 const Allocator = std.mem.Allocator;
 const Version = opcodes.Version;
 const Opcode = opcodes.Opcode;
 const Instruction = decoder.Instruction;
-
-fn inst(op: Opcode, arg: u32) Instruction {
-    return .{
-        .opcode = op,
-        .arg = arg,
-        .offset = 0,
-        .size = 2,
-        .cache_entries = 0,
-    };
-}
-
-fn renderExpr(allocator: Allocator, expr: *const stack.Expr) ![]const u8 {
-    var writer = codegen.Writer.init(allocator);
-    defer writer.deinit(allocator);
-    try writer.writeExpr(allocator, expr);
-    return writer.getOutput(allocator);
-}
-
-fn renderExprWithNewline(allocator: Allocator, expr: *const stack.Expr) ![]const u8 {
-    const output = try renderExpr(allocator, expr);
-    defer allocator.free(output);
-    return std.mem.concat(allocator, u8, &[_][]const u8{ output, "\n" });
-}
-
-fn dupeStrings(allocator: Allocator, items: []const []const u8) ![][]const u8 {
-    const out = try allocator.alloc([]const u8, items.len);
-    var count: usize = 0;
-    errdefer {
-        var i: usize = 0;
-        while (i < count) : (i += 1) {
-            allocator.free(out[i]);
-        }
-        allocator.free(out);
-    }
-
-    for (items, 0..) |item, i| {
-        out[i] = try allocator.dupe(u8, item);
-        count += 1;
-    }
-    return out;
-}
-
-fn simulateExpr(allocator: Allocator, code: *pyc.Code, version: Version, insts: []const Instruction) !*stack.Expr {
-    var sim = stack.SimContext.init(allocator, code, version);
-    defer sim.deinit();
-
-    for (insts) |item| {
-        try sim.simulate(item);
-    }
-    return sim.stack.popExpr();
-}
-
-fn opcodeByte(version: Version, op: Opcode) u8 {
-    const table = opcodes.getOpcodeTable(version);
-    for (table, 0..) |entry, idx| {
-        if (entry == op) return @intCast(idx);
-    }
-    @panic("opcode not in table");
-}
-
-fn emitOp(bytes: *std.ArrayList(u8), allocator: Allocator, version: Version, op: Opcode, arg: u32) !void {
-    try bytes.append(allocator, opcodeByte(version, op));
-    if (version.gte(3, 6)) {
-        try bytes.append(allocator, @intCast(arg & 0xFF));
-
-        const cache_entries = opcodes.cacheEntries(op, version);
-        if (cache_entries > 0) {
-            const cache_bytes = @as(usize, cache_entries) * 2;
-            try bytes.appendNTimes(allocator, 0, cache_bytes);
-        }
-        return;
-    }
-
-    if (op.hasArg(version)) {
-        try bytes.append(allocator, @intCast(arg & 0xFF));
-        try bytes.append(allocator, @intCast((arg >> 8) & 0xFF));
-    }
-}
-
-const OpArg = struct {
-    op: Opcode,
-    arg: u32,
-};
-
-fn emitOps(bytes: *std.ArrayList(u8), allocator: Allocator, version: Version, ops: []const OpArg) !void {
-    for (ops) |item| {
-        try emitOp(bytes, allocator, version, item.op, item.arg);
-    }
-}
-
-fn emitOpsOwned(allocator: Allocator, version: Version, ops: []const OpArg) ![]u8 {
-    var bytes: std.ArrayList(u8) = .{};
-    errdefer bytes.deinit(allocator);
-    try emitOps(&bytes, allocator, version, ops);
-    return bytes.toOwnedSlice(allocator);
-}
-
-fn allocCode(
-    allocator: Allocator,
-    name: []const u8,
-    varnames_in: []const []const u8,
-    consts_in: []const pyc.Object,
-    bytecode: []u8,
-    argcount: u32,
-) !*pyc.Code {
-    const code = try allocator.create(pyc.Code);
-    errdefer allocator.destroy(code);
-
-    errdefer allocator.free(bytecode);
-
-    const name_copy = try allocator.dupe(u8, name);
-    errdefer allocator.free(name_copy);
-
-    const varnames = try dupeStrings(allocator, varnames_in);
-    errdefer {
-        for (varnames) |v| allocator.free(v);
-        allocator.free(varnames);
-    }
-
-    const consts = try allocator.alloc(pyc.Object, consts_in.len);
-    errdefer allocator.free(consts);
-    for (consts_in, 0..) |obj, idx| {
-        consts[idx] = obj;
-    }
-
-    code.* = .{
-        .allocator = allocator,
-        .argcount = argcount,
-        .nlocals = @intCast(varnames_in.len),
-        .code = bytecode,
-        .consts = consts,
-        .varnames = varnames,
-        .name = name_copy,
-    };
-    return code;
-}
-
-fn allocCodeFromOps(
-    allocator: Allocator,
-    version: Version,
-    name: []const u8,
-    varnames_in: []const []const u8,
-    consts_in: []const pyc.Object,
-    ops: []const OpArg,
-    argcount: u32,
-) !*pyc.Code {
-    const bytecode = try emitOpsOwned(allocator, version, ops);
-    return allocCode(allocator, name, varnames_in, consts_in, bytecode, argcount);
-}
+const OpArg = tu.OpArg;
 
 test "snapshot list comprehension" {
     const allocator = testing.allocator;
     const version = Version.init(3, 14);
 
-    const varnames = try dupeStrings(allocator, &[_][]const u8{ "b", "y" });
+    const varnames = try tu.dupeStrings(allocator, &[_][]const u8{ "b", "y" });
     defer {
         for (varnames) |v| allocator.free(v);
         allocator.free(varnames);
@@ -185,28 +38,28 @@ test "snapshot list comprehension" {
     };
 
     const insts = [_]Instruction{
-        inst(.LOAD_FAST_BORROW, 0),
-        inst(.GET_ITER, 0),
-        inst(.LOAD_FAST_AND_CLEAR, 1),
-        inst(.SWAP, 2),
-        inst(.BUILD_LIST, 0),
-        inst(.SWAP, 2),
-        inst(.FOR_ITER, 0),
-        inst(.STORE_FAST_LOAD_FAST, 0x11),
-        inst(.LIST_APPEND, 2),
-        inst(.END_FOR, 0),
-        inst(.POP_ITER, 0),
-        inst(.SWAP, 2),
-        inst(.STORE_FAST, 1),
+        tu.inst(.LOAD_FAST_BORROW, 0),
+        tu.inst(.GET_ITER, 0),
+        tu.inst(.LOAD_FAST_AND_CLEAR, 1),
+        tu.inst(.SWAP, 2),
+        tu.inst(.BUILD_LIST, 0),
+        tu.inst(.SWAP, 2),
+        tu.inst(.FOR_ITER, 0),
+        tu.inst(.STORE_FAST_LOAD_FAST, 0x11),
+        tu.inst(.LIST_APPEND, 2),
+        tu.inst(.END_FOR, 0),
+        tu.inst(.POP_ITER, 0),
+        tu.inst(.SWAP, 2),
+        tu.inst(.STORE_FAST, 1),
     };
 
-    const expr = try simulateExpr(allocator, &code, version, &insts);
+    const expr = try tu.simulateExpr(allocator, &code, version, &insts);
     defer {
         expr.deinit(allocator);
         allocator.destroy(expr);
     }
 
-    const output = try renderExprWithNewline(allocator, expr);
+    const output = try tu.renderExprWithNewline(allocator, expr);
     defer allocator.free(output);
 
     const oh = OhSnap{};
@@ -221,7 +74,7 @@ test "snapshot list comprehension with if" {
     const allocator = testing.allocator;
     const version = Version.init(3, 14);
 
-    const varnames = try dupeStrings(allocator, &[_][]const u8{ "b", "y" });
+    const varnames = try tu.dupeStrings(allocator, &[_][]const u8{ "b", "y" });
     defer {
         for (varnames) |v| allocator.free(v);
         allocator.free(varnames);
@@ -237,31 +90,31 @@ test "snapshot list comprehension with if" {
     };
 
     const insts = [_]Instruction{
-        inst(.LOAD_FAST_BORROW, 0),
-        inst(.GET_ITER, 0),
-        inst(.LOAD_FAST_AND_CLEAR, 1),
-        inst(.SWAP, 2),
-        inst(.BUILD_LIST, 0),
-        inst(.SWAP, 2),
-        inst(.FOR_ITER, 0),
-        inst(.STORE_FAST_LOAD_FAST, 0x11),
-        inst(.TO_BOOL, 0),
-        inst(.POP_JUMP_IF_TRUE, 0),
-        inst(.LOAD_FAST_BORROW, 1),
-        inst(.LIST_APPEND, 2),
-        inst(.END_FOR, 0),
-        inst(.POP_ITER, 0),
-        inst(.SWAP, 2),
-        inst(.STORE_FAST, 1),
+        tu.inst(.LOAD_FAST_BORROW, 0),
+        tu.inst(.GET_ITER, 0),
+        tu.inst(.LOAD_FAST_AND_CLEAR, 1),
+        tu.inst(.SWAP, 2),
+        tu.inst(.BUILD_LIST, 0),
+        tu.inst(.SWAP, 2),
+        tu.inst(.FOR_ITER, 0),
+        tu.inst(.STORE_FAST_LOAD_FAST, 0x11),
+        tu.inst(.TO_BOOL, 0),
+        tu.inst(.POP_JUMP_IF_FALSE, 0),
+        tu.inst(.LOAD_FAST_BORROW, 1),
+        tu.inst(.LIST_APPEND, 2),
+        tu.inst(.END_FOR, 0),
+        tu.inst(.POP_ITER, 0),
+        tu.inst(.SWAP, 2),
+        tu.inst(.STORE_FAST, 1),
     };
 
-    const expr = try simulateExpr(allocator, &code, version, &insts);
+    const expr = try tu.simulateExpr(allocator, &code, version, &insts);
     defer {
         expr.deinit(allocator);
         allocator.destroy(expr);
     }
 
-    const output = try renderExprWithNewline(allocator, expr);
+    const output = try tu.renderExprWithNewline(allocator, expr);
     defer allocator.free(output);
 
     const oh = OhSnap{};
@@ -276,7 +129,7 @@ test "snapshot list comprehension with is None" {
     const allocator = testing.allocator;
     const version = Version.init(3, 14);
 
-    const varnames = try dupeStrings(allocator, &[_][]const u8{ "b", "y" });
+    const varnames = try tu.dupeStrings(allocator, &[_][]const u8{ "b", "y" });
     defer {
         for (varnames) |v| allocator.free(v);
         allocator.free(varnames);
@@ -292,30 +145,30 @@ test "snapshot list comprehension with is None" {
     };
 
     const insts = [_]Instruction{
-        inst(.LOAD_FAST_BORROW, 0),
-        inst(.GET_ITER, 0),
-        inst(.LOAD_FAST_AND_CLEAR, 1),
-        inst(.SWAP, 2),
-        inst(.BUILD_LIST, 0),
-        inst(.SWAP, 2),
-        inst(.FOR_ITER, 0),
-        inst(.STORE_FAST_LOAD_FAST, 0x11),
-        inst(.POP_JUMP_IF_NONE, 0),
-        inst(.LOAD_FAST_BORROW, 1),
-        inst(.LIST_APPEND, 2),
-        inst(.END_FOR, 0),
-        inst(.POP_ITER, 0),
-        inst(.SWAP, 2),
-        inst(.STORE_FAST, 1),
+        tu.inst(.LOAD_FAST_BORROW, 0),
+        tu.inst(.GET_ITER, 0),
+        tu.inst(.LOAD_FAST_AND_CLEAR, 1),
+        tu.inst(.SWAP, 2),
+        tu.inst(.BUILD_LIST, 0),
+        tu.inst(.SWAP, 2),
+        tu.inst(.FOR_ITER, 0),
+        tu.inst(.STORE_FAST_LOAD_FAST, 0x11),
+        tu.inst(.POP_JUMP_IF_NOT_NONE, 0),
+        tu.inst(.LOAD_FAST_BORROW, 1),
+        tu.inst(.LIST_APPEND, 2),
+        tu.inst(.END_FOR, 0),
+        tu.inst(.POP_ITER, 0),
+        tu.inst(.SWAP, 2),
+        tu.inst(.STORE_FAST, 1),
     };
 
-    const expr = try simulateExpr(allocator, &code, version, &insts);
+    const expr = try tu.simulateExpr(allocator, &code, version, &insts);
     defer {
         expr.deinit(allocator);
         allocator.destroy(expr);
     }
 
-    const output = try renderExprWithNewline(allocator, expr);
+    const output = try tu.renderExprWithNewline(allocator, expr);
     defer allocator.free(output);
 
     const oh = OhSnap{};
@@ -326,11 +179,63 @@ test "snapshot list comprehension with is None" {
     ).expectEqual(output);
 }
 
+test "snapshot inline list comprehension py2" {
+    const allocator = testing.allocator;
+    const version = Version.init(2, 7);
+
+    const loop_head_offset: u32 = 7;
+    const loop_exit_offset: u32 = 22;
+    const for_next_offset: u32 = 10;
+    const for_delta: u32 = loop_exit_offset - for_next_offset;
+
+    const ops = [_]OpArg{
+        .{ .op = .BUILD_LIST, .arg = 0 },
+        .{ .op = .LOAD_NAME, .arg = 0 },
+        .{ .op = .GET_ITER, .arg = 0 },
+        .{ .op = .FOR_ITER, .arg = for_delta },
+        .{ .op = .STORE_NAME, .arg = 1 },
+        .{ .op = .LOAD_NAME, .arg = 1 },
+        .{ .op = .LIST_APPEND, .arg = 2 },
+        .{ .op = .JUMP_ABSOLUTE, .arg = loop_head_offset },
+        .{ .op = .PRINT_ITEM, .arg = 0 },
+        .{ .op = .PRINT_NEWLINE, .arg = 0 },
+        .{ .op = .LOAD_CONST, .arg = 0 },
+        .{ .op = .RETURN_VALUE, .arg = 0 },
+    };
+
+    const bytecode = try tu.emitOpsOwned(allocator, version, &ops);
+    const consts = [_]pyc.Object{.none};
+
+    const code = try tu.allocCodeWithNames(
+        allocator,
+        "<module>",
+        &.{},
+        &[_][]const u8{ "XXX", "i" },
+        &consts,
+        bytecode,
+        0,
+    );
+    defer {
+        code.deinit();
+        allocator.destroy(code);
+    }
+
+    const output = try tu.renderModule(allocator, code, version);
+    defer allocator.free(output);
+
+    const oh = OhSnap{};
+    try oh.snap(@src(),
+        \\[]const u8
+        \\  "print [i for i in XXX]
+        \\"
+    ).expectEqual(output);
+}
+
 test "snapshot set comprehension" {
     const allocator = testing.allocator;
     const version = Version.init(3, 14);
 
-    const varnames = try dupeStrings(allocator, &[_][]const u8{ "b", "y" });
+    const varnames = try tu.dupeStrings(allocator, &[_][]const u8{ "b", "y" });
     defer {
         for (varnames) |v| allocator.free(v);
         allocator.free(varnames);
@@ -346,28 +251,28 @@ test "snapshot set comprehension" {
     };
 
     const insts = [_]Instruction{
-        inst(.LOAD_FAST_BORROW, 0),
-        inst(.GET_ITER, 0),
-        inst(.LOAD_FAST_AND_CLEAR, 1),
-        inst(.SWAP, 2),
-        inst(.BUILD_SET, 0),
-        inst(.SWAP, 2),
-        inst(.FOR_ITER, 0),
-        inst(.STORE_FAST_LOAD_FAST, 0x11),
-        inst(.SET_ADD, 2),
-        inst(.END_FOR, 0),
-        inst(.POP_ITER, 0),
-        inst(.SWAP, 2),
-        inst(.STORE_FAST, 1),
+        tu.inst(.LOAD_FAST_BORROW, 0),
+        tu.inst(.GET_ITER, 0),
+        tu.inst(.LOAD_FAST_AND_CLEAR, 1),
+        tu.inst(.SWAP, 2),
+        tu.inst(.BUILD_SET, 0),
+        tu.inst(.SWAP, 2),
+        tu.inst(.FOR_ITER, 0),
+        tu.inst(.STORE_FAST_LOAD_FAST, 0x11),
+        tu.inst(.SET_ADD, 2),
+        tu.inst(.END_FOR, 0),
+        tu.inst(.POP_ITER, 0),
+        tu.inst(.SWAP, 2),
+        tu.inst(.STORE_FAST, 1),
     };
 
-    const expr = try simulateExpr(allocator, &code, version, &insts);
+    const expr = try tu.simulateExpr(allocator, &code, version, &insts);
     defer {
         expr.deinit(allocator);
         allocator.destroy(expr);
     }
 
-    const output = try renderExprWithNewline(allocator, expr);
+    const output = try tu.renderExprWithNewline(allocator, expr);
     defer allocator.free(output);
 
     const oh = OhSnap{};
@@ -382,7 +287,7 @@ test "snapshot dict comprehension" {
     const allocator = testing.allocator;
     const version = Version.init(3, 14);
 
-    const varnames = try dupeStrings(allocator, &[_][]const u8{ "b", "y" });
+    const varnames = try tu.dupeStrings(allocator, &[_][]const u8{ "b", "y" });
     defer {
         for (varnames) |v| allocator.free(v);
         allocator.free(varnames);
@@ -398,29 +303,29 @@ test "snapshot dict comprehension" {
     };
 
     const insts = [_]Instruction{
-        inst(.LOAD_FAST_BORROW, 0),
-        inst(.GET_ITER, 0),
-        inst(.LOAD_FAST_AND_CLEAR, 1),
-        inst(.SWAP, 2),
-        inst(.BUILD_MAP, 0),
-        inst(.SWAP, 2),
-        inst(.FOR_ITER, 0),
-        inst(.STORE_FAST_LOAD_FAST, 0x11),
-        inst(.LOAD_FAST_BORROW, 1),
-        inst(.MAP_ADD, 2),
-        inst(.END_FOR, 0),
-        inst(.POP_ITER, 0),
-        inst(.SWAP, 2),
-        inst(.STORE_FAST, 1),
+        tu.inst(.LOAD_FAST_BORROW, 0),
+        tu.inst(.GET_ITER, 0),
+        tu.inst(.LOAD_FAST_AND_CLEAR, 1),
+        tu.inst(.SWAP, 2),
+        tu.inst(.BUILD_MAP, 0),
+        tu.inst(.SWAP, 2),
+        tu.inst(.FOR_ITER, 0),
+        tu.inst(.STORE_FAST_LOAD_FAST, 0x11),
+        tu.inst(.LOAD_FAST_BORROW, 1),
+        tu.inst(.MAP_ADD, 2),
+        tu.inst(.END_FOR, 0),
+        tu.inst(.POP_ITER, 0),
+        tu.inst(.SWAP, 2),
+        tu.inst(.STORE_FAST, 1),
     };
 
-    const expr = try simulateExpr(allocator, &code, version, &insts);
+    const expr = try tu.simulateExpr(allocator, &code, version, &insts);
     defer {
         expr.deinit(allocator);
         allocator.destroy(expr);
     }
 
-    const output = try renderExprWithNewline(allocator, expr);
+    const output = try tu.renderExprWithNewline(allocator, expr);
     defer allocator.free(output);
 
     const oh = OhSnap{};
@@ -449,7 +354,7 @@ test "snapshot generator expression" {
     };
 
     const gen_consts = [_]pyc.Object{.none};
-    const gen_code = try allocCodeFromOps(
+    const gen_code = try tu.allocCodeFromOps(
         allocator,
         version,
         "<genexpr>",
@@ -462,7 +367,7 @@ test "snapshot generator expression" {
     const outer_consts = try allocator.alloc(pyc.Object, 1);
     outer_consts[0] = .{ .code = gen_code };
 
-    const varnames = try dupeStrings(allocator, &[_][]const u8{"b"});
+    const varnames = try tu.dupeStrings(allocator, &[_][]const u8{"b"});
     const name = try allocator.dupe(u8, "genexpr_outer");
 
     var outer_code = pyc.Code{
@@ -474,20 +379,20 @@ test "snapshot generator expression" {
     defer outer_code.deinit();
 
     const insts = [_]Instruction{
-        inst(.LOAD_CONST, 0),
-        inst(.MAKE_FUNCTION, 0),
-        inst(.LOAD_FAST_BORROW, 0),
-        inst(.GET_ITER, 0),
-        inst(.CALL, 0),
+        tu.inst(.LOAD_CONST, 0),
+        tu.inst(.MAKE_FUNCTION, 0),
+        tu.inst(.LOAD_FAST_BORROW, 0),
+        tu.inst(.GET_ITER, 0),
+        tu.inst(.CALL, 0),
     };
 
-    const expr = try simulateExpr(allocator, &outer_code, version, &insts);
+    const expr = try tu.simulateExpr(allocator, &outer_code, version, &insts);
     defer {
         expr.deinit(allocator);
         allocator.destroy(expr);
     }
 
-    const output = try renderExprWithNewline(allocator, expr);
+    const output = try tu.renderExprWithNewline(allocator, expr);
     defer allocator.free(output);
 
     const oh = OhSnap{};
@@ -509,7 +414,7 @@ test "snapshot lambda expression" {
     };
 
     const lambda_consts = [_]pyc.Object{};
-    const lambda_code = try allocCodeFromOps(
+    const lambda_code = try tu.allocCodeFromOps(
         allocator,
         version,
         "<lambda>",
@@ -532,17 +437,17 @@ test "snapshot lambda expression" {
     defer outer_code.deinit();
 
     const insts = [_]Instruction{
-        inst(.LOAD_CONST, 0),
-        inst(.MAKE_FUNCTION, 0),
+        tu.inst(.LOAD_CONST, 0),
+        tu.inst(.MAKE_FUNCTION, 0),
     };
 
-    const expr = try simulateExpr(allocator, &outer_code, version, &insts);
+    const expr = try tu.simulateExpr(allocator, &outer_code, version, &insts);
     defer {
         expr.deinit(allocator);
         allocator.destroy(expr);
     }
 
-    const output = try renderExprWithNewline(allocator, expr);
+    const output = try tu.renderExprWithNewline(allocator, expr);
     defer allocator.free(output);
 
     const oh = OhSnap{};
@@ -557,7 +462,7 @@ test "snapshot list unpack" {
     const allocator = testing.allocator;
     const version = Version.init(3, 10);
 
-    const names = try dupeStrings(allocator, &[_][]const u8{ "a", "b" });
+    const names = try tu.dupeStrings(allocator, &[_][]const u8{ "a", "b" });
     defer {
         for (names) |v| allocator.free(v);
         allocator.free(names);
@@ -573,18 +478,18 @@ test "snapshot list unpack" {
     };
 
     const insts = [_]Instruction{
-        inst(.LOAD_NAME, 0),
-        inst(.LOAD_NAME, 1),
-        inst(.BUILD_LIST_UNPACK, 2),
+        tu.inst(.LOAD_NAME, 0),
+        tu.inst(.LOAD_NAME, 1),
+        tu.inst(.BUILD_LIST_UNPACK, 2),
     };
 
-    const expr = try simulateExpr(allocator, &code, version, &insts);
+    const expr = try tu.simulateExpr(allocator, &code, version, &insts);
     defer {
         expr.deinit(allocator);
         allocator.destroy(expr);
     }
 
-    const output = try renderExprWithNewline(allocator, expr);
+    const output = try tu.renderExprWithNewline(allocator, expr);
     defer allocator.free(output);
 
     const oh = OhSnap{};
@@ -617,18 +522,18 @@ test "snapshot list extend const tuple" {
     };
 
     const insts = [_]Instruction{
-        inst(.BUILD_LIST, 0),
-        inst(.LOAD_CONST, 0),
-        inst(.LIST_EXTEND, 1),
+        tu.inst(.BUILD_LIST, 0),
+        tu.inst(.LOAD_CONST, 0),
+        tu.inst(.LIST_EXTEND, 1),
     };
 
-    const expr = try simulateExpr(allocator, &code, version, &insts);
+    const expr = try tu.simulateExpr(allocator, &code, version, &insts);
     defer {
         expr.deinit(allocator);
         allocator.destroy(expr);
     }
 
-    const output = try renderExprWithNewline(allocator, expr);
+    const output = try tu.renderExprWithNewline(allocator, expr);
     defer allocator.free(output);
 
     const oh = OhSnap{};
@@ -643,7 +548,7 @@ test "snapshot call with keywords" {
     const allocator = testing.allocator;
     const version = Version.init(3, 10);
 
-    const names = try dupeStrings(allocator, &[_][]const u8{"f"});
+    const names = try tu.dupeStrings(allocator, &[_][]const u8{"f"});
     defer {
         for (names) |v| allocator.free(v);
         allocator.free(names);
@@ -671,20 +576,20 @@ test "snapshot call with keywords" {
     };
 
     const insts = [_]Instruction{
-        inst(.LOAD_NAME, 0),
-        inst(.LOAD_CONST, 0),
-        inst(.LOAD_CONST, 1),
-        inst(.LOAD_CONST, 2),
-        inst(.CALL_FUNCTION_KW, 2),
+        tu.inst(.LOAD_NAME, 0),
+        tu.inst(.LOAD_CONST, 0),
+        tu.inst(.LOAD_CONST, 1),
+        tu.inst(.LOAD_CONST, 2),
+        tu.inst(.CALL_FUNCTION_KW, 2),
     };
 
-    const expr = try simulateExpr(allocator, &code, version, &insts);
+    const expr = try tu.simulateExpr(allocator, &code, version, &insts);
     defer {
         expr.deinit(allocator);
         allocator.destroy(expr);
     }
 
-    const output = try renderExprWithNewline(allocator, expr);
+    const output = try tu.renderExprWithNewline(allocator, expr);
     defer allocator.free(output);
 
     const oh = OhSnap{};
@@ -699,7 +604,7 @@ test "snapshot call method" {
     const allocator = testing.allocator;
     const version = Version.init(3, 10);
 
-    const names = try dupeStrings(allocator, &[_][]const u8{ "obj", "m" });
+    const names = try tu.dupeStrings(allocator, &[_][]const u8{ "obj", "m" });
     defer {
         for (names) |v| allocator.free(v);
         allocator.free(names);
@@ -715,18 +620,18 @@ test "snapshot call method" {
     };
 
     const insts = [_]Instruction{
-        inst(.LOAD_NAME, 0),
-        inst(.LOAD_METHOD, 1),
-        inst(.CALL_METHOD, 0),
+        tu.inst(.LOAD_NAME, 0),
+        tu.inst(.LOAD_METHOD, 1),
+        tu.inst(.CALL_METHOD, 0),
     };
 
-    const expr = try simulateExpr(allocator, &code, version, &insts);
+    const expr = try tu.simulateExpr(allocator, &code, version, &insts);
     defer {
         expr.deinit(allocator);
         allocator.destroy(expr);
     }
 
-    const output = try renderExprWithNewline(allocator, expr);
+    const output = try tu.renderExprWithNewline(allocator, expr);
     defer allocator.free(output);
 
     const oh = OhSnap{};
@@ -747,7 +652,7 @@ test "snapshot decorated function output" {
     };
 
     const func_consts = [_]pyc.Object{.none};
-    const func_code = try allocCodeFromOps(
+    const func_code = try tu.allocCodeFromOps(
         allocator,
         version,
         "foo",
@@ -763,7 +668,7 @@ test "snapshot decorated function output" {
     defer module.deinit();
 
     module.name = try allocator.dupe(u8, "<module>");
-    module.names = try dupeStrings(allocator, &[_][]const u8{ "decorator", "foo" });
+    module.names = try tu.dupeStrings(allocator, &[_][]const u8{ "decorator", "foo" });
 
     const module_ops = [_]OpArg{
         .{ .op = .LOAD_NAME, .arg = 0 },
@@ -775,7 +680,7 @@ test "snapshot decorated function output" {
         .{ .op = .LOAD_CONST, .arg = 2 },
         .{ .op = .RETURN_VALUE, .arg = 0 },
     };
-    module.code = try emitOpsOwned(allocator, version, &module_ops);
+    module.code = try tu.emitOpsOwned(allocator, version, &module_ops);
 
     const consts = try allocator.alloc(pyc.Object, 3);
     consts[0] = .none;
@@ -812,7 +717,7 @@ test "snapshot ternary expression output" {
     defer module.deinit();
 
     module.name = try allocator.dupe(u8, "<module>");
-    module.names = try dupeStrings(allocator, &[_][]const u8{ "a", "x" });
+    module.names = try tu.dupeStrings(allocator, &[_][]const u8{ "a", "x" });
 
     const consts = try allocator.alloc(pyc.Object, 3);
     consts[0] = .{ .int = pyc.Int.fromI64(1) };
@@ -820,17 +725,25 @@ test "snapshot ternary expression output" {
     consts[2] = .none;
     module.consts = consts;
 
+    // Ternary: x = 1 if a else 2
+    // For Python 3.10, jump args are instruction offsets (multiplied by 2 for byte offset)
+    // Offset 0: LOAD_NAME a
+    // Offset 2: POP_JUMP_IF_FALSE 4 (jump to instruction 4 = byte offset 8)
+    // Offset 4: LOAD_CONST 1 (true value)
+    // Offset 6: JUMP_FORWARD 1 (jump forward 1 instruction = to byte offset 10)
+    // Offset 8: LOAD_CONST 2 (false value)
+    // Offset 10: STORE_NAME x (merge point)
     const module_ops = [_]OpArg{
         .{ .op = .LOAD_NAME, .arg = 0 },
-        .{ .op = .POP_JUMP_IF_FALSE, .arg = 8 },
+        .{ .op = .POP_JUMP_IF_FALSE, .arg = 4 },
         .{ .op = .LOAD_CONST, .arg = 0 },
-        .{ .op = .JUMP_FORWARD, .arg = 2 },
+        .{ .op = .JUMP_FORWARD, .arg = 1 },
         .{ .op = .LOAD_CONST, .arg = 1 },
         .{ .op = .STORE_NAME, .arg = 1 },
         .{ .op = .LOAD_CONST, .arg = 2 },
         .{ .op = .RETURN_VALUE, .arg = 0 },
     };
-    module.code = try emitOpsOwned(allocator, version, &module_ops);
+    module.code = try tu.emitOpsOwned(allocator, version, &module_ops);
 
     var out: std.ArrayList(u8) = .{};
     defer out.deinit(allocator);
@@ -855,7 +768,7 @@ test "snapshot ternary boolop condition output" {
     defer module.deinit();
 
     module.name = try allocator.dupe(u8, "<module>");
-    module.names = try dupeStrings(allocator, &[_][]const u8{ "a", "result" });
+    module.names = try tu.dupeStrings(allocator, &[_][]const u8{ "a", "result" });
 
     const consts = try allocator.alloc(pyc.Object, 5);
     consts[0] = .{ .int = pyc.Int.fromI64(0) };
@@ -865,25 +778,29 @@ test "snapshot ternary boolop condition output" {
     consts[4] = .none;
     module.consts = consts;
 
+    // Python 3.10: instruction offsets (byte offset = arg * 2)
+    // Offsets: 0:LOAD_NAME, 2:LOAD_CONST, 4:COMPARE_OP, 6:POP_JUMP_IF_FALSE
+    //          8:LOAD_NAME, 10:LOAD_CONST, 12:BINARY_MODULO, 14:LOAD_CONST, 16:COMPARE_OP, 18:POP_JUMP_IF_FALSE
+    //          20:LOAD_CONST("yes"), 22:JUMP_FORWARD, 24:LOAD_CONST("no"), 26:STORE_NAME
     const module_ops = [_]OpArg{
         .{ .op = .LOAD_NAME, .arg = 0 },
         .{ .op = .LOAD_CONST, .arg = 0 },
         .{ .op = .COMPARE_OP, .arg = 0 },
-        .{ .op = .POP_JUMP_IF_FALSE, .arg = 24 },
+        .{ .op = .POP_JUMP_IF_FALSE, .arg = 12 }, // jump to instruction 12 = byte 24 (LOAD_CONST "no")
         .{ .op = .LOAD_NAME, .arg = 0 },
         .{ .op = .LOAD_CONST, .arg = 1 },
         .{ .op = .BINARY_MODULO, .arg = 0 },
         .{ .op = .LOAD_CONST, .arg = 0 },
         .{ .op = .COMPARE_OP, .arg = 2 },
-        .{ .op = .POP_JUMP_IF_FALSE, .arg = 24 },
+        .{ .op = .POP_JUMP_IF_FALSE, .arg = 12 }, // jump to instruction 12 = byte 24 (LOAD_CONST "no")
         .{ .op = .LOAD_CONST, .arg = 2 },
-        .{ .op = .JUMP_FORWARD, .arg = 2 },
+        .{ .op = .JUMP_FORWARD, .arg = 1 }, // jump 1 instruction = to byte 26 (STORE_NAME)
         .{ .op = .LOAD_CONST, .arg = 3 },
         .{ .op = .STORE_NAME, .arg = 1 },
         .{ .op = .LOAD_CONST, .arg = 4 },
         .{ .op = .RETURN_VALUE, .arg = 0 },
     };
-    module.code = try emitOpsOwned(allocator, version, &module_ops);
+    module.code = try tu.emitOpsOwned(allocator, version, &module_ops);
 
     var out: std.ArrayList(u8) = .{};
     defer out.deinit(allocator);
@@ -907,7 +824,7 @@ test "snapshot python 2.7 class output" {
         .{ .op = .RETURN_VALUE, .arg = 0 },
     };
     const class_consts = [_]pyc.Object{.none};
-    const class_code = try allocCodeFromOps(
+    const class_code = try tu.allocCodeFromOps(
         allocator,
         version,
         "C",
@@ -923,7 +840,7 @@ test "snapshot python 2.7 class output" {
     defer module.deinit();
 
     module.name = try allocator.dupe(u8, "<module>");
-    module.names = try dupeStrings(allocator, &[_][]const u8{"C"});
+    module.names = try tu.dupeStrings(allocator, &[_][]const u8{"C"});
 
     const consts = try allocator.alloc(pyc.Object, 3);
     consts[0] = .{ .code = class_code };
@@ -942,7 +859,7 @@ test "snapshot python 2.7 class output" {
         .{ .op = .LOAD_CONST, .arg = 2 },
         .{ .op = .RETURN_VALUE, .arg = 0 },
     };
-    module.code = try emitOpsOwned(allocator, version, &module_ops);
+    module.code = try tu.emitOpsOwned(allocator, version, &module_ops);
 
     var out: std.ArrayList(u8) = .{};
     defer out.deinit(allocator);

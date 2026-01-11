@@ -314,6 +314,18 @@ pub const SimContext = struct {
         return null;
     }
 
+    /// Get a deref variable name (cellvars first, then freevars).
+    pub fn getDeref(self: *const SimContext, idx: u32) ?[]const u8 {
+        if (idx < self.code.cellvars.len) {
+            return self.code.cellvars[idx];
+        }
+        const free_idx: usize = @as(usize, idx) - self.code.cellvars.len;
+        if (free_idx < self.code.freevars.len) {
+            return self.code.freevars[free_idx];
+        }
+        return null;
+    }
+
     /// Convert a pyc.Object constant to an AST Constant.
     pub fn objToConstant(self: *SimContext, obj: pyc.Object) !ast.Constant {
         return switch (obj) {
@@ -593,6 +605,22 @@ pub const SimContext = struct {
         }
 
         return names;
+    }
+
+    fn keywordNameFromValue(self: *SimContext, value: StackValue) SimError![]const u8 {
+        var owned = value;
+        errdefer owned.deinit(self.allocator);
+
+        const expr = switch (owned) {
+            .expr => |e| e,
+            else => return error.InvalidKeywordNames,
+        };
+
+        if (expr.* != .constant or expr.constant != .string) return error.InvalidKeywordNames;
+        const name = try self.allocator.dupe(u8, expr.constant.string);
+        expr.deinit(self.allocator);
+        self.allocator.destroy(expr);
+        return name;
     }
 
     const UnpackedSeqKind = enum { list, tuple, set };
@@ -1067,7 +1095,18 @@ pub const SimContext = struct {
     }
 
     fn getBuilderAtDepth(self: *SimContext, depth: u32, kind: CompKind) !*CompBuilder {
-        const idx = try self.stackIndexFromDepth(depth);
+        const idx = self.stackIndexFromDepth(depth) catch |err| {
+            if (err != error.StackUnderflow) return err;
+            const missing = depth - @as(u32, @intCast(self.stack.items.items.len));
+            const builder = try self.allocator.create(CompBuilder);
+            builder.* = CompBuilder.init(kind);
+            try self.stack.items.insert(self.allocator, 0, .{ .comp_builder = builder });
+            var i: u32 = 1;
+            while (i < missing) : (i += 1) {
+                try self.stack.items.insert(self.allocator, @intCast(i), .unknown);
+            }
+            return builder;
+        };
         return self.ensureCompBuilderAt(idx, kind);
     }
 
@@ -1102,6 +1141,13 @@ pub const SimContext = struct {
         if (builder.loop_stack.items.len == 0) return error.InvalidComprehension;
         const idx = builder.loop_stack.items[builder.loop_stack.items.len - 1];
         try builder.generators.items[idx].ifs.append(self.allocator, cond);
+    }
+
+    fn addCompTargetName(self: *SimContext, name: []const u8) !void {
+        const builder = self.findActiveCompBuilder() orelse return;
+        if (builder.loop_stack.items.len == 0) return;
+        const target = try ast.makeName(self.allocator, name, .store);
+        try self.addCompTarget(builder, target);
     }
 
     fn makeIsNoneCompare(self: *SimContext, value: *Expr, is_not: bool) !*Expr {
@@ -1205,6 +1251,12 @@ pub const SimContext = struct {
         return expr;
     }
 
+    pub fn buildInlineCompExpr(self: *SimContext) SimError!?*Expr {
+        const builder = self.findActiveCompBuilder() orelse return null;
+        if (!builder.seen_append) return null;
+        return self.buildCompExpr(builder);
+    }
+
     fn buildComprehensionFromCode(self: *SimContext, comp: CompObject, iter_expr: *Expr) SimError!*Expr {
         var nested = SimContext.init(self.allocator, comp.code, self.version);
         defer nested.deinit();
@@ -1233,8 +1285,14 @@ pub const SimContext = struct {
     /// Simulate a single instruction.
     pub fn simulate(self: *SimContext, inst: Instruction) SimError!void {
         switch (inst.opcode) {
-            .NOP, .RESUME, .CACHE, .EXTENDED_ARG, .NOT_TAKEN,
-            .SETUP_LOOP, .SETUP_EXCEPT, .POP_BLOCK,
+            .NOP,
+            .RESUME,
+            .CACHE,
+            .EXTENDED_ARG,
+            .NOT_TAKEN,
+            .SETUP_LOOP,
+            .SETUP_EXCEPT,
+            .POP_BLOCK,
             => {
                 // No stack effect
             },
@@ -1282,6 +1340,9 @@ pub const SimContext = struct {
                     inst.arg >> 1
                 else
                     inst.arg;
+                if (inst.opcode == .LOAD_GLOBAL and self.version.gte(3, 11) and (inst.arg & 1) == 1) {
+                    try self.stack.push(.null_marker);
+                }
                 if (self.getName(name_idx)) |name| {
                     const expr = try ast.makeName(self.allocator, name, .load);
                     try self.stack.push(.{ .expr = expr });
@@ -1345,6 +1406,8 @@ pub const SimContext = struct {
                 // Pop the value and create assignment
                 // For now, just pop the value
                 if (self.stack.pop()) |v| {
+                    const name = self.getName(inst.arg) orelse "<unknown>";
+                    try self.addCompTargetName(name);
                     var val = v;
                     val.deinit(self.allocator);
                 }
@@ -1361,6 +1424,8 @@ pub const SimContext = struct {
             .STORE_FAST => {
                 // Pop the value
                 if (self.stack.pop()) |v| {
+                    const name = self.getLocal(inst.arg) orelse "<unknown>";
+                    try self.addCompTargetName(name);
                     var val = v;
                     val.deinit(self.allocator);
                 }
@@ -1572,14 +1637,7 @@ pub const SimContext = struct {
                     // push unknown since this is likely a closure tuple for MAKE_CLOSURE
                     const elts = self.stack.popNExprs(count) catch |err| {
                         if (err == error.NotAnExpression) {
-                            // Pop the non-expression values and push unknown
-                            var i: u32 = 0;
-                            while (i < count) : (i += 1) {
-                                if (self.stack.pop()) |v| {
-                                    var val = v;
-                                    val.deinit(self.allocator);
-                                }
-                            }
+                            // popNExprs already consumed the values
                             try self.stack.push(.unknown);
                             return;
                         }
@@ -1823,68 +1881,93 @@ pub const SimContext = struct {
             },
 
             .CALL_FUNCTION => {
-                const argc = inst.arg;
-                const args_vals = try self.stack.popN(argc);
-                const callable = self.stack.pop() orelse {
-                    self.deinitStackValues(args_vals);
-                    return error.StackUnderflow;
-                };
-                try self.handleCall(callable, args_vals, &[_]ast.Keyword{}, null);
+                if (self.version.lt(3, 6)) {
+                    const num_pos: usize = @intCast(inst.arg & 0xFF);
+                    const num_kw: usize = @intCast((inst.arg >> 8) & 0xFF);
+
+                    var keywords: []ast.Keyword = &.{};
+                    if (num_kw > 0) {
+                        keywords = try self.allocator.alloc(ast.Keyword, num_kw);
+                    }
+                    var kw_filled: usize = 0;
+                    errdefer {
+                        for (keywords[0..kw_filled]) |kw| {
+                            if (kw.arg) |arg| self.allocator.free(arg);
+                            kw.value.deinit(self.allocator);
+                            self.allocator.destroy(kw.value);
+                        }
+                        if (num_kw > 0) self.allocator.free(keywords);
+                    }
+
+                    var kw_idx = num_kw;
+                    while (kw_idx > 0) : (kw_idx -= 1) {
+                        const value = try self.stack.popExpr();
+                        var value_owned = true;
+                        errdefer if (value_owned) {
+                            value.deinit(self.allocator);
+                            self.allocator.destroy(value);
+                        };
+                        const name_val = self.stack.pop() orelse return error.StackUnderflow;
+                        const name = try self.keywordNameFromValue(name_val);
+                        keywords[kw_idx - 1] = .{ .arg = name, .value = value };
+                        kw_filled += 1;
+                        value_owned = false;
+                    }
+
+                    const args_vals = try self.stack.popN(num_pos);
+                    var args_owned = true;
+                    errdefer if (args_owned) self.deinitStackValues(args_vals);
+
+                    const callable = self.stack.pop() orelse {
+                        self.deinitStackValues(args_vals);
+                        return error.StackUnderflow;
+                    };
+                    args_owned = false;
+
+                    try self.handleCall(callable, args_vals, keywords, null);
+                } else {
+                    const argc = inst.arg;
+                    const args_vals = try self.stack.popN(argc);
+                    const callable = self.stack.pop() orelse {
+                        self.deinitStackValues(args_vals);
+                        return error.StackUnderflow;
+                    };
+                    try self.handleCall(callable, args_vals, &[_]ast.Keyword{}, null);
+                }
             },
 
-            .CALL_FUNCTION_KW => {
-                const names_val = self.stack.pop() orelse return error.StackUnderflow;
-                const kw_names = try self.keywordNamesFromValue(names_val);
-                var kw_names_owned = true;
-                errdefer if (kw_names_owned) {
-                    for (kw_names) |name| {
-                        if (name.len > 0) self.allocator.free(name);
-                    }
-                    self.allocator.free(kw_names);
+            .CALL_FUNCTION_VAR => {
+                const num_pos: usize = @intCast(inst.arg & 0xFF);
+                const num_kw: usize = @intCast((inst.arg >> 8) & 0xFF);
+
+                const star_val = self.stack.pop() orelse return error.StackUnderflow;
+                const star_expr = switch (star_val) {
+                    .expr => |expr| expr,
+                    else => {
+                        var val = star_val;
+                        val.deinit(self.allocator);
+                        return error.NotAnExpression;
+                    },
                 };
 
-                const argc = inst.arg;
-                var args_vals = try self.stack.popN(argc);
-                var args_owned = true;
-                errdefer if (args_owned) self.deinitStackValues(args_vals);
-
-                const callable = self.stack.pop() orelse return error.StackUnderflow;
-                var callable_owned = true;
-                errdefer if (callable_owned) {
-                    var val = callable;
-                    val.deinit(self.allocator);
+                const starred_arg = if (star_expr.* == .starred)
+                    star_expr
+                else blk: {
+                    errdefer {
+                        star_expr.deinit(self.allocator);
+                        self.allocator.destroy(star_expr);
+                    }
+                    break :blk try ast.makeStarred(self.allocator, star_expr, .load);
                 };
-
-                if (kw_names.len > args_vals.len) return error.InvalidKeywordNames;
-
-                const pos_count = args_vals.len - kw_names.len;
-                var args: []*Expr = &.{};
-                if (pos_count > 0) {
-                    args = try self.allocator.alloc(*Expr, pos_count);
-                }
-                var args_filled: usize = 0;
-                errdefer {
-                    for (args[0..args_filled]) |arg| {
-                        arg.deinit(self.allocator);
-                        self.allocator.destroy(arg);
-                    }
-                    if (pos_count > 0) self.allocator.free(args);
-                }
-
-                for (args_vals[0..pos_count], 0..) |val, idx| {
-                    switch (val) {
-                        .expr => |expr| {
-                            args[idx] = expr;
-                            args_filled += 1;
-                            args_vals[idx] = .unknown;
-                        },
-                        else => return error.NotAnExpression,
-                    }
-                }
+                var star_owned = true;
+                errdefer if (star_owned) {
+                    starred_arg.deinit(self.allocator);
+                    self.allocator.destroy(starred_arg);
+                };
 
                 var keywords: []ast.Keyword = &.{};
-                if (kw_names.len > 0) {
-                    keywords = try self.allocator.alloc(ast.Keyword, kw_names.len);
+                if (num_kw > 0) {
+                    keywords = try self.allocator.alloc(ast.Keyword, num_kw);
                 }
                 var kw_filled: usize = 0;
                 errdefer {
@@ -1893,37 +1976,403 @@ pub const SimContext = struct {
                         kw.value.deinit(self.allocator);
                         self.allocator.destroy(kw.value);
                     }
-                    if (kw_names.len > 0) self.allocator.free(keywords);
+                    if (num_kw > 0) self.allocator.free(keywords);
                 }
 
-                var kw_names_mut = @constCast(kw_names);
-                for (kw_names, 0..) |name, idx| {
-                    const arg_idx = pos_count + idx;
-                    const val = args_vals[arg_idx];
-                    switch (val) {
-                        .expr => |expr| {
-                            keywords[idx] = .{ .arg = name, .value = expr };
-                            kw_filled += 1;
-                            kw_names_mut[idx] = "";
-                            args_vals[arg_idx] = .unknown;
-                        },
-                        else => return error.NotAnExpression,
+                var kw_idx = num_kw;
+                while (kw_idx > 0) : (kw_idx -= 1) {
+                    const value = try self.stack.popExpr();
+                    var value_owned = true;
+                    errdefer if (value_owned) {
+                        value.deinit(self.allocator);
+                        self.allocator.destroy(value);
+                    };
+                    const name_val = self.stack.pop() orelse return error.StackUnderflow;
+                    const name = try self.keywordNameFromValue(name_val);
+                    keywords[kw_idx - 1] = .{ .arg = name, .value = value };
+                    kw_filled += 1;
+                    value_owned = false;
+                }
+
+                const pos_vals = try self.stack.popN(num_pos);
+                var pos_owned = true;
+                errdefer if (pos_owned) self.deinitStackValues(pos_vals);
+
+                const pos_exprs = try self.stack.valuesToExprs(pos_vals);
+                pos_owned = false;
+                var pos_exprs_owned = true;
+                errdefer if (pos_exprs_owned) {
+                    for (pos_exprs) |arg| {
+                        arg.deinit(self.allocator);
+                        self.allocator.destroy(arg);
                     }
+                    self.allocator.free(pos_exprs);
+                };
+
+                const args = try self.allocator.alloc(*Expr, pos_exprs.len + 1);
+                errdefer {
+                    for (args) |arg| {
+                        arg.deinit(self.allocator);
+                        self.allocator.destroy(arg);
+                    }
+                    self.allocator.free(args);
                 }
+                @memcpy(args[0..pos_exprs.len], pos_exprs);
+                args[pos_exprs.len] = starred_arg;
+                star_owned = false;
+                pos_exprs_owned = false;
+                self.allocator.free(pos_exprs);
 
-                for (args_vals) |*val| val.* = .unknown;
-                self.allocator.free(args_vals);
-                args_owned = false;
-                self.allocator.free(kw_names);
-                kw_names_owned = false;
-
+                const callable = self.stack.pop() orelse return error.StackUnderflow;
                 switch (callable) {
                     .expr => |callee_expr| {
-                        callable_owned = false;
-                        errdefer {
+                        var cleanup_callee = true;
+                        errdefer if (cleanup_callee) {
                             callee_expr.deinit(self.allocator);
                             self.allocator.destroy(callee_expr);
-                            if (keywords.len > 0) deinitKeywordsOwned(self.allocator, keywords);
+                        };
+                        const call_expr = try ast.makeCallWithKeywords(self.allocator, callee_expr, args, keywords);
+                        errdefer {
+                            call_expr.deinit(self.allocator);
+                            self.allocator.destroy(call_expr);
+                        }
+                        try self.stack.push(.{ .expr = call_expr });
+                        cleanup_callee = false;
+                    },
+                    else => {
+                        var val = callable;
+                        val.deinit(self.allocator);
+                        return error.NotAnExpression;
+                    },
+                }
+            },
+
+            .CALL_FUNCTION_VAR_KW => {
+                const num_pos: usize = @intCast(inst.arg & 0xFF);
+                const num_kw: usize = @intCast((inst.arg >> 8) & 0xFF);
+
+                const kwargs_val = self.stack.pop() orelse return error.StackUnderflow;
+                const kwargs_expr = switch (kwargs_val) {
+                    .expr => |expr| expr,
+                    else => {
+                        var val = kwargs_val;
+                        val.deinit(self.allocator);
+                        return error.NotAnExpression;
+                    },
+                };
+                var kwargs_owned = true;
+                errdefer if (kwargs_owned) {
+                    kwargs_expr.deinit(self.allocator);
+                    self.allocator.destroy(kwargs_expr);
+                };
+
+                const star_val = self.stack.pop() orelse return error.StackUnderflow;
+                const star_expr = switch (star_val) {
+                    .expr => |expr| expr,
+                    else => {
+                        var val = star_val;
+                        val.deinit(self.allocator);
+                        return error.NotAnExpression;
+                    },
+                };
+
+                const starred_arg = if (star_expr.* == .starred)
+                    star_expr
+                else blk: {
+                    errdefer {
+                        star_expr.deinit(self.allocator);
+                        self.allocator.destroy(star_expr);
+                    }
+                    break :blk try ast.makeStarred(self.allocator, star_expr, .load);
+                };
+                var star_owned = true;
+                errdefer if (star_owned) {
+                    starred_arg.deinit(self.allocator);
+                    self.allocator.destroy(starred_arg);
+                };
+
+                var keywords = try self.allocator.alloc(ast.Keyword, num_kw + 1);
+                var kw_filled: usize = 0;
+                errdefer {
+                    for (keywords[0..kw_filled]) |kw| {
+                        if (kw.arg) |arg| self.allocator.free(arg);
+                        kw.value.deinit(self.allocator);
+                        self.allocator.destroy(kw.value);
+                    }
+                    self.allocator.free(keywords);
+                }
+
+                var kw_idx = num_kw;
+                while (kw_idx > 0) : (kw_idx -= 1) {
+                    const value = try self.stack.popExpr();
+                    var value_owned = true;
+                    errdefer if (value_owned) {
+                        value.deinit(self.allocator);
+                        self.allocator.destroy(value);
+                    };
+                    const name_val = self.stack.pop() orelse return error.StackUnderflow;
+                    const name = try self.keywordNameFromValue(name_val);
+                    keywords[kw_idx - 1] = .{ .arg = name, .value = value };
+                    kw_filled += 1;
+                    value_owned = false;
+                }
+
+                keywords[num_kw] = .{ .arg = null, .value = kwargs_expr };
+                kw_filled += 1;
+                kwargs_owned = false;
+
+                const pos_vals = try self.stack.popN(num_pos);
+                var pos_owned = true;
+                errdefer if (pos_owned) self.deinitStackValues(pos_vals);
+
+                const pos_exprs = try self.stack.valuesToExprs(pos_vals);
+                pos_owned = false;
+                var pos_exprs_owned = true;
+                errdefer if (pos_exprs_owned) {
+                    for (pos_exprs) |arg| {
+                        arg.deinit(self.allocator);
+                        self.allocator.destroy(arg);
+                    }
+                    self.allocator.free(pos_exprs);
+                };
+
+                const args = try self.allocator.alloc(*Expr, pos_exprs.len + 1);
+                errdefer {
+                    for (args) |arg| {
+                        arg.deinit(self.allocator);
+                        self.allocator.destroy(arg);
+                    }
+                    self.allocator.free(args);
+                }
+                @memcpy(args[0..pos_exprs.len], pos_exprs);
+                args[pos_exprs.len] = starred_arg;
+                star_owned = false;
+                pos_exprs_owned = false;
+                self.allocator.free(pos_exprs);
+
+                const callable = self.stack.pop() orelse return error.StackUnderflow;
+                switch (callable) {
+                    .expr => |callee_expr| {
+                        var cleanup_callee = true;
+                        errdefer if (cleanup_callee) {
+                            callee_expr.deinit(self.allocator);
+                            self.allocator.destroy(callee_expr);
+                        };
+                        const call_expr = try ast.makeCallWithKeywords(self.allocator, callee_expr, args, keywords);
+                        errdefer {
+                            call_expr.deinit(self.allocator);
+                            self.allocator.destroy(call_expr);
+                        }
+                        try self.stack.push(.{ .expr = call_expr });
+                        cleanup_callee = false;
+                    },
+                    else => {
+                        var val = callable;
+                        val.deinit(self.allocator);
+                        return error.NotAnExpression;
+                    },
+                }
+            },
+
+            .CALL_FUNCTION_KW => {
+                if (self.version.lt(3, 6)) {
+                    const num_pos: usize = @intCast(inst.arg & 0xFF);
+                    const num_kw: usize = @intCast((inst.arg >> 8) & 0xFF);
+
+                    const kwargs_val = self.stack.pop() orelse return error.StackUnderflow;
+                    const kwargs_expr = switch (kwargs_val) {
+                        .expr => |expr| expr,
+                        else => {
+                            var val = kwargs_val;
+                            val.deinit(self.allocator);
+                            return error.NotAnExpression;
+                        },
+                    };
+                    var kwargs_owned = true;
+                    errdefer if (kwargs_owned) {
+                        kwargs_expr.deinit(self.allocator);
+                        self.allocator.destroy(kwargs_expr);
+                    };
+
+                    var keywords = try self.allocator.alloc(ast.Keyword, num_kw + 1);
+                    var kw_filled: usize = 0;
+                    var cleanup_keywords = true;
+                    errdefer if (cleanup_keywords) {
+                        for (keywords[0..kw_filled]) |kw| {
+                            if (kw.arg) |arg| self.allocator.free(arg);
+                            kw.value.deinit(self.allocator);
+                            self.allocator.destroy(kw.value);
+                        }
+                        self.allocator.free(keywords);
+                    };
+
+                    var kw_idx = num_kw;
+                    while (kw_idx > 0) : (kw_idx -= 1) {
+                        const value = try self.stack.popExpr();
+                        var value_owned = true;
+                        errdefer if (value_owned) {
+                            value.deinit(self.allocator);
+                            self.allocator.destroy(value);
+                        };
+                        const name_val = self.stack.pop() orelse return error.StackUnderflow;
+                        const name = try self.keywordNameFromValue(name_val);
+                        keywords[kw_idx - 1] = .{ .arg = name, .value = value };
+                        kw_filled += 1;
+                        value_owned = false;
+                    }
+
+                    keywords[num_kw] = .{ .arg = null, .value = kwargs_expr };
+                    kw_filled += 1;
+                    kwargs_owned = false;
+
+                    const pos_vals = try self.stack.popN(num_pos);
+                    var pos_owned = true;
+                    errdefer if (pos_owned) self.deinitStackValues(pos_vals);
+
+                    const args = try self.stack.valuesToExprs(pos_vals);
+                    pos_owned = false;
+                    var cleanup_args = true;
+                    errdefer if (cleanup_args) {
+                        for (args) |arg| {
+                            arg.deinit(self.allocator);
+                            self.allocator.destroy(arg);
+                        }
+                        self.allocator.free(args);
+                    };
+
+                    const callable = self.stack.pop() orelse return error.StackUnderflow;
+                    switch (callable) {
+                        .expr => |callee_expr| {
+                            var cleanup_callee = true;
+                            errdefer if (cleanup_callee) {
+                                callee_expr.deinit(self.allocator);
+                                self.allocator.destroy(callee_expr);
+                            };
+                            const expr = try ast.makeCallWithKeywords(self.allocator, callee_expr, args, keywords);
+                            errdefer {
+                                expr.deinit(self.allocator);
+                                self.allocator.destroy(expr);
+                            }
+                            try self.stack.push(.{ .expr = expr });
+                            cleanup_callee = false;
+                            cleanup_args = false;
+                            cleanup_keywords = false;
+                        },
+                        else => {
+                            var val = callable;
+                            val.deinit(self.allocator);
+                            return error.NotAnExpression;
+                        },
+                    }
+                } else {
+                    const names_val = self.stack.pop() orelse return error.StackUnderflow;
+                    const kw_names = try self.keywordNamesFromValue(names_val);
+                    var kw_names_owned = true;
+                    errdefer if (kw_names_owned) {
+                        for (kw_names) |name| {
+                            if (name.len > 0) self.allocator.free(name);
+                        }
+                        self.allocator.free(kw_names);
+                    };
+
+                    const argc = inst.arg;
+                    var args_vals = try self.stack.popN(argc);
+                    var args_owned = true;
+                    errdefer if (args_owned) self.deinitStackValues(args_vals);
+
+                    const callable = self.stack.pop() orelse return error.StackUnderflow;
+                    var callable_owned = true;
+                    errdefer if (callable_owned) {
+                        var val = callable;
+                        val.deinit(self.allocator);
+                    };
+
+                    if (kw_names.len > args_vals.len) return error.InvalidKeywordNames;
+
+                    const pos_count = args_vals.len - kw_names.len;
+                    var args: []*Expr = &.{};
+                    if (pos_count > 0) {
+                        args = try self.allocator.alloc(*Expr, pos_count);
+                    }
+                    var args_filled: usize = 0;
+                    errdefer {
+                        for (args[0..args_filled]) |arg| {
+                            arg.deinit(self.allocator);
+                            self.allocator.destroy(arg);
+                        }
+                        if (pos_count > 0) self.allocator.free(args);
+                    }
+
+                    for (args_vals[0..pos_count], 0..) |val, idx| {
+                        switch (val) {
+                            .expr => |expr| {
+                                args[idx] = expr;
+                                args_filled += 1;
+                                args_vals[idx] = .unknown;
+                            },
+                            else => return error.NotAnExpression,
+                        }
+                    }
+
+                    var keywords: []ast.Keyword = &.{};
+                    if (kw_names.len > 0) {
+                        keywords = try self.allocator.alloc(ast.Keyword, kw_names.len);
+                    }
+                    var kw_filled: usize = 0;
+                    errdefer {
+                        for (keywords[0..kw_filled]) |kw| {
+                            if (kw.arg) |arg| self.allocator.free(arg);
+                            kw.value.deinit(self.allocator);
+                            self.allocator.destroy(kw.value);
+                        }
+                        if (kw_names.len > 0) self.allocator.free(keywords);
+                    }
+
+                    var kw_names_mut = @constCast(kw_names);
+                    for (kw_names, 0..) |name, idx| {
+                        const arg_idx = pos_count + idx;
+                        const val = args_vals[arg_idx];
+                        switch (val) {
+                            .expr => |expr| {
+                                keywords[idx] = .{ .arg = name, .value = expr };
+                                kw_filled += 1;
+                                kw_names_mut[idx] = "";
+                                args_vals[arg_idx] = .unknown;
+                            },
+                            else => return error.NotAnExpression,
+                        }
+                    }
+
+                    for (args_vals) |*val| val.* = .unknown;
+                    self.allocator.free(args_vals);
+                    args_owned = false;
+                    self.allocator.free(kw_names);
+                    kw_names_owned = false;
+
+                    switch (callable) {
+                        .expr => |callee_expr| {
+                            callable_owned = false;
+                            errdefer {
+                                callee_expr.deinit(self.allocator);
+                                self.allocator.destroy(callee_expr);
+                                if (keywords.len > 0) deinitKeywordsOwned(self.allocator, keywords);
+                                if (pos_count > 0) {
+                                    for (args) |arg| {
+                                        arg.deinit(self.allocator);
+                                        self.allocator.destroy(arg);
+                                    }
+                                    self.allocator.free(args);
+                                }
+                            }
+                            const expr = try ast.makeCallWithKeywords(self.allocator, callee_expr, args, keywords);
+                            errdefer {
+                                expr.deinit(self.allocator);
+                                self.allocator.destroy(expr);
+                            }
+                            try self.stack.push(.{ .expr = expr });
+                        },
+                        else => {
+                            deinitKeywordsOwned(self.allocator, keywords);
                             if (pos_count > 0) {
                                 for (args) |arg| {
                                     arg.deinit(self.allocator);
@@ -1931,25 +2380,9 @@ pub const SimContext = struct {
                                 }
                                 self.allocator.free(args);
                             }
-                        }
-                        const expr = try ast.makeCallWithKeywords(self.allocator, callee_expr, args, keywords);
-                        errdefer {
-                            expr.deinit(self.allocator);
-                            self.allocator.destroy(expr);
-                        }
-                        try self.stack.push(.{ .expr = expr });
-                    },
-                    else => {
-                        deinitKeywordsOwned(self.allocator, keywords);
-                        if (pos_count > 0) {
-                            for (args) |arg| {
-                                arg.deinit(self.allocator);
-                                self.allocator.destroy(arg);
-                            }
-                            self.allocator.free(args);
-                        }
-                        return error.NotAnExpression;
-                    },
+                            return error.NotAnExpression;
+                        },
+                    }
                 }
             },
 
@@ -2379,13 +2812,19 @@ pub const SimContext = struct {
 
             .LOAD_DEREF => {
                 // LOAD_DEREF i - loads value from a cell
-                // For now, push unknown since we don't track cells
-                try self.stack.push(.unknown);
+                if (self.getDeref(inst.arg)) |name| {
+                    const expr = try ast.makeName(self.allocator, name, .load);
+                    try self.stack.push(.{ .expr = expr });
+                } else {
+                    try self.stack.push(.unknown);
+                }
             },
 
             .STORE_DEREF => {
                 // STORE_DEREF i - stores value to a cell
                 if (self.stack.pop()) |v| {
+                    const name = self.getDeref(inst.arg) orelse "<unknown>";
+                    try self.addCompTargetName(name);
                     var val = v;
                     val.deinit(self.allocator);
                 }
@@ -2617,19 +3056,36 @@ pub const SimContext = struct {
             // Attribute access
             .LOAD_ATTR => {
                 // LOAD_ATTR namei - replace TOS with TOS.names[namei]
-                const obj = try self.stack.popExpr();
-                errdefer {
-                    obj.deinit(self.allocator);
-                    self.allocator.destroy(obj);
-                }
-                const name_idx = if (self.version.gte(3, 11)) inst.arg >> 1 else inst.arg;
-                if (self.getName(name_idx)) |attr_name| {
-                    const attr = try ast.makeAttribute(self.allocator, obj, attr_name, .load);
-                    try self.stack.push(.{ .expr = attr });
-                } else {
-                    obj.deinit(self.allocator);
-                    self.allocator.destroy(obj);
-                    try self.stack.push(.unknown);
+                const obj_val = self.stack.pop() orelse return error.StackUnderflow;
+                const push_null = self.version.gte(3, 11) and (inst.arg & 1) == 1;
+                switch (obj_val) {
+                    .expr => |obj| {
+                        errdefer {
+                            obj.deinit(self.allocator);
+                            self.allocator.destroy(obj);
+                        }
+                        const name_idx = if (self.version.gte(3, 11)) inst.arg >> 1 else inst.arg;
+                        if (self.getName(name_idx)) |attr_name| {
+                            if (push_null) try self.stack.push(.null_marker);
+                            const attr = try ast.makeAttribute(self.allocator, obj, attr_name, .load);
+                            try self.stack.push(.{ .expr = attr });
+                        } else {
+                            obj.deinit(self.allocator);
+                            self.allocator.destroy(obj);
+                            if (push_null) try self.stack.push(.null_marker);
+                            try self.stack.push(.unknown);
+                        }
+                    },
+                    .import_module => |imp| {
+                        // IMPORT_NAME returns the top-level package; LOAD_ATTR extracts the submodule.
+                        // Keep the import module so STORE_NAME can emit the import statement.
+                        try self.stack.push(.{ .import_module = imp });
+                    },
+                    else => {
+                        var val = obj_val;
+                        val.deinit(self.allocator);
+                        return error.NotAnExpression;
+                    },
                 }
             },
 
@@ -2965,8 +3421,12 @@ pub const SimContext = struct {
 
             .LOAD_CLASSDEREF => {
                 // LOAD_CLASSDEREF i - load value from cell or free variable for class scoping
-                // Similar to LOAD_DEREF but with special class scope handling
-                try self.stack.push(.unknown);
+                if (self.getDeref(inst.arg)) |name| {
+                    const expr = try ast.makeName(self.allocator, name, .load);
+                    try self.stack.push(.{ .expr = expr });
+                } else {
+                    try self.stack.push(.unknown);
+                }
             },
 
             // Exception handling opcodes
@@ -3150,18 +3610,18 @@ pub const SimContext = struct {
                 const cond = try self.stack.popExpr();
                 if (self.findActiveCompBuilder()) |builder| {
                     const final_cond = switch (inst.opcode) {
-                        .POP_JUMP_IF_FALSE,
-                        .POP_JUMP_FORWARD_IF_FALSE,
-                        .POP_JUMP_BACKWARD_IF_FALSE,
+                        .POP_JUMP_IF_TRUE,
+                        .POP_JUMP_FORWARD_IF_TRUE,
+                        .POP_JUMP_BACKWARD_IF_TRUE,
                         => try ast.makeUnaryOp(self.allocator, .not_, cond),
                         .POP_JUMP_IF_NONE,
                         .POP_JUMP_FORWARD_IF_NONE,
                         .POP_JUMP_BACKWARD_IF_NONE,
-                        => try self.makeIsNoneCompare(cond, false),
+                        => try self.makeIsNoneCompare(cond, true),
                         .POP_JUMP_IF_NOT_NONE,
                         .POP_JUMP_FORWARD_IF_NOT_NONE,
                         .POP_JUMP_BACKWARD_IF_NOT_NONE,
-                        => try self.makeIsNoneCompare(cond, true),
+                        => try self.makeIsNoneCompare(cond, false),
                         else => cond,
                     };
                     errdefer {

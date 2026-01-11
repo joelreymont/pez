@@ -160,6 +160,16 @@ fn buildCFGWithLeaders(
     const instructions = try iter.collectAlloc(allocator);
     errdefer allocator.free(instructions);
 
+    var legacy_entries: []ExceptionEntry = &.{};
+    const use_legacy = exception_entries.len == 0 and !version.gte(3, 11);
+    if (use_legacy) {
+        legacy_entries = try collectLegacyExceptionEntries(allocator, instructions, version);
+    }
+    defer {
+        if (legacy_entries.len > 0) allocator.free(legacy_entries);
+    }
+    const entries = if (use_legacy) legacy_entries else exception_entries;
+
     if (instructions.len == 0) {
         return CFG{
             .allocator = allocator,
@@ -180,7 +190,7 @@ fn buildCFGWithLeaders(
     defer leaders.deinit();
 
     // Add exception handler targets as leaders
-    for (exception_entries) |entry| {
+    for (entries) |entry| {
         try leaders.put(entry.target, {});
     }
 
@@ -264,6 +274,8 @@ fn buildCFGWithLeaders(
         if (term) |t| {
             if (t.jumpTarget(version)) |target| {
                 if (offset_to_block.get(target)) |target_block| {
+                    const is_back_jump = (t.opcode == .JUMP_BACKWARD or t.opcode == .JUMP_BACKWARD_NO_INTERRUPT) or
+                        (t.opcode == .JUMP_ABSOLUTE and target < t.offset);
                     const edge_type: EdgeType = if (t.isConditionalJump()) blk: {
                         // For POP_JUMP_IF_FALSE/NONE, jump target is the FALSE branch
                         // For POP_JUMP_IF_TRUE/NOT_NONE, jump target is the TRUE branch
@@ -277,6 +289,7 @@ fn buildCFGWithLeaders(
                             .POP_JUMP_BACKWARD_IF_NONE,
                             .FOR_ITER,
                             .JUMP_IF_FALSE, // Python 3.0
+                            .JUMP_IF_FALSE_OR_POP,
                             => .conditional_false,
                             .POP_JUMP_IF_TRUE,
                             .POP_JUMP_IF_NOT_NONE,
@@ -285,10 +298,11 @@ fn buildCFGWithLeaders(
                             .POP_JUMP_BACKWARD_IF_TRUE,
                             .POP_JUMP_BACKWARD_IF_NOT_NONE,
                             .JUMP_IF_TRUE, // Python 3.0
+                            .JUMP_IF_TRUE_OR_POP,
                             => .conditional_true,
                             else => .conditional_true,
                         };
-                    } else if (t.opcode == .JUMP_BACKWARD or t.opcode == .JUMP_BACKWARD_NO_INTERRUPT)
+                    } else if (is_back_jump)
                         .loop_back
                     else
                         .normal;
@@ -312,6 +326,7 @@ fn buildCFGWithLeaders(
                             .POP_JUMP_BACKWARD_IF_FALSE,
                             .POP_JUMP_BACKWARD_IF_NONE,
                             .JUMP_IF_FALSE, // Python 3.0
+                            .JUMP_IF_FALSE_OR_POP,
                             => .conditional_true,
                             .POP_JUMP_IF_TRUE,
                             .POP_JUMP_IF_NOT_NONE,
@@ -319,8 +334,10 @@ fn buildCFGWithLeaders(
                             .POP_JUMP_FORWARD_IF_NOT_NONE,
                             .POP_JUMP_BACKWARD_IF_TRUE,
                             .POP_JUMP_BACKWARD_IF_NOT_NONE,
-                            .FOR_ITER,
                             .JUMP_IF_TRUE, // Python 3.0
+                            .JUMP_IF_TRUE_OR_POP,
+                            => .conditional_false,
+                            .FOR_ITER,
                             => .normal,
                             else => .conditional_false,
                         };
@@ -375,13 +392,153 @@ fn buildCFGWithLeaders(
         }
     }
 
-    return CFG{
+    var cfg = CFG{
         .allocator = allocator,
         .blocks = blocks,
         .entry = 0,
         .instructions = instructions,
         .version = version,
     };
+
+    if (use_legacy and entries.len > 0) {
+        try applyExceptionEntries(allocator, &cfg, entries);
+    }
+
+    return cfg;
+}
+
+fn collectLegacyExceptionEntries(
+    allocator: Allocator,
+    instructions: []const Instruction,
+    version: Version,
+) ![]ExceptionEntry {
+    var entries: std.ArrayList(ExceptionEntry) = .{};
+    errdefer entries.deinit(allocator);
+
+    const SetupKind = enum { loop, except, finally };
+    const SetupEntry = struct {
+        kind: SetupKind,
+        start: u32,
+        target: u32,
+    };
+
+    var stack: std.ArrayList(SetupEntry) = .{};
+    defer stack.deinit(allocator);
+
+    const multiplier: u32 = if (version.gte(3, 10)) 2 else 1;
+
+    for (instructions) |inst| {
+        switch (inst.opcode) {
+            .SETUP_LOOP => {
+                try stack.append(allocator, .{
+                    .kind = .loop,
+                    .start = inst.offset + inst.size,
+                    .target = 0,
+                });
+            },
+            .SETUP_EXCEPT => {
+                const target = inst.offset + inst.size + inst.arg * multiplier;
+                try stack.append(allocator, .{
+                    .kind = .except,
+                    .start = inst.offset + inst.size,
+                    .target = target,
+                });
+            },
+            .SETUP_FINALLY => {
+                const target = inst.offset + inst.size + inst.arg * multiplier;
+                try stack.append(allocator, .{
+                    .kind = .finally,
+                    .start = inst.offset + inst.size,
+                    .target = target,
+                });
+            },
+            .POP_BLOCK => {
+                if (stack.items.len == 0) continue;
+                const entry = stack.pop() orelse continue;
+                switch (entry.kind) {
+                    .except, .finally => {
+                        try entries.append(allocator, .{
+                            .start = entry.start,
+                            .end = inst.offset + inst.size,
+                            .target = entry.target,
+                            .depth = 0,
+                            .push_lasti = false,
+                        });
+                    },
+                    else => {},
+                }
+            },
+            else => {},
+        }
+    }
+
+    return entries.toOwnedSlice(allocator);
+}
+
+fn applyExceptionEntries(allocator: Allocator, cfg: *CFG, entries: []const ExceptionEntry) !void {
+    if (entries.len == 0) return;
+
+    const EdgeToAdd = struct { from: u32, to: u32 };
+    var edges_to_add: std.ArrayList(EdgeToAdd) = .{};
+    defer edges_to_add.deinit(allocator);
+
+    for (entries) |entry| {
+        const handler_block_ptr = cfg.blockContaining(entry.target);
+        var handler_block_id: ?u32 = null;
+        if (handler_block_ptr) |ptr| {
+            handler_block_id = ptr.id;
+        }
+        if (handler_block_id) |hid| {
+            cfg.blocks[hid].is_exception_handler = true;
+        }
+
+        for (cfg.blocks, 0..) |*block, block_idx| {
+            if (block.start_offset < entry.end and block.end_offset > entry.start) {
+                if (handler_block_id) |hid| {
+                    var has_edge = false;
+                    for (block.successors) |edge| {
+                        if (edge.target == hid and edge.edge_type == .exception) {
+                            has_edge = true;
+                            break;
+                        }
+                    }
+                    if (!has_edge) {
+                        try edges_to_add.append(allocator, .{ .from = @intCast(block_idx), .to = hid });
+                    }
+                }
+            }
+        }
+    }
+
+    for (edges_to_add.items) |edge_info| {
+        const block_idx = edge_info.from;
+        const hid = edge_info.to;
+
+        const block = &cfg.blocks[block_idx];
+        const old_len = block.successors.len;
+        const new_succs = try allocator.alloc(Edge, old_len + 1);
+        @memcpy(new_succs[0..old_len], block.successors);
+        new_succs[old_len] = .{
+            .target = hid,
+            .edge_type = .exception,
+        };
+
+        if (old_len > 0) {
+            allocator.free(block.successors);
+        }
+        cfg.blocks[block_idx].successors = new_succs;
+
+        const handler = &cfg.blocks[hid];
+        const old_preds = handler.predecessors;
+        const new_preds = try allocator.alloc(u32, old_preds.len + 1);
+        @memcpy(new_preds[0..old_preds.len], old_preds);
+        new_preds[old_preds.len] = @intCast(block_idx);
+
+        if (old_preds.len > 0) {
+            allocator.free(old_preds);
+        }
+        cfg.blocks[hid].predecessors = new_preds;
+    }
 }
 
 // ============================================================================
@@ -491,78 +648,7 @@ pub fn buildCFGWithExceptions(
     var cfg = try buildCFGWithLeaders(allocator, bytecode, version, entries);
     errdefer cfg.deinit();
 
-    // Collect edges to add (two-pass to avoid iterator invalidation)
-    const EdgeToAdd = struct { from: u32, to: u32 };
-    var edges_to_add: std.ArrayList(EdgeToAdd) = .{};
-    defer edges_to_add.deinit(allocator);
-
-    // First pass: mark handlers and collect edges
-    for (entries) |entry| {
-        // Find the handler block - use blockContaining since handler offset may be mid-block
-        const handler_block_ptr = cfg.blockContaining(entry.target);
-        var handler_block_id: ?u32 = null;
-        if (handler_block_ptr) |ptr| {
-            handler_block_id = ptr.id;
-        }
-        if (handler_block_id) |hid| {
-            cfg.blocks[hid].is_exception_handler = true;
-        }
-
-        // Collect exception edges from all blocks in the protected range
-        for (cfg.blocks, 0..) |*block, block_idx| {
-            // Check if this block overlaps with the protected range
-            if (block.start_offset < entry.end and block.end_offset > entry.start) {
-                // Collect exception edge if handler exists
-                if (handler_block_id) |hid| {
-                    // Check if edge already exists
-                    var has_edge = false;
-                    for (block.successors) |edge| {
-                        if (edge.target == hid and edge.edge_type == .exception) {
-                            has_edge = true;
-                            break;
-                        }
-                    }
-
-                    if (!has_edge) {
-                        try edges_to_add.append(allocator, .{ .from = @intCast(block_idx), .to = hid });
-                    }
-                }
-            }
-        }
-    }
-
-    // Second pass: add all collected edges
-    for (edges_to_add.items) |edge_info| {
-        const block_idx = edge_info.from;
-        const hid = edge_info.to;
-
-        // Add to successors
-        const block = &cfg.blocks[block_idx];
-        const old_len = block.successors.len;
-        const new_succs = try allocator.alloc(Edge, old_len + 1);
-        @memcpy(new_succs[0..old_len], block.successors);
-        new_succs[old_len] = .{
-            .target = hid,
-            .edge_type = .exception,
-        };
-
-        if (old_len > 0) {
-            allocator.free(block.successors);
-        }
-        cfg.blocks[block_idx].successors = new_succs;
-
-        // Add to predecessors
-        const handler = &cfg.blocks[hid];
-        const old_preds = handler.predecessors;
-        const new_preds = try allocator.alloc(u32, old_preds.len + 1);
-        @memcpy(new_preds[0..old_preds.len], old_preds);
-        new_preds[old_preds.len] = block.id;
-
-        if (old_preds.len > 0) {
-            allocator.free(old_preds);
-        }
-        cfg.blocks[hid].predecessors = new_preds;
-    }
+    try applyExceptionEntries(allocator, &cfg, entries);
 
     return cfg;
 }
@@ -605,6 +691,14 @@ pub fn debugPrint(cfg: *const CFG, writer: anytype) !void {
     }
 }
 
+fn opcodeByte(version: Version, op: Opcode) u8 {
+    const table = opcodes.getOpcodeTable(version);
+    for (table, 0..) |entry, idx| {
+        if (entry == op) return @intCast(idx);
+    }
+    @panic("opcode not in table");
+}
+
 test "cfg simple function" {
     const testing = std.testing;
     const allocator = testing.allocator;
@@ -637,12 +731,12 @@ test "cfg with conditional" {
 
     // if x: return 1 else: return 2
     // RESUME, LOAD_FAST, POP_JUMP_IF_FALSE (to else), RETURN_CONST 1, RETURN_CONST 2
-    // POP_JUMP_IF_FALSE is byte 114, target is instruction offset in 3.12
+    // POP_JUMP_IF_FALSE is byte 114, target is relative from next instruction
     // Note: POP_JUMP_IF_FALSE has NO cache entries in 3.12
     const bytecode = [_]u8{
         151, 0, // RESUME 0 @ 0
         124, 0, // LOAD_FAST 0 @ 2
-        114, 4, // POP_JUMP_IF_FALSE to offset 8 (4 * 2) @ 4
+        114, 1, // POP_JUMP_IF_FALSE to offset 8 @ 4
         121, 0, // RETURN_CONST 0 (then branch) @ 6
         121, 1, // RETURN_CONST 1 (else branch) @ 8
     };
@@ -658,6 +752,26 @@ test "cfg with conditional" {
 
     // Block 0 should have two successors (true -> block 2, false -> block 1)
     try testing.expectEqual(@as(usize, 2), cfg.blocks[0].successors.len);
+}
+
+test "cfg jump absolute back edge" {
+    const testing = std.testing;
+    const allocator = testing.allocator;
+    const v38 = Version.init(3, 8);
+
+    // Simple backward jump to form a loop header.
+    const bytecode = [_]u8{
+        opcodeByte(v38, .LOAD_CONST), 0, // offset 0
+        opcodeByte(v38, .JUMP_ABSOLUTE), 0, // offset 2 -> jump back to 0
+    };
+
+    var cfg = try buildCFG(allocator, &bytecode, v38);
+    defer cfg.deinit();
+
+    try testing.expectEqual(@as(usize, 1), cfg.blocks.len);
+    try testing.expectEqual(@as(usize, 1), cfg.blocks[0].successors.len);
+    try testing.expectEqual(EdgeType.loop_back, cfg.blocks[0].successors[0].edge_type);
+    try testing.expect(cfg.blocks[0].is_loop_header);
 }
 
 test "exception table parsing" {
