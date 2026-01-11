@@ -301,6 +301,81 @@ pub const Decompiler = struct {
                         try stmts.append(self.allocator, stmt);
                     }
                 },
+                .STORE_SUBSCR => {
+                    // STORE_SUBSCR: TOS1[TOS] = TOS2
+                    // Stack: key, container, value
+                    // All stack values are arena-allocated, so no manual cleanup needed
+                    const key_val = sim.stack.pop() orelse {
+                        try sim.simulate(inst);
+                        continue;
+                    };
+                    const container_val = sim.stack.pop() orelse {
+                        try sim.simulate(inst);
+                        continue;
+                    };
+                    const value_val = sim.stack.pop() orelse {
+                        try sim.simulate(inst);
+                        continue;
+                    };
+
+                    // All three must be expressions to generate assignment
+                    const key = if (key_val == .expr) key_val.expr else continue;
+                    const container = if (container_val == .expr) container_val.expr else continue;
+                    const value = if (value_val == .expr) value_val.expr else continue;
+
+                    const a = self.arena.allocator();
+                    const subscript = try a.create(Expr);
+                    subscript.* = .{ .subscript = .{
+                        .value = container,
+                        .slice = key,
+                        .ctx = .store,
+                    } };
+                    const stmt = try self.makeAssign(subscript, value);
+                    try stmts.append(self.allocator, stmt);
+                },
+                .STORE_SLICE => {
+                    // STORE_SLICE (3.12+): TOS3[TOS2:TOS1] = TOS
+                    // Stack: stop, start, container, value
+                    // All stack values are arena-allocated, so no manual cleanup needed
+                    const stop_val = sim.stack.pop() orelse {
+                        try sim.simulate(inst);
+                        continue;
+                    };
+                    const start_val = sim.stack.pop() orelse {
+                        try sim.simulate(inst);
+                        continue;
+                    };
+                    const container_val = sim.stack.pop() orelse {
+                        try sim.simulate(inst);
+                        continue;
+                    };
+                    const value_val = sim.stack.pop() orelse {
+                        try sim.simulate(inst);
+                        continue;
+                    };
+
+                    // All four must be expressions to generate assignment
+                    const stop = if (stop_val == .expr) stop_val.expr else continue;
+                    const start = if (start_val == .expr) start_val.expr else continue;
+                    const container = if (container_val == .expr) container_val.expr else continue;
+                    const value = if (value_val == .expr) value_val.expr else continue;
+
+                    const a = self.arena.allocator();
+                    // Build slice expression
+                    const slice_expr = try a.create(Expr);
+                    const lower = if (start.* == .constant and start.constant == .none) null else start;
+                    const upper = if (stop.* == .constant and stop.constant == .none) null else stop;
+                    slice_expr.* = .{ .slice = .{ .lower = lower, .upper = upper, .step = null } };
+
+                    const subscript = try a.create(Expr);
+                    subscript.* = .{ .subscript = .{
+                        .value = container,
+                        .slice = slice_expr,
+                        .ctx = .store,
+                    } };
+                    const stmt = try self.makeAssign(subscript, value);
+                    try stmts.append(self.allocator, stmt);
+                },
                 .RETURN_VALUE => {
                     const value = try sim.stack.popExpr();
                     const stmt = try self.makeReturn(value);
@@ -3150,6 +3225,44 @@ pub const Decompiler = struct {
                     if (try self.handleStoreValue(name, value)) |stmt| {
                         try stmts.append(a, stmt);
                     }
+                },
+                .STORE_SUBSCR => {
+                    // STORE_SUBSCR: TOS1[TOS] = TOS2
+                    // Arena allocator handles cleanup, no errdefer needed
+                    const key = try sim.stack.popExpr();
+                    const container = try sim.stack.popExpr();
+                    const value = try sim.stack.popExpr();
+
+                    const subscript = try a.create(Expr);
+                    subscript.* = .{ .subscript = .{
+                        .value = container,
+                        .slice = key,
+                        .ctx = .store,
+                    } };
+                    const stmt = try self.makeAssign(subscript, value);
+                    try stmts.append(a, stmt);
+                },
+                .STORE_SLICE => {
+                    // STORE_SLICE (3.12+): TOS3[TOS2:TOS1] = TOS
+                    // Arena allocator handles cleanup, no errdefer needed
+                    const stop = try sim.stack.popExpr();
+                    const start = try sim.stack.popExpr();
+                    const container = try sim.stack.popExpr();
+                    const value = try sim.stack.popExpr();
+
+                    const slice_expr = try a.create(Expr);
+                    const lower = if (start.* == .constant and start.constant == .none) null else start;
+                    const upper = if (stop.* == .constant and stop.constant == .none) null else stop;
+                    slice_expr.* = .{ .slice = .{ .lower = lower, .upper = upper, .step = null } };
+
+                    const subscript = try a.create(Expr);
+                    subscript.* = .{ .subscript = .{
+                        .value = container,
+                        .slice = slice_expr,
+                        .ctx = .store,
+                    } };
+                    const stmt = try self.makeAssign(subscript, value);
+                    try stmts.append(a, stmt);
                 },
                 .JUMP_FORWARD, .JUMP_BACKWARD, .JUMP_BACKWARD_NO_INTERRUPT, .JUMP_ABSOLUTE => {
                     if (loop_header) |header_id| {
