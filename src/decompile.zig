@@ -2613,10 +2613,14 @@ pub const Decompiler = struct {
 
             for (block.instructions) |inst| {
                 if (inst.opcode == .COMPARE_OP and inst.arg == 10) {
-                    if (sim.stack.peek()) |val| {
+                    // Pop the exception type - we're taking ownership
+                    if (sim.stack.pop()) |val| {
                         switch (val) {
                             .expr => |e| exc_type = e,
-                            else => {},
+                            else => {
+                                var v = val;
+                                v.deinit(a);
+                            },
                         }
                     }
                     break;

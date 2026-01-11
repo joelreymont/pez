@@ -17,8 +17,7 @@ Many "mismatches" are formatting differences (tabs/spaces, quotes, parens).
 Real issues: chained assignments expanded, some incomplete patterns.
 
 Unit tests: 108/108 passing (0 memory leaks - all fixed)
-Golden tests: 188 decompile successfully, 2 errors remaining:
+Golden tests: 189 decompile successfully, 1 error remaining:
 - async_for.3.7.pyc: NotAnExpression (async for handling issue)
-- try_except_finally.2.6.pyc: Segfault (Python 2.6 try/except/finally)
 
-Next: Address golden test mismatches or fix remaining errors
+Next: Address async_for error or golden test mismatches
