@@ -60,6 +60,18 @@ pub const Writer = struct {
         }
     }
 
+    /// Write a body block, inserting 'pass' if empty.
+    fn writeBody(self: *Writer, allocator: std.mem.Allocator, body: []const *Stmt) WriteError!void {
+        if (body.len == 0) {
+            try self.writeIndent(allocator);
+            try self.write(allocator, "pass\n");
+        } else {
+            for (body) |s| {
+                try self.writeStmt(allocator, s);
+            }
+        }
+    }
+
     /// Write an if statement, with special handling for elif chains.
     fn writeIfStmt(self: *Writer, allocator: std.mem.Allocator, i: anytype, is_elif: bool) WriteError!void {
         // Write the keyword
@@ -73,9 +85,7 @@ pub const Writer = struct {
 
         // Write body
         self.indent_level += 1;
-        for (i.body) |s| {
-            try self.writeStmt(allocator, s);
-        }
+        try self.writeBody(allocator, i.body);
         self.indent_level -= 1;
 
         // Write else/elif
@@ -87,9 +97,7 @@ pub const Writer = struct {
             } else {
                 try self.write(allocator, "else:\n");
                 self.indent_level += 1;
-                for (i.else_body) |s| {
-                    try self.writeStmt(allocator, s);
-                }
+                try self.writeBody(allocator, i.else_body);
                 self.indent_level -= 1;
             }
         }
@@ -626,17 +634,13 @@ pub const Writer = struct {
                 try self.writeExpr(allocator, w.condition);
                 try self.write(allocator, ":\n");
                 self.indent_level += 1;
-                for (w.body) |s| {
-                    try self.writeStmt(allocator, s);
-                }
+                try self.writeBody(allocator, w.body);
                 self.indent_level -= 1;
                 if (w.else_body.len > 0) {
                     try self.writeIndent(allocator);
                     try self.write(allocator, "else:\n");
                     self.indent_level += 1;
-                    for (w.else_body) |s| {
-                        try self.writeStmt(allocator, s);
-                    }
+                    try self.writeBody(allocator, w.else_body);
                     self.indent_level -= 1;
                 }
             },
@@ -648,17 +652,13 @@ pub const Writer = struct {
                 try self.writeExpr(allocator, f.iter);
                 try self.write(allocator, ":\n");
                 self.indent_level += 1;
-                for (f.body) |s| {
-                    try self.writeStmt(allocator, s);
-                }
+                try self.writeBody(allocator, f.body);
                 self.indent_level -= 1;
                 if (f.else_body.len > 0) {
                     try self.writeIndent(allocator);
                     try self.write(allocator, "else:\n");
                     self.indent_level += 1;
-                    for (f.else_body) |s| {
-                        try self.writeStmt(allocator, s);
-                    }
+                    try self.writeBody(allocator, f.else_body);
                     self.indent_level -= 1;
                 }
             },
@@ -675,14 +675,7 @@ pub const Writer = struct {
                 }
                 try self.write(allocator, ":\n");
                 self.indent_level += 1;
-                if (w.body.len == 0) {
-                    try self.writeIndent(allocator);
-                    try self.write(allocator, "pass\n");
-                } else {
-                    for (w.body) |s| {
-                        try self.writeStmt(allocator, s);
-                    }
-                }
+                try self.writeBody(allocator, w.body);
                 self.indent_level -= 1;
             },
             .match_stmt => |m| {
@@ -866,14 +859,7 @@ pub const Writer = struct {
             .try_stmt => |t| {
                 try self.write(allocator, "try:\n");
                 self.indent_level += 1;
-                if (t.body.len == 0) {
-                    try self.writeIndent(allocator);
-                    try self.write(allocator, "pass\n");
-                } else {
-                    for (t.body) |s| {
-                        try self.writeStmt(allocator, s);
-                    }
-                }
+                try self.writeBody(allocator, t.body);
                 self.indent_level -= 1;
 
                 for (t.handlers) |h| {
@@ -889,14 +875,7 @@ pub const Writer = struct {
                     }
                     try self.write(allocator, ":\n");
                     self.indent_level += 1;
-                    if (h.body.len == 0) {
-                        try self.writeIndent(allocator);
-                        try self.write(allocator, "pass\n");
-                    } else {
-                        for (h.body) |s| {
-                            try self.writeStmt(allocator, s);
-                        }
-                    }
+                    try self.writeBody(allocator, h.body);
                     self.indent_level -= 1;
                 }
 
@@ -904,9 +883,7 @@ pub const Writer = struct {
                     try self.writeIndent(allocator);
                     try self.write(allocator, "else:\n");
                     self.indent_level += 1;
-                    for (t.else_body) |s| {
-                        try self.writeStmt(allocator, s);
-                    }
+                    try self.writeBody(allocator, t.else_body);
                     self.indent_level -= 1;
                 }
 
@@ -914,9 +891,7 @@ pub const Writer = struct {
                     try self.writeIndent(allocator);
                     try self.write(allocator, "finally:\n");
                     self.indent_level += 1;
-                    for (t.finalbody) |s| {
-                        try self.writeStmt(allocator, s);
-                    }
+                    try self.writeBody(allocator, t.finalbody);
                     self.indent_level -= 1;
                 }
             },
