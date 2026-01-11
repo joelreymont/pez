@@ -120,9 +120,9 @@ const CompBuilder = struct {
     }
 
     fn deinit(self: *CompBuilder, allocator: Allocator) void {
-        // Arena-allocated, no cleanup needed
-        _ = self;
-        _ = allocator;
+        self.generators.deinit(allocator);
+        self.loop_stack.deinit(allocator);
+        allocator.destroy(self);
     }
 };
 
@@ -156,9 +156,37 @@ pub const StackValue = union(enum) {
     unknown,
 
     pub fn deinit(self: StackValue, allocator: Allocator) void {
-        // All values arena-allocated in SimContext, no manual cleanup needed
-        _ = self;
-        _ = allocator;
+        switch (self) {
+            .expr => |e| {
+                e.deinit(allocator);
+                allocator.destroy(e);
+            },
+            .function_obj => |f| {
+                for (f.decorators.items) |dec| {
+                    dec.deinit(allocator);
+                    allocator.destroy(dec);
+                }
+                f.decorators.deinit(allocator);
+                allocator.destroy(f);
+            },
+            .class_obj => |c| {
+                for (c.decorators.items) |dec| {
+                    dec.deinit(allocator);
+                    allocator.destroy(dec);
+                }
+                c.decorators.deinit(allocator);
+                for (c.bases) |base| {
+                    base.deinit(allocator);
+                    allocator.destroy(base);
+                }
+                if (c.bases.len > 0) allocator.free(c.bases);
+                allocator.destroy(c);
+            },
+            .comp_builder => |b| {
+                b.deinit(allocator);
+            },
+            else => {},
+        }
     }
 };
 
@@ -4168,6 +4196,13 @@ test "stack simulation load const" {
     try testing.expect(val == .expr);
     try testing.expect(val.expr.constant == .int);
     try testing.expectEqual(@as(i64, 42), val.expr.constant.int);
+
+    // Clean up the expression since we're using testing.allocator, not an arena
+    const popped = ctx.stack.pop().?;
+    if (popped == .expr) {
+        popped.expr.deinit(allocator);
+        allocator.destroy(popped.expr);
+    }
 }
 
 test "stack simulation dup top clones expr" {
@@ -4207,12 +4242,16 @@ test "stack simulation dup top clones expr" {
     try testing.expectEqual(@as(usize, 2), ctx.stack.len());
     const first = ctx.stack.pop().?;
     const second = ctx.stack.pop().?;
-    defer first.deinit(allocator);
-    defer second.deinit(allocator);
 
     try testing.expect(first == .expr);
     try testing.expect(second == .expr);
     try testing.expect(first.expr != second.expr);
+
+    // Clean up expressions since we're using testing.allocator, not an arena
+    first.expr.deinit(allocator);
+    allocator.destroy(first.expr);
+    second.expr.deinit(allocator);
+    allocator.destroy(second.expr);
 }
 
 test "stack simulation composite load const" {
@@ -4257,7 +4296,6 @@ test "stack simulation composite load const" {
     };
     try ctx.simulate(tuple_inst);
     const tuple_val = ctx.stack.pop().?;
-    defer tuple_val.deinit(allocator);
     try testing.expect(tuple_val == .expr);
 
     var tuple_writer = codegen.Writer.init(allocator);
@@ -4276,7 +4314,6 @@ test "stack simulation composite load const" {
     };
     try ctx.simulate(dict_inst);
     const dict_val = ctx.stack.pop().?;
-    defer dict_val.deinit(allocator);
     try testing.expect(dict_val == .expr);
 
     var dict_writer = codegen.Writer.init(allocator);
@@ -4285,6 +4322,12 @@ test "stack simulation composite load const" {
     const dict_output = try dict_writer.getOutput(allocator);
     defer allocator.free(dict_output);
     try testing.expectEqualStrings("{1: 2}", dict_output);
+
+    // Clean up expressions since we're using testing.allocator, not an arena
+    tuple_val.expr.deinit(allocator);
+    allocator.destroy(tuple_val.expr);
+    dict_val.expr.deinit(allocator);
+    allocator.destroy(dict_val.expr);
 }
 
 test "stack simulation CALL_FUNCTION_KW error clears moved args" {
@@ -4297,7 +4340,16 @@ test "stack simulation CALL_FUNCTION_KW error clears moved args" {
     const version = Version.init(3, 9);
 
     var ctx = SimContext.init(allocator, &code, version);
-    defer ctx.deinit();
+    defer {
+        // Clean up remaining stack items
+        while (ctx.stack.pop()) |val| {
+            if (val == .expr) {
+                val.expr.deinit(allocator);
+                allocator.destroy(val.expr);
+            }
+        }
+        ctx.deinit();
+    }
 
     const callable = try ast.makeName(allocator, "f", .load);
     try ctx.stack.push(.{ .expr = callable });

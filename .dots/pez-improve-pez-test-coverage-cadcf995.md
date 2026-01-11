@@ -16,6 +16,6 @@ WIP changes reduced crashes from 19 to 1. Those 18 now produce output but don't 
 Many "mismatches" are formatting differences (tabs/spaces, quotes, parens).
 Real issues: chained assignments expanded, some incomplete patterns.
 
-Unit tests: 108/108 passing (11 memory leaks in stack sim tests pre-existing)
+Unit tests: 108/108 passing (0 memory leaks - all fixed)
 
-Next: Address specific issues or commit current working state
+Next: Address golden test mismatches or expand unit test coverage
