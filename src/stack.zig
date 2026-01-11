@@ -161,30 +161,11 @@ pub const StackValue = union(enum) {
                 e.deinit(allocator);
                 allocator.destroy(e);
             },
-            .function_obj => |f| {
-                for (f.decorators.items) |dec| {
-                    dec.deinit(allocator);
-                    allocator.destroy(dec);
-                }
-                f.decorators.deinit(allocator);
-                allocator.destroy(f);
-            },
-            .class_obj => |c| {
-                for (c.decorators.items) |dec| {
-                    dec.deinit(allocator);
-                    allocator.destroy(dec);
-                }
-                c.decorators.deinit(allocator);
-                for (c.bases) |base| {
-                    base.deinit(allocator);
-                    allocator.destroy(base);
-                }
-                if (c.bases.len > 0) allocator.free(c.bases);
-                allocator.destroy(c);
-            },
             .comp_builder => |b| {
                 b.deinit(allocator);
             },
+            // function_obj and class_obj are consumed by decompiler and ownership transfers
+            // to arena or they're cleaned up explicitly by the code that creates them
             else => {},
         }
     }
