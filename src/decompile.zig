@@ -378,12 +378,20 @@ pub const Decompiler = struct {
                 },
                 .RETURN_VALUE => {
                     const value = try sim.stack.popExpr();
+                    // Skip 'return None' at module level (implicit return)
+                    if (self.isModuleLevel() and value.* == .constant and value.constant == .none) {
+                        continue;
+                    }
                     const stmt = try self.makeReturn(value);
                     try stmts.append(self.allocator, stmt);
                 },
                 .RETURN_CONST => {
                     if (sim.getConst(inst.arg)) |obj| {
                         const value = try sim.objToExpr(obj);
+                        // Skip 'return None' at module level (implicit return)
+                        if (self.isModuleLevel() and value.* == .constant and value.constant == .none) {
+                            continue;
+                        }
                         const stmt = try self.makeReturn(value);
                         try stmts.append(self.allocator, stmt);
                     }
@@ -3285,12 +3293,20 @@ pub const Decompiler = struct {
                 },
                 .RETURN_VALUE => {
                     const value = try sim.stack.popExpr();
+                    // Skip 'return None' at module level (implicit return)
+                    if (self.isModuleLevel() and value.* == .constant and value.constant == .none) {
+                        continue;
+                    }
                     const stmt = try self.makeReturn(value);
                     try stmts.append(a, stmt);
                 },
                 .RETURN_CONST => {
                     if (sim.getConst(inst.arg)) |obj| {
                         const value = try sim.objToExpr(obj);
+                        // Skip 'return None' at module level (implicit return)
+                        if (self.isModuleLevel() and value.* == .constant and value.constant == .none) {
+                            continue;
+                        }
                         const stmt = try self.makeReturn(value);
                         try stmts.append(a, stmt);
                     }
@@ -3866,6 +3882,11 @@ pub const Decompiler = struct {
             }
         }
         return false;
+    }
+
+    /// Check if this is module-level code.
+    fn isModuleLevel(self: *const Decompiler) bool {
+        return std.mem.eql(u8, self.code.name, "<module>");
     }
 };
 
