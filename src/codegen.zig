@@ -15,6 +15,14 @@ pub const UnaryOp = ast.UnaryOp;
 pub const CmpOp = ast.CmpOp;
 pub const BoolOp = ast.BoolOp;
 
+/// Pick quote character: prefer single quote unless string contains single quotes
+fn pickQuote(s: []const u8) u8 {
+    for (s) |c| {
+        if (c == '\'') return '"';
+    }
+    return '\'';
+}
+
 /// Python source code writer.
 pub const Writer = struct {
     output: std.ArrayList(u8),
@@ -363,18 +371,18 @@ pub const Writer = struct {
                 try self.writeByte(allocator, '}');
             },
             .joined_str => |j| {
-                try self.write(allocator, "f\"");
+                try self.write(allocator, "f'");
                 for (j.values) |v| {
                     switch (v.*) {
                         .constant => |c| {
                             if (c == .string) {
-                                try self.writeStringContents(allocator, c.string);
+                                try self.writeStringContents(allocator, c.string, '\'');
                             }
                         },
                         else => try self.writeExpr(allocator, v),
                     }
                 }
-                try self.writeByte(allocator, '"');
+                try self.writeByte(allocator, '\'');
             },
             .await_expr => |a| {
                 try self.write(allocator, "await ");
@@ -428,26 +436,38 @@ pub const Writer = struct {
                 }
             },
             .string => |s| {
-                try self.writeByte(allocator, '"');
-                try self.writeStringContents(allocator, s);
-                try self.writeByte(allocator, '"');
+                const quote = pickQuote(s);
+                try self.writeByte(allocator, quote);
+                try self.writeStringContents(allocator, s, quote);
+                try self.writeByte(allocator, quote);
             },
             .bytes => |b| {
-                try self.write(allocator, "b\"");
-                try self.writeStringContents(allocator, b);
-                try self.writeByte(allocator, '"');
+                const quote = pickQuote(b);
+                try self.writeByte(allocator, 'b');
+                try self.writeByte(allocator, quote);
+                try self.writeStringContents(allocator, b, quote);
+                try self.writeByte(allocator, quote);
             },
         }
     }
 
-    fn writeStringContents(self: *Writer, allocator: std.mem.Allocator, s: []const u8) !void {
+    fn writeStringContents(self: *Writer, allocator: std.mem.Allocator, s: []const u8, quote: u8) !void {
         for (s) |c| {
             switch (c) {
                 '\n' => try self.write(allocator, "\\n"),
                 '\r' => try self.write(allocator, "\\r"),
                 '\t' => try self.write(allocator, "\\t"),
                 '\\' => try self.write(allocator, "\\\\"),
-                '"' => try self.write(allocator, "\\\""),
+                '\'' => if (quote == '\'') {
+                    try self.write(allocator, "\\'");
+                } else {
+                    try self.writeByte(allocator, '\'');
+                },
+                '"' => if (quote == '"') {
+                    try self.write(allocator, "\\\"");
+                } else {
+                    try self.writeByte(allocator, '"');
+                },
                 else => {
                     if (c >= 0x20 and c < 0x7F) {
                         try self.writeByte(allocator, c);
@@ -731,7 +751,7 @@ pub const Writer = struct {
                             if (expr.* == .constant and expr.constant == .string) {
                                 try self.writeIndent(allocator);
                                 try self.write(allocator, "\"\"\"");
-                                try self.writeStringContents(allocator, expr.constant.string);
+                                try self.writeStringContents(allocator, expr.constant.string, '"');
                                 try self.write(allocator, "\"\"\"\n");
                                 continue;
                             }
@@ -779,7 +799,7 @@ pub const Writer = struct {
                             if (expr.* == .constant and expr.constant == .string) {
                                 try self.writeIndent(allocator);
                                 try self.write(allocator, "\"\"\"");
-                                try self.writeStringContents(allocator, expr.constant.string);
+                                try self.writeStringContents(allocator, expr.constant.string, '"');
                                 try self.write(allocator, "\"\"\"\n");
                                 continue;
                             }
@@ -1024,7 +1044,7 @@ test "codegen string escaping" {
     const output = try writer.getOutput(allocator);
     defer allocator.free(output);
 
-    try testing.expectEqualStrings("\"hello\\nworld\"", output);
+    try testing.expectEqualStrings("'hello\\nworld'", output);
 }
 
 test "codegen with statement" {

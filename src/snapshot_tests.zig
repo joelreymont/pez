@@ -810,7 +810,7 @@ test "snapshot ternary boolop condition output" {
     const oh = OhSnap{};
     try oh.snap(@src(),
         \\[]const u8
-        \\  "result = "yes" if a < 0 and a % 2 == 0 else "no"
+        \\  "result = 'yes' if a < 0 and a % 2 == 0 else 'no'
         \\"
     ).expectEqual(output);
 }

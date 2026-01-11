@@ -1,9 +1,10 @@
 ---
 title: Improve pez test coverage
-status: active
+status: closed
 priority: 2
 issue-type: task
-created-at: "\"\\\"\\\\\\\"2026-01-10T18:08:37.052345+02:00\\\\\\\"\\\"\""
+created-at: "\"\\\"\\\\\\\"\\\\\\\\\\\\\\\"2026-01-10T18:08:37.052345+02:00\\\\\\\\\\\\\\\"\\\\\\\"\\\"\""
+closed-at: "2026-01-11T12:42:15.825602+02:00"
 ---
 
 Working on improving decompiler test coverage.

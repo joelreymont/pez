@@ -1858,14 +1858,14 @@ pub const Decompiler = struct {
         var setup_id: ?u32 = null;
         var setup_off: ?u32 = null;
         var aiter_id: ?u32 = null;
-        var setup_scan: []const u32 = &.{try_id};
-        if (try_block.predecessors.len > 0) {
+        const setup_scan = blk: {
+            if (try_block.predecessors.len == 0) break :blk &[_]u32{try_id};
             const tmp = try self.allocator.alloc(u32, try_block.predecessors.len + 1);
-            defer self.allocator.free(tmp);
             tmp[0] = try_id;
             @memcpy(tmp[1..], try_block.predecessors);
-            setup_scan = tmp;
-        }
+            break :blk tmp;
+        };
+        defer if (try_block.predecessors.len > 0) self.allocator.free(setup_scan);
         for (setup_scan) |block_id| {
             if (block_id >= self.cfg.blocks.len) continue;
             const block = &self.cfg.blocks[block_id];
@@ -2039,12 +2039,26 @@ pub const Decompiler = struct {
         }
 
         var loop_end_off: ?u32 = null;
-        for (setup_block.instructions) |inst| {
-            if (inst.opcode == .SETUP_LOOP) {
-                const multiplier: u32 = if (self.version.gte(3, 10)) 2 else 1;
-                loop_end_off = inst.offset + inst.size + inst.arg * multiplier;
-                break;
+        // Search setup block and predecessors for SETUP_LOOP
+        const search_blocks = blk: {
+            if (setup_block.predecessors.len == 0) break :blk &[_]u32{setup_block_id};
+            const tmp = try self.allocator.alloc(u32, setup_block.predecessors.len + 1);
+            tmp[0] = setup_block_id;
+            @memcpy(tmp[1..], setup_block.predecessors);
+            break :blk tmp;
+        };
+        defer if (setup_block.predecessors.len > 0) self.allocator.free(search_blocks);
+        for (search_blocks) |bid| {
+            if (bid >= self.cfg.blocks.len) continue;
+            const blk = &self.cfg.blocks[bid];
+            for (blk.instructions) |inst| {
+                if (inst.opcode == .SETUP_LOOP) {
+                    const multiplier: u32 = if (self.version.gte(3, 10)) 2 else 1;
+                    loop_end_off = inst.offset + inst.size + inst.arg * multiplier;
+                    break;
+                }
             }
+            if (loop_end_off != null) break;
         }
         const exit_off = loop_end_off orelse return null;
         const exit_ptr = self.cfg.blockContaining(exit_off) orelse return null;
