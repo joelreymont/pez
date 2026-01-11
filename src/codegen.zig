@@ -374,7 +374,21 @@ pub const Writer = struct {
                 }
                 if (f.format_spec) |spec| {
                     try self.writeByte(allocator, ':');
-                    try self.writeExpr(allocator, spec);
+                    // Format spec is raw text, not a quoted string
+                    if (spec.* == .constant and spec.constant == .string) {
+                        try self.write(allocator, spec.constant.string);
+                    } else if (spec.* == .joined_str) {
+                        // Nested f-string format spec
+                        for (spec.joined_str.values) |v| {
+                            if (v.* == .constant and v.constant == .string) {
+                                try self.write(allocator, v.constant.string);
+                            } else {
+                                try self.writeExpr(allocator, v);
+                            }
+                        }
+                    } else {
+                        try self.writeExpr(allocator, spec);
+                    }
                 }
                 try self.writeByte(allocator, '}');
             },
@@ -384,7 +398,8 @@ pub const Writer = struct {
                     switch (v.*) {
                         .constant => |c| {
                             if (c == .string) {
-                                try self.writeStringContents(allocator, c.string, '\'');
+                                // Use in_fstring=true to escape { and } as {{ and }}
+                                try self.writeStringContentsEx(allocator, c.string, '\'', true);
                             }
                         },
                         else => try self.writeExpr(allocator, v),
@@ -460,6 +475,10 @@ pub const Writer = struct {
     }
 
     fn writeStringContents(self: *Writer, allocator: std.mem.Allocator, s: []const u8, quote: u8) !void {
+        try self.writeStringContentsEx(allocator, s, quote, false);
+    }
+
+    fn writeStringContentsEx(self: *Writer, allocator: std.mem.Allocator, s: []const u8, quote: u8, in_fstring: bool) !void {
         for (s) |c| {
             switch (c) {
                 '\n' => try self.write(allocator, "\\n"),
@@ -475,6 +494,16 @@ pub const Writer = struct {
                     try self.write(allocator, "\\\"");
                 } else {
                     try self.writeByte(allocator, '"');
+                },
+                '{' => if (in_fstring) {
+                    try self.write(allocator, "{{");
+                } else {
+                    try self.writeByte(allocator, '{');
+                },
+                '}' => if (in_fstring) {
+                    try self.write(allocator, "}}");
+                } else {
+                    try self.writeByte(allocator, '}');
                 },
                 else => {
                     if (c >= 0x20 and c < 0x7F) {
