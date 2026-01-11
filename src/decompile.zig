@@ -3070,8 +3070,49 @@ pub const Decompiler = struct {
                             continue;
                         }
                         skip_store_count = count;
+                        try sim.simulate(inst);
+                        continue;
                     }
-                    try sim.simulate(inst);
+                    // Look ahead for unpacking assignment pattern
+                    const seq_expr = sim.stack.popExpr() catch {
+                        try sim.simulate(inst);
+                        continue;
+                    };
+                    var targets: std.ArrayList([]const u8) = .{};
+                    defer targets.deinit(a);
+                    var found_all = true;
+                    var j: usize = 0;
+                    for (block.instructions) |check_inst| {
+                        if (check_inst.offset <= inst.offset) continue;
+                        if (j >= count) break;
+                        const name: ?[]const u8 = switch (check_inst.opcode) {
+                            .STORE_NAME, .STORE_GLOBAL => sim.getName(check_inst.arg),
+                            .STORE_FAST => sim.getLocal(check_inst.arg),
+                            .STORE_DEREF => sim.getDeref(check_inst.arg),
+                            else => null,
+                        };
+                        if (name) |n| {
+                            try targets.append(a, n);
+                            j += 1;
+                        } else {
+                            found_all = false;
+                            break;
+                        }
+                    }
+                    if (found_all and targets.items.len == count) {
+                        const stmt = try self.makeUnpackAssign(targets.items, seq_expr);
+                        try stmts.append(a, stmt);
+                        skip_store_count = count;
+                        // Push unknowns so skipped STORE_* have values to pop
+                        var k: u32 = 0;
+                        while (k < count) : (k += 1) {
+                            try sim.stack.push(.unknown);
+                        }
+                    } else {
+                        // Fallback: push expression back and simulate
+                        try sim.stack.push(.{ .expr = seq_expr });
+                        try sim.simulate(inst);
+                    }
                 },
                 .STORE_FAST, .STORE_NAME, .STORE_GLOBAL, .STORE_DEREF => {
                     if (skip_store_count > 0) {

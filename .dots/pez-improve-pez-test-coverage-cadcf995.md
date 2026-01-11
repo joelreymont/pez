@@ -16,8 +16,11 @@ WIP changes reduced crashes from 19 to 1. Those 18 now produce output but don't 
 Many "mismatches" are formatting differences (tabs/spaces, quotes, parens).
 Real issues: chained assignments expanded, some incomplete patterns.
 
-Unit tests: 108/108 passing (0 memory leaks - all fixed)
-Golden tests: 189 decompile successfully, 1 error remaining:
-- async_for.3.7.pyc: NotAnExpression (async for handling issue)
+Unit tests: 108/108 passing (0 memory leaks)
+Golden tests: 190/190 decompile successfully (0 errors)
 
-Next: Address async_for error or golden test mismatches
+Output quality: Many mismatches vs expected are formatting differences
+(single vs double quotes, parens). Real issues include async for being
+decompiled as try/except with yield from (not recognized as async for).
+
+Next: Improve output quality or close dot
