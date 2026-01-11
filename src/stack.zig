@@ -215,6 +215,11 @@ pub const Stack = struct {
         return self.items.items[self.items.items.len - 1];
     }
 
+    pub fn peekExpr(self: *const Stack) ?*Expr {
+        const val = self.peek() orelse return null;
+        return if (val == .expr) val.expr else null;
+    }
+
     pub fn len(self: *const Stack) usize {
         return self.items.items.len;
     }
@@ -277,6 +282,8 @@ pub const SimContext = struct {
     comp_builder: ?*CompBuilder = null,
     /// Pending keyword argument names from KW_NAMES (3.11+).
     pending_kwnames: ?[]const []const u8 = null,
+    /// GET_AWAITABLE was seen, next YIELD_FROM should be await.
+    pending_await: bool = false,
 
     pub fn init(allocator: Allocator, code: *const pyc.Code, version: Version) SimContext {
         return .{
@@ -3686,15 +3693,26 @@ pub const SimContext = struct {
             },
 
             .YIELD_FROM => {
-                // YIELD_FROM - yield from iterable
+                // YIELD_FROM - yield from iterable, or await if preceded by GET_AWAITABLE
                 const value = try self.stack.popExpr();
-                errdefer {
+
+                // Check if this is an await (GET_AWAITABLE was seen)
+                if (self.pending_await) {
+                    self.pending_await = false;
+                    // Get the awaitable from stack (GET_AWAITABLE left it there)
+                    const awaitable = try self.stack.popExpr();
+                    // Discard the None value from LOAD_CONST
                     value.deinit(self.allocator);
                     self.allocator.destroy(value);
+                    // Create await expression
+                    const expr = try self.allocator.create(Expr);
+                    expr.* = .{ .await_expr = .{ .value = awaitable } };
+                    try self.stack.push(.{ .expr = expr });
+                } else {
+                    const expr = try self.allocator.create(Expr);
+                    expr.* = .{ .yield_from = .{ .value = value } };
+                    try self.stack.push(.{ .expr = expr });
                 }
-                const expr = try self.allocator.create(Expr);
-                expr.* = .{ .yield_from = .{ .value = value } };
-                try self.stack.push(.{ .expr = expr });
             },
 
             .SEND => {
@@ -3869,7 +3887,8 @@ pub const SimContext = struct {
             // Await expression
             .GET_AWAITABLE => {
                 // GET_AWAITABLE - get awaitable from TOS
-                // Leaves awaitable on stack
+                // Set flag so YIELD_FROM creates await expression
+                self.pending_await = true;
             },
 
             .END_ASYNC_FOR => {
