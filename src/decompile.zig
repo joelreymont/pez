@@ -289,6 +289,192 @@ pub const Decompiler = struct {
                     }
                 },
                 .STORE_NAME, .STORE_FAST, .STORE_GLOBAL, .STORE_DEREF => {
+                    // Check for chain assignment pattern: DUP_TOP before STORE indicates chained assignment
+                    const real_idx = skip_first + i;
+                    const prev_was_dup = if (real_idx > 0) blk: {
+                        const prev = block.instructions[real_idx - 1];
+                        break :blk prev.opcode == .DUP_TOP or prev.opcode == .COPY;
+                    } else false;
+
+                    if (prev_was_dup) {
+                        // This is a chain assignment. Collect all targets.
+                        const arena = self.arena.allocator();
+                        var targets: std.ArrayList(*Expr) = .{};
+
+                        // Add current target
+                        const first_name = switch (inst.opcode) {
+                            .STORE_NAME, .STORE_GLOBAL => sim.getName(inst.arg) orelse "<unknown>",
+                            .STORE_FAST => sim.getLocal(inst.arg) orelse "<unknown>",
+                            .STORE_DEREF => sim.getDeref(inst.arg) orelse "<unknown>",
+                            else => "<unknown>",
+                        };
+                        const first_target = try ast.makeName(self.allocator, first_name, .store);
+                        try targets.append(arena, first_target);
+
+                        // Pop one value (the dup'd copy) - don't deinit, arena-allocated
+                        _ = sim.stack.pop() orelse return error.StackUnderflow;
+
+                        // Look ahead for more chain: (DUP_TOP + STORE)* STORE
+                        var j: usize = i + 1;
+                        while (j < instructions.len) {
+                            const next_inst = instructions[j];
+                            if (next_inst.opcode == .DUP_TOP or next_inst.opcode == .COPY) {
+                                // DUP - check what follows: could be STORE or UNPACK_SEQUENCE
+                                try sim.simulate(next_inst);
+                                if (j + 1 < instructions.len) {
+                                    const following = instructions[j + 1];
+                                    if (following.opcode == .STORE_NAME or
+                                        following.opcode == .STORE_FAST or
+                                        following.opcode == .STORE_GLOBAL or
+                                        following.opcode == .STORE_DEREF)
+                                    {
+                                        const store_name: ?[]const u8 = switch (following.opcode) {
+                                            .STORE_NAME, .STORE_GLOBAL => sim.getName(following.arg),
+                                            .STORE_FAST => sim.getLocal(following.arg),
+                                            .STORE_DEREF => sim.getDeref(following.arg),
+                                            else => null,
+                                        };
+                                        if (store_name) |sn| {
+                                            const target = try ast.makeName(self.allocator, sn, .store);
+                                            try targets.append(arena, target);
+                                            // Pop dup'd value (from the simulated DUP)
+                                            _ = sim.stack.pop() orelse return error.StackUnderflow;
+                                            j += 2;
+                                            continue;
+                                        }
+                                    } else if (following.opcode == .UNPACK_SEQUENCE) {
+                                        // DUP + UNPACK: add tuple target
+                                        const unpack_cnt = following.arg;
+                                        var tup_targets: std.ArrayList(*Expr) = .{};
+                                        try tup_targets.ensureTotalCapacity(arena, unpack_cnt);
+
+                                        var kk: usize = 0;
+                                        while (kk < unpack_cnt and j + 2 + kk < instructions.len) : (kk += 1) {
+                                            const us2 = instructions[j + 2 + kk];
+                                            const un2: ?[]const u8 = switch (us2.opcode) {
+                                                .STORE_NAME, .STORE_GLOBAL => sim.getName(us2.arg),
+                                                .STORE_FAST => sim.getLocal(us2.arg),
+                                                .STORE_DEREF => sim.getDeref(us2.arg),
+                                                else => null,
+                                            };
+                                            if (un2) |nm| {
+                                                const tgt = try ast.makeName(self.allocator, nm, .store);
+                                                try tup_targets.append(arena, tgt);
+                                            } else break;
+                                        }
+
+                                        if (tup_targets.items.len == unpack_cnt) {
+                                            const tup_expr = try self.allocator.create(Expr);
+                                            tup_expr.* = .{ .tuple = .{ .elts = tup_targets.items, .ctx = .store } };
+                                            try targets.append(arena, tup_expr);
+                                            // Pop dup'd value
+                                            _ = sim.stack.pop() orelse return error.StackUnderflow;
+                                            j += 2 + unpack_cnt;
+                                            continue;
+                                        }
+                                    } else if (following.opcode == .LOAD_NAME or
+                                        following.opcode == .LOAD_FAST or
+                                        following.opcode == .LOAD_GLOBAL or
+                                        following.opcode == .LOAD_DEREF)
+                                    {
+                                        // Possibly DUP + LOAD container + LOAD key + STORE_SUBSCR
+                                        // Or DUP + LOAD container + LOAD attr + STORE_ATTR
+                                        if (try self.tryParseSubscriptTarget(sim, instructions, j + 1, arena)) |result| {
+                                            try targets.append(arena, result.target);
+                                            // Pop dup'd value
+                                            _ = sim.stack.pop() orelse return error.StackUnderflow;
+                                            j = result.next_idx;
+                                            continue;
+                                        }
+                                    }
+                                }
+                                break;
+                            } else if (next_inst.opcode == .STORE_NAME or
+                                next_inst.opcode == .STORE_FAST or
+                                next_inst.opcode == .STORE_GLOBAL or
+                                next_inst.opcode == .STORE_DEREF)
+                            {
+                                // Final store in chain (no preceding DUP)
+                                const store_name: ?[]const u8 = switch (next_inst.opcode) {
+                                    .STORE_NAME, .STORE_GLOBAL => sim.getName(next_inst.arg),
+                                    .STORE_FAST => sim.getLocal(next_inst.arg),
+                                    .STORE_DEREF => sim.getDeref(next_inst.arg),
+                                    else => null,
+                                };
+                                if (store_name) |sn| {
+                                    const target = try ast.makeName(self.allocator, sn, .store);
+                                    try targets.append(arena, target);
+                                    j += 1;
+                                }
+                                break;
+                            } else if (next_inst.opcode == .LOAD_NAME or
+                                next_inst.opcode == .LOAD_FAST or
+                                next_inst.opcode == .LOAD_GLOBAL or
+                                next_inst.opcode == .LOAD_DEREF)
+                            {
+                                // Possibly final subscript/attr target: LOAD container + LOAD key + STORE_SUBSCR
+                                if (try self.tryParseSubscriptTarget(sim, instructions, j, arena)) |result| {
+                                    try targets.append(arena, result.target);
+                                    j = result.next_idx;
+                                }
+                                break;
+                            } else if (next_inst.opcode == .UNPACK_SEQUENCE) {
+                                // Chain with unpacking: a = [b, c] = value
+                                // Handle UNPACK_SEQUENCE followed by STORE_*
+                                const unpack_count = next_inst.arg;
+                                var tuple_targets: std.ArrayList(*Expr) = .{};
+                                try tuple_targets.ensureTotalCapacity(arena, unpack_count);
+
+                                var k: usize = 0;
+                                while (k < unpack_count and j + 1 + k < instructions.len) : (k += 1) {
+                                    const us = instructions[j + 1 + k];
+                                    const un: ?[]const u8 = switch (us.opcode) {
+                                        .STORE_NAME, .STORE_GLOBAL => sim.getName(us.arg),
+                                        .STORE_FAST => sim.getLocal(us.arg),
+                                        .STORE_DEREF => sim.getDeref(us.arg),
+                                        else => null,
+                                    };
+                                    if (un) |name| {
+                                        const t = try ast.makeName(self.allocator, name, .store);
+                                        try tuple_targets.append(arena, t);
+                                    } else break;
+                                }
+
+                                if (tuple_targets.items.len == unpack_count) {
+                                    // Create tuple/list target
+                                    const tuple_expr = try self.allocator.create(Expr);
+                                    tuple_expr.* = .{ .tuple = .{ .elts = tuple_targets.items, .ctx = .store } };
+                                    try targets.append(arena, tuple_expr);
+                                    j += 1 + unpack_count;
+                                    // UNPACK_SEQUENCE consumes the final value; don't pop here,
+                                    // the final pop at the end will get it.
+                                }
+                                break;
+                            } else {
+                                break;
+                            }
+                        }
+
+                        // Get the actual value (last one on stack)
+                        const value = sim.stack.pop() orelse return error.StackUnderflow;
+
+                        if (value == .expr) {
+                            // Create chain assignment: target1 = target2 = ... = value
+                            const stmt = try self.allocator.create(Stmt);
+                            stmt.* = .{ .assign = .{
+                                .targets = targets.items,
+                                .value = value.expr,
+                                .type_comment = null,
+                            } };
+                            try stmts.append(self.allocator, stmt);
+                        }
+
+                        // Skip processed instructions
+                        i = j - 1; // -1 because loop will increment
+                        continue;
+                    }
+
+                    // Regular single assignment
                     const name = switch (inst.opcode) {
                         .STORE_NAME, .STORE_GLOBAL => sim.getName(inst.arg) orelse "<unknown>",
                         .STORE_FAST => sim.getLocal(inst.arg) orelse "<unknown>",
@@ -304,7 +490,89 @@ pub const Decompiler = struct {
                 .STORE_SUBSCR => {
                     // STORE_SUBSCR: TOS1[TOS] = TOS2
                     // Stack: key, container, value
-                    // All stack values are arena-allocated, so no manual cleanup needed
+                    // Check for simple chain: 3 instructions back should be DUP_TOP
+                    // Only handle chains of simple subscripts, not mixed with unpacking
+                    const real_idx = skip_first + i;
+                    const is_chain = if (real_idx >= 3) blk: {
+                        const maybe_dup = block.instructions[real_idx - 3];
+                        if (maybe_dup.opcode != .DUP_TOP and maybe_dup.opcode != .COPY) break :blk false;
+                        // Check next instruction isn't UNPACK_SEQUENCE (complex case)
+                        if (i + 1 < instructions.len and instructions[i + 1].opcode == .UNPACK_SEQUENCE) break :blk false;
+                        break :blk true;
+                    } else false;
+
+                    if (is_chain) {
+                        // This is a subscript chain assignment
+                        const arena = self.arena.allocator();
+                        var targets: std.ArrayList(*Expr) = .{};
+
+                        // Build first target from current instruction's context
+                        const key_val = sim.stack.pop() orelse return error.StackUnderflow;
+                        const container_val = sim.stack.pop() orelse return error.StackUnderflow;
+                        _ = sim.stack.pop() orelse return error.StackUnderflow; // pop dup'd value
+
+                        if (key_val == .expr and container_val == .expr) {
+                            const first_target = try self.allocator.create(Expr);
+                            first_target.* = .{ .subscript = .{
+                                .value = container_val.expr,
+                                .slice = key_val.expr,
+                                .ctx = .store,
+                            } };
+                            try targets.append(arena, first_target);
+                        }
+
+                        // Look ahead for more subscript chain targets
+                        var j: usize = i + 1;
+                        while (j < instructions.len) {
+                            const next_inst = instructions[j];
+                            if (next_inst.opcode == .DUP_TOP or next_inst.opcode == .COPY) {
+                                // DUP + subscript target - check it's not followed by UNPACK
+                                const after_target = j + 4; // DUP + LOAD + LOAD + STORE_SUBSCR
+                                if (after_target < instructions.len and
+                                    instructions[after_target].opcode == .UNPACK_SEQUENCE)
+                                {
+                                    break; // Complex case, let other handler deal with it
+                                }
+                                try sim.simulate(next_inst);
+                                if (try self.tryParseSubscriptTarget(sim, instructions, j + 1, arena)) |result| {
+                                    try targets.append(arena, result.target);
+                                    _ = sim.stack.pop() orelse return error.StackUnderflow;
+                                    j = result.next_idx;
+                                    continue;
+                                }
+                                break;
+                            } else if (next_inst.opcode == .LOAD_NAME or
+                                next_inst.opcode == .LOAD_FAST or
+                                next_inst.opcode == .LOAD_GLOBAL or
+                                next_inst.opcode == .LOAD_CONST)
+                            {
+                                // Final subscript target (no DUP)
+                                if (try self.tryParseSubscriptTarget(sim, instructions, j, arena)) |result| {
+                                    try targets.append(arena, result.target);
+                                    j = result.next_idx;
+                                }
+                                break;
+                            } else {
+                                break;
+                            }
+                        }
+
+                        // Get the value
+                        const value = sim.stack.pop() orelse return error.StackUnderflow;
+                        if (value == .expr and targets.items.len > 0) {
+                            const stmt = try self.allocator.create(Stmt);
+                            stmt.* = .{ .assign = .{
+                                .targets = targets.items,
+                                .value = value.expr,
+                                .type_comment = null,
+                            } };
+                            try stmts.append(self.allocator, stmt);
+                        }
+                        i = j - 1;
+                        continue;
+                    }
+
+                    // Regular single subscript assignment
                     const key_val = sim.stack.pop() orelse {
                         try sim.simulate(inst);
                         continue;
@@ -3773,6 +4041,87 @@ pub const Decompiler = struct {
         }
 
         return stmt;
+    }
+
+    const SubscriptTargetResult = struct {
+        target: *Expr,
+        next_idx: usize,
+    };
+
+    /// Try to parse a subscript or attribute target from instruction stream.
+    /// Pattern: LOAD container, (LOAD key | LOAD_CONST key), STORE_SUBSCR
+    /// Or: LOAD container, STORE_ATTR
+    fn tryParseSubscriptTarget(
+        self: *Decompiler,
+        sim: *SimContext,
+        instructions: []const decoder.Instruction,
+        start_idx: usize,
+        arena: Allocator,
+    ) DecompileError!?SubscriptTargetResult {
+        _ = arena;
+        if (start_idx >= instructions.len) return null;
+
+        // Simulate loads to build container expression
+        var idx = start_idx;
+        const container_inst = instructions[idx];
+
+        // Get container name
+        const container_name: ?[]const u8 = switch (container_inst.opcode) {
+            .LOAD_NAME, .LOAD_GLOBAL => sim.getName(container_inst.arg),
+            .LOAD_FAST => sim.getLocal(container_inst.arg),
+            .LOAD_DEREF => sim.getDeref(container_inst.arg),
+            else => null,
+        };
+        if (container_name == null) return null;
+
+        const container = try ast.makeName(self.allocator, container_name.?, .load);
+        idx += 1;
+
+        if (idx >= instructions.len) return null;
+        const next = instructions[idx];
+
+        // Check for STORE_ATTR (container.attr)
+        if (next.opcode == .STORE_ATTR) {
+            const attr_name = sim.getName(next.arg) orelse return null;
+            const target = try self.allocator.create(Expr);
+            target.* = .{ .attribute = .{
+                .value = container,
+                .attr = attr_name,
+                .ctx = .store,
+            } };
+            return .{ .target = target, .next_idx = idx + 1 };
+        }
+
+        // Check for LOAD key + STORE_SUBSCR
+        const key_expr: ?*Expr = switch (next.opcode) {
+            .LOAD_NAME, .LOAD_GLOBAL => blk: {
+                const name = sim.getName(next.arg) orelse break :blk null;
+                break :blk try ast.makeName(self.allocator, name, .load);
+            },
+            .LOAD_FAST => blk: {
+                const name = sim.getLocal(next.arg) orelse break :blk null;
+                break :blk try ast.makeName(self.allocator, name, .load);
+            },
+            .LOAD_CONST => blk: {
+                const c = sim.getConst(next.arg) orelse break :blk null;
+                break :blk try sim.objToExpr(c);
+            },
+            else => null,
+        };
+        if (key_expr == null) return null;
+        idx += 1;
+
+        if (idx >= instructions.len) return null;
+        if (instructions[idx].opcode != .STORE_SUBSCR) return null;
+
+        // Build subscript target
+        const target = try self.allocator.create(Expr);
+        target.* = .{ .subscript = .{
+            .value = container,
+            .slice = key_expr.?,
+            .ctx = .store,
+        } };
+        return .{ .target = target, .next_idx = idx + 1 };
     }
 
     /// Create an assignment statement.

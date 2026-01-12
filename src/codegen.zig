@@ -28,12 +28,16 @@ pub const Writer = struct {
     output: std.ArrayList(u8),
     indent_level: u32,
     indent_str: []const u8,
+    /// When inside an f-string, this is the quote char used by the f-string.
+    /// Strings inside expressions must use the opposite quote.
+    fstring_quote: ?u8,
 
     pub fn init(_: std.mem.Allocator) Writer {
         return .{
             .output = .{},
             .indent_level = 0,
             .indent_str = "    ",
+            .fstring_quote = null,
         };
     }
 
@@ -366,46 +370,11 @@ pub const Writer = struct {
                 try self.writeExpr(allocator, s.value);
             },
             .formatted_value => |f| {
-                try self.writeByte(allocator, '{');
-                try self.writeExpr(allocator, f.value);
-                if (f.conversion) |c| {
-                    try self.writeByte(allocator, '!');
-                    try self.writeByte(allocator, c);
-                }
-                if (f.format_spec) |spec| {
-                    try self.writeByte(allocator, ':');
-                    // Format spec is raw text, not a quoted string
-                    if (spec.* == .constant and spec.constant == .string) {
-                        try self.write(allocator, spec.constant.string);
-                    } else if (spec.* == .joined_str) {
-                        // Nested f-string format spec
-                        for (spec.joined_str.values) |v| {
-                            if (v.* == .constant and v.constant == .string) {
-                                try self.write(allocator, v.constant.string);
-                            } else {
-                                try self.writeExpr(allocator, v);
-                            }
-                        }
-                    } else {
-                        try self.writeExpr(allocator, spec);
-                    }
-                }
-                try self.writeByte(allocator, '}');
+                // Standalone formatted_value needs f-string wrapper
+                try self.writeFormattedValue(allocator, f, false);
             },
             .joined_str => |j| {
-                try self.write(allocator, "f'");
-                for (j.values) |v| {
-                    switch (v.*) {
-                        .constant => |c| {
-                            if (c == .string) {
-                                // Use in_fstring=true to escape { and } as {{ and }}
-                                try self.writeStringContentsEx(allocator, c.string, '\'', true);
-                            }
-                        },
-                        else => try self.writeExpr(allocator, v),
-                    }
-                }
-                try self.writeByte(allocator, '\'');
+                try self.writeJoinedStr(allocator, j);
             },
             .await_expr => |a| {
                 try self.write(allocator, "await ");
@@ -423,6 +392,9 @@ pub const Writer = struct {
                 try self.writeExpr(allocator, y.value);
             },
             .lambda => |l| {
+                // Lambda has lowest precedence (0), needs parens in most contexts
+                const needs_parens = parent_prec > 0;
+                if (needs_parens) try self.writeByte(allocator, '(');
                 try self.write(allocator, "lambda");
                 const has_args = l.args.posonlyargs.len > 0 or l.args.args.len > 0 or l.args.kwonlyargs.len > 0 or
                     l.args.vararg != null or l.args.kwarg != null;
@@ -430,6 +402,7 @@ pub const Writer = struct {
                 try self.writeArguments(allocator, l.args);
                 try self.write(allocator, ": ");
                 try self.writeExpr(allocator, l.body);
+                if (needs_parens) try self.writeByte(allocator, ')');
             },
         }
     }
@@ -459,13 +432,21 @@ pub const Writer = struct {
                 }
             },
             .string => |s| {
-                const quote = pickQuote(s);
+                // Inside f-string expressions, use opposite quote from the f-string
+                const quote = if (self.fstring_quote) |fq|
+                    (if (fq == '\'') @as(u8, '"') else '\'')
+                else
+                    pickQuote(s);
                 try self.writeByte(allocator, quote);
                 try self.writeStringContents(allocator, s, quote);
                 try self.writeByte(allocator, quote);
             },
             .bytes => |b| {
-                const quote = pickQuote(b);
+                // Inside f-string expressions, use opposite quote from the f-string
+                const quote = if (self.fstring_quote) |fq|
+                    (if (fq == '\'') @as(u8, '"') else '\'')
+                else
+                    pickQuote(b);
                 try self.writeByte(allocator, 'b');
                 try self.writeByte(allocator, quote);
                 try self.writeStringContents(allocator, b, quote);
@@ -513,6 +494,177 @@ pub const Writer = struct {
                     }
                 },
             }
+        }
+    }
+
+    /// Check if an expression contains string constants with a specific quote char.
+    fn exprHasQuote(expr: *const Expr, quote: u8) bool {
+        switch (expr.*) {
+            .constant => |c| {
+                if (c == .string) {
+                    for (c.string) |ch| {
+                        if (ch == quote) return true;
+                    }
+                }
+                return false;
+            },
+            .formatted_value => |f| {
+                if (exprHasQuote(f.value, quote)) return true;
+                if (f.format_spec) |spec| {
+                    if (exprHasQuote(spec, quote)) return true;
+                }
+                return false;
+            },
+            .joined_str => |j| {
+                for (j.values) |v| {
+                    if (exprHasQuote(v, quote)) return true;
+                }
+                return false;
+            },
+            .bin_op => |b| return exprHasQuote(b.left, quote) or exprHasQuote(b.right, quote),
+            .unary_op => |u| return exprHasQuote(u.operand, quote),
+            .call => |c| {
+                if (exprHasQuote(c.func, quote)) return true;
+                for (c.args) |a| {
+                    if (exprHasQuote(a, quote)) return true;
+                }
+                for (c.keywords) |kw| {
+                    if (exprHasQuote(kw.value, quote)) return true;
+                }
+                return false;
+            },
+            .attribute => |a| return exprHasQuote(a.value, quote),
+            .subscript => |s| return exprHasQuote(s.value, quote) or exprHasQuote(s.slice, quote),
+            .list => |l| {
+                for (l.elts) |e| {
+                    if (exprHasQuote(e, quote)) return true;
+                }
+                return false;
+            },
+            .tuple => |t| {
+                for (t.elts) |e| {
+                    if (exprHasQuote(e, quote)) return true;
+                }
+                return false;
+            },
+            .dict => |d| {
+                for (d.keys) |k| {
+                    if (k != null and exprHasQuote(k.?, quote)) return true;
+                }
+                for (d.values) |v| {
+                    if (exprHasQuote(v, quote)) return true;
+                }
+                return false;
+            },
+            .if_exp => |i| {
+                return exprHasQuote(i.condition, quote) or
+                    exprHasQuote(i.body, quote) or
+                    exprHasQuote(i.else_body, quote);
+            },
+            .compare => |c| {
+                if (exprHasQuote(c.left, quote)) return true;
+                for (c.comparators) |cmp| {
+                    if (exprHasQuote(cmp, quote)) return true;
+                }
+                return false;
+            },
+            .bool_op => |b| {
+                for (b.values) |v| {
+                    if (exprHasQuote(v, quote)) return true;
+                }
+                return false;
+            },
+            .lambda => |l| return exprHasQuote(l.body, quote),
+            else => return false,
+        }
+    }
+
+    /// Pick quote char for f-string: prefer single unless expressions contain single quotes.
+    fn pickFstringQuote(values: []const *Expr) u8 {
+        // Check all formatted values for quote usage
+        for (values) |v| {
+            if (v.* == .formatted_value) {
+                if (exprHasQuote(v.formatted_value.value, '\'')) return '"';
+            }
+        }
+        return '\'';
+    }
+
+    /// Write a joined_str (f-string).
+    fn writeJoinedStr(self: *Writer, allocator: std.mem.Allocator, j: anytype) WriteError!void {
+        const quote = pickFstringQuote(j.values);
+        const saved_fstring_quote = self.fstring_quote;
+        self.fstring_quote = quote;
+        defer self.fstring_quote = saved_fstring_quote;
+
+        try self.writeByte(allocator, 'f');
+        try self.writeByte(allocator, quote);
+        for (j.values) |v| {
+            switch (v.*) {
+                .constant => |c| {
+                    if (c == .string) {
+                        try self.writeStringContentsEx(allocator, c.string, quote, true);
+                    }
+                },
+                .formatted_value => |f| {
+                    try self.writeFormattedValueInner(allocator, f);
+                },
+                else => try self.writeExpr(allocator, v),
+            }
+        }
+        try self.writeByte(allocator, quote);
+    }
+
+    /// Write a formatted value inside an f-string (no prefix needed).
+    fn writeFormattedValueInner(self: *Writer, allocator: std.mem.Allocator, f: anytype) WriteError!void {
+        try self.writeByte(allocator, '{');
+        try self.writeExpr(allocator, f.value);
+        if (f.conversion) |c| {
+            try self.writeByte(allocator, '!');
+            try self.writeByte(allocator, c);
+        }
+        if (f.format_spec) |spec| {
+            try self.writeByte(allocator, ':');
+            try self.writeFormatSpec(allocator, spec);
+        }
+        try self.writeByte(allocator, '}');
+    }
+
+    /// Write a standalone formatted value (wraps with f'...').
+    fn writeFormattedValue(self: *Writer, allocator: std.mem.Allocator, f: anytype, in_fstring: bool) WriteError!void {
+        if (!in_fstring) {
+            // Standalone formatted value - pick quote based on content
+            const quote: u8 = if (exprHasQuote(f.value, '\'')) '"' else '\'';
+            const saved_fstring_quote = self.fstring_quote;
+            self.fstring_quote = quote;
+            defer self.fstring_quote = saved_fstring_quote;
+
+            try self.writeByte(allocator, 'f');
+            try self.writeByte(allocator, quote);
+            try self.writeFormattedValueInner(allocator, f);
+            try self.writeByte(allocator, quote);
+        } else {
+            try self.writeFormattedValueInner(allocator, f);
+        }
+    }
+
+    /// Write format spec (the part after : in f-string).
+    fn writeFormatSpec(self: *Writer, allocator: std.mem.Allocator, spec: *const Expr) WriteError!void {
+        if (spec.* == .constant and spec.constant == .string) {
+            try self.write(allocator, spec.constant.string);
+        } else if (spec.* == .joined_str) {
+            // Nested f-string format spec
+            for (spec.joined_str.values) |v| {
+                if (v.* == .constant and v.constant == .string) {
+                    try self.write(allocator, v.constant.string);
+                } else if (v.* == .formatted_value) {
+                    try self.writeFormattedValue(allocator, v.formatted_value, true);
+                } else {
+                    try self.writeExpr(allocator, v);
+                }
+            }
+        } else {
+            try self.writeExpr(allocator, spec);
         }
     }
 
