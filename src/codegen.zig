@@ -791,9 +791,15 @@ pub const Writer = struct {
                 try self.writeByte(allocator, '\n');
             },
             .assign => |a| {
+                // For chain assignments with multiple targets, tuple targets need parens
+                const multi_target = a.targets.len > 1;
                 for (a.targets, 0..) |t, i| {
                     if (i > 0) try self.write(allocator, " = ");
+                    // Wrap tuple targets in parens for chain assignments
+                    const needs_parens = multi_target and t.* == .tuple;
+                    if (needs_parens) try self.writeByte(allocator, '(');
                     try self.writeExpr(allocator, t);
+                    if (needs_parens) try self.writeByte(allocator, ')');
                 }
                 try self.write(allocator, " = ");
                 try self.writeExpr(allocator, a.value);

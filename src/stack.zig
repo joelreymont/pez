@@ -1476,7 +1476,7 @@ pub const SimContext = struct {
             },
 
             .BINARY_OP => {
-                // Pop two operands, create BinOp expression
+                // Pop two operands
                 const right = try self.stack.popExpr();
                 errdefer {
                     right.deinit(self.allocator);
@@ -1488,9 +1488,20 @@ pub const SimContext = struct {
                     self.allocator.destroy(left);
                 }
 
-                const op = binOpFromArg(inst.arg);
-                const expr = try ast.makeBinOp(self.allocator, left, op, right);
-                try self.stack.push(.{ .expr = expr });
+                // BINARY_OP arg 26 is NB_SUBSCR (subscript operation)
+                if (inst.arg == 26) {
+                    const expr = try self.allocator.create(Expr);
+                    expr.* = .{ .subscript = .{
+                        .value = left,
+                        .slice = right,
+                        .ctx = .load,
+                    } };
+                    try self.stack.push(.{ .expr = expr });
+                } else {
+                    const op = binOpFromArg(inst.arg);
+                    const expr = try ast.makeBinOp(self.allocator, left, op, right);
+                    try self.stack.push(.{ .expr = expr });
+                }
             },
 
             // Legacy binary operators (Python < 3.11)
