@@ -2732,7 +2732,7 @@ const opcode_table_3_1 = [_]?Opcode{
     .LOAD_CLASSDEREF, // 148 - new in 3.4
 };
 
-/// Python 3.5 opcode byte values (adds BINARY_MATRIX_MULTIPLY and INPLACE_MATRIX_MULTIPLY)
+/// Python 3.5 opcode byte values (adds async/await, matrix multiply)
 const opcode_table_3_5 = [_]?Opcode{
     .STOP_CODE, // 0
     .POP_TOP, // 1
@@ -2784,9 +2784,9 @@ const opcode_table_3_5 = [_]?Opcode{
     null, // 47
     null, // 48
     null, // 49
-    null, // 50
-    null, // 51
-    null, // 52
+    .GET_AITER, // 50 - new in 3.5
+    .GET_ANEXT, // 51 - new in 3.5
+    .BEFORE_ASYNC_WITH, // 52 - new in 3.5
     null, // 53
     .STORE_MAP, // 54
     .INPLACE_ADD, // 55
@@ -2803,11 +2803,11 @@ const opcode_table_3_5 = [_]?Opcode{
     .BINARY_OR, // 66
     .INPLACE_POWER, // 67
     .GET_ITER, // 68
-    .STORE_LOCALS, // 69
+    .GET_YIELD_FROM_ITER, // 69 - new in 3.5
     .PRINT_EXPR, // 70
     .LOAD_BUILD_CLASS, // 71
-    null, // 72
-    null, // 73
+    .YIELD_FROM, // 72 - new in 3.5
+    .GET_AWAITABLE, // 73 - new in 3.5
     null, // 74
     .INPLACE_LSHIFT, // 75
     .INPLACE_RSHIFT, // 76
@@ -2885,9 +2885,9 @@ const opcode_table_3_5 = [_]?Opcode{
     .LOAD_CLASSDEREF, // 148 - new in 3.4, kept in 3.5
     null, // 149
     null, // 150
-    .GET_AWAITABLE, // 151 - new in 3.5
-    .GET_AITER, // 152 - new in 3.5
-    .GET_ANEXT, // 153 - new in 3.5
+    null, // 151
+    null, // 152
+    null, // 153
     null, // 154
     null, // 155
     null, // 156
