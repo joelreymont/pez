@@ -1356,15 +1356,16 @@ pub const SimContext = struct {
                     inst.arg >> 1
                 else
                     inst.arg;
-                if (inst.opcode == .LOAD_GLOBAL and self.version.gte(3, 11) and (inst.arg & 1) == 1) {
-                    try self.stack.push(.null_marker);
-                }
+                const push_null = inst.opcode == .LOAD_GLOBAL and self.version.gte(3, 11) and (inst.arg & 1) == 1;
                 if (self.getName(name_idx)) |name| {
                     const expr = try ast.makeName(self.allocator, name, .load);
                     try self.stack.push(.{ .expr = expr });
                 } else {
                     try self.stack.push(.unknown);
                 }
+                // In 3.11+: push NULL on TOP for call preparation
+                // Stack order: [callable, NULL/self, args...] from bottom to top
+                if (push_null) try self.stack.push(.null_marker);
             },
 
             .LOAD_FAST, .LOAD_FAST_CHECK, .LOAD_FAST_BORROW => {
@@ -1472,6 +1473,20 @@ pub const SimContext = struct {
                         const target = try ast.makeName(self.allocator, store_name, .store);
                         try self.addCompTarget(builder, target);
                     }
+                }
+            },
+
+            .STORE_FAST_STORE_FAST => {
+                // STORE_FAST_STORE_FAST - store TOS into local1 then TOS into local2
+                // arg packs indices in 4-bit nibbles: (hi=idx1, lo=idx2)
+                // Pops two values from stack
+                if (self.stack.pop()) |v| {
+                    var val = v;
+                    val.deinit(self.allocator);
+                }
+                if (self.stack.pop()) |v| {
+                    var val = v;
+                    val.deinit(self.allocator);
                 }
             },
 
@@ -1742,39 +1757,39 @@ pub const SimContext = struct {
             },
 
             .CALL => {
-                // In 3.11+: CALL argc with stack layout [NULL/self, callable, args...]
+                // In 3.11+: CALL argc with stack layout [callable, NULL/self, args...]
+                // PUSH_NULL pushes NULL on TOP of callable, so stack is: callable, NULL, arg0, arg1...
                 const argc = inst.arg;
                 const args_vals = try self.stack.popN(argc);
 
-                // Pop callable
-                const callable_val = self.stack.pop() orelse {
-                    self.deinitStackValues(args_vals);
-                    return error.StackUnderflow;
-                };
-                var callable = callable_val;
-                var iter_expr_from_stack: ?*Expr = null;
-
-                // Pop NULL marker (or self for method calls)
+                // Pop NULL marker (or self for method calls) - this is on TOP
                 const null_or_self = self.stack.pop() orelse {
-                    callable_val.deinit(self.allocator);
                     self.deinitStackValues(args_vals);
                     return error.StackUnderflow;
                 };
+
+                // Pop callable - this is BELOW the NULL/self marker
+                const callable_val = self.stack.pop() orelse {
+                    null_or_self.deinit(self.allocator);
+                    self.deinitStackValues(args_vals);
+                    return error.StackUnderflow;
+                };
+                const callable = callable_val;
+                var iter_expr_from_stack: ?*Expr = null;
 
                 // Handle the NULL/self marker
                 if (null_or_self == .null_marker) {
-                    // Function call - discard NULL marker
-                } else if (argc == 0 and callable_val == .expr) {
-                    // Could be a comprehension call like iter_func(iter_expr)
-                    if (null_or_self == .comp_obj) {
-                        iter_expr_from_stack = callable_val.expr;
-                        callable = null_or_self;
-                    } else {
-                        // Method call or some other case - discard the extra value
-                        null_or_self.deinit(self.allocator);
-                    }
+                    // Function call with PUSH_NULL - discard NULL marker (already popped)
+                } else if (argc == 0 and callable_val == .comp_obj and null_or_self == .expr) {
+                    // Comprehension call: gen_func(iter_expr) without PUSH_NULL
+                    // Stack was [gen_func, iter] with iter on top
+                    iter_expr_from_stack = null_or_self.expr;
+                    // callable_val is already the comp_obj
+                } else if (argc == 0 and callable_val == .function_obj and null_or_self == .expr) {
+                    // Another comprehension pattern with function_obj
+                    iter_expr_from_stack = null_or_self.expr;
                 } else {
-                    // Method call - discard self
+                    // Method call or some other case - discard the extra value
                     null_or_self.deinit(self.allocator);
                 }
 
@@ -3093,14 +3108,16 @@ pub const SimContext = struct {
                         }
                         const name_idx = if (self.version.gte(3, 11)) inst.arg >> 1 else inst.arg;
                         if (self.getName(name_idx)) |attr_name| {
-                            if (push_null) try self.stack.push(.null_marker);
                             const attr = try ast.makeAttribute(self.allocator, obj, attr_name, .load);
                             try self.stack.push(.{ .expr = attr });
+                            // In 3.11+: push NULL on TOP for method call preparation
+                            // Stack order: [callable, NULL/self, args...] from bottom to top
+                            if (push_null) try self.stack.push(.null_marker);
                         } else {
                             obj.deinit(self.allocator);
                             self.allocator.destroy(obj);
-                            if (push_null) try self.stack.push(.null_marker);
                             try self.stack.push(.unknown);
+                            if (push_null) try self.stack.push(.null_marker);
                         }
                     },
                     .import_module => |imp| {
@@ -3118,7 +3135,8 @@ pub const SimContext = struct {
 
             .LOAD_METHOD => {
                 // LOAD_METHOD namei - prepare method call with optional self slot
-                // Pushes (NULL/self, method) for use by CALL
+                // Pre-3.11: Stack order [NULL, method] with method on top for CALL_METHOD
+                // 3.11+: Stack order [method, NULL] with NULL on top for CALL
                 const obj = try self.stack.popExpr();
                 errdefer {
                     obj.deinit(self.allocator);
@@ -3126,15 +3144,26 @@ pub const SimContext = struct {
                 }
                 const name_idx = if (self.version.gte(3, 11)) inst.arg >> 1 else inst.arg;
                 if (self.getName(name_idx)) |attr_name| {
-                    // Push NULL marker (or self in real execution, but we use NULL for simulation)
-                    try self.stack.push(.null_marker);
                     const attr = try ast.makeAttribute(self.allocator, obj, attr_name, .load);
-                    try self.stack.push(.{ .expr = attr });
+                    if (self.version.gte(3, 11)) {
+                        // 3.11+: callable on bottom, NULL on top
+                        try self.stack.push(.{ .expr = attr });
+                        try self.stack.push(.null_marker);
+                    } else {
+                        // Pre-3.11: NULL on bottom, method on top
+                        try self.stack.push(.null_marker);
+                        try self.stack.push(.{ .expr = attr });
+                    }
                 } else {
                     obj.deinit(self.allocator);
                     self.allocator.destroy(obj);
-                    try self.stack.push(.null_marker);
-                    try self.stack.push(.unknown);
+                    if (self.version.gte(3, 11)) {
+                        try self.stack.push(.unknown);
+                        try self.stack.push(.null_marker);
+                    } else {
+                        try self.stack.push(.null_marker);
+                        try self.stack.push(.unknown);
+                    }
                 }
             },
 

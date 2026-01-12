@@ -25,6 +25,14 @@ const StackValue = stack_mod.StackValue;
 const Opcode = decoder.Opcode;
 pub const DecompileError = stack_mod.SimError || error{ UnexpectedEmptyWorklist, InvalidBlock };
 
+/// Check if an opcode is a LOAD instruction.
+fn isLoadInstr(op: Opcode) bool {
+    return switch (op) {
+        .LOAD_NAME, .LOAD_FAST, .LOAD_GLOBAL, .LOAD_DEREF, .LOAD_FAST_BORROW, .LOAD_FAST_CHECK => true,
+        else => false,
+    };
+}
+
 /// Error context for debugging.
 pub const ErrorContext = struct {
     code_name: []const u8,
@@ -57,6 +65,8 @@ pub const Decompiler = struct {
     print_dest: ?*Expr = null,
     /// Error context for debugging.
     last_error_ctx: ?ErrorContext = null,
+    /// Pending chain targets from STORE_ATTR before UNPACK_SEQUENCE.
+    pending_chain_targets: std.ArrayList(*Expr),
 
     pub fn init(allocator: Allocator, code: *const pyc.Code, version: Version) DecompileError!Decompiler {
         var arena = std.heap.ArenaAllocator.init(allocator);
@@ -90,6 +100,7 @@ pub const Decompiler = struct {
             .statements = .{},
             .nested_decompilers = .{},
             .print_items = .{},
+            .pending_chain_targets = .{},
         };
     }
 
@@ -100,6 +111,7 @@ pub const Decompiler = struct {
         }
         self.nested_decompilers.deinit(self.allocator);
         self.print_items.deinit(self.allocator);
+        self.pending_chain_targets.deinit(self.allocator);
         self.analyzer.deinit();
         self.dom.deinit();
         self.arena.deinit();
@@ -251,37 +263,137 @@ pub const Decompiler = struct {
             };
             switch (inst.opcode) {
                 .UNPACK_SEQUENCE => {
-                    // Look ahead for N STORE_* instructions to generate unpacking assignment
+                    // Look ahead for N store targets to generate unpacking assignment
+                    // Targets can be: STORE_*, or LOAD + STORE_ATTR, or LOAD + STORE_SUBSCR
                     const count = inst.arg;
                     const seq_expr = try sim.stack.popExpr();
                     const arena = self.arena.allocator();
 
-                    // Collect target names from following STORE_* instructions
-                    var targets = try std.ArrayList([]const u8).initCapacity(arena, count);
+                    // Collect targets from following instructions
+                    var targets = try std.ArrayList(*Expr).initCapacity(arena, count);
+                    var skip_count: usize = 0;
 
                     var j: usize = 0;
-                    while (j < count and i + 1 + j < instructions.len) : (j += 1) {
-                        const store_inst = instructions[i + 1 + j];
-                        const name: ?[]const u8 = switch (store_inst.opcode) {
+                    var instr_idx: usize = i + 1;
+                    while (j < count and instr_idx < instructions.len) : (j += 1) {
+                        const store_inst = instructions[instr_idx];
+                        // STORE_FAST_STORE_FAST: stores two values
+                        if (store_inst.opcode == .STORE_FAST_STORE_FAST and j + 1 < count) {
+                            const idx1 = (store_inst.arg >> 4) & 0xF;
+                            const idx2 = store_inst.arg & 0xF;
+                            if (sim.getLocal(idx1)) |n1| {
+                                const t1 = try ast.makeName(arena, n1, .store);
+                                try targets.append(arena, t1);
+                            }
+                            if (sim.getLocal(idx2)) |n2| {
+                                const t2 = try ast.makeName(arena, n2, .store);
+                                try targets.append(arena, t2);
+                            }
+                            j += 1; // Count as 2 targets
+                            skip_count += 1;
+                            instr_idx += 1;
+                            continue;
+                        }
+                        // Simple STORE_* instructions
+                        const simple_name: ?[]const u8 = switch (store_inst.opcode) {
                             .STORE_NAME, .STORE_GLOBAL => sim.getName(store_inst.arg),
                             .STORE_FAST => sim.getLocal(store_inst.arg),
                             .STORE_DEREF => sim.getDeref(store_inst.arg),
                             else => null,
                         };
-                        if (name) |n| {
-                            try targets.append(arena, n);
-                        } else {
-                            break;
+                        if (simple_name) |n| {
+                            const target = try ast.makeName(arena, n, .store);
+                            try targets.append(arena, target);
+                            skip_count += 1;
+                            instr_idx += 1;
+                            continue;
                         }
+                        // LOAD + STORE_ATTR pattern: LOAD_FAST self, STORE_ATTR b
+                        if (isLoadInstr(store_inst.opcode) and instr_idx + 1 < instructions.len) {
+                            const next = instructions[instr_idx + 1];
+                            if (next.opcode == .STORE_ATTR) {
+                                // Simulate the LOAD to get container expr
+                                try sim.simulate(store_inst);
+                                const container = sim.stack.pop() orelse break;
+                                if (container != .expr) {
+                                    container.deinit(sim.allocator);
+                                    break;
+                                }
+                                const attr_name = sim.getName(next.arg) orelse break;
+                                const target = try ast.makeAttribute(arena, container.expr, attr_name, .store);
+                                try targets.append(arena, target);
+                                skip_count += 2;
+                                instr_idx += 2;
+                                continue;
+                            } else if (next.opcode == .STORE_SUBSCR and instr_idx + 2 < instructions.len) {
+                                // LOAD container, LOAD index, STORE_SUBSCR
+                                const idx_inst = instructions[instr_idx + 1];
+                                if (isLoadInstr(idx_inst.opcode) or idx_inst.opcode == .LOAD_SMALL_INT or idx_inst.opcode == .LOAD_CONST) {
+                                    try sim.simulate(store_inst);
+                                    try sim.simulate(idx_inst);
+                                    const idx_val = sim.stack.pop() orelse break;
+                                    const cont_val = sim.stack.pop() orelse {
+                                        idx_val.deinit(sim.allocator);
+                                        break;
+                                    };
+                                    if (cont_val != .expr or idx_val != .expr) {
+                                        cont_val.deinit(sim.allocator);
+                                        idx_val.deinit(sim.allocator);
+                                        break;
+                                    }
+                                    const target = try ast.makeSubscript(arena, cont_val.expr, idx_val.expr, .store);
+                                    try targets.append(arena, target);
+                                    skip_count += 3;
+                                    instr_idx += 3;
+                                    continue;
+                                }
+                            }
+                        }
+                        break;
                     }
 
                     if (targets.items.len == count) {
+                        // Check for pending chain targets from preceding STORE_ATTR
+                        const has_pending = self.pending_chain_targets.items.len > 0;
+                        if (has_pending) {
+                            // Combine pending targets with unpack targets
+                            // Create: self.a = (self.b, self.c) = expr
+                            const all_targets = try arena.alloc(*Expr, 1 + self.pending_chain_targets.items.len);
+
+                            // First, create tuple from unpack targets
+                            const tuple_expr = try arena.create(Expr);
+                            tuple_expr.* = .{ .tuple = .{
+                                .elts = try arena.dupe(*Expr, targets.items),
+                                .ctx = .store,
+                            } };
+
+                            // Put pending targets first (leftmost in chain), then tuple
+                            for (self.pending_chain_targets.items, 0..) |t, idx| {
+                                all_targets[idx] = t;
+                            }
+                            all_targets[self.pending_chain_targets.items.len] = tuple_expr;
+                            self.pending_chain_targets.clearRetainingCapacity();
+
+                            const stmt = try arena.create(Stmt);
+                            stmt.* = .{ .assign = .{
+                                .targets = all_targets,
+                                .value = seq_expr,
+                                .type_comment = null,
+                            } };
+                            try stmts.append(self.allocator, stmt);
+                            i += skip_count;
+                            continue;
+                        }
                         // Generate unpacking assignment: a, b, c = expr
-                        const stmt = try self.makeUnpackAssign(targets.items, seq_expr);
+                        const stmt = try self.makeUnpackAssignExprs(targets.items, seq_expr);
                         try stmts.append(self.allocator, stmt);
-                        i += count; // Skip the STORE instructions
+                        i += skip_count; // Skip the processed instructions
                     } else {
                         // Fallback: push unknown for each element
+                        for (targets.items) |t| {
+                            t.deinit(arena);
+                            arena.destroy(t);
+                        }
                         var k: u32 = 0;
                         while (k < count) : (k += 1) {
                             try sim.stack.push(.unknown);
@@ -342,6 +454,22 @@ pub const Decompiler = struct {
                                             j += 2;
                                             continue;
                                         }
+                                    } else if (following.opcode == .STORE_FAST_STORE_FAST) {
+                                        // DUP + STORE_FAST_STORE_FAST: stores two values
+                                        const idx1 = (following.arg >> 4) & 0xF;
+                                        const idx2 = following.arg & 0xF;
+                                        if (sim.getLocal(idx1)) |n1| {
+                                            const t1 = try ast.makeName(arena, n1, .store);
+                                            try targets.append(arena, t1);
+                                        }
+                                        if (sim.getLocal(idx2)) |n2| {
+                                            const t2 = try ast.makeName(arena, n2, .store);
+                                            try targets.append(arena, t2);
+                                        }
+                                        // Pop dup'd value
+                                        _ = sim.stack.pop() orelse return error.StackUnderflow;
+                                        j += 2;
+                                        continue;
                                     } else if (following.opcode == .UNPACK_SEQUENCE) {
                                         // DUP + UNPACK: add tuple target (may be subscripts/attrs)
                                         const unpack_cnt = following.arg;
@@ -352,6 +480,23 @@ pub const Decompiler = struct {
                                         var found: usize = 0;
                                         while (found < unpack_cnt and kk < instructions.len) {
                                             const us2 = instructions[kk];
+                                            // STORE_FAST_STORE_FAST: stores two values
+                                            if (us2.opcode == .STORE_FAST_STORE_FAST and found + 1 < unpack_cnt) {
+                                                const idx1 = (us2.arg >> 4) & 0xF;
+                                                const idx2 = us2.arg & 0xF;
+                                                if (sim.getLocal(idx1)) |n1| {
+                                                    const t1 = try ast.makeName(arena, n1, .store);
+                                                    try tup_targets.append(arena, t1);
+                                                    found += 1;
+                                                }
+                                                if (sim.getLocal(idx2)) |n2| {
+                                                    const t2 = try ast.makeName(arena, n2, .store);
+                                                    try tup_targets.append(arena, t2);
+                                                    found += 1;
+                                                }
+                                                kk += 1;
+                                                continue;
+                                            }
                                             const un2: ?[]const u8 = switch (us2.opcode) {
                                                 .STORE_NAME, .STORE_GLOBAL => sim.getName(us2.arg),
                                                 .STORE_FAST => sim.getLocal(us2.arg),
@@ -445,6 +590,23 @@ pub const Decompiler = struct {
                                 var targets_found: usize = 0;
                                 while (targets_found < unpack_count and k < instructions.len) {
                                     const us = instructions[k];
+                                    // STORE_FAST_STORE_FAST: stores two values at once
+                                    if (us.opcode == .STORE_FAST_STORE_FAST and targets_found + 1 < unpack_count) {
+                                        const idx1 = (us.arg >> 4) & 0xF;
+                                        const idx2 = us.arg & 0xF;
+                                        if (sim.getLocal(idx1)) |n1| {
+                                            const t1 = try ast.makeName(arena, n1, .store);
+                                            try tuple_targets.append(arena, t1);
+                                            targets_found += 1;
+                                        }
+                                        if (sim.getLocal(idx2)) |n2| {
+                                            const t2 = try ast.makeName(arena, n2, .store);
+                                            try tuple_targets.append(arena, t2);
+                                            targets_found += 1;
+                                        }
+                                        k += 1;
+                                        continue;
+                                    }
                                     // Try simple STORE_* first
                                     const un: ?[]const u8 = switch (us.opcode) {
                                         .STORE_NAME, .STORE_GLOBAL => sim.getName(us.arg),
@@ -815,10 +977,29 @@ pub const Decompiler = struct {
                     // Check for chain: 2 instructions back should be DUP_TOP
                     // Pattern: DUP_TOP, LOAD container, STORE_ATTR
                     const real_idx = skip_first + i;
-                    const is_chain = if (real_idx >= 2) blk: {
+                    const has_dup_before = if (real_idx >= 2) blk: {
                         const maybe_dup = block.instructions[real_idx - 2];
                         break :blk maybe_dup.opcode == .DUP_TOP or maybe_dup.opcode == .COPY;
                     } else false;
+                    const next_is_unpack = if (i + 1 < instructions.len)
+                        instructions[i + 1].opcode == .UNPACK_SEQUENCE
+                    else
+                        false;
+
+                    // If part of a chain followed by UNPACK_SEQUENCE, defer to UNPACK handler
+                    if (has_dup_before and next_is_unpack) {
+                        const arena = self.arena.allocator();
+                        const container_val = sim.stack.pop() orelse return error.StackUnderflow;
+                        _ = sim.stack.pop() orelse return error.StackUnderflow; // pop dup'd value
+                        if (container_val == .expr) {
+                            const attr_name = sim.getName(inst.arg) orelse "<unknown>";
+                            const target = try ast.makeAttribute(arena, container_val.expr, attr_name, .store);
+                            try self.pending_chain_targets.append(self.allocator, target);
+                        }
+                        continue;
+                    }
+
+                    const is_chain = has_dup_before;
 
                     if (is_chain) {
                         // This is an attribute chain assignment
@@ -4557,6 +4738,28 @@ pub const Decompiler = struct {
         const tuple_expr = try a.create(Expr);
         tuple_expr.* = .{ .tuple = .{
             .elts = try target_exprs.toOwnedSlice(a),
+            .ctx = .store,
+        } };
+
+        const targets = try a.alloc(*Expr, 1);
+        targets[0] = tuple_expr;
+
+        const stmt = try a.create(Stmt);
+        stmt.* = .{ .assign = .{
+            .targets = targets,
+            .value = value,
+            .type_comment = null,
+        } };
+        return stmt;
+    }
+
+    /// Create unpacking assignment from expr targets: (self.a, b[0]) = expr
+    fn makeUnpackAssignExprs(self: *Decompiler, target_exprs: []*Expr, value: *Expr) DecompileError!*Stmt {
+        const a = self.arena.allocator();
+
+        const tuple_expr = try a.create(Expr);
+        tuple_expr.* = .{ .tuple = .{
+            .elts = try a.dupe(*Expr, target_exprs),
             .ctx = .store,
         } };
 
