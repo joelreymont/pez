@@ -3170,8 +3170,7 @@ pub const Decompiler = struct {
         std.mem.sort(u32, handler_blocks.items, {}, std.sort.asc(u32));
 
         if (self.version.gte(3, 11)) {
-            const max_handler = handler_blocks.items[handler_blocks.items.len - 1];
-            return .{ .stmt = null, .next_block = max_handler + 1 };
+            return try self.decompileTry311(pattern, handler_blocks.items);
         }
 
         var handler_set = try std.DynamicBitSet.initEmpty(self.allocator, self.cfg.blocks.len);
@@ -3619,6 +3618,212 @@ pub const Decompiler = struct {
         }
 
         return stmts.toOwnedSlice(self.allocator);
+    }
+
+    /// Decompile try/except for Python 3.11+
+    fn decompileTry311(
+        self: *Decompiler,
+        pattern: ctrl.TryPattern,
+        handler_ids: []const u32,
+    ) DecompileError!PatternResult {
+        const a = self.arena.allocator();
+
+        // Find first handler block
+        if (handler_ids.len == 0) {
+            return .{ .stmt = null, .next_block = pattern.try_block + 1 };
+        }
+
+        const first_handler = handler_ids[0];
+        const max_handler = handler_ids[handler_ids.len - 1];
+
+        // Decompile try body (blocks from try_block to first handler)
+        const try_body = try self.decompileBlockRangeWithStack(
+            pattern.try_block,
+            first_handler,
+            &.{},
+        );
+
+        // Decompile handlers
+        var handlers: std.ArrayList(ast.ExceptHandler) = .{};
+        errdefer handlers.deinit(a);
+
+        // Track actual end of all handler blocks for marking processed
+        var actual_end: u32 = max_handler + 1;
+
+        for (handler_ids) |hid| {
+            if (hid >= self.cfg.blocks.len) continue;
+            const handler_block = &self.cfg.blocks[hid];
+
+            // Skip cleanup blocks (RERAISE without PUSH_EXC_INFO pattern)
+            var has_push_exc = false;
+            var has_reraise = false;
+            for (handler_block.instructions) |inst| {
+                if (inst.opcode == .PUSH_EXC_INFO) has_push_exc = true;
+                if (inst.opcode == .RERAISE) has_reraise = true;
+            }
+            if (!has_push_exc and has_reraise) continue;
+
+            // Extract exception type and name from handler header
+            // Python 3.11+ handler patterns:
+            // - Bare except: PUSH_EXC_INFO, POP_TOP, <body>, POP_EXCEPT
+            // - except Type: PUSH_EXC_INFO, <load type>, CHECK_EXC_MATCH, POP_JUMP_IF_FALSE, POP_TOP, <body>
+            // - except Type as e: PUSH_EXC_INFO, <load type>, CHECK_EXC_MATCH, POP_JUMP_IF_FALSE, STORE_*, <body>
+            var exc_type: ?*Expr = null;
+            var exc_name: ?[]const u8 = null;
+            var body_skip: usize = 0;
+
+            var sim = SimContext.init(a, self.code, self.version);
+            defer sim.deinit();
+
+            var seen_push_exc = false;
+            var seen_check_match = false;
+            var seen_cond_jump = false;
+
+            for (handler_block.instructions, 0..) |inst, i| {
+                switch (inst.opcode) {
+                    .PUSH_EXC_INFO => {
+                        seen_push_exc = true;
+                        body_skip = i + 1;
+                    },
+                    .NOT_TAKEN => {
+                        // NOT_TAKEN is just a marker, skip and continue
+                        body_skip = i + 1;
+                    },
+                    .POP_TOP => {
+                        if (seen_push_exc and !seen_check_match) {
+                            // Bare except - POP_TOP discards exception, body starts here
+                            body_skip = i + 1;
+                            break;
+                        } else if (seen_cond_jump) {
+                            // After conditional jump in typed except - pops exception value
+                            body_skip = i + 1;
+                            break;
+                        }
+                        body_skip = i + 1;
+                    },
+                    .CHECK_EXC_MATCH => {
+                        // Exception type is on stack BEFORE this instruction consumes it
+                        seen_check_match = true;
+                        if (sim.stack.peek()) |val| {
+                            switch (val) {
+                                .expr => |e| exc_type = e,
+                                else => {},
+                            }
+                        }
+                        // Don't pop - let simulation handle it (it pushes bool)
+                        body_skip = i + 1;
+                    },
+                    .POP_JUMP_IF_FALSE, .POP_JUMP_IF_TRUE => {
+                        seen_cond_jump = true;
+                        body_skip = i + 1;
+                    },
+                    .STORE_NAME, .STORE_FAST, .STORE_GLOBAL => {
+                        if (seen_cond_jump) {
+                            // This is "except Type as name:" - store the exception name
+                            exc_name = switch (inst.opcode) {
+                                .STORE_NAME, .STORE_GLOBAL => sim.getName(inst.arg),
+                                .STORE_FAST => sim.getLocal(inst.arg),
+                                else => null,
+                            };
+                            body_skip = i + 1;
+                            break;
+                        }
+                        // Otherwise it's part of body
+                        break;
+                    },
+                    else => {
+                        sim.simulate(inst) catch {};
+                    },
+                }
+            }
+
+            // For typed except, body is in fall-through successor after cond jump
+            var body_block = hid;
+            if (seen_check_match and seen_cond_jump) {
+                // Body is NOT_TAKEN path (conditional_true = exception matched)
+                for (handler_block.successors) |edge| {
+                    if (edge.edge_type == .conditional_true) {
+                        body_block = edge.target;
+                        body_skip = 0;
+                        break;
+                    }
+                }
+                // Check body block for "as name:" binding (NOT_TAKEN, STORE_NAME pattern)
+                if (body_block < self.cfg.blocks.len) {
+                    const body_blk = &self.cfg.blocks[body_block];
+                    for (body_blk.instructions, 0..) |inst, i| {
+                        if (inst.opcode == .NOT_TAKEN) {
+                            body_skip = i + 1;
+                        } else if (inst.opcode == .STORE_NAME or inst.opcode == .STORE_FAST or inst.opcode == .STORE_GLOBAL) {
+                            // "except Type as name:" - extract name
+                            exc_name = switch (inst.opcode) {
+                                .STORE_NAME, .STORE_GLOBAL => sim.getName(inst.arg),
+                                .STORE_FAST => sim.getLocal(inst.arg),
+                                else => null,
+                            };
+                            body_skip = i + 1;
+                            break;
+                        } else if (inst.opcode == .POP_TOP) {
+                            // "except Type:" without name binding
+                            body_skip = i + 1;
+                            break;
+                        } else {
+                            break;
+                        }
+                    }
+                }
+            }
+
+            // Find body end
+            var handler_end_block = body_block + 1;
+            if (body_block < self.cfg.blocks.len) {
+                const body_blk = &self.cfg.blocks[body_block];
+                for (body_blk.successors) |edge| {
+                    if (edge.edge_type == .normal) {
+                        handler_end_block = edge.target;
+                        break;
+                    }
+                }
+            }
+
+            // Decompile handler body
+            const handler_body = try self.decompileBlockRangeWithStackAndSkip(
+                body_block,
+                handler_end_block,
+                &.{},
+                body_skip,
+            );
+
+            try handlers.append(a, .{
+                .type = exc_type,
+                .name = exc_name,
+                .body = handler_body,
+            });
+
+            // Track the actual end of processed blocks
+            if (handler_end_block > actual_end) actual_end = handler_end_block;
+        }
+
+        if (handlers.items.len == 0) {
+            // No real handlers, skip
+            return .{ .stmt = null, .next_block = max_handler + 1 };
+        }
+
+        // Mark all processed blocks to prevent re-detection
+        self.analyzer.markProcessed(pattern.try_block, actual_end);
+
+        // Build try statement
+        const try_stmt = try a.create(Stmt);
+        try_stmt.* = .{
+            .try_stmt = .{
+                .body = try_body,
+                .handlers = try handlers.toOwnedSlice(a),
+                .else_body = &.{},
+                .finalbody = &.{},
+            },
+        };
+
+        return .{ .stmt = try_stmt, .next_block = actual_end };
     }
 
     fn decompileTryBody(self: *Decompiler, start: u32, end: u32) DecompileError![]const *Stmt {
