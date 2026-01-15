@@ -3636,22 +3636,52 @@ pub const SimContext = struct {
                 // No stack effect
             },
 
-            // Format string opcodes
-            .FORMAT_SIMPLE => {
-                // FORMAT_SIMPLE - format TOS for f-string (no conversion, no format spec)
+            .CONVERT_VALUE => {
+                // CONVERT_VALUE conversion - applies str/repr/ascii to TOS
+                // arg: 1=str(), 2=repr(), 3=ascii()
                 const value = try self.stack.popExpr();
                 errdefer {
                     value.deinit(self.allocator);
                     self.allocator.destroy(value);
                 }
 
+                const conv: u8 = switch (inst.arg) {
+                    1 => 's',
+                    2 => 'r',
+                    3 => 'a',
+                    else => 's',
+                };
+
                 const expr = try self.allocator.create(Expr);
                 expr.* = .{ .formatted_value = .{
                     .value = value,
-                    .conversion = null,
+                    .conversion = conv,
                     .format_spec = null,
                 } };
                 try self.stack.push(.{ .expr = expr });
+            },
+
+            // Format string opcodes
+            .FORMAT_SIMPLE => {
+                // FORMAT_SIMPLE - format TOS for f-string (no conversion, no format spec)
+                // If TOS is already formatted_value (from CONVERT_VALUE), just pass through
+                const value = try self.stack.popExpr();
+                if (value.* == .formatted_value) {
+                    try self.stack.push(.{ .expr = value });
+                } else {
+                    errdefer {
+                        value.deinit(self.allocator);
+                        self.allocator.destroy(value);
+                    }
+
+                    const expr = try self.allocator.create(Expr);
+                    expr.* = .{ .formatted_value = .{
+                        .value = value,
+                        .conversion = null,
+                        .format_spec = null,
+                    } };
+                    try self.stack.push(.{ .expr = expr });
+                }
             },
 
             .FORMAT_WITH_SPEC => {

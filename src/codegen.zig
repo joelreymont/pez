@@ -599,7 +599,31 @@ pub const Writer = struct {
 
         try self.writeByte(allocator, 'f');
         try self.writeByte(allocator, quote);
-        for (j.values) |v| {
+        var i: usize = 0;
+        while (i < j.values.len) : (i += 1) {
+            const v = j.values[i];
+            // Check for debug syntax: "name=" followed by formatted_value with repr and matching name
+            if (i + 1 < j.values.len and v.* == .constant and v.constant == .string) {
+                const s = v.constant.string;
+                if (s.len > 0 and s[s.len - 1] == '=') {
+                    const next = j.values[i + 1];
+                    if (next.* == .formatted_value) {
+                        const fv = next.formatted_value;
+                        if (fv.conversion == 'r' and fv.format_spec == null and fv.value.* == .name) {
+                            const prefix = s[0 .. s.len - 1];
+                            if (std.mem.eql(u8, prefix, fv.value.name.id)) {
+                                // Debug syntax: {name=}
+                                try self.writeByte(allocator, '{');
+                                try self.write(allocator, fv.value.name.id);
+                                try self.writeByte(allocator, '=');
+                                try self.writeByte(allocator, '}');
+                                i += 1; // Skip next value
+                                continue;
+                            }
+                        }
+                    }
+                }
+            }
             switch (v.*) {
                 .constant => |c| {
                     if (c == .string) {
