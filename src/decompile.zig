@@ -23,7 +23,7 @@ pub const Expr = ast.Expr;
 pub const Stmt = ast.Stmt;
 const StackValue = stack_mod.StackValue;
 const Opcode = decoder.Opcode;
-pub const DecompileError = stack_mod.SimError || error{ UnexpectedEmptyWorklist, InvalidBlock };
+pub const DecompileError = stack_mod.SimError || error{ UnexpectedEmptyWorklist, InvalidBlock, SkipStatement };
 
 /// Check if an opcode is a LOAD instruction.
 fn isLoadInstr(op: Opcode) bool {
@@ -169,7 +169,10 @@ pub const Decompiler = struct {
                 const val = sim.stack.pop() orelse return error.StackUnderflow;
                 switch (val) {
                     .expr => |e| {
-                        return try self.makeExprStmt(e);
+                        return self.makeExprStmt(e) catch |err| {
+                            if (err == error.SkipStatement) return null;
+                            return err;
+                        };
                     },
                     else => {
                         val.deinit(self.allocator);
@@ -1312,8 +1315,11 @@ pub const Decompiler = struct {
                     const val = sim.stack.pop().?;
                     switch (val) {
                         .expr => |e| {
-                            const stmt = try self.makeExprStmt(e);
-                            try stmts.append(self.allocator, stmt);
+                            if (self.makeExprStmt(e)) |stmt| {
+                                try stmts.append(self.allocator, stmt);
+                            } else |err| {
+                                if (err != error.SkipStatement) return err;
+                            }
                         },
                         else => {
                             // Discard non-expression values (e.g., intermediate stack values)
@@ -4547,8 +4553,11 @@ pub const Decompiler = struct {
                     const val = sim.stack.pop().?;
                     switch (val) {
                         .expr => |expr| {
-                            const stmt = try self.makeExprStmt(expr);
-                            try stmts.append(a, stmt);
+                            if (self.makeExprStmt(expr)) |stmt| {
+                                try stmts.append(a, stmt);
+                            } else |err| {
+                                if (err != error.SkipStatement) return err;
+                            }
                         },
                         else => val.deinit(self.allocator),
                     }
@@ -4883,6 +4892,15 @@ pub const Decompiler = struct {
         var sim = SimContext.init(a, self.code, self.version);
         defer sim.deinit();
 
+        // Exception handlers need 3 values (type, value, traceback) on stack
+        if (block.is_exception_handler) {
+            for (0..3) |_| {
+                const placeholder = try a.create(Expr);
+                placeholder.* = .{ .name = .{ .id = "__exception__", .ctx = .load } };
+                try sim.stack.push(.{ .expr = placeholder });
+            }
+        }
+
         // FOR_LOOP header needs [seq, idx] on stack from setup predecessor
         const term = block.terminator();
         if (term != null and term.?.opcode == .FOR_LOOP) {
@@ -5121,8 +5139,11 @@ pub const Decompiler = struct {
                     const val = sim.stack.pop().?;
                     switch (val) {
                         .expr => |expr| {
-                            const stmt = try self.makeExprStmt(expr);
-                            try stmts.append(a, stmt);
+                            if (self.makeExprStmt(expr)) |stmt| {
+                                try stmts.append(a, stmt);
+                            } else |err| {
+                                if (err != error.SkipStatement) return err;
+                            }
                         },
                         else => {
                             // Discard non-expression values (e.g., condition cleanup).
@@ -5842,6 +5863,10 @@ pub const Decompiler = struct {
 
     /// Create an expression statement.
     fn makeExprStmt(self: *Decompiler, value: *Expr) DecompileError!*Stmt {
+        // Suppress __exception__ placeholders from appearing as statements
+        if (value.* == .name and std.mem.eql(u8, value.name.id, "__exception__")) {
+            return error.SkipStatement;
+        }
         const a = self.arena.allocator();
         const stmt = try a.create(Stmt);
         stmt.* = .{ .expr_stmt = .{
