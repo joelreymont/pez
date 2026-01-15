@@ -873,10 +873,12 @@ pub const Analyzer = struct {
 
         const handlers = try self.allocator.dupe(HandlerInfo, handler_list.items);
 
-        // Detect else block for Python 3.11+
+        // Detect else block
         var else_block: ?u32 = null;
         if (self.cfg.version.gte(3, 11)) {
             else_block = try self.detectElseBlock311(block_id, handler_list.items, exit_block);
+        } else {
+            else_block = try self.detectElseBlockLegacy(block_id, handler_list.items, exit_block);
         }
 
         return TryPattern{
@@ -953,6 +955,55 @@ pub const Analyzer = struct {
         if (exit_block) |exit| {
             if (cand >= exit) return null;
         }
+
+        return candidate;
+    }
+
+    fn detectElseBlockLegacy(
+        self: *Analyzer,
+        try_block: u32,
+        handlers: []const HandlerInfo,
+        exit_block: ?u32,
+    ) !?u32 {
+        if (try_block >= self.cfg.blocks.len) return null;
+        if (handlers.len == 0) return null;
+
+        // Find normal exit from try body (not exception edges)
+        const try_blk = &self.cfg.blocks[try_block];
+        var try_normal_succ: ?u32 = null;
+        for (try_blk.successors) |edge| {
+            if (edge.edge_type == .normal) {
+                try_normal_succ = edge.target;
+                break;
+            }
+        }
+        if (try_normal_succ == null) return null;
+        const candidate = try_normal_succ.?;
+
+        // Verify not a handler
+        for (handlers) |h| {
+            if (candidate == h.handler_block) return null;
+        }
+
+        // Verify not reachable from handlers via exception path
+        for (handlers) |h| {
+            if (h.handler_block >= self.cfg.blocks.len) continue;
+            const h_blk = &self.cfg.blocks[h.handler_block];
+            for (h_blk.successors) |edge| {
+                if (edge.target == candidate) {
+                    // Handler reaches candidate - could be exit, check if it's exception edge
+                    if (edge.edge_type == .exception) return null;
+                }
+            }
+        }
+
+        // Verify candidate comes before exit
+        if (exit_block) |exit| {
+            if (candidate >= exit) return null;
+        }
+
+        // Verify candidate comes after try block
+        if (candidate <= try_block) return null;
 
         return candidate;
     }
