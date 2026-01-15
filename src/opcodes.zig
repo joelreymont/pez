@@ -490,8 +490,8 @@ const opcode_table_3_11 = [_]?Opcode{
     null, // 23
     null, // 24
     .BINARY_SUBSCR, // 25
-    null, // 26
-    null, // 27
+    .BINARY_FLOOR_DIVIDE, // 26
+    .BINARY_TRUE_DIVIDE, // 27
     null, // 28
     null, // 29
     .GET_LEN, // 30
@@ -2306,8 +2306,8 @@ const opcode_table_1_5 = [_]?Opcode{
     .BINARY_ADD, // 23
     .BINARY_SUBTRACT, // 24
     .BINARY_SUBSCR, // 25
-    null, // 26
-    null, // 27
+    .BINARY_FLOOR_DIVIDE, // 26
+    .BINARY_TRUE_DIVIDE, // 27
     null, // 28
     null, // 29
     .SLICE_0, // 30
