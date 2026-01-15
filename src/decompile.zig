@@ -2749,6 +2749,72 @@ pub const Decompiler = struct {
         };
     }
 
+    /// Try to decompile assert pattern: if cond: pass else: raise AssertionError[(...)]
+    fn tryDecompileAssert(
+        self: *Decompiler,
+        pattern: ctrl.IfPattern,
+        cond: *Expr,
+        else_block: u32,
+        then_body: []const *Stmt,
+        base_vals: []const StackValue,
+        skip: usize,
+    ) DecompileError!?*Stmt {
+        _ = pattern;
+        _ = base_vals;
+        // Assert has empty then body and else raises AssertionError
+        if (then_body.len != 0) return null;
+        if (else_block >= self.cfg.blocks.len) return null;
+
+        const block = &self.cfg.blocks[else_block];
+        // Pattern: [NOT_TAKEN,] LOAD_COMMON_CONSTANT 0, [LOAD_CONST msg, CALL,] RAISE_VARARGS 1
+        var i: usize = skip;
+        while (i < block.instructions.len and block.instructions[i].opcode == .NOT_TAKEN) : (i += 1) {}
+        if (i >= block.instructions.len) return null;
+
+        // Check for LOAD_COMMON_CONSTANT 0 (AssertionError) or LOAD_ASSERTION_ERROR
+        const load_inst = block.instructions[i];
+        const is_assertion_error = (load_inst.opcode == .LOAD_COMMON_CONSTANT and load_inst.arg == 0) or
+            load_inst.opcode == .LOAD_ASSERTION_ERROR;
+        if (!is_assertion_error) return null;
+
+        i += 1;
+        if (i >= block.instructions.len) return null;
+
+        // Check for optional message: LOAD_CONST followed by CALL
+        var msg: ?*Expr = null;
+        if (block.instructions[i].opcode == .LOAD_CONST) {
+            const const_idx = block.instructions[i].arg;
+            var sim = SimContext.init(self.arena.allocator(), self.code, self.version);
+            defer sim.deinit();
+            if (sim.getConst(const_idx)) |obj| {
+                msg = try sim.objToExpr(obj);
+            }
+            i += 1;
+            if (i < block.instructions.len and block.instructions[i].opcode == .CALL) {
+                i += 1;
+            }
+        }
+
+        // Check for RAISE_VARARGS 1
+        if (i >= block.instructions.len) return null;
+        if (block.instructions[i].opcode != .RAISE_VARARGS or block.instructions[i].arg != 1) {
+            if (msg) |m| {
+                m.deinit(self.arena.allocator());
+                self.arena.allocator().destroy(m);
+            }
+            return null;
+        }
+
+        // Create assert statement
+        const a = self.arena.allocator();
+        const stmt = try a.create(Stmt);
+        stmt.* = .{ .assert_stmt = .{
+            .condition = cond,
+            .msg = msg,
+        } };
+        return stmt;
+    }
+
     /// Decompile an if statement pattern.
     fn decompileIf(self: *Decompiler, pattern: ctrl.IfPattern) DecompileError!?*Stmt {
         return self.decompileIfWithSkip(pattern, 0);
@@ -2808,6 +2874,15 @@ pub const Decompiler = struct {
         defer self.allocator.free(then_body_tmp);
         const a = self.arena.allocator();
         const then_body = try a.dupe(*Stmt, then_body_tmp);
+
+        // Check for assert pattern: if cond: pass else: raise AssertionError
+        if (pattern.else_block) |else_id| {
+            if (try self.tryDecompileAssert(pattern, condition, else_id, then_body_tmp, base_vals, skip)) |assert_stmt| {
+                for (base_vals) |val| val.deinit(self.allocator);
+                self.allocator.free(base_vals);
+                return assert_stmt;
+            }
+        }
 
         // Decompile the else body
         const else_body = if (pattern.else_block) |else_id| blk: {
