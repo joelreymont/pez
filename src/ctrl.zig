@@ -1018,12 +1018,105 @@ pub const Analyzer = struct {
         else_block: ?u32,
         exit_block: ?u32,
     ) !?u32 {
-        _ = try_block;
-        _ = handlers;
-        _ = else_block;
-        _ = exit_block;
-        _ = self;
-        return null; // TODO: implement for 3.11+
+        if (try_block >= self.cfg.blocks.len) return null;
+        if (handlers.len == 0) return null;
+
+        // In 3.11+, finally is a common successor of:
+        // - try body normal path
+        // - else block normal path (if present)
+        // - all exception handlers
+
+        // Collect candidates from try/else normal exits
+        var candidates: std.ArrayList(u32) = .{};
+        defer candidates.deinit(self.allocator);
+
+        // Start with try body's normal successor
+        const try_blk = &self.cfg.blocks[try_block];
+        for (try_blk.successors) |edge| {
+            if (edge.edge_type == .normal) {
+                try candidates.append(self.allocator, edge.target);
+            }
+        }
+
+        // If else exists, use its successors
+        if (else_block) |eb| {
+            candidates.clearRetainingCapacity();
+            if (eb < self.cfg.blocks.len) {
+                const else_blk = &self.cfg.blocks[eb];
+                for (else_blk.successors) |edge| {
+                    if (edge.edge_type == .normal) {
+                        try candidates.append(self.allocator, edge.target);
+                    }
+                }
+            }
+        }
+
+        // Add handler normal exits
+        for (handlers) |h| {
+            if (h.handler_block >= self.cfg.blocks.len) continue;
+            const h_blk = &self.cfg.blocks[h.handler_block];
+            for (h_blk.successors) |edge| {
+                if (edge.edge_type == .normal) {
+                    var exists = false;
+                    for (candidates.items) |c| {
+                        if (c == edge.target) {
+                            exists = true;
+                            break;
+                        }
+                    }
+                    if (!exists) try candidates.append(self.allocator, edge.target);
+                }
+            }
+        }
+
+        if (candidates.items.len == 0) return null;
+
+        // Find common successor
+        var common: ?u32 = null;
+        for (candidates.items) |cand| {
+            var all_reach = true;
+            for (candidates.items) |other| {
+                if (cand == other) continue;
+                var reaches = false;
+                if (other < self.cfg.blocks.len) {
+                    const other_blk = &self.cfg.blocks[other];
+                    for (other_blk.successors) |edge| {
+                        if (edge.target == cand) {
+                            reaches = true;
+                            break;
+                        }
+                    }
+                }
+                if (!reaches) {
+                    all_reach = false;
+                    break;
+                }
+            }
+            if (all_reach) {
+                common = cand;
+                break;
+            }
+        }
+
+        if (common == null) return null;
+        const candidate = common.?;
+
+        // Verify not a handler
+        for (handlers) |h| {
+            if (candidate == h.handler_block) return null;
+        }
+
+        // Verify not the else block
+        if (else_block) |eb| {
+            if (candidate == eb) return null;
+        }
+
+        // Verify comes before exit
+        if (exit_block) |exit| {
+            if (candidate >= exit) return null;
+        }
+
+        return candidate;
     }
 
     fn detectFinallyBlockLegacy(
