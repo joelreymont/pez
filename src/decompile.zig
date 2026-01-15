@@ -3484,7 +3484,14 @@ pub const Decompiler = struct {
 
         const final_body = if (finally_start) |start| blk: {
             if (start >= final_end) break :blk &[_]*Stmt{};
-            break :blk try self.decompileStructuredRange(start, final_end);
+            const a = self.arena.allocator();
+            var exc_stack: [3]StackValue = undefined;
+            for (&exc_stack) |*slot| {
+                const placeholder = try a.create(Expr);
+                placeholder.* = .{ .name = .{ .id = "__exception__", .ctx = .load } };
+                slot.* = .{ .expr = placeholder };
+            }
+            break :blk try self.decompileStructuredRangeWithStack(start, final_end, &exc_stack);
         } else &[_]*Stmt{};
 
         const a = self.arena.allocator();
@@ -3802,6 +3809,10 @@ pub const Decompiler = struct {
     }
 
     fn decompileStructuredRange(self: *Decompiler, start: u32, end: u32) DecompileError![]const *Stmt {
+        return self.decompileStructuredRangeWithStack(start, end, &.{});
+    }
+
+    fn decompileStructuredRangeWithStack(self: *Decompiler, start: u32, end: u32, init_stack: []const StackValue) DecompileError![]const *Stmt {
         // Handle empty range (start == end)
         if (start >= end) return &[_]*Stmt{};
 
@@ -3870,7 +3881,7 @@ pub const Decompiler = struct {
                     block_idx = result.next_block;
                 },
                 else => {
-                    try self.decompileBlockInto(block_idx, &stmts);
+                    try self.decompileBlockIntoWithStack(block_idx, &stmts, init_stack);
                     block_idx += 1;
                 },
             }
@@ -4415,24 +4426,82 @@ pub const Decompiler = struct {
         }
 
         var skip_store = skip_first_store;
-        var seed_pop = false;
         var head = self.cfg.blocks[start];
         if (skip > 0 and skip < head.instructions.len) {
             head.instructions = head.instructions[skip..];
         }
 
-        try self.processBlockStatements(
-            start,
-            &head,
-            &stmts,
-            &skip_store,
-            &seed_pop,
-            false,
-            null,
-        );
+        var sim = SimContext.init(a, self.code, self.version);
+        defer sim.deinit();
+
+        // Python pushes (type, value, traceback) on stack when entering handler
+        // Use placeholder exprs so operations like COMPARE_OP work
+        for (0..3) |_| {
+            const placeholder = try a.create(Expr);
+            placeholder.* = .{ .name = .{ .id = "__exception__", .ctx = .load } };
+            try sim.stack.push(.{ .expr = placeholder });
+        }
+
+        for (head.instructions) |inst| {
+            errdefer if (self.last_error_ctx == null) {
+                self.last_error_ctx = .{
+                    .code_name = self.code.name,
+                    .block_id = start,
+                    .offset = inst.offset,
+                    .opcode = inst.opcode.name(),
+                };
+            };
+
+            switch (inst.opcode) {
+                .STORE_FAST, .STORE_NAME, .STORE_GLOBAL, .STORE_DEREF => {
+                    if (skip_store) {
+                        skip_store = false;
+                        try sim.simulate(inst);
+                        continue;
+                    }
+                    const name = switch (inst.opcode) {
+                        .STORE_FAST => sim.getLocal(inst.arg),
+                        .STORE_NAME, .STORE_GLOBAL => sim.getName(inst.arg),
+                        .STORE_DEREF => sim.getDeref(inst.arg),
+                        else => unreachable,
+                    };
+                    if (name) |n| {
+                        const value = sim.stack.pop() orelse {
+                            try sim.simulate(inst);
+                            continue;
+                        };
+                        if (try self.handleStoreValue(n, value)) |stmt| {
+                            try stmts.append(a, stmt);
+                        }
+                    } else {
+                        try sim.simulate(inst);
+                    }
+                },
+                .POP_TOP => {
+                    if (sim.stack.len() == 0) continue;
+                    const val = sim.stack.pop().?;
+                    switch (val) {
+                        .expr => |expr| {
+                            const stmt = try self.makeExprStmt(expr);
+                            try stmts.append(a, stmt);
+                        },
+                        else => val.deinit(self.allocator),
+                    }
+                },
+                else => {
+                    try sim.simulate(inst);
+                },
+            }
+        }
 
         if (start + 1 < end) {
-            const rest = try self.decompileStructuredRange(start + 1, end);
+            var exc_stack: [3]StackValue = undefined;
+            for (&exc_stack) |*slot| {
+                const placeholder = try a.create(Expr);
+                placeholder.* = .{ .name = .{ .id = "__exception__", .ctx = .load } };
+                slot.* = .{ .expr = placeholder };
+            }
+            const rest = try self.decompileStructuredRangeWithStack(start + 1, end, &exc_stack);
             try stmts.appendSlice(a, rest);
         }
 
