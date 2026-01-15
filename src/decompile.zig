@@ -1905,13 +1905,20 @@ pub const Decompiler = struct {
     ) DecompileError!?u32 {
         const setup = &self.cfg.blocks[pattern.setup_block];
         const header = &self.cfg.blocks[pattern.header_block];
-        var list_start: ?u32 = null;
+        var comp_start: ?u32 = null;
         var after_build = false;
 
-        // Check setup block first (Python <3.12 pattern: BUILD_LIST before GET_ITER)
+        // Helper to check if opcode is a BUILD_* for comprehensions
+        const isBuildComp = struct {
+            fn check(op: Opcode, arg: u32) bool {
+                return arg == 0 and (op == .BUILD_LIST or op == .BUILD_SET or op == .BUILD_MAP);
+            }
+        }.check;
+
+        // Check setup block first (Python <3.12 pattern: BUILD_* before GET_ITER)
         for (setup.instructions) |inst| {
-            if (inst.opcode == .BUILD_LIST and inst.arg == 0) {
-                list_start = inst.offset;
+            if (isBuildComp(inst.opcode, inst.arg)) {
+                comp_start = inst.offset;
                 after_build = true;
                 continue;
             }
@@ -1924,7 +1931,7 @@ pub const Decompiler = struct {
                     .STORE_DEREF,
                     .POP_TOP,
                     => {
-                        list_start = null;
+                        comp_start = null;
                         after_build = false;
                     },
                     else => {},
@@ -1932,8 +1939,8 @@ pub const Decompiler = struct {
             }
         }
 
-        // Python 3.12+: BUILD_LIST is AFTER GET_ITER in setup block (before FOR_ITER)
-        if (list_start == null) {
+        // Python 3.12+: BUILD_* is AFTER GET_ITER in setup block (before FOR_ITER)
+        if (comp_start == null) {
             var past_get_iter = false;
             for (setup.instructions) |inst| {
                 if (inst.opcode == .GET_ITER) {
@@ -1941,25 +1948,25 @@ pub const Decompiler = struct {
                     continue;
                 }
                 if (!past_get_iter) continue;
-                if (inst.opcode == .BUILD_LIST and inst.arg == 0) {
-                    list_start = inst.offset;
+                if (isBuildComp(inst.opcode, inst.arg)) {
+                    comp_start = inst.offset;
                     break;
                 }
             }
         }
 
-        // Fallback: check header block for BUILD_LIST before FOR_ITER
-        if (list_start == null) {
+        // Fallback: check header block for BUILD_* before FOR_ITER
+        if (comp_start == null) {
             for (header.instructions) |inst| {
-                if (inst.opcode == .BUILD_LIST and inst.arg == 0) {
-                    list_start = inst.offset;
+                if (isBuildComp(inst.opcode, inst.arg)) {
+                    comp_start = inst.offset;
                     break;
                 }
                 if (inst.opcode == .FOR_ITER) break;
             }
         }
 
-        const start = list_start orelse return null;
+        const start = comp_start orelse return null;
 
         const term = header.terminator() orelse return null;
         if (term.opcode != .FOR_ITER) return null;
