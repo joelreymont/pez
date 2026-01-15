@@ -2517,7 +2517,7 @@ pub const Decompiler = struct {
                             &.{},
                             1,
                         );
-                        defer self.allocator.free(exit_stmts);
+                        defer self.arena.allocator().free(exit_stmts);
                         try self.statements.appendSlice(self.allocator, exit_stmts);
                         block_idx = p.exit_block + 1;
                     } else {
