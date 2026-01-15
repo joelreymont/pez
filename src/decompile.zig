@@ -3346,7 +3346,25 @@ pub const Decompiler = struct {
         if (!body_empty) {
             const body_off = body_start_off orelse return null;
             const body_block = self.cfg.blockAtOffset(body_off) orelse return null;
-            body = try self.decompileStructuredRange(body_block, exit_block);
+            // Initialize stack with 3 placeholder exprs for exception handler context
+            const exc_stack = &[_]StackValue{
+                .{ .expr = blk: {
+                    const e = try a.create(Expr);
+                    e.* = .{ .name = .{ .id = "__exception__", .ctx = .load } };
+                    break :blk e;
+                } },
+                .{ .expr = blk: {
+                    const e = try a.create(Expr);
+                    e.* = .{ .name = .{ .id = "__exception__", .ctx = .load } };
+                    break :blk e;
+                } },
+                .{ .expr = blk: {
+                    const e = try a.create(Expr);
+                    e.* = .{ .name = .{ .id = "__exception__", .ctx = .load } };
+                    break :blk e;
+                } },
+            };
+            body = try self.decompileStructuredRangeWithStack(body_block, exit_block, exc_stack);
         }
 
         const stmt = try a.create(Stmt);
@@ -5175,6 +5193,8 @@ pub const Decompiler = struct {
             const term = pred.terminator() orelse continue;
             if (term.opcode == .FOR_ITER) return true;
         }
+        // Check if this is an exception handler
+        if (block.is_exception_handler) return true;
         return false;
     }
 
