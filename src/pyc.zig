@@ -303,6 +303,7 @@ pub const ObjectType = enum(u8) {
     TYPE_SMALL_TUPLE = ')',
     TYPE_SHORT_ASCII = 'z',
     TYPE_SHORT_ASCII_INTERNED = 'Z',
+    TYPE_SLICE = ':', // Python 3.14+ marshal format version 5
 
     // FLAG_REF can be OR'd with type to indicate the object should be
     // added to the refs list for later reference
@@ -322,7 +323,7 @@ pub const ObjectType = enum(u8) {
     /// These types require pre-allocation in the refs table before parsing children.
     pub fn hasChildren(self: ObjectType) bool {
         return switch (self) {
-            .TYPE_TUPLE, .TYPE_SMALL_TUPLE, .TYPE_LIST, .TYPE_SET, .TYPE_FROZENSET, .TYPE_DICT, .TYPE_CODE => true,
+            .TYPE_TUPLE, .TYPE_SMALL_TUPLE, .TYPE_LIST, .TYPE_SET, .TYPE_FROZENSET, .TYPE_DICT, .TYPE_CODE, .TYPE_SLICE => true,
             else => false,
         };
     }
@@ -467,6 +468,7 @@ pub const Object = union(enum) {
     code: *Code,
     /// Non-owning reference to a code object (from TYPE_REF resolution)
     code_ref: *Code,
+    slice: struct { start: *Object, stop: *Object, step: *Object },
 
     pub fn deinit(self: *Object, allocator: Allocator) void {
         switch (self.*) {
@@ -475,6 +477,14 @@ pub const Object = union(enum) {
             .tuple, .list, .set, .frozenset => |items| {
                 for (items) |*item| item.deinit(allocator);
                 if (items.len > 0) allocator.free(items);
+            },
+            .slice => |*s| {
+                s.start.deinit(allocator);
+                allocator.destroy(s.start);
+                s.stop.deinit(allocator);
+                allocator.destroy(s.stop);
+                s.step.deinit(allocator);
+                allocator.destroy(s.step);
             },
             .dict => |entries| {
                 for (entries) |*entry| {
@@ -558,6 +568,15 @@ pub const Object = union(enum) {
                 }
                 try writer.writeByte('}');
             },
+            .slice => |s| {
+                try writer.writeAll("slice(");
+                try s.start.format("", .{}, writer);
+                try writer.writeAll(", ");
+                try s.stop.format("", .{}, writer);
+                try writer.writeAll(", ");
+                try s.step.format("", .{}, writer);
+                try writer.writeByte(')');
+            },
             .code, .code_ref => |c| try writer.print("<code '{s}'>", .{c.name}),
         }
     }
@@ -613,6 +632,34 @@ pub const Object = union(enum) {
                     };
                 }
                 break :blk .{ .dict = new_entries };
+            },
+            .slice => |s| blk: {
+                const start_ptr = try allocator.create(Object);
+                start_ptr.* = try s.start.clone(allocator);
+                errdefer {
+                    start_ptr.deinit(allocator);
+                    allocator.destroy(start_ptr);
+                }
+
+                const stop_ptr = try allocator.create(Object);
+                stop_ptr.* = try s.stop.clone(allocator);
+                errdefer {
+                    stop_ptr.deinit(allocator);
+                    allocator.destroy(stop_ptr);
+                }
+
+                const step_ptr = try allocator.create(Object);
+                step_ptr.* = try s.step.clone(allocator);
+                errdefer {
+                    step_ptr.deinit(allocator);
+                    allocator.destroy(step_ptr);
+                }
+
+                break :blk .{ .slice = .{
+                    .start = start_ptr,
+                    .stop = stop_ptr,
+                    .step = step_ptr,
+                } };
             },
             .code, .code_ref => |c| .{ .code_ref = c }, // Return non-owning reference
         };
@@ -1228,6 +1275,34 @@ pub const Module = struct {
             .TYPE_CODE => blk: {
                 const code = try self.readCode(reader);
                 break :blk .{ .code = code };
+            },
+            .TYPE_SLICE => blk: {
+                const start_ptr = try self.allocator.create(Object);
+                start_ptr.* = try self.readAnyObject(reader);
+                errdefer {
+                    start_ptr.deinit(self.allocator);
+                    self.allocator.destroy(start_ptr);
+                }
+
+                const stop_ptr = try self.allocator.create(Object);
+                stop_ptr.* = try self.readAnyObject(reader);
+                errdefer {
+                    stop_ptr.deinit(self.allocator);
+                    self.allocator.destroy(stop_ptr);
+                }
+
+                const step_ptr = try self.allocator.create(Object);
+                step_ptr.* = try self.readAnyObject(reader);
+                errdefer {
+                    step_ptr.deinit(self.allocator);
+                    self.allocator.destroy(step_ptr);
+                }
+
+                break :blk .{ .slice = .{
+                    .start = start_ptr,
+                    .stop = stop_ptr,
+                    .step = step_ptr,
+                } };
             },
             .TYPE_REF => unreachable, // Handled above
             else => .none,

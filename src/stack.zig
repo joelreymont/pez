@@ -445,6 +445,27 @@ pub const SimContext = struct {
                 expr.* = .{ .dict = .{ .keys = keys, .values = values } };
                 return expr;
             },
+            .slice => |s| {
+                const lower = if (s.start.* == .none) null else try self.objToExpr(s.start.*);
+                errdefer if (lower) |l| {
+                    l.deinit(self.allocator);
+                    self.allocator.destroy(l);
+                };
+                const upper = if (s.stop.* == .none) null else try self.objToExpr(s.stop.*);
+                errdefer if (upper) |u| {
+                    u.deinit(self.allocator);
+                    self.allocator.destroy(u);
+                };
+                const step = if (s.step.* == .none) null else try self.objToExpr(s.step.*);
+                errdefer if (step) |st| {
+                    st.deinit(self.allocator);
+                    self.allocator.destroy(st);
+                };
+
+                const expr = try self.allocator.create(Expr);
+                expr.* = .{ .slice = .{ .lower = lower, .upper = upper, .step = step } };
+                return expr;
+            },
             .code, .code_ref => error.UnsupportedConstant,
             else => {
                 const constant = try self.objToConstant(obj);
