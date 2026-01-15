@@ -189,9 +189,13 @@ fn buildCFGWithLeaders(
     var leaders = std.AutoHashMap(u32, void).init(allocator);
     defer leaders.deinit();
 
-    // Add exception handler targets as leaders
+    // Add exception handler targets and range boundaries as leaders
     for (entries) |entry| {
         try leaders.put(entry.target, {});
+        // The start and end of exception-protected range should also be leaders
+        // This ensures with statements and try blocks have proper block boundaries
+        try leaders.put(entry.start, {});
+        try leaders.put(entry.end, {});
     }
 
     // First instruction is always a leader

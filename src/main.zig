@@ -120,7 +120,7 @@ fn dumpCodeCFG(allocator: std.mem.Allocator, code: *const pyc.Code, version: dec
 
     // Build CFG
     if (code.code.len > 0) {
-        var cfg = try cfg_mod.buildCFG(allocator, code.code, version);
+        var cfg = try cfg_mod.buildCFGWithExceptions(allocator, code.code, code.exceptiontable, version);
         defer cfg.deinit();
 
         // Print CFG summary

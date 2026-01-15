@@ -958,6 +958,9 @@ pub const Analyzer = struct {
         var body_block: ?u32 = null;
         var cleanup_block: ?u32 = null;
 
+        // In Python 3.14+, exception protection starts at body, not setup
+        // Setup block has LOAD_SPECIAL but no exception edge
+        // Body block has the exception edge to cleanup
         for (block.successors) |edge| {
             if (edge.edge_type == .normal) {
                 body_block = edge.target;
@@ -967,6 +970,27 @@ pub const Analyzer = struct {
         }
 
         const body_id = body_block orelse return null;
+
+        // If no exception edge from setup, check the body block for exception edge
+        if (cleanup_block == null and body_id < self.cfg.blocks.len) {
+            const body_blk = &self.cfg.blocks[body_id];
+            for (body_blk.successors) |edge| {
+                if (edge.edge_type == .exception) {
+                    // Check if handler has WITH_EXCEPT_START
+                    if (edge.target < self.cfg.blocks.len) {
+                        const handler = &self.cfg.blocks[edge.target];
+                        for (handler.instructions) |inst| {
+                            if (inst.opcode == .WITH_EXCEPT_START) {
+                                cleanup_block = edge.target;
+                                break;
+                            }
+                        }
+                    }
+                    break;
+                }
+            }
+        }
+
         const cleanup_id = cleanup_block orelse return null;
 
         // Find exit block - where control goes after cleanup

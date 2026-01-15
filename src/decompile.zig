@@ -3357,49 +3357,95 @@ pub const Decompiler = struct {
         var sim = SimContext.init(self.arena.allocator(), self.code, self.version);
         defer sim.deinit();
 
-        var after_before_with = false;
         var is_async = false;
         var optional_vars: ?*Expr = null;
+        var context_expr: ?*Expr = null;
 
+        // Python 3.14+ uses LOAD_SPECIAL for with statement setup
+        // Pattern: CALL (context manager) -> COPY -> LOAD_SPECIAL...
+        // We need to capture the context expression before COPY or LOAD_SPECIAL
         for (setup.instructions) |inst| {
-            if (inst.opcode == .BEFORE_WITH or inst.opcode == .BEFORE_ASYNC_WITH or inst.opcode == .LOAD_SPECIAL) {
-                after_before_with = true;
-                if (inst.opcode == .BEFORE_ASYNC_WITH) {
-                    is_async = true;
-                }
-                continue;
-            }
-            if (!after_before_with) {
-                try sim.simulate(inst);
-                continue;
+            switch (inst.opcode) {
+                .BEFORE_ASYNC_WITH => is_async = true,
+                else => {},
             }
 
-            switch (inst.opcode) {
-                .STORE_FAST => {
-                    if (sim.getLocal(inst.arg)) |name| {
-                        optional_vars = try ast.makeName(self.allocator, name, .store);
+            // Capture context expression right before COPY or LOAD_SPECIAL (clone, don't pop)
+            if ((inst.opcode == .COPY or inst.opcode == .LOAD_SPECIAL) and context_expr == null) {
+                if (sim.stack.items.items.len > 0) {
+                    const top = sim.stack.items.items[sim.stack.items.items.len - 1];
+                    if (top == .expr) {
+                        context_expr = try ast.cloneExpr(self.arena.allocator(), top.expr);
                     }
-                    break;
-                },
-                .STORE_NAME, .STORE_GLOBAL => {
-                    if (sim.getName(inst.arg)) |name| {
-                        optional_vars = try ast.makeName(self.allocator, name, .store);
-                    }
-                    break;
-                },
-                else => {},
+                }
+            }
+
+            // Stop at LOAD_SPECIAL - rest is just method binding
+            if (inst.opcode == .LOAD_SPECIAL or inst.opcode == .BEFORE_WITH or inst.opcode == .BEFORE_ASYNC_WITH) {
+                break;
+            }
+
+            try sim.simulate(inst);
+        }
+
+        // In Python 3.14+, the variable binding (STORE_NAME) is in the body block
+        // Check first instruction of body block for the binding
+        if (pattern.body_block < self.cfg.blocks.len) {
+            const body = &self.cfg.blocks[pattern.body_block];
+            if (body.instructions.len > 0) {
+                const first = body.instructions[0];
+                switch (first.opcode) {
+                    .STORE_FAST => {
+                        if (sim.getLocal(first.arg)) |name| {
+                            optional_vars = try ast.makeName(self.allocator, name, .store);
+                        }
+                    },
+                    .STORE_NAME, .STORE_GLOBAL => {
+                        if (sim.getName(first.arg)) |name| {
+                            optional_vars = try ast.makeName(self.allocator, name, .store);
+                        }
+                    },
+                    else => {},
+                }
             }
         }
 
-        const context_expr = try sim.stack.popExpr();
+        const ctx_expr = context_expr orelse try sim.stack.popExpr();
 
         const item = try self.allocator.alloc(ast.WithItem, 1);
         item[0] = .{
-            .context_expr = context_expr,
+            .context_expr = ctx_expr,
             .optional_vars = optional_vars,
         };
 
-        const body = try self.decompileStructuredRange(pattern.body_block, pattern.cleanup_block);
+        // Skip the first instruction of body if it's the STORE for the "as" variable
+        var skip_body_first: u32 = 0;
+        if (optional_vars != null and pattern.body_block < self.cfg.blocks.len) {
+            const body_blk = &self.cfg.blocks[pattern.body_block];
+            if (body_blk.instructions.len > 0) {
+                const first = body_blk.instructions[0];
+                if (first.opcode == .STORE_FAST or first.opcode == .STORE_NAME or first.opcode == .STORE_GLOBAL) {
+                    skip_body_first = 1;
+                }
+            }
+        }
+
+        // Decompile body directly without pattern detection
+        // The body block may be detected as TRY (due to exception handling for with),
+        // but it's not a user-written try/except - it's the with statement body
+        var body_stmts: std.ArrayList(*Stmt) = .{};
+        errdefer body_stmts.deinit(self.allocator);
+
+        if (pattern.body_block < self.cfg.blocks.len) {
+            const body_blk = &self.cfg.blocks[pattern.body_block];
+            // Skip the STORE instruction for the "as" variable
+            const skip_count: u32 = if (optional_vars != null) 1 else 0;
+            try self.decompileBlockIntoWithStackAndSkip(pattern.body_block, &body_stmts, &.{}, skip_count);
+            // Mark body block as processed so it's not reprocessed
+            _ = body_blk;
+        }
+
+        const body = try body_stmts.toOwnedSlice(self.allocator);
 
         const a = self.arena.allocator();
         const stmt = try a.create(Stmt);
@@ -3412,7 +3458,21 @@ pub const Decompiler = struct {
             },
         };
 
-        return .{ .stmt = stmt, .next_block = pattern.exit_block };
+        // Calculate exit block - skip past all with-related blocks
+        // For a with statement, we need to skip: setup, body, normal cleanup, and exception handlers
+        var exit = pattern.exit_block;
+        // Make sure we skip past body and cleanup blocks
+        if (pattern.body_block >= exit) exit = pattern.body_block + 1;
+        if (pattern.cleanup_block >= exit) exit = pattern.cleanup_block + 1;
+        // Find the highest exception handler block and skip past it
+        if (pattern.cleanup_block < self.cfg.blocks.len) {
+            const cleanup_blk = &self.cfg.blocks[pattern.cleanup_block];
+            for (cleanup_blk.successors) |edge| {
+                if (edge.target >= exit) exit = edge.target + 1;
+            }
+        }
+
+        return .{ .stmt = stmt, .next_block = exit };
     }
 
     fn decompileMatch(self: *Decompiler, pattern: ctrl.MatchPattern) DecompileError!PatternResult {

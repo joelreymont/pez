@@ -1805,13 +1805,24 @@ pub const SimContext = struct {
                     self.allocator.free(args_vals);
                     try self.stack.push(tos);
                 } else {
-                    // Normal call: [NULL/self, callable, args...]
-                    // tos = callable, tos1 = NULL/self marker
-                    callable = tos;
-                    if (tos1 == .null_marker) {
-                        // Function call with PUSH_NULL - discard NULL marker
+                    // Two stack orders for function calls with NULL:
+                    // 1. LOAD_GLOBAL with push_null: [NULL, callable] → tos=callable, tos1=NULL
+                    // 2. LOAD_NAME + PUSH_NULL: [callable, NULL] → tos=NULL, tos1=callable
+                    if (tos == .null_marker and tos1 == .expr) {
+                        // Case 2: LOAD_NAME + PUSH_NULL order
+                        callable = tos1;
+                        // tos (null_marker) is discarded
+                    } else if (tos1 == .null_marker and tos == .expr) {
+                        // Case 1: LOAD_GLOBAL with push_null order
+                        callable = tos;
+                        // tos1 (null_marker) is discarded
+                    } else if (tos == .expr and tos1 != .null_marker) {
+                        // Method call - tos is callable, tos1 is self
+                        callable = tos;
+                        tos1.deinit(self.allocator);
                     } else {
-                        // Method call - tos1 is self, discard it (handled elsewhere)
+                        // Fallback: try tos as callable
+                        callable = tos;
                         tos1.deinit(self.allocator);
                     }
 
@@ -3180,6 +3191,26 @@ pub const SimContext = struct {
                     try self.stack.push(.null_marker);
                     try self.stack.push(.unknown);
                 }
+            },
+
+            .LOAD_SPECIAL => {
+                // LOAD_SPECIAL namei - load special method from TOS (3.14+)
+                // If method: pushes [method, self] with self on top
+                // If not method: pushes [attr, NULL] with NULL on top
+                // Special method names: 0=__enter__, 1=__exit__, etc.
+                const obj = try self.stack.popExpr();
+                const special_names = [_][]const u8{ "__enter__", "__exit__", "__aenter__", "__aexit__" };
+                const attr_name = if (inst.arg < special_names.len) special_names[inst.arg] else "__special__";
+                // Clone obj first since makeAttribute consumes it
+                const obj_copy = try ast.cloneExpr(self.allocator, obj);
+                errdefer {
+                    obj_copy.deinit(self.allocator);
+                    self.allocator.destroy(obj_copy);
+                }
+                const attr = try ast.makeAttribute(self.allocator, obj, attr_name, .load);
+                // For context managers, these are methods - push [method, self]
+                try self.stack.push(.{ .expr = attr });
+                try self.stack.push(.{ .expr = obj_copy });
             },
 
             .STORE_ATTR => {
