@@ -3643,25 +3643,74 @@ pub const Decompiler = struct {
             &.{},
         );
 
-        // Decompile handlers
+        // Decompile handlers - follow the chain of CHECK_EXC_MATCH blocks
         var handlers: std.ArrayList(ast.ExceptHandler) = .{};
         errdefer handlers.deinit(a);
 
         // Track actual end of all handler blocks for marking processed
         var actual_end: u32 = max_handler + 1;
 
-        for (handler_ids) |hid| {
-            if (hid >= self.cfg.blocks.len) continue;
+        // Start with first handler block (has PUSH_EXC_INFO)
+        var current_handler: ?u32 = first_handler;
+
+        while (current_handler) |hid| {
+            if (hid >= self.cfg.blocks.len) break;
             const handler_block = &self.cfg.blocks[hid];
 
-            // Skip cleanup blocks (RERAISE without PUSH_EXC_INFO pattern)
+            // Check if this is a valid handler block or finally block
             var has_push_exc = false;
+            var has_check_match = false;
             var has_reraise = false;
+            var has_pop_top = false;
+            var has_pop_except = false;
             for (handler_block.instructions) |inst| {
                 if (inst.opcode == .PUSH_EXC_INFO) has_push_exc = true;
+                if (inst.opcode == .CHECK_EXC_MATCH) has_check_match = true;
                 if (inst.opcode == .RERAISE) has_reraise = true;
+                if (inst.opcode == .POP_TOP) has_pop_top = true;
+                if (inst.opcode == .POP_EXCEPT) has_pop_except = true;
             }
-            if (!has_push_exc and has_reraise) continue;
+            // Stop if we hit a RERAISE-only block (cleanup, not handler)
+            if (!has_push_exc and !has_check_match and has_reraise) break;
+
+            // Check for finally pattern: PUSH_EXC_INFO + RERAISE without POP_EXCEPT
+            // Finally handlers re-raise after cleanup, except handlers use POP_EXCEPT
+            if (has_push_exc and has_reraise and !has_pop_except and !has_check_match) {
+                // This is a finally block - extract finally body from handler
+                // The finally code is between PUSH_EXC_INFO and RERAISE
+                var finally_start: usize = 0;
+                var finally_end: usize = handler_block.instructions.len;
+                for (handler_block.instructions, 0..) |inst, i| {
+                    if (inst.opcode == .PUSH_EXC_INFO) {
+                        finally_start = i + 1;
+                    } else if (inst.opcode == .RERAISE) {
+                        finally_end = i;
+                        break;
+                    }
+                }
+                // Decompile finally body from the handler block
+                const finally_body = try self.decompileBlockRangeWithStackAndSkip(
+                    hid,
+                    hid + 1,
+                    &.{},
+                    finally_start,
+                );
+                // Build try/finally statement (no handlers)
+                const try_stmt = try a.create(Stmt);
+                try_stmt.* = .{
+                    .try_stmt = .{
+                        .body = try_body,
+                        .handlers = &.{},
+                        .else_body = &.{},
+                        .finalbody = finally_body,
+                    },
+                };
+                self.analyzer.markProcessed(pattern.try_block, hid + 2);
+                return .{ .stmt = try_stmt, .next_block = hid + 2 };
+            }
+
+            // Skip if block has neither handler pattern
+            if (!has_push_exc and !has_check_match and !has_pop_top) break;
 
             // Extract exception type and name from handler header
             // Python 3.11+ handler patterns:
@@ -3691,7 +3740,11 @@ pub const Decompiler = struct {
                     },
                     .POP_TOP => {
                         if (seen_push_exc and !seen_check_match) {
-                            // Bare except - POP_TOP discards exception, body starts here
+                            // Bare except (first handler) - POP_TOP discards exception
+                            body_skip = i + 1;
+                            break;
+                        } else if (!seen_push_exc and !seen_check_match and i == 0) {
+                            // Bare except (chained) - POP_TOP at start of block
                             body_skip = i + 1;
                             break;
                         } else if (seen_cond_jump) {
@@ -3738,14 +3791,18 @@ pub const Decompiler = struct {
             }
 
             // For typed except, body is in fall-through successor after cond jump
+            // Also track next handler (conditional_false = exception didn't match)
             var body_block = hid;
+            var next_handler_block: ?u32 = null;
             if (seen_check_match and seen_cond_jump) {
                 // Body is NOT_TAKEN path (conditional_true = exception matched)
+                // Next handler is conditional_false path (exception didn't match)
                 for (handler_block.successors) |edge| {
                     if (edge.edge_type == .conditional_true) {
                         body_block = edge.target;
                         body_skip = 0;
-                        break;
+                    } else if (edge.edge_type == .conditional_false) {
+                        next_handler_block = edge.target;
                     }
                 }
                 // Check body block for "as name:" binding (NOT_TAKEN, STORE_NAME pattern)
@@ -3802,6 +3859,40 @@ pub const Decompiler = struct {
 
             // Track the actual end of processed blocks
             if (handler_end_block > actual_end) actual_end = handler_end_block;
+            if (body_block >= actual_end) actual_end = body_block + 1;
+
+            // Follow chain to next handler (if any)
+            // next_handler_block points to RERAISE or another handler block
+            current_handler = null;
+            if (next_handler_block) |next_blk| {
+                if (next_blk < self.cfg.blocks.len) {
+                    const next_block = &self.cfg.blocks[next_blk];
+                    // Check if this is another handler (has CHECK_EXC_MATCH or starts with POP_TOP for bare except)
+                    var is_handler = false;
+                    for (next_block.instructions) |inst| {
+                        if (inst.opcode == .CHECK_EXC_MATCH) {
+                            is_handler = true;
+                            break;
+                        }
+                        if (inst.opcode == .RERAISE) {
+                            // This is the end of handlers
+                            break;
+                        }
+                    }
+                    // Also check for bare except (POP_TOP followed by handler body)
+                    if (!is_handler and next_block.instructions.len > 0) {
+                        const first_op = next_block.instructions[0].opcode;
+                        if (first_op == .POP_TOP) {
+                            // This is a bare except handler
+                            is_handler = true;
+                        }
+                    }
+                    if (is_handler) {
+                        current_handler = next_blk;
+                    }
+                    if (next_blk >= actual_end) actual_end = next_blk + 1;
+                }
+            }
         }
 
         if (handlers.items.len == 0) {
