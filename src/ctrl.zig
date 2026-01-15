@@ -257,8 +257,8 @@ pub const Analyzer = struct {
             }
         }
 
-        // Check for FOR_ITER (for loop pattern)
-        if (term.opcode == .FOR_ITER) {
+        // Check for FOR_ITER/FOR_LOOP (for loop pattern)
+        if (term.opcode == .FOR_ITER or term.opcode == .FOR_LOOP) {
             if (self.detectForPattern(block_id)) |pattern| {
                 return .{ .for_loop = pattern };
             }

@@ -2593,6 +2593,22 @@ pub const Decompiler = struct {
 
         var sim = SimContext.init(self.arena.allocator(), self.code, self.version);
         defer sim.deinit();
+
+        // FOR_LOOP header needs [seq, idx] on stack from setup predecessor
+        const term = block.terminator();
+        if (term != null and term.?.opcode == .FOR_LOOP) {
+            // Find setup predecessor (not the loop back edge)
+            for (block.predecessors) |pred_id| {
+                if (pred_id < block_id) { // Setup comes before header
+                    const pred = &self.cfg.blocks[pred_id];
+                    for (pred.instructions) |inst| {
+                        try sim.simulate(inst);
+                    }
+                    break;
+                }
+            }
+        }
+
         try self.processBlockWithSim(block, &sim, &self.statements);
     }
 
@@ -4848,6 +4864,21 @@ pub const Decompiler = struct {
         const a = self.arena.allocator();
         var sim = SimContext.init(a, self.code, self.version);
         defer sim.deinit();
+
+        // FOR_LOOP header needs [seq, idx] on stack from setup predecessor
+        const term = block.terminator();
+        if (term != null and term.?.opcode == .FOR_LOOP) {
+            // Find setup predecessor (not the loop back edge)
+            for (block.predecessors) |pred_id| {
+                if (pred_id < block_id) { // Setup comes before header
+                    const pred = &self.cfg.blocks[pred_id];
+                    for (pred.instructions) |inst| {
+                        try sim.simulate(inst);
+                    }
+                    break;
+                }
+            }
+        }
 
         if (skip_first_store.*) {
             // Loop target consumes the iteration value from the stack.

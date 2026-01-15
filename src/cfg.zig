@@ -283,7 +283,7 @@ fn buildCFGWithLeaders(
                     const edge_type: EdgeType = if (t.isConditionalJump()) blk: {
                         // For POP_JUMP_IF_FALSE/NONE, jump target is the FALSE branch
                         // For POP_JUMP_IF_TRUE/NOT_NONE, jump target is the TRUE branch
-                        // For FOR_ITER, jump target is the exhausted/exit path
+                        // For FOR_ITER/FOR_LOOP, jump target is the exhausted/exit path
                         break :blk switch (t.opcode) {
                             .POP_JUMP_IF_FALSE,
                             .POP_JUMP_IF_NONE,
@@ -292,6 +292,7 @@ fn buildCFGWithLeaders(
                             .POP_JUMP_BACKWARD_IF_FALSE,
                             .POP_JUMP_BACKWARD_IF_NONE,
                             .FOR_ITER,
+                            .FOR_LOOP,
                             .JUMP_IF_FALSE, // Python 3.0
                             .JUMP_IF_FALSE_OR_POP,
                             => .conditional_false,
@@ -342,6 +343,7 @@ fn buildCFGWithLeaders(
                             .JUMP_IF_TRUE_OR_POP,
                             => .conditional_false,
                             .FOR_ITER,
+                            .FOR_LOOP,
                             => .normal,
                             else => .conditional_false,
                         };
