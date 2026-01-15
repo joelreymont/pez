@@ -4605,16 +4605,35 @@ pub const Decompiler = struct {
     /// Decompile a for loop pattern.
     fn decompileFor(self: *Decompiler, pattern: ctrl.ForPattern) DecompileError!?*Stmt {
         // Get the iterator expression from the setup block
-        // The setup block contains: ... GET_ITER
-        // The expression before GET_ITER is the iterator
+        // Python 3+: ... GET_ITER
+        // Python 1.x-2.2: ... LOAD_CONST 0 (sequence on TOS, index pushed)
         const setup = &self.cfg.blocks[pattern.setup_block];
+        const header = &self.cfg.blocks[pattern.header_block];
 
         var iter_sim = SimContext.init(self.arena.allocator(), self.code, self.version);
         defer iter_sim.deinit();
 
-        for (setup.instructions) |inst| {
-            if (inst.opcode == .GET_ITER) break;
-            try iter_sim.simulate(inst);
+        const header_term = header.terminator() orelse return null;
+        if (header_term.opcode == .FOR_LOOP) {
+            // Python 1.x-2.2: Setup block pushes sequence, header block adds index
+            // Simulate setup block completely, it should leave sequence on TOS
+            for (setup.instructions) |inst| {
+                try iter_sim.simulate(inst);
+            }
+            // After simulating setup, stack should be [seq, idx, ...other stuff]
+            // But we only want the sequence. Pop everything after the sequence.
+            // Actually, the last LOAD_CONST in setup pushes the index.
+            // So before the last LOAD_CONST, TOS is the sequence.
+            // Simplification: Assume TOS-1 is sequence, TOS is index
+            if (iter_sim.stack.items.items.len >= 2) {
+                _ = iter_sim.stack.pop(); // pop index
+            }
+        } else {
+            // Python 3+: GET_ITER
+            for (setup.instructions) |inst| {
+                if (inst.opcode == .GET_ITER) break;
+                try iter_sim.simulate(inst);
+            }
         }
 
         const iter_expr = try iter_sim.stack.popExpr();

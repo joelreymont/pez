@@ -777,7 +777,7 @@ pub const Analyzer = struct {
         const block = &self.cfg.blocks[block_id];
         const term = block.terminator() orelse return null;
 
-        if (term.opcode != .FOR_ITER) return null;
+        if (term.opcode != .FOR_ITER and term.opcode != .FOR_LOOP) return null;
 
         // FOR_ITER has two successors: body (fallthrough) and exit (jump)
         var body_block: ?u32 = null;
@@ -793,7 +793,12 @@ pub const Analyzer = struct {
 
         // Look backwards for GET_ITER in predecessor
         var setup_block: u32 = block_id;
-        if (block.predecessors.len > 0) {
+        if (term.opcode == .FOR_LOOP) {
+            // FOR_LOOP (Python 1.x-2.2): predecessor has sequence + index setup
+            if (block.predecessors.len > 0) {
+                setup_block = block.predecessors[0];
+            }
+        } else if (block.predecessors.len > 0) {
             for (block.predecessors) |pred_id| {
                 const pred = &self.cfg.blocks[pred_id];
                 // Check if predecessor has GET_ITER

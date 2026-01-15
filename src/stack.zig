@@ -3125,6 +3125,15 @@ pub const SimContext = struct {
                 // Push the iteration value placeholder
                 try self.stack.push(.unknown);
             },
+            .FOR_LOOP => {
+                // FOR_LOOP (Python 1.x-2.2): Stack [seq, idx] -> [seq, idx+1, element]
+                // Pops index, increments, pushes back index+1 and next element
+                // On exhaustion: pops both, jumps
+                _ = self.stack.pop() orelse return error.StackUnderflow; // pop index
+                // Sequence remains on stack
+                try self.stack.push(.unknown); // push index+1
+                try self.stack.push(.unknown); // push element
+            },
 
             // Import opcodes
             .IMPORT_NAME => {

@@ -105,6 +105,7 @@ pub const Opcode = enum(u16) {
     DELETE_NAME,
     UNPACK_SEQUENCE,
     FOR_ITER,
+    FOR_LOOP,
     UNPACK_EX,
     STORE_ATTR,
     DELETE_ATTR,
@@ -2393,7 +2394,7 @@ const opcode_table_1_5 = [_]?Opcode{
     .JUMP_IF_FALSE, // 111
     .JUMP_IF_TRUE, // 112
     .JUMP_ABSOLUTE, // 113
-    null, // 114
+    .FOR_LOOP, // 114
     null, // 115
     .LOAD_GLOBAL, // 116
     null, // 117
@@ -2541,7 +2542,7 @@ const opcode_table_2_3 = [_]?Opcode{
     .JUMP_IF_FALSE, // 111
     .JUMP_IF_TRUE, // 112
     .JUMP_ABSOLUTE, // 113
-    null, // 114
+    .FOR_LOOP, // 114
     null, // 115
     .LOAD_GLOBAL, // 116
     null, // 117
@@ -3309,7 +3310,7 @@ const opcode_table_3_0 = [_]?Opcode{
     .JUMP_IF_FALSE, // 111 - Python 3.0 specific
     .JUMP_IF_TRUE, // 112 - Python 3.0 specific
     .JUMP_ABSOLUTE, // 113
-    null, // 114
+    .FOR_LOOP, // 114
     null, // 115
     .LOAD_GLOBAL, // 116
     null, // 117

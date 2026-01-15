@@ -89,6 +89,7 @@ pub const Instruction = struct {
             .JUMP_IF_FALSE, // Python 3.0
             .JUMP_IF_NOT_EXC_MATCH,
             .FOR_ITER,
+            .FOR_LOOP,
             .SEND,
             => true,
             else => false,
