@@ -2016,10 +2016,15 @@ pub const Decompiler = struct {
         return pattern.merge_block;
     }
 
+    const InlineCompResult = struct {
+        exit_block: u32,
+        stack: []const StackValue,
+    };
+
     fn tryDecompileInlineListComp(
         self: *Decompiler,
         pattern: ctrl.ForPattern,
-    ) DecompileError!?u32 {
+    ) DecompileError!?InlineCompResult {
         const setup = &self.cfg.blocks[pattern.setup_block];
         const header = &self.cfg.blocks[pattern.header_block];
         var comp_start: ?u32 = null;
@@ -2156,7 +2161,9 @@ pub const Decompiler = struct {
 
         if (self.pending_ternary_expr != null) return error.InvalidBlock;
         self.pending_ternary_expr = expr;
-        return pattern.exit_block;
+
+        const stack_copy = try self.allocator.dupe(StackValue, sim.stack.items.items);
+        return .{ .exit_block = pattern.exit_block, .stack = stack_copy };
     }
 
     /// Try to decompile a try pattern as an inline comprehension.
@@ -2243,12 +2250,13 @@ pub const Decompiler = struct {
         }
 
         // Try to decompile as inline comprehension
-        if (try self.tryDecompileInlineListComp(for_pattern)) |_| {
+        if (try self.tryDecompileInlineListComp(for_pattern)) |result| {
             // Comprehension is now in pending_ternary_expr
             // Process the exit block to pick it up
+            defer self.allocator.free(result.stack);
             const exit_id = exit_block_id.?;
             if (exit_id < self.cfg.blocks.len) {
-                const exit_stmts = try self.decompileBlockRangeWithStack(exit_id, handler_id, &.{});
+                const exit_stmts = try self.decompileBlockRangeWithStack(exit_id, handler_id, result.stack);
                 defer self.allocator.free(exit_stmts);
                 try stmts.appendSlice(self.allocator, exit_stmts);
             }
@@ -2517,8 +2525,9 @@ pub const Decompiler = struct {
                     }
                 },
                 .for_loop => |p| {
-                    if (try self.tryDecompileInlineListComp(p)) |next_block| {
-                        block_idx = next_block;
+                    if (try self.tryDecompileInlineListComp(p)) |result| {
+                        self.allocator.free(result.stack);
+                        block_idx = result.exit_block;
                         continue;
                     }
                     const stmt = try self.decompileFor(p);
@@ -3817,8 +3826,9 @@ pub const Decompiler = struct {
                     block_idx = p.exit_block;
                 },
                 .for_loop => |p| {
-                    if (try self.tryDecompileInlineListComp(p)) |next_block| {
-                        block_idx = next_block;
+                    if (try self.tryDecompileInlineListComp(p)) |result| {
+                        self.allocator.free(result.stack);
+                        block_idx = result.exit_block;
                         continue;
                     }
                     const stmt = try self.decompileFor(p);
@@ -4588,8 +4598,9 @@ pub const Decompiler = struct {
                     continue;
                 },
                 .for_loop => |p| {
-                    if (try self.tryDecompileInlineListComp(p)) |next_block| {
-                        block_idx = next_block;
+                    if (try self.tryDecompileInlineListComp(p)) |result| {
+                        self.allocator.free(result.stack);
+                        block_idx = result.exit_block;
                         continue;
                     }
                     const stmt = try self.decompileFor(p);
