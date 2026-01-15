@@ -1,0 +1,9 @@
+---
+title: "Phase 3: Suppress Python 2.x class 'return locals()'"
+status: open
+priority: 2
+issue-type: task
+created-at: "2026-01-15T18:23:49.275483+02:00"
+---
+
+src/decompile.zig - Detect LOAD_LOCALS + RETURN_VALUE at end of Python 2.x class bodies (flags 0x42) and suppress outputting 'return locals()'. Affects test_class.2.5.pyc, test_docstring.2.5.pyc.

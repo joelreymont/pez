@@ -1,9 +1,10 @@
 ---
 title: Fix spurious global declaration
-status: open
+status: closed
 priority: 1
 issue-type: task
-created-at: "2026-01-15T18:06:58.680905+02:00"
+created-at: "\"2026-01-15T18:06:58.680905+02:00\""
+closed-at: "2026-01-15T18:29:33.195699+02:00"
 ---
 
 src/decompile.zig:5293 generates 'global' for both STORE_GLOBAL and LOAD_GLOBAL.

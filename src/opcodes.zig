@@ -310,6 +310,7 @@ pub const Opcode = enum(u16) {
     CALL_FUNCTION_KW,
     CALL_FUNCTION_VAR_KW,
     SETUP_WITH,
+    SET_LINENO,
 
     INVALID,
 
@@ -2406,7 +2407,7 @@ const opcode_table_2_6 = [_]?Opcode{
     .LOAD_FAST, // 124
     .STORE_FAST, // 125
     .DELETE_FAST, // 126
-    null, // 127
+    .SET_LINENO, // 127
     null, // 128
     null, // 129
     .RAISE_VARARGS, // 130
@@ -2554,7 +2555,7 @@ const opcode_table_2_7 = [_]?Opcode{
     .LOAD_FAST, // 124
     .STORE_FAST, // 125
     .DELETE_FAST, // 126
-    null, // 127
+    .SET_LINENO, // 127
     null, // 128
     null, // 129
     .RAISE_VARARGS, // 130
@@ -2708,7 +2709,7 @@ const opcode_table_3_1 = [_]?Opcode{
     .LOAD_FAST, // 124
     .STORE_FAST, // 125
     .DELETE_FAST, // 126
-    null, // 127
+    .SET_LINENO, // 127
     null, // 128
     null, // 129
     .RAISE_VARARGS, // 130
@@ -2861,7 +2862,7 @@ const opcode_table_3_5 = [_]?Opcode{
     .LOAD_FAST, // 124
     .STORE_FAST, // 125
     .DELETE_FAST, // 126
-    null, // 127
+    .SET_LINENO, // 127
     null, // 128
     null, // 129
     .RAISE_VARARGS, // 130
@@ -3026,7 +3027,7 @@ const opcode_table_3_0 = [_]?Opcode{
     .LOAD_FAST, // 124
     .STORE_FAST, // 125
     .DELETE_FAST, // 126
-    null, // 127
+    .SET_LINENO, // 127
     null, // 128
     null, // 129
     .RAISE_VARARGS, // 130

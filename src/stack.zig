@@ -1349,6 +1349,7 @@ pub const SimContext = struct {
             .SETUP_LOOP,
             .SETUP_EXCEPT,
             .POP_BLOCK,
+            .SET_LINENO,
             => {
                 // No stack effect
             },
@@ -3128,11 +3129,14 @@ pub const SimContext = struct {
             // Import opcodes
             .IMPORT_NAME => {
                 // IMPORT_NAME namei - imports module names[namei]
-                // Stack: level, fromlist -> module (TOS is fromlist)
+                // Stack (Python 2.5+): level, fromlist -> module
+                // Stack (Python < 2.5): fromlist -> module
                 const fromlist_val = self.stack.pop() orelse return error.StackUnderflow;
                 defer fromlist_val.deinit(self.allocator);
-                const level = self.stack.pop() orelse return error.StackUnderflow;
-                defer level.deinit(self.allocator);
+                if (self.version.gte(2, 5)) {
+                    const level = self.stack.pop() orelse return error.StackUnderflow;
+                    defer level.deinit(self.allocator);
+                }
 
                 // Extract fromlist tuple if available
                 var fromlist: []const []const u8 = &.{};

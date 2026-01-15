@@ -936,12 +936,16 @@ pub const Module = struct {
             code.qualname = try self.readStringAlloc(reader);
         }
 
-        if (ver.gte(1, 5)) {
-            // Python 1.5+: firstlineno and lnotab
+        if (ver.gte(2, 3)) {
+            // Python 2.3+: 32-bit firstlineno
             code.firstlineno = try reader.readU32();
             code.linetable = try self.readBytesAlloc(reader);
+        } else if (ver.gte(1, 5)) {
+            // Python 1.5-2.2: 16-bit firstlineno
+            code.firstlineno = try reader.readU16();
+            code.linetable = try self.readBytesAlloc(reader);
         } else if (ver.gte(1, 3)) {
-            // Python 1.3-1.4: firstlineno as 16-bit, no lnotab
+            // Python 1.3-1.4: 16-bit firstlineno, no lnotab
             code.firstlineno = try reader.readU16();
             code.linetable = &.{};
         } else {
