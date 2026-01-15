@@ -3142,9 +3142,25 @@ pub const SimContext = struct {
                 // IMPORT_FROM namei - load attribute names[namei] from module on TOS
                 // Stack: module -> module, attr
                 // Module stays on stack, attr is pushed
-                if (self.getName(inst.arg)) |name| {
-                    const expr = try ast.makeName(self.allocator, name, .load);
-                    try self.stack.push(.{ .expr = expr });
+                const top = self.stack.items.items[self.stack.items.items.len - 1];
+                if (top == .import_module) {
+                    if (self.getName(inst.arg)) |attr_name| {
+                        const imp = top.import_module;
+                        var new_fromlist: std.ArrayList([]const u8) = .{};
+                        try new_fromlist.appendSlice(self.allocator, imp.fromlist);
+                        try new_fromlist.append(self.allocator, attr_name);
+                        const top_idx = self.stack.items.items.len - 1;
+                        self.stack.items.items[top_idx] = .{ .import_module = .{
+                            .module = imp.module,
+                            .fromlist = try new_fromlist.toOwnedSlice(self.allocator),
+                        } };
+                        try self.stack.push(.{ .import_module = .{
+                            .module = imp.module,
+                            .fromlist = &.{attr_name},
+                        } });
+                    } else {
+                        try self.stack.push(.unknown);
+                    }
                 } else {
                     try self.stack.push(.unknown);
                 }
