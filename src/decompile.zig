@@ -143,7 +143,11 @@ pub const Decompiler = struct {
             std.mem.eql(u8, name, "YIELD_FROM") or
             std.mem.eql(u8, name, "END_FOR") or
             std.mem.eql(u8, name, "END_SEND") or
-            std.mem.eql(u8, name, "RAISE_VARARGS");
+            std.mem.eql(u8, name, "RAISE_VARARGS") or
+            std.mem.eql(u8, name, "DELETE_NAME") or
+            std.mem.eql(u8, name, "DELETE_FAST") or
+            std.mem.eql(u8, name, "DELETE_GLOBAL") or
+            std.mem.eql(u8, name, "DELETE_DEREF");
     }
 
     /// Try to emit a statement for the given opcode from the current stack state.
@@ -172,6 +176,21 @@ pub const Decompiler = struct {
                         return null;
                     },
                 }
+            },
+            .DELETE_NAME, .DELETE_FAST, .DELETE_GLOBAL, .DELETE_DEREF => {
+                const name = switch (inst.opcode) {
+                    .DELETE_NAME, .DELETE_GLOBAL => sim.getName(inst.arg) orelse "<unknown>",
+                    .DELETE_FAST => sim.getLocal(inst.arg) orelse "<unknown>",
+                    .DELETE_DEREF => sim.getDeref(inst.arg) orelse "<unknown>",
+                    else => "<unknown>",
+                };
+                const a = self.arena.allocator();
+                const target = try ast.makeName(a, name, .del);
+                const targets = try a.alloc(*Expr, 1);
+                targets[0] = target;
+                const stmt = try a.create(Stmt);
+                stmt.* = .{ .delete = .{ .targets = targets } };
+                return stmt;
             },
             .RAISE_VARARGS => {
                 // RAISE_VARARGS argc: 0=bare, 1=exc, 2=exc from cause
@@ -1279,7 +1298,7 @@ pub const Decompiler = struct {
                     const stmt = try self.makePrintStmt(dest, true);
                     try stmts.append(self.allocator, stmt);
                 },
-                .RAISE_VARARGS => {
+                .RAISE_VARARGS, .DELETE_NAME, .DELETE_FAST, .DELETE_GLOBAL, .DELETE_DEREF => {
                     if (try self.tryEmitStatement(inst, sim)) |stmt| {
                         try stmts.append(self.allocator, stmt);
                     }
