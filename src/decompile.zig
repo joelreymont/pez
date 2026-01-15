@@ -142,7 +142,8 @@ pub const Decompiler = struct {
             std.mem.eql(u8, name, "YIELD_VALUE") or
             std.mem.eql(u8, name, "YIELD_FROM") or
             std.mem.eql(u8, name, "END_FOR") or
-            std.mem.eql(u8, name, "END_SEND");
+            std.mem.eql(u8, name, "END_SEND") or
+            std.mem.eql(u8, name, "RAISE_VARARGS");
     }
 
     /// Try to emit a statement for the given opcode from the current stack state.
@@ -171,6 +172,37 @@ pub const Decompiler = struct {
                         return null;
                     },
                 }
+            },
+            .RAISE_VARARGS => {
+                // RAISE_VARARGS argc: 0=bare, 1=exc, 2=exc from cause
+                if (inst.arg == 0) {
+                    const a = self.arena.allocator();
+                    const stmt = try a.create(Stmt);
+                    stmt.* = .{ .raise_stmt = .{ .exc = null, .cause = null } };
+                    return stmt;
+                } else if (inst.arg == 1) {
+                    const val = sim.stack.pop() orelse return error.StackUnderflow;
+                    if (val == .expr) {
+                        const a = self.arena.allocator();
+                        const stmt = try a.create(Stmt);
+                        stmt.* = .{ .raise_stmt = .{ .exc = val.expr, .cause = null } };
+                        return stmt;
+                    }
+                    val.deinit(self.allocator);
+                } else if (inst.arg == 2) {
+                    const cause_val = sim.stack.pop() orelse return error.StackUnderflow;
+                    errdefer cause_val.deinit(self.allocator);
+                    const exc_val = sim.stack.pop() orelse return error.StackUnderflow;
+                    if (exc_val == .expr and cause_val == .expr) {
+                        const a = self.arena.allocator();
+                        const stmt = try a.create(Stmt);
+                        stmt.* = .{ .raise_stmt = .{ .exc = exc_val.expr, .cause = cause_val.expr } };
+                        return stmt;
+                    }
+                    exc_val.deinit(self.allocator);
+                    cause_val.deinit(self.allocator);
+                }
+                return null;
             },
             else => {
                 // For other statement opcodes, simulate and don't emit
@@ -1246,6 +1278,11 @@ pub const Decompiler = struct {
                     self.print_dest = null;
                     const stmt = try self.makePrintStmt(dest, true);
                     try stmts.append(self.allocator, stmt);
+                },
+                .RAISE_VARARGS => {
+                    if (try self.tryEmitStatement(inst, sim)) |stmt| {
+                        try stmts.append(self.allocator, stmt);
+                    }
                 },
                 else => {
                     try sim.simulate(inst);
@@ -2498,28 +2535,21 @@ pub const Decompiler = struct {
         init_stack: []const StackValue,
         skip_first: usize,
     ) DecompileError![]const *Stmt {
-        var stmts: std.ArrayList(*Stmt) = .{};
-        errdefer stmts.deinit(self.allocator);
-
-        var block_idx = start_block;
         const limit = end_block orelse @as(u32, @intCast(self.cfg.blocks.len));
+        if (start_block >= limit) return &[_]*Stmt{};
 
-        while (block_idx < limit) {
-            // Process this block's statements
-            if (try self.tryDecompileTernaryInto(block_idx, limit, &stmts)) |next_block| {
-                block_idx = next_block;
-                continue;
-            }
-            // First block gets the initial stack and skip
-            if (block_idx == start_block) {
-                try self.decompileBlockIntoWithStackAndSkip(block_idx, &stmts, init_stack, skip_first);
-            } else {
-                try self.decompileBlockInto(block_idx, &stmts);
-            }
-            block_idx += 1;
+        const a = self.arena.allocator();
+        var stmts: std.ArrayList(*Stmt) = .{};
+        errdefer stmts.deinit(a);
+
+        try self.decompileBlockIntoWithStackAndSkip(start_block, &stmts, init_stack, skip_first);
+
+        if (start_block + 1 < limit) {
+            const rest = try self.decompileStructuredRange(start_block + 1, limit);
+            try stmts.appendSlice(a, rest);
         }
 
-        return stmts.toOwnedSlice(self.allocator);
+        return stmts.toOwnedSlice(a);
     }
 
     /// Decompile a single block's statements into the provided list.
