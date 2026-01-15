@@ -3130,25 +3130,31 @@ pub const SimContext = struct {
             .IMPORT_NAME => {
                 // IMPORT_NAME namei - imports module names[namei]
                 // Stack (Python 2.5+): level, fromlist -> module
-                // Stack (Python < 2.5): fromlist -> module
-                const fromlist_val = self.stack.pop() orelse return error.StackUnderflow;
-                defer fromlist_val.deinit(self.allocator);
-                if (self.version.gte(2, 5)) {
-                    const level = self.stack.pop() orelse return error.StackUnderflow;
-                    defer level.deinit(self.allocator);
+                // Stack (Python 2.0-2.4): fromlist -> module
+                // Stack (Python < 2.0): -> module (no stack arguments)
+                var fromlist_val: ?StackValue = null;
+                if (self.version.gte(2, 0)) {
+                    fromlist_val = self.stack.pop() orelse return error.StackUnderflow;
+                    if (self.version.gte(2, 5)) {
+                        const level = self.stack.pop() orelse return error.StackUnderflow;
+                        defer level.deinit(self.allocator);
+                    }
                 }
+                defer if (fromlist_val) |fv| fv.deinit(self.allocator);
 
                 // Extract fromlist tuple if available
                 var fromlist: []const []const u8 = &.{};
-                if (fromlist_val == .expr and fromlist_val.expr.* == .tuple) {
-                    const tuple_elts = fromlist_val.expr.tuple.elts;
-                    var names: std.ArrayList([]const u8) = .{};
-                    for (tuple_elts) |elt| {
-                        if (elt.* == .constant and elt.constant == .string) {
-                            try names.append(self.allocator, elt.constant.string);
+                if (fromlist_val) |fv| {
+                    if (fv == .expr and fv.expr.* == .tuple) {
+                        const tuple_elts = fv.expr.tuple.elts;
+                        var names: std.ArrayList([]const u8) = .{};
+                        for (tuple_elts) |elt| {
+                            if (elt.* == .constant and elt.constant == .string) {
+                                try names.append(self.allocator, elt.constant.string);
+                            }
                         }
+                        fromlist = try names.toOwnedSlice(self.allocator);
                     }
-                    fromlist = try names.toOwnedSlice(self.allocator);
                 }
 
                 if (self.getName(inst.arg)) |module_name| {
