@@ -5431,7 +5431,12 @@ pub const Decompiler = struct {
             .class_obj => |cls| try self.makeClassDef(name, cls),
             .import_module => |imp| try self.makeImport(name, imp),
             .saved_local => null,
-            else => error.NotAnExpression,
+            .code_obj, .comp_obj, .comp_builder, .null_marker, .unknown => blk: {
+                // Fallback for unhandled stack values - create placeholder assignment
+                const placeholder = try ast.makeName(a, "<value>", .load);
+                const target = try ast.makeName(a, name, .store);
+                break :blk try self.makeAssign(target, placeholder);
+            },
         };
     }
 
