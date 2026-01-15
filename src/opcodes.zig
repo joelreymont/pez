@@ -2348,7 +2348,7 @@ const opcode_table_1_5 = [_]?Opcode{
     .BINARY_XOR, // 65
     .BINARY_OR, // 66
     .INPLACE_POWER, // 67
-    null, // 68
+    .GET_ITER, // 68
     null, // 69
     .PRINT_EXPR, // 70
     .PRINT_ITEM, // 71
@@ -2373,7 +2373,7 @@ const opcode_table_1_5 = [_]?Opcode{
     .STORE_NAME, // 90 (HAVE_ARGUMENT)
     .DELETE_NAME, // 91
     .UNPACK_SEQUENCE, // 92
-    null, // 93
+    .FOR_ITER, // 93
     null, // 94
     .STORE_ATTR, // 95
     .DELETE_ATTR, // 96
