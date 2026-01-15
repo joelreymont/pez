@@ -1137,6 +1137,12 @@ pub const Analyzer = struct {
     fn findMergePoint(self: *Analyzer, then_block: u32, else_block: ?u32) !?u32 {
         const else_id = else_block orelse return null;
 
+        // If else block doesn't return (no successors), merge is the then target
+        const else_blk = &self.cfg.blocks[else_id];
+        if (else_blk.successors.len == 0) {
+            return then_block;
+        }
+
         // Simple approach: follow each branch until we find a common successor
         var then_visited = std.AutoHashMap(u32, void).init(self.allocator);
         defer then_visited.deinit();
