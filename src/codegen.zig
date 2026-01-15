@@ -452,6 +452,16 @@ pub const Writer = struct {
                 try self.writeStringContents(allocator, b, quote);
                 try self.writeByte(allocator, quote);
             },
+            .tuple => |items| {
+                try self.writeByte(allocator, '(');
+                for (items, 0..) |item, i| {
+                    if (i > 0) try self.write(allocator, ", ");
+                    try self.writeConstant(allocator, item);
+                }
+                if (items.len == 1) try self.writeByte(allocator, ',');
+                try self.writeByte(allocator, ')');
+            },
+            .code => try self.write(allocator, "<code>"),
         }
     }
 
@@ -1719,7 +1729,6 @@ pub const DebugPrinter = struct {
     }
 
     fn printConstant(self: *DebugPrinter, w: anytype, c: Constant) !void {
-        _ = self;
         switch (c) {
             .none => try w.writeAll("None"),
             .true_ => try w.writeAll("True"),
@@ -1731,6 +1740,16 @@ pub const DebugPrinter = struct {
             .complex => |v| try w.print("{d}+{d}j", .{ v.real, v.imag }),
             .string => |s| try w.print("\"{s}\"", .{s}),
             .bytes => |b| try w.print("b\"{s}\"", .{b}),
+            .tuple => |items| {
+                try w.writeByte('(');
+                for (items, 0..) |item, i| {
+                    if (i > 0) try w.writeAll(", ");
+                    try self.printConstant(w, item);
+                }
+                if (items.len == 1) try w.writeByte(',');
+                try w.writeByte(')');
+            },
+            .code => try w.writeAll("<code>"),
         }
     }
 

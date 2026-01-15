@@ -873,13 +873,88 @@ pub const Analyzer = struct {
 
         const handlers = try self.allocator.dupe(HandlerInfo, handler_list.items);
 
+        // Detect else block for Python 3.11+
+        var else_block: ?u32 = null;
+        if (self.cfg.version.gte(3, 11)) {
+            else_block = try self.detectElseBlock311(block_id, handler_list.items, exit_block);
+        }
+
         return TryPattern{
             .try_block = block_id,
             .handlers = handlers,
-            .else_block = null, // TODO: detect else clause
+            .else_block = else_block,
             .finally_block = null, // TODO: detect finally clause
             .exit_block = exit_block,
         };
+    }
+
+    fn detectElseBlock311(
+        self: *Analyzer,
+        try_block: u32,
+        handlers: []const HandlerInfo,
+        exit_block: ?u32,
+    ) !?u32 {
+        if (try_block >= self.cfg.blocks.len) return null;
+        if (handlers.len == 0) return null;
+        const first_handler = handlers[0].handler_block;
+
+        // Find the last block in the try body (before first handler)
+        var last_try_block = try_block;
+        var cur = try_block;
+        while (cur < first_handler) {
+            const blk = &self.cfg.blocks[cur];
+            var has_normal_succ = false;
+            for (blk.successors) |edge| {
+                if (edge.edge_type == .normal and edge.target < first_handler) {
+                    has_normal_succ = true;
+                    last_try_block = edge.target;
+                }
+            }
+            if (!has_normal_succ) break;
+            cur += 1;
+            if (cur >= self.cfg.blocks.len) break;
+        }
+
+        // Check if last_try_block has a normal successor after all handlers
+        const last_blk = &self.cfg.blocks[last_try_block];
+        var candidate: ?u32 = null;
+        for (last_blk.successors) |edge| {
+            if (edge.edge_type != .normal) continue;
+            if (edge.target <= first_handler) continue;
+            // Check if target is after all handlers
+            var is_after_handlers = true;
+            for (handlers) |h| {
+                if (edge.target == h.handler_block) {
+                    is_after_handlers = false;
+                    break;
+                }
+            }
+            if (is_after_handlers) {
+                candidate = edge.target;
+                break;
+            }
+        }
+
+        if (candidate == null) return null;
+        const cand = candidate.?;
+
+        // Verify candidate is not reachable from any handler without going through exit
+        for (handlers) |h| {
+            const h_block = &self.cfg.blocks[h.handler_block];
+            for (h_block.successors) |edge| {
+                if (edge.target == cand and edge.edge_type == .normal) {
+                    // Handler directly reaches candidate - not an else block
+                    return null;
+                }
+            }
+        }
+
+        // Verify candidate comes before exit_block
+        if (exit_block) |exit| {
+            if (cand >= exit) return null;
+        }
+
+        return candidate;
     }
 
     fn edgeTypeTo(self: *Analyzer, pred_id: u32, target_id: u32) ?EdgeType {

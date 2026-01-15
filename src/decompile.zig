@@ -3891,10 +3891,11 @@ pub const Decompiler = struct {
         const first_handler = handler_ids[0];
         const max_handler = handler_ids[handler_ids.len - 1];
 
-        // Decompile try body (blocks from try_block to first handler)
+        // Decompile try body (blocks from try_block to first handler, or to else block)
+        const try_end = pattern.else_block orelse first_handler;
         const try_body = try self.decompileBlockRangeWithStack(
             pattern.try_block,
-            first_handler,
+            try_end,
             &.{},
         );
 
@@ -4183,6 +4184,18 @@ pub const Decompiler = struct {
             return .{ .stmt = null, .next_block = max_handler + 1 };
         }
 
+        // Decompile else block if present
+        var else_body: []const *Stmt = &.{};
+        if (pattern.else_block) |else_start| {
+            // Else block runs from else_start to first handler
+            else_body = try self.decompileBlockRangeWithStack(
+                else_start,
+                first_handler,
+                &.{},
+            );
+            if (else_start >= actual_end) actual_end = else_start + 1;
+        }
+
         // Mark all processed blocks to prevent re-detection
         self.analyzer.markProcessed(pattern.try_block, actual_end);
 
@@ -4192,7 +4205,7 @@ pub const Decompiler = struct {
             .try_stmt = .{
                 .body = try_body,
                 .handlers = try handlers.toOwnedSlice(a),
-                .else_body = &.{},
+                .else_body = else_body,
                 .finalbody = &.{},
             },
         };

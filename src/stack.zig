@@ -342,8 +342,25 @@ pub const SimContext = struct {
         return null;
     }
 
+    fn cloneTupleItems(self: *SimContext, allocator: Allocator, items: []const pyc.Object) Allocator.Error![]const ast.Constant {
+        const cloned = try allocator.alloc(ast.Constant, items.len);
+        var count: usize = 0;
+        errdefer {
+            var i: usize = 0;
+            while (i < count) : (i += 1) {
+                cloned[i].deinit(allocator);
+            }
+            allocator.free(cloned);
+        }
+        for (items, 0..) |item, idx| {
+            cloned[idx] = try self.objToConstant(item);
+            count += 1;
+        }
+        return cloned;
+    }
+
     /// Convert a pyc.Object constant to an AST Constant.
-    pub fn objToConstant(self: *SimContext, obj: pyc.Object) !ast.Constant {
+    pub fn objToConstant(self: *SimContext, obj: pyc.Object) Allocator.Error!ast.Constant {
         return switch (obj) {
             .none => .none,
             .true_val => .true_,
@@ -357,7 +374,9 @@ pub const SimContext = struct {
             .complex => |v| .{ .complex = .{ .real = v.real, .imag = v.imag } },
             .string => |s| .{ .string = try self.allocator.dupe(u8, s) },
             .bytes => |b| .{ .bytes = try self.allocator.dupe(u8, b) },
-            else => .none, // TODO: handle tuples, code objects, etc.
+            .tuple => |items| .{ .tuple = try self.cloneTupleItems(self.allocator, items) },
+            .code => |c| .{ .code = c },
+            else => .none,
         };
     }
 

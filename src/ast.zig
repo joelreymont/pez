@@ -501,6 +501,8 @@ pub const Constant = union(enum) {
     complex: struct { real: f64, imag: f64 },
     string: []const u8,
     bytes: []const u8,
+    tuple: []const Constant,
+    code: *const pyc.Code,
 
     pub fn deinit(self: Constant, allocator: Allocator) void {
         switch (self) {
@@ -509,6 +511,10 @@ pub const Constant = union(enum) {
             .big_int => |b| {
                 var tmp = b;
                 tmp.deinit(allocator);
+            },
+            .tuple => |items| {
+                for (items) |item| item.deinit(allocator);
+                allocator.free(items);
             },
             else => {},
         }
@@ -736,6 +742,24 @@ fn deinitArguments(allocator: Allocator, args: *Arguments) void {
 
 const CloneError = Allocator.Error;
 
+fn cloneConstantSlice(allocator: Allocator, items: []const Constant) CloneError![]const Constant {
+    if (items.len == 0) return &.{};
+    const out = try allocator.alloc(Constant, items.len);
+    var count: usize = 0;
+    errdefer {
+        var i: usize = 0;
+        while (i < count) : (i += 1) {
+            out[i].deinit(allocator);
+        }
+        allocator.free(out);
+    }
+    for (items, 0..) |item, idx| {
+        out[idx] = try cloneConstant(allocator, item);
+        count += 1;
+    }
+    return out;
+}
+
 pub fn cloneConstant(allocator: Allocator, value: Constant) CloneError!Constant {
     return switch (value) {
         .none => .none,
@@ -748,6 +772,8 @@ pub fn cloneConstant(allocator: Allocator, value: Constant) CloneError!Constant 
         .complex => |v| .{ .complex = .{ .real = v.real, .imag = v.imag } },
         .string => |s| .{ .string = try allocator.dupe(u8, s) },
         .bytes => |b| .{ .bytes = try allocator.dupe(u8, b) },
+        .tuple => |items| .{ .tuple = try cloneConstantSlice(allocator, items) },
+        .code => |c| .{ .code = c },
     };
 }
 
