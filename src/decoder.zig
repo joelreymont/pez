@@ -48,6 +48,7 @@ pub const Instruction = struct {
             .JUMP_IF_FALSE, // Python 3.0
             .JUMP_IF_NOT_EXC_MATCH,
             .FOR_ITER,
+            .FOR_LOOP,
             .SEND,
             .CONTINUE_LOOP,
             => true,
@@ -98,6 +99,7 @@ pub const Instruction = struct {
 
     /// Check if this instruction terminates a basic block.
     pub fn isBlockTerminator(self: Instruction) bool {
+        // Terminators that don't fall through
         return switch (self.opcode) {
             .RETURN_VALUE,
             .RETURN_CONST,
@@ -131,7 +133,7 @@ pub const Instruction = struct {
             .JUMP_FORWARD => next_offset + self.arg * multiplier,
             .JUMP_BACKWARD, .JUMP_BACKWARD_NO_INTERRUPT => next_offset -| (self.arg *| multiplier),
             .JUMP_ABSOLUTE, .CONTINUE_LOOP => self.arg * multiplier,
-            .FOR_ITER, .SEND => next_offset + self.arg * multiplier, // Jump on exhaustion/end
+            .FOR_ITER, .FOR_LOOP, .SEND => next_offset + self.arg * multiplier, // Jump on exhaustion/end
             .POP_JUMP_IF_TRUE,
             .POP_JUMP_IF_FALSE,
             .POP_JUMP_IF_NONE,
