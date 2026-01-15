@@ -873,19 +873,22 @@ pub const Analyzer = struct {
 
         const handlers = try self.allocator.dupe(HandlerInfo, handler_list.items);
 
-        // Detect else block
+        // Detect else and finally blocks
         var else_block: ?u32 = null;
+        var finally_block: ?u32 = null;
         if (self.cfg.version.gte(3, 11)) {
             else_block = try self.detectElseBlock311(block_id, handler_list.items, exit_block);
+            finally_block = try self.detectFinallyBlock311(block_id, handler_list.items, else_block, exit_block);
         } else {
             else_block = try self.detectElseBlockLegacy(block_id, handler_list.items, exit_block);
+            finally_block = try self.detectFinallyBlockLegacy(block_id, handler_list.items, else_block, exit_block);
         }
 
         return TryPattern{
             .try_block = block_id,
             .handlers = handlers,
             .else_block = else_block,
-            .finally_block = null, // TODO: detect finally clause
+            .finally_block = finally_block,
             .exit_block = exit_block,
         };
     }
@@ -1004,6 +1007,131 @@ pub const Analyzer = struct {
 
         // Verify candidate comes after try block
         if (candidate <= try_block) return null;
+
+        return candidate;
+    }
+
+    fn detectFinallyBlock311(
+        self: *Analyzer,
+        try_block: u32,
+        handlers: []const HandlerInfo,
+        else_block: ?u32,
+        exit_block: ?u32,
+    ) !?u32 {
+        _ = try_block;
+        _ = handlers;
+        _ = else_block;
+        _ = exit_block;
+        _ = self;
+        return null; // TODO: implement for 3.11+
+    }
+
+    fn detectFinallyBlockLegacy(
+        self: *Analyzer,
+        try_block: u32,
+        handlers: []const HandlerInfo,
+        else_block: ?u32,
+        exit_block: ?u32,
+    ) !?u32 {
+        if (try_block >= self.cfg.blocks.len) return null;
+        if (handlers.len == 0) return null;
+
+        // Collect all paths that should reach finally:
+        // 1. Normal exit from try body
+        // 2. Normal exit from else block (if present)
+        // 3. Normal exit from each handler
+
+        var candidates: std.ArrayList(u32) = .{};
+        defer candidates.deinit(self.allocator);
+
+        // Add try body normal successor
+        const try_blk = &self.cfg.blocks[try_block];
+        for (try_blk.successors) |edge| {
+            if (edge.edge_type == .normal) {
+                try candidates.append(self.allocator, edge.target);
+            }
+        }
+
+        // If else exists, use its successors instead of try's
+        if (else_block) |eb| {
+            candidates.clearRetainingCapacity();
+            if (eb < self.cfg.blocks.len) {
+                const else_blk = &self.cfg.blocks[eb];
+                for (else_blk.successors) |edge| {
+                    if (edge.edge_type == .normal) {
+                        try candidates.append(self.allocator, edge.target);
+                    }
+                }
+            }
+        }
+
+        // Add handler exits
+        for (handlers) |h| {
+            if (h.handler_block >= self.cfg.blocks.len) continue;
+            const h_blk = &self.cfg.blocks[h.handler_block];
+            for (h_blk.successors) |edge| {
+                if (edge.edge_type == .normal and !self.cfg.blocks[edge.target].is_exception_handler) {
+                    var exists = false;
+                    for (candidates.items) |c| {
+                        if (c == edge.target) {
+                            exists = true;
+                            break;
+                        }
+                    }
+                    if (!exists) try candidates.append(self.allocator, edge.target);
+                }
+            }
+        }
+
+        if (candidates.items.len == 0) return null;
+
+        // Find common successor - block that all paths reach
+        var common: ?u32 = null;
+        for (candidates.items) |cand| {
+            var all_reach = true;
+            for (candidates.items) |other| {
+                if (cand == other) continue;
+                // Check if other reaches cand
+                var reaches = false;
+                if (other == cand) {
+                    reaches = true;
+                } else if (other < self.cfg.blocks.len) {
+                    const other_blk = &self.cfg.blocks[other];
+                    for (other_blk.successors) |edge| {
+                        if (edge.target == cand) {
+                            reaches = true;
+                            break;
+                        }
+                    }
+                }
+                if (!reaches) {
+                    all_reach = false;
+                    break;
+                }
+            }
+            if (all_reach) {
+                common = cand;
+                break;
+            }
+        }
+
+        if (common == null) return null;
+        const candidate = common.?;
+
+        // Verify not a handler
+        for (handlers) |h| {
+            if (candidate == h.handler_block) return null;
+        }
+
+        // Verify not the else block
+        if (else_block) |eb| {
+            if (candidate == eb) return null;
+        }
+
+        // Verify comes before exit
+        if (exit_block) |exit| {
+            if (candidate >= exit) return null;
+        }
 
         return candidate;
     }
