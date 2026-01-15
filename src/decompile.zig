@@ -3428,19 +3428,23 @@ pub const Decompiler = struct {
             }
         }
 
-        var else_start: ?u32 = null;
-        if (post_try_entry) |entry| {
-            if (!handler_reach.isSet(entry)) {
-                if (join_block == null or entry != join_block.?) {
-                    else_start = entry;
+        const else_start: ?u32 = pattern.else_block orelse blk: {
+            if (post_try_entry) |entry| {
+                if (!handler_reach.isSet(entry)) {
+                    if (join_block == null or entry != join_block.?) {
+                        break :blk entry;
+                    }
                 }
             }
-        }
+            break :blk null;
+        };
 
-        var finally_start: ?u32 = null;
-        if (has_finally) {
-            finally_start = join_block orelse post_try_entry;
-        }
+        const finally_start: ?u32 = pattern.finally_block orelse blk: {
+            if (has_finally) {
+                break :blk join_block orelse post_try_entry;
+            }
+            break :blk null;
+        };
 
         const handler_start = handler_blocks.items[0];
         var try_end: u32 = handler_start;
@@ -4186,14 +4190,31 @@ pub const Decompiler = struct {
 
         // Decompile else block if present
         var else_body: []const *Stmt = &.{};
+        var else_end_block = first_handler;
         if (pattern.else_block) |else_start| {
-            // Else block runs from else_start to first handler
+            // Determine where else block ends
+            if (pattern.finally_block) |finally_start| {
+                else_end_block = finally_start;
+            }
+            // Else block runs from else_start to finally or first handler
             else_body = try self.decompileBlockRangeWithStack(
                 else_start,
-                first_handler,
+                else_end_block,
                 &.{},
             );
-            if (else_start >= actual_end) actual_end = else_start + 1;
+            if (else_end_block >= actual_end) actual_end = else_end_block;
+        }
+
+        // Decompile finally block if present
+        var final_body: []const *Stmt = &.{};
+        if (pattern.finally_block) |finally_start| {
+            const finally_end = pattern.exit_block orelse @as(u32, @intCast(self.cfg.blocks.len));
+            final_body = try self.decompileBlockRangeWithStack(
+                finally_start,
+                finally_end,
+                &.{},
+            );
+            if (finally_end >= actual_end) actual_end = finally_end;
         }
 
         // Mark all processed blocks to prevent re-detection
@@ -4206,7 +4227,7 @@ pub const Decompiler = struct {
                 .body = try_body,
                 .handlers = try handlers.toOwnedSlice(a),
                 .else_body = else_body,
-                .finalbody = &.{},
+                .finalbody = final_body,
             },
         };
 
