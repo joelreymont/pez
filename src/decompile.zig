@@ -772,6 +772,47 @@ pub const Decompiler = struct {
                     };
                     const value = sim.stack.pop() orelse return error.StackUnderflow;
                     errdefer value.deinit(self.allocator);
+
+                    // Check for augmented assignment: x = x + 5 -> x += 5
+                    if (value == .expr and value.expr.* == .bin_op) {
+                        const binop = &value.expr.bin_op;
+                        if (binop.left.* == .name and std.mem.eql(u8, binop.left.name.id, name)) {
+                            const arena = self.arena.allocator();
+                            binop.left.deinit(arena);
+                            arena.destroy(binop.left);
+                            const stmt = try arena.create(Stmt);
+                            const target = try ast.makeName(arena, name, .store);
+                            stmt.* = .{ .aug_assign = .{
+                                .target = target,
+                                .op = binop.op,
+                                .value = binop.right,
+                            } };
+                            arena.destroy(value.expr);
+                            try stmts.append(self.allocator, stmt);
+                            continue;
+                        }
+                    }
+
+                    // Check for augmented assignment: x = x + 5 -> x += 5
+                    if (value == .expr and value.expr.* == .bin_op) {
+                        const binop = &value.expr.bin_op;
+                        if (binop.left.* == .name and std.mem.eql(u8, binop.left.name.id, name)) {
+                            const arena = self.arena.allocator();
+                            binop.left.deinit(arena);
+                            arena.destroy(binop.left);
+                            const stmt = try arena.create(Stmt);
+                            const target = try ast.makeName(arena, name, .store);
+                            stmt.* = .{ .aug_assign = .{
+                                .target = target,
+                                .op = binop.op,
+                                .value = binop.right,
+                            } };
+                            arena.destroy(value.expr);
+                            try stmts.append(self.allocator, stmt);
+                            continue;
+                        }
+                    }
+
                     if (try self.handleStoreValue(name, value)) |stmt| {
                         try stmts.append(self.allocator, stmt);
                     }
