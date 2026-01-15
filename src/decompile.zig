@@ -340,16 +340,25 @@ pub const Decompiler = struct {
                 };
             };
             switch (inst.opcode) {
-                .UNPACK_SEQUENCE => {
+                .UNPACK_SEQUENCE, .UNPACK_EX => {
                     // Look ahead for N store targets to generate unpacking assignment
                     // Targets can be: STORE_*, or LOAD + STORE_ATTR, or LOAD + STORE_SUBSCR
-                    const count = inst.arg;
+                    const count = if (inst.opcode == .UNPACK_EX) blk: {
+                        const before = inst.arg & 0xFF;
+                        const after = (inst.arg >> 8) & 0xFF;
+                        break :blk before + 1 + after;
+                    } else inst.arg;
                     const seq_expr = try sim.stack.popExpr();
                     const arena = self.arena.allocator();
 
                     // Collect targets from following instructions
                     var targets = try std.ArrayList(*Expr).initCapacity(arena, count);
                     var skip_count: usize = 0;
+
+                    const star_pos: ?u32 = if (inst.opcode == .UNPACK_EX) blk: {
+                        const before = inst.arg & 0xFF;
+                        break :blk before;
+                    } else null;
 
                     var j: usize = 0;
                     var instr_idx: usize = i + 1;
@@ -380,7 +389,14 @@ pub const Decompiler = struct {
                             else => null,
                         };
                         if (simple_name) |n| {
-                            const target = try ast.makeName(arena, n, .store);
+                            const target = if (star_pos != null and j == star_pos.?) blk: {
+                                const starred = try arena.create(Expr);
+                                starred.* = .{ .starred = .{
+                                    .value = try ast.makeName(arena, n, .store),
+                                    .ctx = .store,
+                                } };
+                                break :blk starred;
+                            } else try ast.makeName(arena, n, .store);
                             try targets.append(arena, target);
                             skip_count += 1;
                             instr_idx += 1;
