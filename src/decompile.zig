@@ -276,6 +276,10 @@ pub const Decompiler = struct {
         var i: usize = 0;
         while (i < instructions.len) : (i += 1) {
             const inst = instructions[i];
+
+            // Stop at POP_EXCEPT - marks end of except handler body, cleanup follows
+            if (inst.opcode == .POP_EXCEPT) break;
+
             errdefer if (self.last_error_ctx == null) {
                 self.last_error_ctx = .{
                     .code_name = self.code.name,
@@ -3866,11 +3870,14 @@ pub const Decompiler = struct {
                     }
                 }
                 // Check body block for "as name:" binding (NOT_TAKEN, STORE_NAME pattern)
-                if (body_block < self.cfg.blocks.len) {
-                    const body_blk = &self.cfg.blocks[body_block];
-                    for (body_blk.instructions, 0..) |inst, i| {
+                // Note: NOT_TAKEN, POP_TOP, or STORE_NAME may be in next block if CFG split them
+                var check_block = body_block;
+                while (check_block < self.cfg.blocks.len and check_block < body_block + 2) {
+                    const check_blk = &self.cfg.blocks[check_block];
+                    for (check_blk.instructions, 0..) |inst, i| {
+                        const is_first_block = (check_block == body_block);
                         if (inst.opcode == .NOT_TAKEN) {
-                            body_skip = i + 1;
+                            if (is_first_block) body_skip = i + 1;
                         } else if (inst.opcode == .STORE_NAME or inst.opcode == .STORE_FAST or inst.opcode == .STORE_GLOBAL) {
                             // "except Type as name:" - extract name
                             exc_name = switch (inst.opcode) {
@@ -3878,29 +3885,54 @@ pub const Decompiler = struct {
                                 .STORE_FAST => sim.getLocal(inst.arg),
                                 else => null,
                             };
-                            body_skip = i + 1;
+                            if (is_first_block) {
+                                body_skip = i + 1;
+                            } else {
+                                // Binding is in next block, skip entire first block
+                                body_skip = check_blk.instructions.len;
+                                body_block = check_block;
+                                body_skip = 1;
+                            }
+                            check_block = @intCast(self.cfg.blocks.len); // Break outer loop
                             break;
                         } else if (inst.opcode == .POP_TOP) {
                             // "except Type:" without name binding
-                            body_skip = i + 1;
+                            if (is_first_block) {
+                                body_skip = i + 1;
+                            } else {
+                                // POP_TOP is in next block, skip it
+                                body_block = check_block;
+                                body_skip = 1;
+                            }
+                            check_block = @intCast(self.cfg.blocks.len); // Break outer loop
                             break;
                         } else {
+                            check_block = @intCast(self.cfg.blocks.len); // Break outer loop
                             break;
                         }
                     }
+                    check_block += 1;
                 }
             }
 
-            // Find body end
+            // Find body end by scanning forward for POP_EXCEPT
             var handler_end_block = body_block + 1;
-            if (body_block < self.cfg.blocks.len) {
-                const body_blk = &self.cfg.blocks[body_block];
-                for (body_blk.successors) |edge| {
-                    if (edge.edge_type == .normal) {
-                        handler_end_block = edge.target;
+            var scan_block = body_block;
+            while (scan_block < self.cfg.blocks.len) {
+                const scan_blk = &self.cfg.blocks[scan_block];
+                var found_pop_except = false;
+                for (scan_blk.instructions) |inst| {
+                    if (inst.opcode == .POP_EXCEPT) {
+                        found_pop_except = true;
                         break;
                     }
                 }
+                if (found_pop_except) {
+                    handler_end_block = scan_block + 1;
+                    break;
+                }
+                scan_block += 1;
+                if (scan_block > body_block + 10) break; // Safety limit
             }
 
             // Decompile handler body
