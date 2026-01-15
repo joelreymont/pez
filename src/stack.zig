@@ -1785,52 +1785,67 @@ pub const SimContext = struct {
                     (tos1 == .comp_obj or tos1 == .function_obj) and
                     tos == .expr;
 
+                // Detect decorator application: decorator(function)
+                // Stack: [decorator_expr, function_obj], argc=0
+                const is_decorator_call = argc == 0 and
+                    tos1 == .expr and
+                    tos == .function_obj;
+
                 if (is_comp_call) {
                     // Comprehension call: gen_func(iter_expr) without PUSH_NULL
                     // Stack was [callable, iter_expr] with iter_expr on top
                     callable = tos1;
                     iter_expr_from_stack = tos.expr;
+                    try self.handleCall(callable, args_vals, &[_]ast.Keyword{}, iter_expr_from_stack);
+                } else if (is_decorator_call) {
+                    // Decorator application: decorator(function)
+                    // Attach decorator to the function object and push it back
+                    const decorator = tos1.expr;
+                    try tos.function_obj.decorators.insert(self.allocator, 0, decorator);
+                    self.allocator.free(args_vals);
+                    try self.stack.push(tos);
                 } else {
-                    // Normal call: [NULL/self, callable, args...]
-                    callable = tos;
-                    if (tos1 == .null_marker) {
+                    // Normal call: [callable, NULL/self, args...]
+                    // tos1 = callable, tos = NULL/self marker
+                    callable = tos1;
+                    if (tos == .null_marker) {
                         // Function call with PUSH_NULL - discard NULL marker
                     } else {
-                        // Method call or some other case - discard the extra value
-                        tos1.deinit(self.allocator);
-                    }
-                }
-
-                // Check if KW_NAMES set up keyword argument names
-                if (self.pending_kwnames) |kwnames| {
-                    defer {
-                        self.allocator.free(kwnames);
-                        self.pending_kwnames = null;
-                    }
-                    const num_kwargs = kwnames.len;
-                    const num_posargs = argc - num_kwargs;
-
-                    // Split args into positional and keyword
-                    const posargs = args_vals[0..num_posargs];
-                    const kwvalues = args_vals[num_posargs..];
-
-                    // Build keyword arguments
-                    const keywords = try self.allocator.alloc(ast.Keyword, num_kwargs);
-                    errdefer self.allocator.free(keywords);
-                    for (kwnames, kwvalues, 0..) |name, kwval, i| {
-                        const value = switch (kwval) {
-                            .expr => |e| e,
-                            else => return error.NotAnExpression,
-                        };
-                        keywords[i] = .{
-                            .arg = if (std.mem.eql(u8, name, "<unknown>")) null else name,
-                            .value = value,
-                        };
+                        // Method call - tos is self, discard it (handled elsewhere)
+                        tos.deinit(self.allocator);
                     }
 
-                    try self.handleCall(callable, posargs, keywords, iter_expr_from_stack);
-                } else {
-                    try self.handleCall(callable, args_vals, &[_]ast.Keyword{}, iter_expr_from_stack);
+                    // Check if KW_NAMES set up keyword argument names
+                    if (self.pending_kwnames) |kwnames| {
+                        defer {
+                            self.allocator.free(kwnames);
+                            self.pending_kwnames = null;
+                        }
+                        const num_kwargs = kwnames.len;
+                        const num_posargs = argc - num_kwargs;
+
+                        // Split args into positional and keyword
+                        const posargs = args_vals[0..num_posargs];
+                        const kwvalues = args_vals[num_posargs..];
+
+                        // Build keyword arguments
+                        const keywords = try self.allocator.alloc(ast.Keyword, num_kwargs);
+                        errdefer self.allocator.free(keywords);
+                        for (kwnames, kwvalues, 0..) |name, kwval, i| {
+                            const value = switch (kwval) {
+                                .expr => |e| e,
+                                else => return error.NotAnExpression,
+                            };
+                            keywords[i] = .{
+                                .arg = if (std.mem.eql(u8, name, "<unknown>")) null else name,
+                                .value = value,
+                            };
+                        }
+
+                        try self.handleCall(callable, posargs, keywords, iter_expr_from_stack);
+                    } else {
+                        try self.handleCall(callable, args_vals, &[_]ast.Keyword{}, iter_expr_from_stack);
+                    }
                 }
             },
 
@@ -3382,25 +3397,46 @@ pub const SimContext = struct {
             .BUILD_SLICE => {
                 // BUILD_SLICE argc - build slice from argc elements
                 // argc=2: TOS1:TOS, argc=3: TOS2:TOS1:TOS
+                // None values become null (omitted in output like [::-1])
                 const argc = inst.arg;
                 var step: ?*Expr = null;
                 if (argc == 3) {
-                    step = try self.stack.popExpr();
+                    const step_expr = try self.stack.popExpr();
+                    if (step_expr.* == .constant and step_expr.constant == .none) {
+                        step_expr.deinit(self.allocator);
+                        self.allocator.destroy(step_expr);
+                    } else {
+                        step = step_expr;
+                    }
                 }
                 errdefer if (step) |s| {
                     s.deinit(self.allocator);
                     self.allocator.destroy(s);
                 };
-                const stop = try self.stack.popExpr();
-                errdefer {
-                    stop.deinit(self.allocator);
-                    self.allocator.destroy(stop);
+                const stop_expr = try self.stack.popExpr();
+                var stop: ?*Expr = null;
+                if (stop_expr.* == .constant and stop_expr.constant == .none) {
+                    stop_expr.deinit(self.allocator);
+                    self.allocator.destroy(stop_expr);
+                } else {
+                    stop = stop_expr;
                 }
-                const start = try self.stack.popExpr();
-                errdefer {
-                    start.deinit(self.allocator);
-                    self.allocator.destroy(start);
+                errdefer if (stop) |s| {
+                    s.deinit(self.allocator);
+                    self.allocator.destroy(s);
+                };
+                const start_expr = try self.stack.popExpr();
+                var start: ?*Expr = null;
+                if (start_expr.* == .constant and start_expr.constant == .none) {
+                    start_expr.deinit(self.allocator);
+                    self.allocator.destroy(start_expr);
+                } else {
+                    start = start_expr;
                 }
+                errdefer if (start) |s| {
+                    s.deinit(self.allocator);
+                    self.allocator.destroy(s);
+                };
 
                 const expr = try self.allocator.create(Expr);
                 expr.* = .{ .slice = .{
@@ -3770,9 +3806,10 @@ pub const SimContext = struct {
 
             // Comprehension opcodes
             .LIST_APPEND => {
-                // LIST_APPEND i - append TOS to list at stack[i]
+                // LIST_APPEND i - append TOS to list at STACK[-i]
                 // Used in list comprehensions
-                // Stack: ..., list, ..., item -> ..., list, ...
+                // Python: v = POP(); list = PEEK(i); list.append(v)
+                // After popping item, PEEK(i) uses depth i from new stack
                 const item = try self.stack.popExpr();
                 const builder = if (self.comp_builder) |b| blk: {
                     if (b.kind != .list) return error.InvalidComprehension;
@@ -3787,8 +3824,9 @@ pub const SimContext = struct {
             },
 
             .SET_ADD => {
-                // SET_ADD i - add TOS to set at stack[i]
+                // SET_ADD i - add TOS to set at STACK[-i]
                 // Used in set comprehensions
+                // Python: v = POP(); set = PEEK(i); set.add(v)
                 const item = try self.stack.popExpr();
                 const builder = if (self.comp_builder) |b| blk: {
                     if (b.kind != .set) return error.InvalidComprehension;
@@ -3803,9 +3841,10 @@ pub const SimContext = struct {
             },
 
             .MAP_ADD => {
-                // MAP_ADD i - add TOS1:TOS to dict at stack[i]
+                // MAP_ADD i - add TOS1:TOS to dict at STACK[-i]
                 // Used in dict comprehensions
-                // Stack: ..., dict, ..., key, value -> ..., dict, ...
+                // Python: v = POP(); k = POP(); dict = PEEK(i); dict[k] = v
+                // After popping both, PEEK(i) uses depth i from new stack
                 const value = try self.stack.popExpr();
                 errdefer {
                     value.deinit(self.allocator);

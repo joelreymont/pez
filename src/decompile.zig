@@ -244,12 +244,35 @@ pub const Decompiler = struct {
         skip_first: usize,
     ) DecompileError!void {
         // Check for pending ternary expression from tryDecompileTernaryInto
+        // For inline comprehensions (Python 3.12+), we need to skip cleanup ops
+        // before pushing the expression: END_FOR, POP_TOP, SWAP, STORE_FAST (loop var restore)
+        var extra_skip: usize = 0;
+        if (self.pending_ternary_expr != null) {
+            // Skip cleanup ops at start of block
+            const cleanup_insts = block.instructions[skip_first..];
+            for (cleanup_insts, 0..) |cleanup_inst, j| {
+                switch (cleanup_inst.opcode) {
+                    .END_FOR, .POP_TOP, .POP_ITER, .SWAP => {
+                        extra_skip += 1;
+                    },
+                    .STORE_FAST => {
+                        // STORE_FAST after SWAP is loop variable restore - skip it
+                        if (j > 0 and cleanup_insts[j - 1].opcode == .SWAP) {
+                            extra_skip += 1;
+                        } else {
+                            break;
+                        }
+                    },
+                    else => break,
+                }
+            }
+        }
         if (self.pending_ternary_expr) |expr| {
             try sim.stack.push(.{ .expr = expr });
             self.pending_ternary_expr = null;
         }
 
-        const instructions = block.instructions[skip_first..];
+        const instructions = block.instructions[skip_first + extra_skip ..];
         var i: usize = 0;
         while (i < instructions.len) : (i += 1) {
             const inst = instructions[i];
@@ -919,14 +942,47 @@ pub const Decompiler = struct {
                     const value = if (value_val == .expr) value_val.expr else continue;
 
                     const a = self.arena.allocator();
-                    const subscript = try a.create(Expr);
-                    subscript.* = .{ .subscript = .{
-                        .value = container,
-                        .slice = key,
-                        .ctx = .store,
-                    } };
-                    const stmt = try self.makeAssign(subscript, value);
-                    try stmts.append(self.allocator, stmt);
+
+                    // Check for variable annotation pattern: __annotations__['varname'] = type
+                    if (container.* == .name and std.mem.eql(u8, container.name.id, "__annotations__") and
+                        key.* == .constant and key.constant == .string)
+                    {
+                        const var_name = key.constant.string;
+                        const target = try ast.makeName(a, var_name, .store);
+
+                        // Check if previous statement was an assignment to the same variable
+                        // Pattern: x = value; __annotations__['x'] = type => x: type = value
+                        var assign_value: ?*Expr = null;
+                        if (stmts.items.len > 0) {
+                            const prev = stmts.items[stmts.items.len - 1];
+                            if (prev.* == .assign and prev.assign.targets.len == 1) {
+                                const prev_target = prev.assign.targets[0];
+                                if (prev_target.* == .name and std.mem.eql(u8, prev_target.name.id, var_name)) {
+                                    assign_value = prev.assign.value;
+                                    // Remove the previous assignment
+                                    _ = stmts.pop();
+                                }
+                            }
+                        }
+
+                        const stmt = try a.create(Stmt);
+                        stmt.* = .{ .ann_assign = .{
+                            .target = target,
+                            .annotation = value,
+                            .value = assign_value,
+                            .simple = true,
+                        } };
+                        try stmts.append(self.allocator, stmt);
+                    } else {
+                        const subscript = try a.create(Expr);
+                        subscript.* = .{ .subscript = .{
+                            .value = container,
+                            .slice = key,
+                            .ctx = .store,
+                        } };
+                        const stmt = try self.makeAssign(subscript, value);
+                        try stmts.append(self.allocator, stmt);
+                    }
                 },
                 .STORE_SLICE => {
                     // STORE_SLICE (3.12+): TOS3[TOS2:TOS1] = TOS
@@ -1848,9 +1904,11 @@ pub const Decompiler = struct {
         pattern: ctrl.ForPattern,
     ) DecompileError!?u32 {
         const setup = &self.cfg.blocks[pattern.setup_block];
+        const header = &self.cfg.blocks[pattern.header_block];
         var list_start: ?u32 = null;
         var after_build = false;
 
+        // Check setup block first (Python <3.12 pattern: BUILD_LIST before GET_ITER)
         for (setup.instructions) |inst| {
             if (inst.opcode == .BUILD_LIST and inst.arg == 0) {
                 list_start = inst.offset;
@@ -1874,20 +1932,95 @@ pub const Decompiler = struct {
             }
         }
 
+        // Python 3.12+: BUILD_LIST is AFTER GET_ITER in setup block (before FOR_ITER)
+        if (list_start == null) {
+            var past_get_iter = false;
+            for (setup.instructions) |inst| {
+                if (inst.opcode == .GET_ITER) {
+                    past_get_iter = true;
+                    continue;
+                }
+                if (!past_get_iter) continue;
+                if (inst.opcode == .BUILD_LIST and inst.arg == 0) {
+                    list_start = inst.offset;
+                    break;
+                }
+            }
+        }
+
+        // Fallback: check header block for BUILD_LIST before FOR_ITER
+        if (list_start == null) {
+            for (header.instructions) |inst| {
+                if (inst.opcode == .BUILD_LIST and inst.arg == 0) {
+                    list_start = inst.offset;
+                    break;
+                }
+                if (inst.opcode == .FOR_ITER) break;
+            }
+        }
+
         const start = list_start orelse return null;
 
-        const header = &self.cfg.blocks[pattern.header_block];
         const term = header.terminator() orelse return null;
         if (term.opcode != .FOR_ITER) return null;
         const exit_offset = term.jumpTarget(self.version) orelse return null;
         if (exit_offset <= start) return null;
 
+        // Find GET_ITER position
+        var get_iter_offset: ?u32 = null;
+        for (setup.instructions) |inst| {
+            if (inst.opcode == .GET_ITER) {
+                get_iter_offset = inst.offset;
+                break;
+            }
+        }
+
         var sim = SimContext.init(self.arena.allocator(), self.code, self.version);
         defer sim.deinit();
 
+        // Determine simulation start point based on pattern type
+        var sim_start = start;
+
+        // Python <3.12: BUILD_LIST comes before GET_ITER, simulate from BUILD_LIST
+        // Python 3.12+: BUILD_LIST comes after GET_ITER, need to set up iterator first
+        if (get_iter_offset) |gio| {
+            if (start < gio) {
+                // Python <3.12: BUILD_LIST before GET_ITER
+                // Simulate from BUILD_LIST (start)
+                sim_start = start;
+            } else {
+                // Python 3.12+: BUILD_LIST after GET_ITER
+                // Simulate setup code to get iterator expression, then start from GET_ITER
+                var setup_sim = SimContext.init(self.arena.allocator(), self.code, self.version);
+                defer setup_sim.deinit();
+
+                var setup_iter = decoder.InstructionIterator.init(self.code.code, self.version);
+                while (setup_iter.next()) |inst| {
+                    if (inst.offset >= gio) break;
+                    if (inst.opcode == .RESUME) continue;
+                    setup_sim.simulate(inst) catch continue;
+                }
+
+                // Get the iterator expression from TOS
+                if (setup_sim.stack.pop()) |val| {
+                    switch (val) {
+                        .expr => |e| try sim.stack.push(.{ .expr = e }),
+                        else => {
+                            const iter_placeholder = try ast.makeName(self.arena.allocator(), ".iter", .load);
+                            try sim.stack.push(.{ .expr = iter_placeholder });
+                        },
+                    }
+                } else {
+                    const iter_placeholder = try ast.makeName(self.arena.allocator(), ".iter", .load);
+                    try sim.stack.push(.{ .expr = iter_placeholder });
+                }
+                sim_start = gio;
+            }
+        }
+
         var iter = decoder.InstructionIterator.init(self.code.code, self.version);
         while (iter.next()) |inst| {
-            if (inst.offset < start) continue;
+            if (inst.offset < sim_start) continue;
             if (inst.offset >= exit_offset) break;
             try sim.simulate(inst);
         }
@@ -1900,6 +2033,106 @@ pub const Decompiler = struct {
         if (self.pending_ternary_expr != null) return error.InvalidBlock;
         self.pending_ternary_expr = expr;
         return pattern.exit_block;
+    }
+
+    /// Try to decompile a try pattern as an inline comprehension.
+    /// Python 3.12+ comprehensions have exception cleanup code that looks like try/except.
+    fn tryDecompileTryAsComprehension(
+        self: *Decompiler,
+        pattern: ctrl.TryPattern,
+        stmts: *std.ArrayList(*Stmt),
+    ) DecompileError!?u32 {
+        if (!self.version.gte(3, 12)) return null;
+        if (pattern.handlers.len == 0) return null;
+
+        const handler_id = pattern.handlers[0].handler_block;
+        if (handler_id >= self.cfg.blocks.len) return null;
+        const handler = &self.cfg.blocks[handler_id];
+
+        // Check if this is comprehension cleanup: SWAP, POP_TOP, SWAP, STORE_FAST, RERAISE
+        var has_reraise = false;
+        for (handler.instructions) |inst| {
+            if (inst.opcode == .RERAISE) {
+                has_reraise = true;
+                break;
+            }
+        }
+        if (!has_reraise) return null;
+
+        // Look for FOR_ITER in try body that has LIST_APPEND/SET_ADD/MAP_ADD
+        const try_id = pattern.try_block;
+        var for_block_id: ?u32 = null;
+        var exit_block_id: ?u32 = null;
+
+        var bid = try_id;
+        var body_block_id: ?u32 = null;
+        while (bid < handler_id) : (bid += 1) {
+            const block = &self.cfg.blocks[bid];
+            const term = block.terminator() orelse continue;
+            if (term.opcode == .FOR_ITER) {
+                // Get body and exit from successors
+                var body_id_opt: ?u32 = null;
+                var exit_id_opt: ?u32 = null;
+                for (block.successors) |edge| {
+                    if (edge.edge_type == .normal) {
+                        body_id_opt = edge.target;
+                    } else if (edge.edge_type == .conditional_false) {
+                        exit_id_opt = edge.target;
+                    }
+                }
+                const body_id = body_id_opt orelse continue;
+                const exit_id = exit_id_opt orelse continue;
+
+                // Check if body has LIST_APPEND/SET_ADD/MAP_ADD
+                if (body_id < self.cfg.blocks.len) {
+                    const body = &self.cfg.blocks[body_id];
+                    for (body.instructions) |inst| {
+                        if (inst.opcode == .LIST_APPEND or
+                            inst.opcode == .SET_ADD or
+                            inst.opcode == .MAP_ADD)
+                        {
+                            for_block_id = bid;
+                            body_block_id = body_id;
+                            exit_block_id = exit_id;
+                            break;
+                        }
+                    }
+                }
+            }
+            if (for_block_id != null) break;
+        }
+
+        if (for_block_id == null) return null;
+
+        const for_pattern = ctrl.ForPattern{
+            .setup_block = try_id,
+            .header_block = for_block_id.?,
+            .body_block = body_block_id.?,
+            .exit_block = exit_block_id.?,
+        };
+
+        // Decompile blocks before the for loop
+        if (for_block_id.? > try_id) {
+            const pre_stmts = try self.decompileBlockRangeWithStack(try_id, for_block_id.?, &.{});
+            defer self.allocator.free(pre_stmts);
+            try stmts.appendSlice(self.allocator, pre_stmts);
+        }
+
+        // Try to decompile as inline comprehension
+        if (try self.tryDecompileInlineListComp(for_pattern)) |_| {
+            // Comprehension is now in pending_ternary_expr
+            // Process the exit block to pick it up
+            const exit_id = exit_block_id.?;
+            if (exit_id < self.cfg.blocks.len) {
+                const exit_stmts = try self.decompileBlockRangeWithStack(exit_id, handler_id, &.{});
+                defer self.allocator.free(exit_stmts);
+                try stmts.appendSlice(self.allocator, exit_stmts);
+            }
+            self.allocator.free(pattern.handlers);
+            return handler_id + 1;
+        }
+
+        return null;
     }
 
     /// Try to decompile a short-circuit boolean expression (x and y, x or y).
@@ -2171,6 +2404,11 @@ pub const Decompiler = struct {
                     block_idx = p.exit_block;
                 },
                 .try_stmt => |p| {
+                    // Check for inline comprehension before try/except
+                    if (try self.tryDecompileTryAsComprehension(p, &self.statements)) |next_block| {
+                        block_idx = next_block;
+                        continue;
+                    }
                     if (try self.tryDecompileAsyncFor(p)) |result| {
                         if (result.stmt) |s| {
                             try self.statements.append(self.allocator, s);
@@ -3979,16 +4217,48 @@ pub const Decompiler = struct {
                     // Arena allocator handles cleanup, no errdefer needed
                     const key = try sim.stack.popExpr();
                     const container = try sim.stack.popExpr();
-                    const value = try sim.stack.popExpr();
+                    const annotation = try sim.stack.popExpr();
 
-                    const subscript = try a.create(Expr);
-                    subscript.* = .{ .subscript = .{
-                        .value = container,
-                        .slice = key,
-                        .ctx = .store,
-                    } };
-                    const stmt = try self.makeAssign(subscript, value);
-                    try stmts.append(a, stmt);
+                    // Check for variable annotation pattern: __annotations__['varname'] = type
+                    if (container.* == .name and std.mem.eql(u8, container.name.id, "__annotations__") and
+                        key.* == .constant and key.constant == .string)
+                    {
+                        const var_name = key.constant.string;
+                        const target = try ast.makeName(a, var_name, .store);
+
+                        // Check if previous statement was an assignment to the same variable
+                        // Pattern: x = value; __annotations__['x'] = type => x: type = value
+                        var assign_value: ?*Expr = null;
+                        if (stmts.items.len > 0) {
+                            const prev = stmts.items[stmts.items.len - 1];
+                            if (prev.* == .assign and prev.assign.targets.len == 1) {
+                                const prev_target = prev.assign.targets[0];
+                                if (prev_target.* == .name and std.mem.eql(u8, prev_target.name.id, var_name)) {
+                                    assign_value = prev.assign.value;
+                                    // Remove the previous assignment
+                                    _ = stmts.pop();
+                                }
+                            }
+                        }
+
+                        const stmt = try a.create(Stmt);
+                        stmt.* = .{ .ann_assign = .{
+                            .target = target,
+                            .annotation = annotation,
+                            .value = assign_value,
+                            .simple = true,
+                        } };
+                        try stmts.append(a, stmt);
+                    } else {
+                        const subscript = try a.create(Expr);
+                        subscript.* = .{ .subscript = .{
+                            .value = container,
+                            .slice = key,
+                            .ctx = .store,
+                        } };
+                        const stmt = try self.makeAssign(subscript, annotation);
+                        try stmts.append(a, stmt);
+                    }
                 },
                 .STORE_SLICE => {
                     // STORE_SLICE (3.12+): TOS3[TOS2:TOS1] = TOS
@@ -4013,6 +4283,10 @@ pub const Decompiler = struct {
                     try stmts.append(a, stmt);
                 },
                 .JUMP_FORWARD, .JUMP_BACKWARD, .JUMP_BACKWARD_NO_INTERRUPT, .JUMP_ABSOLUTE => {
+                    // When stop_at_jump is true, we're at the natural end of a loop body.
+                    // The terminating back-edge is NOT a continue statement - it's implicit.
+                    // Only emit break/continue for jumps that are NOT the natural terminator.
+                    if (stop_at_jump) return;
                     if (loop_header) |header_id| {
                         const exit = self.analyzer.detectLoopExit(block_id, &[_]u32{header_id});
                         switch (exit) {
@@ -4029,7 +4303,6 @@ pub const Decompiler = struct {
                             else => {},
                         }
                     }
-                    if (stop_at_jump) return;
                 },
                 .RETURN_VALUE => {
                     const value = try sim.stack.popExpr();
@@ -4112,7 +4385,7 @@ pub const Decompiler = struct {
     fn allowsEmptyPop(self: *Decompiler, block: *const cfg_mod.BasicBlock) bool {
         for (block.instructions) |inst| {
             switch (inst.opcode) {
-                .END_FINALLY, .POP_EXCEPT, .RERAISE => return true,
+                .END_FINALLY, .POP_EXCEPT, .RERAISE, .END_FOR => return true,
                 else => {},
             }
         }
@@ -4123,6 +4396,13 @@ pub const Decompiler = struct {
                 const term = pred.terminator() orelse continue;
                 if (term.opcode == .JUMP_IF_FALSE or term.opcode == .JUMP_IF_TRUE) return true;
             }
+        }
+        // Check if predecessor is a for loop header (FOR_ITER terminator)
+        for (block.predecessors) |pred_id| {
+            if (pred_id >= self.cfg.blocks.len) continue;
+            const pred = &self.cfg.blocks[pred_id];
+            const term = pred.terminator() orelse continue;
+            if (term.opcode == .FOR_ITER) return true;
         }
         return false;
     }
