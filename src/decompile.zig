@@ -601,7 +601,7 @@ pub const Decompiler = struct {
                                                 else => null,
                                             };
                                             if (un2) |nm| {
-                                                const tgt = try ast.makeName(self.allocator, nm, .store);
+                                                const tgt = try ast.makeName(arena, nm, .store);
                                                 try tup_targets.append(arena, tgt);
                                                 found += 1;
                                                 kk += 1;
