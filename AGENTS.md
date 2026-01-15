@@ -1,5 +1,9 @@
 # Pez
 
+## Active Plan
+
+Decompiler parity spec: `~/.claude/plans/bright-kindling-plum.md`
+
 ## Build
 
 ```bash

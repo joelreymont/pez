@@ -3440,6 +3440,10 @@ pub const SimContext = struct {
                 // Stack: keys_tuple, val1, val2, ..., valN -> dict
                 const count = inst.arg;
 
+                // Pop values first (TOS down to TOS-count+1)
+                const keys_val = self.stack.pop() orelse return error.StackUnderflow;
+                defer keys_val.deinit(self.allocator);
+
                 // Pop values in reverse order
                 const values = try self.allocator.alloc(*Expr, count);
                 errdefer self.allocator.free(values);
@@ -3455,20 +3459,40 @@ pub const SimContext = struct {
                     }
                 }
 
-                // Pop keys tuple
-                const keys_val = self.stack.pop() orelse return error.StackUnderflow;
-                defer keys_val.deinit(self.allocator);
-
                 // Extract keys from tuple expr
                 const keys = try self.allocator.alloc(?*Expr, count);
                 errdefer self.allocator.free(keys);
 
-                if (keys_val == .expr and keys_val.expr.* == .tuple) {
-                    const key_exprs = keys_val.expr.tuple.elts;
-                    if (key_exprs.len != count) return error.InvalidConstKeyMap;
+                if (keys_val == .expr) {
+                    switch (keys_val.expr.*) {
+                        .tuple => |tup| {
+                            const key_exprs = tup.elts;
+                            if (key_exprs.len != count) return error.InvalidConstKeyMap;
 
-                    for (key_exprs, 0..) |key, j| {
-                        keys[j] = try ast.cloneExpr(self.allocator, key);
+                            for (key_exprs, 0..) |key, j| {
+                                keys[j] = try ast.cloneExpr(self.allocator, key);
+                            }
+                        },
+                        .constant => |c| {
+                            // Constant wraps a tuple - extract it
+                            switch (c) {
+                                .tuple => |items| {
+                                    if (items.len != count) return error.InvalidConstKeyMap;
+                                    for (items, 0..) |item, j| {
+                                        const key_expr = try ast.makeConstant(self.allocator, item);
+                                        keys[j] = key_expr;
+                                    }
+                                },
+                                else => {
+                                    // Fall back to unknown keys
+                                    for (keys) |*k| k.* = null;
+                                },
+                            }
+                        },
+                        else => {
+                            // Fall back to unknown keys
+                            for (keys) |*k| k.* = null;
+                        },
                     }
                 } else {
                     // Fall back to unknown keys

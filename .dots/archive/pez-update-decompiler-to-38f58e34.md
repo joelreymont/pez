@@ -1,9 +1,11 @@
 ---
 title: Update decompiler to emit else/finally
-status: open
+status: closed
 priority: 2
 issue-type: task
-created-at: "2026-01-15T16:56:08.557006+02:00"
+created-at: "\"\\\"2026-01-15T16:56:08.557006+02:00\\\"\""
+closed-at: "2026-01-15T17:17:00.082879+02:00"
+close-reason: updated decompileTry and decompileTry311 to use pattern fields
 ---
 
 In src/decompile.zig, update try/except decompilation to use TryPattern.else_block and finally_block:

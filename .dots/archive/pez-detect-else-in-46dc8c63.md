@@ -1,9 +1,11 @@
 ---
 title: Detect else in detectTryPattern <3.11
-status: open
+status: closed
 priority: 2
 issue-type: task
-created-at: "2026-01-15T16:55:46.090166+02:00"
+created-at: "\"\\\"2026-01-15T16:55:46.090166+02:00\\\"\""
+closed-at: "2026-01-15T17:11:44.150187+02:00"
+close-reason: implemented detectElseBlockLegacy
 ---
 
 In src/ctrl.zig:821 detectTryPattern(), for Python <3.11:

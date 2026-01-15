@@ -1,9 +1,11 @@
 ---
 title: Detect finally in detectTryPattern <3.11
-status: open
+status: closed
 priority: 2
 issue-type: task
-created-at: "2026-01-15T16:56:01.248797+02:00"
+created-at: "\"\\\"2026-01-15T16:56:01.248797+02:00\\\"\""
+closed-at: "2026-01-15T17:13:45.332142+02:00"
+close-reason: implemented detectFinallyBlockLegacy
 ---
 
 In src/ctrl.zig:821 detectTryPattern(), for Python <3.11:

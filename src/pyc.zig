@@ -678,6 +678,13 @@ const BufferReader = struct {
         return b;
     }
 
+    fn readU16(self: *BufferReader) !u16 {
+        if (self.pos + 2 > self.data.len) return error.UnexpectedEndOfFile;
+        const val = std.mem.readInt(u16, self.data[self.pos..][0..2], .little);
+        self.pos += 2;
+        return val;
+    }
+
     fn readU32(self: *BufferReader) !u32 {
         if (self.pos + 4 > self.data.len) return error.UnexpectedEndOfFile;
         const val = std.mem.readInt(u32, self.data[self.pos..][0..4], .little);
@@ -865,11 +872,27 @@ pub const Module = struct {
             code.nlocals = try reader.readU32();
             code.stacksize = try reader.readU32();
             code.flags = try reader.readU32();
-        } else {
+        } else if (ver.gte(2, 3)) {
+            // Python 2.3-2.7: 32-bit fields
             code.argcount = try reader.readU32();
             code.nlocals = try reader.readU32();
             code.stacksize = try reader.readU32();
             code.flags = try reader.readU32();
+        } else if (ver.gte(1, 5)) {
+            // Python 1.5-2.2: 16-bit fields
+            code.argcount = try reader.readU16();
+            code.nlocals = try reader.readU16();
+            code.stacksize = try reader.readU16();
+            code.flags = try reader.readU16();
+        } else if (ver.gte(1, 3)) {
+            // Python 1.3-1.4: no stacksize
+            code.argcount = try reader.readU16();
+            code.nlocals = try reader.readU16();
+            code.flags = try reader.readU16();
+        } else {
+            // Python 1.0-1.2: no argcount
+            code.nlocals = try reader.readU16();
+            code.flags = try reader.readU16();
         }
 
         // Read bytecode
@@ -889,10 +912,21 @@ pub const Module = struct {
             if (localspluskinds.len > 0) allocator.free(localspluskinds); // discard for now
             code.freevars = &.{};
             code.cellvars = &.{};
-        } else {
+        } else if (ver.gte(2, 1)) {
+            // Python 2.1+: varnames, freevars, cellvars
             code.varnames = try self.readTupleStrings(reader);
             code.freevars = try self.readTupleStrings(reader);
             code.cellvars = try self.readTupleStrings(reader);
+        } else if (ver.gte(1, 3)) {
+            // Python 1.3-2.0: varnames only
+            code.varnames = try self.readTupleStrings(reader);
+            code.freevars = &.{};
+            code.cellvars = &.{};
+        } else {
+            // Python 1.0-1.2: no varnames
+            code.varnames = &.{};
+            code.freevars = &.{};
+            code.cellvars = &.{};
         }
 
         code.filename = try self.readStringAlloc(reader);
@@ -902,8 +936,19 @@ pub const Module = struct {
             code.qualname = try self.readStringAlloc(reader);
         }
 
-        code.firstlineno = try reader.readU32();
-        code.linetable = try self.readBytesAlloc(reader);
+        if (ver.gte(1, 5)) {
+            // Python 1.5+: firstlineno and lnotab
+            code.firstlineno = try reader.readU32();
+            code.linetable = try self.readBytesAlloc(reader);
+        } else if (ver.gte(1, 3)) {
+            // Python 1.3-1.4: firstlineno as 16-bit, no lnotab
+            code.firstlineno = try reader.readU16();
+            code.linetable = &.{};
+        } else {
+            // Python 1.0-1.2: no firstlineno or lnotab
+            code.firstlineno = 0;
+            code.linetable = &.{};
+        }
 
         if (ver.gte(3, 11)) {
             code.exceptiontable = try self.readBytesAlloc(reader);
