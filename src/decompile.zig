@@ -3729,6 +3729,37 @@ pub const Decompiler = struct {
         // Extract pattern from bytecode
         const pat = try self.extractMatchPattern(block);
 
+        // Detect guard: STORE_NAME followed by LOAD_NAME + comparison + POP_JUMP_IF_FALSE
+        var guard: ?*Expr = null;
+        var i: usize = 0;
+        while (i + 3 < block.instructions.len) : (i += 1) {
+            const inst1 = block.instructions[i];
+            const inst2 = block.instructions[i + 1];
+            const inst3 = block.instructions[i + 2];
+            const inst4 = block.instructions[i + 3];
+
+            if (inst1.opcode == .STORE_NAME and inst2.opcode == .LOAD_NAME and
+                (inst3.opcode == .COMPARE_OP or inst3.opcode == .LOAD_SMALL_INT or inst3.opcode == .LOAD_CONST) and
+                (inst4.opcode == .POP_JUMP_IF_FALSE or inst4.opcode == .POP_JUMP_FORWARD_IF_FALSE))
+            {
+                if (inst1.arg < self.code.names.len and inst2.arg < self.code.names.len) {
+                    if (std.mem.eql(u8, self.code.names[inst1.arg], self.code.names[inst2.arg])) {
+                        // Extract guard expression by simulating from LOAD_NAME to jump
+                        var sim = SimContext.init(self.allocator, self.code, self.version);
+                        defer sim.deinit();
+                        var j = i + 1;
+                        while (j < block.instructions.len) : (j += 1) {
+                            const g_inst = block.instructions[j];
+                            if (g_inst.opcode == .POP_JUMP_IF_FALSE or g_inst.opcode == .POP_JUMP_FORWARD_IF_FALSE) break;
+                            sim.simulate(g_inst) catch break;
+                        }
+                        guard = sim.stack.popExpr() catch null;
+                        break;
+                    }
+                }
+            }
+        }
+
         // Find body block (true branch of conditional)
         var body_block: ?u32 = null;
         for (block.successors) |edge| {
@@ -3757,7 +3788,7 @@ pub const Decompiler = struct {
 
         return ast.MatchCase{
             .pattern = pat,
-            .guard = null, // TODO: detect guards
+            .guard = guard,
             .body = body,
         };
     }
@@ -5354,12 +5385,12 @@ pub const Decompiler = struct {
             try decls.append(a, nl_stmt);
         }
 
-        // Global: scan bytecode for STORE_GLOBAL/LOAD_GLOBAL
+        // Global: scan bytecode for STORE_GLOBAL
         var globals: std.StringHashMapUnmanaged(void) = .{};
         defer globals.deinit(a);
         var iter = decoder.InstructionIterator.init(func.code.code, self.version);
         while (iter.next()) |inst| {
-            if (inst.opcode == .STORE_GLOBAL or inst.opcode == .LOAD_GLOBAL) {
+            if (inst.opcode == .STORE_GLOBAL) {
                 if (inst.arg < func.code.names.len) {
                     try globals.put(a, func.code.names[inst.arg], {});
                 }
@@ -5443,6 +5474,11 @@ pub const Decompiler = struct {
 
         var body = try self.decompileNestedBody(cls.code);
         body = try self.trimTrailingReturnNone(body);
+
+        // Python 2.x classes: trim trailing "return locals()"
+        if (body.len > 0 and Decompiler.isReturnLocals(body[body.len - 1])) {
+            body = body[0 .. body.len - 1];
+        }
 
         // Extract class docstring from consts[1] if it's a string
         if (cls.code.consts.len > 1) {
@@ -5803,6 +5839,21 @@ pub const Decompiler = struct {
         if (ret.value) |val| {
             if (val.* == .constant) {
                 return val.constant == .none;
+            }
+        }
+        return false;
+    }
+
+    /// Check if a statement is `return locals()` (Python 2.x class body).
+    fn isReturnLocals(stmt: *const Stmt) bool {
+        if (stmt.* != .return_stmt) return false;
+        const ret = stmt.return_stmt;
+        if (ret.value) |val| {
+            if (val.* == .call) {
+                const call = val.call;
+                if (call.func.* == .name and std.mem.eql(u8, call.func.name.id, "locals")) {
+                    return call.args.len == 0;
+                }
             }
         }
         return false;
