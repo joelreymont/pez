@@ -3984,9 +3984,39 @@ pub const SimContext = struct {
 
             .DICT_UPDATE => {
                 // DICT_UPDATE i - update dict at stack[i] with TOS
-                if (self.stack.pop()) |v| {
-                    var val = v;
-                    val.deinit(self.allocator);
+                const update_val = self.stack.pop() orelse return error.StackUnderflow;
+                errdefer update_val.deinit(self.allocator);
+
+                const idx: usize = @intCast(inst.arg);
+                if (idx > self.stack.items.items.len) return error.StackUnderflow;
+                const dict_idx = self.stack.items.items.len - idx;
+
+                if (self.stack.items.items[dict_idx] == .expr and
+                    self.stack.items.items[dict_idx].expr.* == .dict and
+                    update_val == .expr)
+                {
+                    const dict = &self.stack.items.items[dict_idx].expr.dict;
+                    const update_expr = update_val.expr;
+
+                    const old_len = dict.keys.len;
+                    const new_len = old_len + 1;
+
+                    const new_keys = try self.allocator.alloc(?*Expr, new_len);
+                    const new_values = try self.allocator.alloc(*Expr, new_len);
+
+                    @memcpy(new_keys[0..old_len], dict.keys);
+                    @memcpy(new_values[0..old_len], dict.values);
+
+                    new_keys[old_len] = null;
+                    new_values[old_len] = update_expr;
+
+                    self.allocator.free(dict.keys);
+                    self.allocator.free(dict.values);
+
+                    dict.keys = new_keys;
+                    dict.values = new_values;
+                } else {
+                    update_val.deinit(self.allocator);
                 }
             },
 
