@@ -1065,6 +1065,23 @@ pub const Writer = struct {
                 }
                 try self.writeByte(allocator, '\n');
             },
+            .global_stmt => |g| {
+                try self.write(allocator, "global ");
+                for (g.names, 0..) |n, i| {
+                    if (i > 0) try self.write(allocator, ", ");
+                    try self.write(allocator, n);
+                }
+                try self.writeByte(allocator, '\n');
+            },
+            .nonlocal_stmt => |n| {
+                try self.write(allocator, "nonlocal ");
+                for (n.names, 0..) |name, i| {
+                    if (i > 0) try self.write(allocator, ", ");
+                    try self.write(allocator, name);
+                }
+                try self.writeByte(allocator, '\n');
+            },
+
             .raise_stmt => |r| {
                 try self.write(allocator, "raise");
                 if (r.exc) |e| {
@@ -1115,22 +1132,6 @@ pub const Writer = struct {
                     try self.writeBody(allocator, t.finalbody);
                     self.indent_level -= 1;
                 }
-            },
-            .global_stmt => |g| {
-                try self.write(allocator, "global ");
-                for (g.names, 0..) |n, i| {
-                    if (i > 0) try self.write(allocator, ", ");
-                    try self.write(allocator, n);
-                }
-                try self.writeByte(allocator, '\n');
-            },
-            .nonlocal_stmt => |n| {
-                try self.write(allocator, "nonlocal ");
-                for (n.names, 0..) |name, i| {
-                    if (i > 0) try self.write(allocator, ", ");
-                    try self.write(allocator, name);
-                }
-                try self.writeByte(allocator, '\n');
             },
             .delete => |d| {
                 try self.write(allocator, "del ");

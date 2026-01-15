@@ -5236,6 +5236,52 @@ pub const Decompiler = struct {
         var body = try self.decompileNestedBody(func.code);
         body = try self.trimTrailingReturnNone(body);
 
+        // Generate global/nonlocal declarations
+        var decls: std.ArrayListUnmanaged(*Stmt) = .{};
+        defer decls.deinit(a);
+
+        // Nonlocal: variables in freevars
+        if (func.code.freevars.len > 0) {
+            const names = try a.alloc([]const u8, func.code.freevars.len);
+            for (func.code.freevars, 0..) |fv, i| {
+                names[i] = try a.dupe(u8, fv);
+            }
+            const nl_stmt = try a.create(Stmt);
+            nl_stmt.* = .{ .nonlocal_stmt = .{ .names = names } };
+            try decls.append(a, nl_stmt);
+        }
+
+        // Global: scan bytecode for STORE_GLOBAL/LOAD_GLOBAL
+        var globals: std.StringHashMapUnmanaged(void) = .{};
+        defer globals.deinit(a);
+        var iter = decoder.InstructionIterator.init(func.code.code, self.version);
+        while (iter.next()) |inst| {
+            if (inst.opcode == .STORE_GLOBAL or inst.opcode == .LOAD_GLOBAL) {
+                if (inst.arg < func.code.names.len) {
+                    try globals.put(a, func.code.names[inst.arg], {});
+                }
+            }
+        }
+        if (globals.count() > 0) {
+            const names = try a.alloc([]const u8, globals.count());
+            var it = globals.keyIterator();
+            var i: usize = 0;
+            while (it.next()) |key| : (i += 1) {
+                names[i] = try a.dupe(u8, key.*);
+            }
+            const g_stmt = try a.create(Stmt);
+            g_stmt.* = .{ .global_stmt = .{ .names = names } };
+            try decls.append(a, g_stmt);
+        }
+
+        // Prepend declarations to body
+        if (decls.items.len > 0) {
+            const new_body = try a.alloc(*Stmt, body.len + decls.items.len);
+            @memcpy(new_body[0..decls.items.len], decls.items);
+            @memcpy(new_body[decls.items.len..], body);
+            body = new_body;
+        }
+
         // Extract docstring from consts[0] if it's a string
         if (func.code.consts.len > 0) {
             const first_const = &func.code.consts[0];
