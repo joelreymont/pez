@@ -1805,14 +1805,14 @@ pub const SimContext = struct {
                     self.allocator.free(args_vals);
                     try self.stack.push(tos);
                 } else {
-                    // Normal call: [callable, NULL/self, args...]
-                    // tos1 = callable, tos = NULL/self marker
-                    callable = tos1;
-                    if (tos == .null_marker) {
+                    // Normal call: [NULL/self, callable, args...]
+                    // tos = callable, tos1 = NULL/self marker
+                    callable = tos;
+                    if (tos1 == .null_marker) {
                         // Function call with PUSH_NULL - discard NULL marker
                     } else {
-                        // Method call - tos is self, discard it (handled elsewhere)
-                        tos.deinit(self.allocator);
+                        // Method call - tos1 is self, discard it (handled elsewhere)
+                        tos1.deinit(self.allocator);
                     }
 
                     // Check if KW_NAMES set up keyword argument names

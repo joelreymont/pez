@@ -847,6 +847,8 @@ pub const Analyzer = struct {
         for (handler_targets.items) |hid| {
             if (hid >= self.cfg.blocks.len) continue;
             const handler_block = &self.cfg.blocks[hid];
+            // Skip generator StopIteration handlers (CALL_INTRINSIC_1 + RERAISE)
+            if (self.isStopIterHandler(handler_block)) continue;
             const is_bare = !self.hasExceptionTypeCheck(handler_block);
             try handler_list.append(self.allocator, .{
                 .handler_block = hid,
@@ -913,6 +915,18 @@ pub const Analyzer = struct {
         }
 
         std.mem.sort(u32, targets.items, {}, std.sort.asc(u32));
+    }
+
+    /// Check if handler is a generator StopIteration handler (CALL_INTRINSIC_1 + RERAISE).
+    fn isStopIterHandler(self: *const Analyzer, block: *const BasicBlock) bool {
+        _ = self;
+        var has_intrinsic = false;
+        var has_reraise = false;
+        for (block.instructions) |inst| {
+            if (inst.opcode == .CALL_INTRINSIC_1) has_intrinsic = true;
+            if (inst.opcode == .RERAISE) has_reraise = true;
+        }
+        return has_intrinsic and has_reraise;
     }
 
     /// Check if handler block has exception type check (CHECK_EXC_MATCH).

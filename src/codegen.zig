@@ -813,6 +813,16 @@ pub const Writer = struct {
                 try self.writeExpr(allocator, a.value);
                 try self.writeByte(allocator, '\n');
             },
+            .ann_assign => |a| {
+                try self.writeExpr(allocator, a.target);
+                try self.write(allocator, ": ");
+                try self.writeExpr(allocator, a.annotation);
+                if (a.value) |v| {
+                    try self.write(allocator, " = ");
+                    try self.writeExpr(allocator, v);
+                }
+                try self.writeByte(allocator, '\n');
+            },
             .if_stmt => |i| {
                 try self.writeIfStmt(allocator, i, false);
             },
@@ -1114,9 +1124,6 @@ pub const Writer = struct {
                     try self.writeExpr(allocator, m);
                 }
                 try self.writeByte(allocator, '\n');
-            },
-            else => {
-                try self.write(allocator, "# <unsupported statement>\n");
             },
         }
     }
