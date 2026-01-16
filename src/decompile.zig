@@ -67,6 +67,8 @@ pub const Decompiler = struct {
     last_error_ctx: ?ErrorContext = null,
     /// Pending chain targets from STORE_ATTR before UNPACK_SEQUENCE.
     pending_chain_targets: std.ArrayList(*Expr),
+    /// Entry stack state per block (computed by dataflow).
+    stack_in: []?[]StackValue,
 
     pub fn init(allocator: Allocator, code: *const pyc.Code, version: Version) DecompileError!Decompiler {
         var arena = std.heap.ArenaAllocator.init(allocator);
@@ -89,7 +91,7 @@ pub const Decompiler = struct {
         var dom = try dom_mod.DomTree.init(allocator, cfg);
         errdefer dom.deinit();
 
-        return .{
+        var decomp = Decompiler{
             .allocator = allocator,
             .arena = arena,
             .code = code,
@@ -101,7 +103,11 @@ pub const Decompiler = struct {
             .nested_decompilers = .{},
             .print_items = .{},
             .pending_chain_targets = .{},
+            .stack_in = &.{},
         };
+
+        try decomp.initStackFlow();
+        return decomp;
     }
 
     pub fn deinit(self: *Decompiler) void {
@@ -112,6 +118,12 @@ pub const Decompiler = struct {
         self.nested_decompilers.deinit(self.allocator);
         self.print_items.deinit(self.allocator);
         self.pending_chain_targets.deinit(self.allocator);
+        for (self.stack_in) |entry_opt| {
+            if (entry_opt) |entry| {
+                if (entry.len > 0) self.allocator.free(entry);
+            }
+        }
+        if (self.stack_in.len > 0) self.allocator.free(self.stack_in);
         self.analyzer.deinit();
         self.dom.deinit();
         self.arena.deinit();
@@ -257,9 +269,12 @@ pub const Decompiler = struct {
             }
             self.allocator.free(out);
         }
+        _ = sim;
+        var clone_sim = SimContext.init(self.allocator, self.code, self.version);
+        defer clone_sim.deinit();
 
         for (values, 0..) |val, idx| {
-            out[idx] = try sim.cloneStackValue(val);
+            out[idx] = try clone_sim.cloneStackValue(val);
             count += 1;
         }
 
@@ -281,6 +296,201 @@ pub const Decompiler = struct {
         for (values) |val| {
             try sim.stack.push(val);
             moved += 1;
+        }
+    }
+
+    fn stackValueEqual(a: StackValue, b: StackValue) bool {
+        return switch (a) {
+            .expr => |ae| switch (b) {
+                .expr => |be| ae == be,
+                else => false,
+            },
+            .function_obj => |af| switch (b) {
+                .function_obj => |bf| af == bf,
+                else => false,
+            },
+            .class_obj => |ac| switch (b) {
+                .class_obj => |bc| ac == bc,
+                else => false,
+            },
+            .comp_builder => |ab| switch (b) {
+                .comp_builder => |bb| ab == bb,
+                else => false,
+            },
+            .comp_obj => |aco| switch (b) {
+                .comp_obj => |bco| aco.code == bco.code and aco.kind == bco.kind,
+                else => false,
+            },
+            .code_obj => |acode| switch (b) {
+                .code_obj => |bcode| acode == bcode,
+                else => false,
+            },
+            .import_module => |aimp| switch (b) {
+                .import_module => |bimp| blk: {
+                    if (!std.mem.eql(u8, aimp.module, bimp.module)) break :blk false;
+                    if (aimp.fromlist.len != bimp.fromlist.len) break :blk false;
+                    for (aimp.fromlist, 0..) |name, idx| {
+                        if (!std.mem.eql(u8, name, bimp.fromlist[idx])) break :blk false;
+                    }
+                    break :blk true;
+                },
+                else => false,
+            },
+            .null_marker => switch (b) {
+                .null_marker => true,
+                else => false,
+            },
+            .saved_local => |name| switch (b) {
+                .saved_local => |other| std.mem.eql(u8, name, other),
+                else => false,
+            },
+            .unknown => switch (b) {
+                .unknown => true,
+                else => false,
+            },
+        };
+    }
+
+    fn cloneStackValuesArena(
+        self: *Decompiler,
+        sim: *SimContext,
+        values: []const StackValue,
+    ) DecompileError![]StackValue {
+        if (values.len == 0) return &.{};
+
+        const out = try self.allocator.alloc(StackValue, values.len);
+        errdefer self.allocator.free(out);
+
+        for (values, 0..) |val, idx| {
+            out[idx] = try sim.cloneStackValue(val);
+        }
+
+        return out;
+    }
+
+    fn mergeStackEntry(
+        self: *Decompiler,
+        existing_opt: ?[]StackValue,
+        incoming: []const StackValue,
+        clone_sim: *SimContext,
+    ) DecompileError!?[]StackValue {
+        if (existing_opt == null) {
+            return try self.cloneStackValuesArena(clone_sim, incoming);
+        }
+
+        const existing = existing_opt.?;
+        const existing_len = existing.len;
+        const incoming_len = incoming.len;
+        if (existing_len == 0 and incoming_len == 0) return null;
+
+        const max_len = @max(existing_len, incoming_len);
+        const existing_off = max_len - existing_len;
+        const incoming_off = max_len - incoming_len;
+
+        var changed = false;
+        const out = try self.allocator.alloc(StackValue, max_len);
+        errdefer self.allocator.free(out);
+
+        for (0..max_len) |idx| {
+            const cur_opt: ?StackValue = if (idx >= existing_off) existing[idx - existing_off] else null;
+            const inc_opt: ?StackValue = if (idx >= incoming_off) incoming[idx - incoming_off] else null;
+
+            if (cur_opt == null or inc_opt == null) {
+                out[idx] = .unknown;
+                changed = true;
+                continue;
+            }
+
+            const cur = cur_opt.?;
+            const inc = inc_opt.?;
+            if (cur == .unknown) {
+                out[idx] = cur;
+                continue;
+            }
+            if (stackValueEqual(cur, inc)) {
+                out[idx] = cur;
+                continue;
+            }
+            out[idx] = .unknown;
+            changed = true;
+        }
+
+        if (!changed) {
+            self.allocator.free(out);
+            return null;
+        }
+
+        return out;
+    }
+
+    fn initStackFlow(self: *Decompiler) DecompileError!void {
+        const block_count: u32 = @intCast(self.cfg.blocks.len);
+        if (block_count == 0) {
+            self.stack_in = &.{};
+            return;
+        }
+
+        self.stack_in = try self.allocator.alloc(?[]StackValue, block_count);
+        errdefer {
+            for (self.stack_in) |entry_opt| {
+                if (entry_opt) |entry| {
+                    if (entry.len > 0) self.allocator.free(entry);
+                }
+            }
+            self.allocator.free(self.stack_in);
+            self.stack_in = &.{};
+        }
+        for (self.stack_in) |*slot| {
+            slot.* = null;
+        }
+
+        var worklist: std.ArrayListUnmanaged(u32) = .{};
+        defer worklist.deinit(self.allocator);
+
+        self.stack_in[0] = &.{};
+        try worklist.append(self.allocator, 0);
+
+        var clone_sim = SimContext.init(self.arena.allocator(), self.code, self.version);
+        defer clone_sim.deinit();
+
+        while (worklist.items.len > 0) {
+            const bid = worklist.items[worklist.items.len - 1];
+            worklist.items.len -= 1;
+
+            const entry = self.stack_in[bid] orelse continue;
+
+            var sim = SimContext.init(self.arena.allocator(), self.code, self.version);
+            defer sim.deinit();
+            sim.lenient = true;
+
+            for (entry) |val| {
+                const cloned = try clone_sim.cloneStackValue(val);
+                try sim.stack.push(cloned);
+            }
+
+            const block = &self.cfg.blocks[bid];
+            for (block.instructions) |inst| {
+                try sim.simulate(inst);
+            }
+
+            const exit = try self.cloneStackValuesArena(&clone_sim, sim.stack.items.items);
+            defer if (exit.len > 0) self.allocator.free(exit);
+
+            for (block.successors) |edge| {
+                if (edge.edge_type == .exception) continue;
+                const succ = edge.target;
+                if (succ >= block_count) continue;
+                if (self.cfg.blocks[succ].is_exception_handler) continue;
+
+                const merged = try self.mergeStackEntry(self.stack_in[succ], exit, &clone_sim);
+                if (merged) |new_entry| {
+                    if (self.stack_in[succ]) |old| {
+                        if (old.len > 0) self.allocator.free(old);
+                    }
+                    self.stack_in[succ] = new_entry;
+                    try worklist.append(self.allocator, succ);
+                }
+            }
         }
     }
 
@@ -2739,56 +2949,19 @@ pub const Decompiler = struct {
         var sim = SimContext.init(self.arena.allocator(), self.code, self.version);
         defer sim.deinit();
 
-        // Initialize stack with provided values
-        if (init_stack.len > 0) {
-            for (init_stack) |val| {
+        const seed = if (init_stack.len > 0)
+            init_stack
+        else blk: {
+            if (block_id < self.stack_in.len) {
+                if (self.stack_in[block_id]) |entry| break :blk entry;
+            }
+            break :blk &.{};
+        };
+
+        if (seed.len > 0) {
+            for (seed) |val| {
                 const cloned = try sim.cloneStackValue(val);
                 try sim.stack.push(cloned);
-            }
-        } else {
-            // Check if block needs predecessor stack
-            // Any opcode that pops from stack needs predecessor simulation
-            const needs_predecessor = blk: {
-                if (block.instructions.len > 0) {
-                    const first = block.instructions[0].opcode;
-                    switch (first) {
-                        .SEND, .YIELD_VALUE, .STORE_FAST, .STORE_NAME, .STORE_GLOBAL, .STORE_ATTR, .STORE_SUBSCR, .POP_TOP, .BINARY_OP, .COMPARE_OP, .CALL, .BUILD_TUPLE, .BUILD_LIST, .BUILD_MAP, .BUILD_SET, .UNPACK_SEQUENCE, .RETURN_VALUE, .END_SEND => break :blk true,
-                        else => {},
-                    }
-                }
-                break :blk false;
-            };
-
-            if (needs_predecessor) {
-                // Recursively find the chain of fall-through predecessors
-                // and simulate them to build up stack state
-                var cur_id = block_id;
-                var to_simulate: [16]u32 = undefined;
-                var sim_count: usize = 0;
-                while (sim_count < 16) {
-                    var found_pred: ?u32 = null;
-                    const cur_block = &self.cfg.blocks[cur_id];
-                    for (cur_block.predecessors) |pred_id| {
-                        if (pred_id < cur_id) {
-                            found_pred = pred_id;
-                            break;
-                        }
-                    }
-                    if (found_pred) |pid| {
-                        to_simulate[sim_count] = pid;
-                        sim_count += 1;
-                        cur_id = pid;
-                    } else break;
-                }
-                // Simulate in reverse order (earliest first)
-                var i = sim_count;
-                while (i > 0) {
-                    i -= 1;
-                    const pred = &self.cfg.blocks[to_simulate[i]];
-                    for (pred.instructions) |inst| {
-                        sim.simulate(inst) catch {};
-                    }
-                }
             }
         }
 
@@ -3044,19 +3217,8 @@ pub const Decompiler = struct {
         self.chained_cmp_next_block = null;
 
         // Save remaining stack values to transfer to branches
-        const base_vals = try self.allocator.alloc(StackValue, sim.stack.len());
-        var saved: usize = 0;
-        errdefer {
-            for (base_vals[0..saved]) |val| {
-                val.deinit(self.allocator);
-            }
-            self.allocator.free(base_vals);
-        }
-        for (0..sim.stack.len()) |i| {
-            const val = sim.stack.items.items[i];
-            base_vals[i] = try sim.cloneStackValue(val);
-            saved += 1;
-        }
+        const base_vals = try self.cloneStackValues(&sim, sim.stack.items.items);
+        errdefer deinitStackValuesSlice(self.allocator, base_vals);
 
         // For JUMP_IF_FALSE/TRUE (Python 3.0), skip the leading POP_TOP in each branch
         // that was used to clean up the condition left on stack
@@ -3070,8 +3232,7 @@ pub const Decompiler = struct {
         // Check for assert pattern: if cond: pass else: raise AssertionError
         if (pattern.else_block) |else_id| {
             if (try self.tryDecompileAssert(pattern, condition, else_id, then_body, base_vals, skip)) |assert_stmt| {
-                for (base_vals) |val| val.deinit(self.allocator);
-                self.allocator.free(base_vals);
+                deinitStackValuesSlice(self.allocator, base_vals);
                 return assert_stmt;
             }
         }
@@ -3081,8 +3242,7 @@ pub const Decompiler = struct {
             // Check if else is an elif
             if (pattern.is_elif) {
                 // Elif needs to start with fresh stack
-                for (base_vals) |val| val.deinit(self.allocator);
-                self.allocator.free(base_vals);
+                deinitStackValuesSlice(self.allocator, base_vals);
 
                 // The else block is another if statement - recurse
                 // For legacy conditionals, elif block starts with POP_TOP to clean up previous condition
@@ -3099,14 +3259,12 @@ pub const Decompiler = struct {
             }
             // Regular else with inherited stack
             defer {
-                for (base_vals) |val| val.deinit(self.allocator);
-                self.allocator.free(base_vals);
+                deinitStackValuesSlice(self.allocator, base_vals);
             }
             break :blk try self.decompileBranchRange(else_id, pattern.merge_block, base_vals, skip);
         } else blk: {
             // No else block - clean up base_vals
-            for (base_vals) |val| val.deinit(self.allocator);
-            self.allocator.free(base_vals);
+            deinitStackValuesSlice(self.allocator, base_vals);
             break :blk &[_]*Stmt{};
         };
 
@@ -6388,6 +6546,10 @@ pub const Decompiler = struct {
         const limit = @min(end, @as(u32, @intCast(self.cfg.blocks.len)));
 
         while (block_idx < limit) {
+            if (self.cfg.blocks[block_idx].is_exception_handler) {
+                block_idx += 1;
+                continue;
+            }
             const pattern = try self.analyzer.detectPattern(block_idx);
 
             switch (pattern) {
@@ -6864,6 +7026,11 @@ pub const Decompiler = struct {
         var has_exc_cmp = false;
         var has_jump = false;
         for (block.instructions) |inst| {
+            if (inst.opcode == .JUMP_IF_NOT_EXC_MATCH) {
+                has_exc_cmp = true;
+                has_jump = true;
+                continue;
+            }
             switch (inst.opcode) {
                 .DUP_TOP => has_dup = true,
                 .COMPARE_OP => {
@@ -6886,6 +7053,18 @@ pub const Decompiler = struct {
             for (block.instructions) |inst| {
                 if (inst.opcode == .COMPARE_OP and inst.arg == 10) {
                     // Pop the exception type - we're taking ownership
+                    if (sim.stack.pop()) |val| {
+                        switch (val) {
+                            .expr => |e| exc_type = e,
+                            else => {
+                                var v = val;
+                                v.deinit(a);
+                            },
+                        }
+                    }
+                    break;
+                }
+                if (inst.opcode == .JUMP_IF_NOT_EXC_MATCH) {
                     if (sim.stack.pop()) |val| {
                         switch (val) {
                             .expr => |e| exc_type = e,
@@ -8457,6 +8636,26 @@ pub const Decompiler = struct {
         return std.mem.eql(u8, self.code.name, "<module>");
     }
 };
+
+pub fn computeStackDepthsForTest(
+    allocator: Allocator,
+    code: *const pyc.Code,
+    version: Version,
+) DecompileError![]?usize {
+    var decompiler = try Decompiler.init(allocator, code, version);
+    defer decompiler.deinit();
+
+    const count: usize = decompiler.cfg.blocks.len;
+    const out = try allocator.alloc(?usize, count);
+    for (decompiler.stack_in, 0..) |entry_opt, idx| {
+        if (entry_opt) |entry| {
+            out[idx] = entry.len;
+        } else {
+            out[idx] = null;
+        }
+    }
+    return out;
+}
 
 /// Decompile a code object and write Python source to writer.
 pub fn decompileToSource(allocator: Allocator, code: *const pyc.Code, version: Version, writer: anytype) !void {

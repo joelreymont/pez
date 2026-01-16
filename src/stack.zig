@@ -202,6 +202,11 @@ pub const Stack = struct {
         const val = self.pop() orelse return error.StackUnderflow;
         return switch (val) {
             .expr => |e| e,
+            .unknown => {
+                const expr = try self.allocator.create(Expr);
+                expr.* = .{ .name = .{ .id = "__unknown__", .ctx = .load } };
+                return expr;
+            },
             else => {
                 var tmp = val;
                 tmp.deinit(self.allocator);
@@ -243,7 +248,13 @@ pub const Stack = struct {
 
     pub fn valuesToExprs(self: *Stack, values: []StackValue) ![]const *Expr {
         const exprs = try self.allocator.alloc(*Expr, values.len);
+        var created: std.ArrayListUnmanaged(*Expr) = .{};
         errdefer {
+            for (created.items) |e| {
+                e.deinit(self.allocator);
+                self.allocator.destroy(e);
+            }
+            created.deinit(self.allocator);
             for (values) |*val| {
                 val.deinit(self.allocator);
             }
@@ -254,11 +265,18 @@ pub const Stack = struct {
         for (values, 0..) |v, i| {
             exprs[i] = switch (v) {
                 .expr => |e| e,
+                .unknown => blk: {
+                    const expr = try self.allocator.create(Expr);
+                    expr.* = .{ .name = .{ .id = "__unknown__", .ctx = .load } };
+                    try created.append(self.allocator, expr);
+                    break :blk expr;
+                },
                 else => return error.NotAnExpression,
             };
         }
 
-        self.allocator.free(values);
+        if (values.len > 0) self.allocator.free(values);
+        created.deinit(self.allocator);
         return exprs;
     }
 };
@@ -284,6 +302,8 @@ pub const SimContext = struct {
     pending_kwnames: ?[]const []const u8 = null,
     /// GET_AWAITABLE was seen, next YIELD_FROM should be await.
     pending_await: bool = false,
+    /// Relaxed stack simulation (used by stack-flow analysis).
+    lenient: bool = false,
 
     pub fn init(allocator: Allocator, code: *const pyc.Code, version: Version) SimContext {
         return .{
@@ -293,6 +313,7 @@ pub const SimContext = struct {
             .stack = Stack.init(allocator),
             .iter_override = null,
             .comp_builder = null,
+            .lenient = false,
         };
     }
 
@@ -1350,6 +1371,11 @@ pub const SimContext = struct {
             .SETUP_EXCEPT,
             .POP_BLOCK,
             .SET_LINENO,
+            .JUMP_FORWARD,
+            .JUMP_BACKWARD,
+            .JUMP_BACKWARD_NO_INTERRUPT,
+            .JUMP_ABSOLUTE,
+            .CONTINUE_LOOP,
             => {
                 // No stack effect
             },
@@ -3051,7 +3077,13 @@ pub const SimContext = struct {
             .COPY => {
                 // COPY i - copy stack item at position i to TOS
                 const pos = inst.arg;
-                if (pos < 1 or pos > self.stack.items.items.len) return error.StackUnderflow;
+                if (pos < 1 or pos > self.stack.items.items.len) {
+                    if (self.lenient) {
+                        try self.stack.push(.unknown);
+                        return;
+                    }
+                    return error.StackUnderflow;
+                }
                 const copy_idx = self.stack.items.items.len - pos;
                 const val = self.stack.items.items[copy_idx];
                 try self.stack.push(try self.cloneStackValue(val));
@@ -3098,6 +3130,10 @@ pub const SimContext = struct {
             .FOR_ITER => {
                 // FOR_ITER delta - get next value from iterator
                 // On exhaustion, jumps forward by delta
+                if (self.lenient) {
+                    try self.stack.push(.unknown);
+                    return;
+                }
                 if (self.comp_builder) |builder| {
                     const top = self.stack.peek() orelse return error.StackUnderflow;
                     switch (top) {
@@ -4031,6 +4067,13 @@ pub const SimContext = struct {
                 // Used in list comprehensions
                 // Python: v = POP(); list = PEEK(i); list.append(v)
                 // After popping item, PEEK(i) uses depth i from new stack
+                if (self.lenient) {
+                    if (self.stack.pop()) |v| {
+                        var val = v;
+                        val.deinit(self.allocator);
+                    }
+                    return;
+                }
                 const item = try self.stack.popExpr();
                 const builder = if (self.comp_builder) |b| blk: {
                     if (b.kind != .list) return error.InvalidComprehension;
@@ -4048,6 +4091,13 @@ pub const SimContext = struct {
                 // SET_ADD i - add TOS to set at STACK[-i]
                 // Used in set comprehensions
                 // Python: v = POP(); set = PEEK(i); set.add(v)
+                if (self.lenient) {
+                    if (self.stack.pop()) |v| {
+                        var val = v;
+                        val.deinit(self.allocator);
+                    }
+                    return;
+                }
                 const item = try self.stack.popExpr();
                 const builder = if (self.comp_builder) |b| blk: {
                     if (b.kind != .set) return error.InvalidComprehension;
@@ -4066,6 +4116,17 @@ pub const SimContext = struct {
                 // Used in dict comprehensions
                 // Python: v = POP(); k = POP(); dict = PEEK(i); dict[k] = v
                 // After popping both, PEEK(i) uses depth i from new stack
+                if (self.lenient) {
+                    if (self.stack.pop()) |v| {
+                        var val = v;
+                        val.deinit(self.allocator);
+                    }
+                    if (self.stack.pop()) |v| {
+                        var val = v;
+                        val.deinit(self.allocator);
+                    }
+                    return;
+                }
                 const value = try self.stack.popExpr();
                 errdefer {
                     value.deinit(self.allocator);
