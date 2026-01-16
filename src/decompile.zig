@@ -2609,17 +2609,48 @@ pub const Decompiler = struct {
         var sim = SimContext.init(self.arena.allocator(), self.code, self.version);
         defer sim.deinit();
 
-        // FOR_LOOP header needs [seq, idx] on stack from setup predecessor
+        // Inherit stack from fall-through predecessor if needed
         const term = block.terminator();
-        if (term != null and term.?.opcode == .FOR_LOOP) {
-            // Find setup predecessor (not the loop back edge)
-            for (block.predecessors) |pred_id| {
-                if (pred_id < block_id) { // Setup comes before header
-                    const pred = &self.cfg.blocks[pred_id];
-                    for (pred.instructions) |inst| {
-                        try sim.simulate(inst);
+        const needs_predecessor = blk: {
+            if (term != null and term.?.opcode == .FOR_LOOP) break :blk true;
+            if (block.instructions.len > 0) {
+                const first = block.instructions[0].opcode;
+                switch (first) {
+                    .SEND, .YIELD_VALUE, .STORE_FAST, .STORE_NAME, .STORE_GLOBAL, .STORE_ATTR, .STORE_SUBSCR, .POP_TOP, .BINARY_OP, .COMPARE_OP, .CALL, .BUILD_TUPLE, .BUILD_LIST, .BUILD_MAP, .BUILD_SET, .UNPACK_SEQUENCE, .RETURN_VALUE, .END_SEND => break :blk true,
+                    else => {},
+                }
+            }
+            break :blk false;
+        };
+
+        if (needs_predecessor) {
+            // Recursively find the chain of fall-through predecessors
+            // and simulate them to build up stack state
+            var cur_id = block_id;
+            var to_simulate: [16]u32 = undefined;
+            var sim_count: usize = 0;
+            while (sim_count < 16) {
+                var found_pred: ?u32 = null;
+                const cur_block = &self.cfg.blocks[cur_id];
+                for (cur_block.predecessors) |pred_id| {
+                    if (pred_id < cur_id) {
+                        found_pred = pred_id;
+                        break;
                     }
-                    break;
+                }
+                if (found_pred) |pid| {
+                    to_simulate[sim_count] = pid;
+                    sim_count += 1;
+                    cur_id = pid;
+                } else break;
+            }
+            // Simulate in reverse order (earliest first)
+            var i = sim_count;
+            while (i > 0) {
+                i -= 1;
+                const pred = &self.cfg.blocks[to_simulate[i]];
+                for (pred.instructions) |inst| {
+                    sim.simulate(inst) catch {};
                 }
             }
         }
@@ -2702,6 +2733,51 @@ pub const Decompiler = struct {
             for (init_stack) |val| {
                 const cloned = try sim.cloneStackValue(val);
                 try sim.stack.push(cloned);
+            }
+        } else {
+            // Check if block needs predecessor stack
+            // Any opcode that pops from stack needs predecessor simulation
+            const needs_predecessor = blk: {
+                if (block.instructions.len > 0) {
+                    const first = block.instructions[0].opcode;
+                    switch (first) {
+                        .SEND, .YIELD_VALUE, .STORE_FAST, .STORE_NAME, .STORE_GLOBAL, .STORE_ATTR, .STORE_SUBSCR, .POP_TOP, .BINARY_OP, .COMPARE_OP, .CALL, .BUILD_TUPLE, .BUILD_LIST, .BUILD_MAP, .BUILD_SET, .UNPACK_SEQUENCE, .RETURN_VALUE, .END_SEND => break :blk true,
+                        else => {},
+                    }
+                }
+                break :blk false;
+            };
+
+            if (needs_predecessor) {
+                // Recursively find the chain of fall-through predecessors
+                // and simulate them to build up stack state
+                var cur_id = block_id;
+                var to_simulate: [16]u32 = undefined;
+                var sim_count: usize = 0;
+                while (sim_count < 16) {
+                    var found_pred: ?u32 = null;
+                    const cur_block = &self.cfg.blocks[cur_id];
+                    for (cur_block.predecessors) |pred_id| {
+                        if (pred_id < cur_id) {
+                            found_pred = pred_id;
+                            break;
+                        }
+                    }
+                    if (found_pred) |pid| {
+                        to_simulate[sim_count] = pid;
+                        sim_count += 1;
+                        cur_id = pid;
+                    } else break;
+                }
+                // Simulate in reverse order (earliest first)
+                var i = sim_count;
+                while (i > 0) {
+                    i -= 1;
+                    const pred = &self.cfg.blocks[to_simulate[i]];
+                    for (pred.instructions) |inst| {
+                        sim.simulate(inst) catch {};
+                    }
+                }
             }
         }
 

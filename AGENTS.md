@@ -2,7 +2,7 @@
 
 ## Active Plan
 
-Decompiler parity spec: `~/.claude/plans/bright-kindling-plum.md`
+Decompiler parity spec: `~/.claude/plans/composed-wishing-diffie.md`
 
 ## Build
 

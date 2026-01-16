@@ -41720,3 +41720,234 @@ Continue with the current task.
 **Claude:** The readAnyObject method in Module handles decoding. Let me find it:
 
 ---
+
+## Session - 2026-01-16 13:55:54
+
+### Active Work (bd)
+
+```
+(no in-progress items)
+```
+
+### Conversation
+
+**User:** Read your project guidelines (AGENTS.md).
+Check active dots: `dot ls --status active`
+If the dot description contains a plan file path, read it.
+Continue with the current task.
+
+**Claude:** I'll check for active dots and continue with the current task.
+
+**Claude:** The plan shows all 190/190 pyc files parse correctly. The only remaining work is match statement guards, which is deferred. Ready for next task.
+
+**User:** plan getting to 100% parity with pycdc and uncompyle6, including fixing match statement guards and creating examples to test them. ask questions using the ask user tool
+
+**Claude:** All 190 pycdc tests pass. Let me check match guard test coverage specifically.
+
+**User:** Base directory for this skill: /Users/joel/.claude/skills/small-dots
+
+# Small Dots
+
+Decompose a large task into small, actionable dots using the dot CLI.
+
+## Rules
+
+1. Each dot should be completable in <30 minutes
+2. Include full context in description: file:line, cause, fix approach
+3. Note dependencies between dots
+4. Use imperative verb for title: "Add", "Fix", "Update", "Wire", "Remove"
+
+## Format
+
+```bash
+dot add "Title" -d "Full context including:
+- Files to modify: path/to/file.zig:line
+- What to change: description
+- Dependencies: dot-id if any
+- Verification: how to test"
+```
+
+## Example Decomposition
+
+For a task like "Wire native JIT into BN plugin":
+
+```bash
+dot add "Add Low IR emit ops" -d "Add emit_mnem, emit_reg, emit_imm to src/jit/low_ir.zig. Pattern after existing ops."
+
+dot add "Lower SSA emit to Low IR" -d "In d07_isel.zig:802, lower emit_* ops to Low IR calls. Currently returns null (TODO)."
+
+dot add "Generate ARM64 for emit ops" -d "In d10_emit.zig, add case for emit_* Low IR ops. Call helper functions to fill token buffer."
+
+dot add "Update DecodeResult struct" -d "In native.zig, change DecodeResult to match vm.NativeDecodeResult layout (tokens, flow_type, etc)."
+```
+
+## Workflow
+
+1. Read the plan/task description
+2. Identify discrete units of work
+3. Order by dependency (do prerequisites first)
+4. Create dots with full context
+5. Start working on first dot
+
+
+ARGUMENTS: Break down the plan at ~/.claude/plans/composed-wishing-diffie.md into a tree of small dots (<30 min each). The plan has 6 phases covering: Python 3.14 match statement changes, core stack fixes, comprehension cleanup, exception handling opcodes (CHECK_EG_MATCH, CALL_INTRINSIC), PEP 695 type parameters, and match guard tests.
+
+**Claude:** Created 19 dots for parity work:
+
+**Core Opcodes (no deps, start here):**
+- `pez-add-call-intrinsic-2c14738b` - CALL_INTRINSIC_1
+- `pez-add-call-intrinsic-1f043a5d` - CALL_INTRINSIC_2
+- `pez-add-check-eg-f2dcecfd` - CHECK_EG_MATCH
+- `pez-fix-send-stack-67be9935` - SEND validation
+
+**Cleanup Patterns:**
+- `pez-detect-inline-comprehension-53eae51b` - inline comprehension
+- `pez-fix-with-stmt-e113192b` - with_stmt cleanup
+- `pez-fix-exceptions-block-8d0d7015` - exceptions block
+
+**Match Statement:**
+- `pez-fix-match-literal-a1709be4` - literal case tracking
+- `pez-fix-match-pattern-3fb952b0` - pattern extraction
+
+**except* (sequential):**
+1. `pez-add-excepthandler-is-8a9adc98` - is_star field
+2. `pez-detect-except-pattern-0c65530d` - detection
+3. `pez-emit-except-in-feeb31c8` - codegen
+
+**PEP 695 (sequential):**
+1. `pez-add-typeparam-ast-1c059286` - TypeParam AST
+2. `pez-add-typealias-statement-5bd3e82b` - TypeAlias AST
+3. `pez-handle-fn-obj-0db8caa8` - handleCall
+4. `pez-add-decompiletypeparamwrapper-23493002` - wrapper decompile
+5. `pez-handle-intrinsic-typealias-5bd25b04` - TYPEALIAS
+6. `pez-emit-type-params-340bf427` - codegen
+
+**Testing:**
+- `pez-create-match-guard-b934e400` - guard tests
+- `pez-debug-elif-mem-ae519936` - memory debug
+
+Updated AGENTS.md with plan link.
+
+**User:** small-dots
+
+**User:** Base directory for this skill: /Users/joel/.claude/skills/small-dots
+
+# Small Dots
+
+Decompose a large task into small, actionable dots using the dot CLI.
+
+## Rules
+
+1. Each dot should be completable in <30 minutes
+2. Include full context in description: file:line, cause, fix approach
+3. Note dependencies between dots
+4. Use imperative verb for title: "Add", "Fix", "Update", "Wire", "Remove"
+
+## Format
+
+```bash
+dot add "Title" -d "Full context including:
+- Files to modify: path/to/file.zig:line
+- What to change: description
+- Dependencies: dot-id if any
+- Verification: how to test"
+```
+
+## Example Decomposition
+
+For a task like "Wire native JIT into BN plugin":
+
+```bash
+dot add "Add Low IR emit ops" -d "Add emit_mnem, emit_reg, emit_imm to src/jit/low_ir.zig. Pattern after existing ops."
+
+dot add "Lower SSA emit to Low IR" -d "In d07_isel.zig:802, lower emit_* ops to Low IR calls. Currently returns null (TODO)."
+
+dot add "Generate ARM64 for emit ops" -d "In d10_emit.zig, add case for emit_* Low IR ops. Call helper functions to fill token buffer."
+
+dot add "Update DecodeResult struct" -d "In native.zig, change DecodeResult to match vm.NativeDecodeResult layout (tokens, flow_type, etc)."
+```
+
+## Workflow
+
+1. Read the plan/task description
+2. Identify discrete units of work
+3. Order by dependency (do prerequisites first)
+4. Create dots with full context
+5. Start working on first dot
+
+
+ARGUMENTS: Review the existing dots and break down any that are too large (>30 min). Focus on the complex ones: pez-detect-inline-comprehension-53eae51b, pez-fix-match-literal-a1709be4, pez-detect-except-pattern-0c65530d, pez-add-decompiletypeparamwrapper-23493002
+
+**Claude:** Breaking down complex dots:
+
+**Claude:** **Decomposed:**
+
+`pez-fix-match-literal` → 3 dots:
+1. `pez-add-is-first-fdd1fa3f` - Add is_first_case param
+2. `pez-update-decompilematch-to-971cbfb3` - Update callers
+3. `pez-adjust-match-case-c8a49b5a` - Adjust stack init
+
+`pez-add-decompiletypeparamwrapper` → 4 dots:
+1. `pez-add-decompiletypeparamwrapper-f8eac5a3` - Add skeleton
+2. `pez-extract-typevar-names-27c3e4a4` - Extract TypeVars
+3. `pez-find-inner-fn-123f46bd` - Find inner function
+4. `pez-build-fn-obj-01fdd17b` - Build result
+
+**Total: 25 parity dots**, all <30 min each.
+
+**Suggested start order:**
+1. Core opcodes (parallel): `pez-add-call-intrinsic-*`, `pez-add-check-eg-*`, `pez-fix-send-stack-*`
+2. Then: `pez-detect-inline-comprehension-*` (unblocks 3 tests)
+3. Then: Match fixes (`pez-add-is-first-*` chain)
+
+**User:** small-dots
+
+**User:** Base directory for this skill: /Users/joel/.claude/skills/small-dots
+
+# Small Dots
+
+Decompose a large task into small, actionable dots using the dot CLI.
+
+## Rules
+
+1. Each dot should be completable in <30 minutes
+2. Include full context in description: file:line, cause, fix approach
+3. Note dependencies between dots
+4. Use imperative verb for title: "Add", "Fix", "Update", "Wire", "Remove"
+
+## Format
+
+```bash
+dot add "Title" -d "Full context including:
+- Files to modify: path/to/file.zig:line
+- What to change: description
+- Dependencies: dot-id if any
+- Verification: how to test"
+```
+
+## Example Decomposition
+
+For a task like "Wire native JIT into BN plugin":
+
+```bash
+dot add "Add Low IR emit ops" -d "Add emit_mnem, emit_reg, emit_imm to src/jit/low_ir.zig. Pattern after existing ops."
+
+dot add "Lower SSA emit to Low IR" -d "In d07_isel.zig:802, lower emit_* ops to Low IR calls. Currently returns null (TODO)."
+
+dot add "Generate ARM64 for emit ops" -d "In d10_emit.zig, add case for emit_* Low IR ops. Call helper functions to fill token buffer."
+
+dot add "Update DecodeResult struct" -d "In native.zig, change DecodeResult to match vm.NativeDecodeResult layout (tokens, flow_type, etc)."
+```
+
+## Workflow
+
+1. Read the plan/task description
+2. Identify discrete units of work
+3. Order by dependency (do prerequisites first)
+4. Create dots with full context
+5. Start working on first dot
+
+
+ARGUMENTS: Review remaining complex dots: pez-detect-inline-comprehension-53eae51b, pez-detect-except-pattern-0c65530d, pez-debug-elif-mem-ae519936, pez-fix-with-stmt-e113192b, pez-fix-exceptions-block-8d0d7015. Break down any that need more than 30 min.
+
+---

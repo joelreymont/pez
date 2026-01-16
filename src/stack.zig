@@ -3669,6 +3669,16 @@ pub const SimContext = struct {
                 try self.stack.push(.unknown);
             },
 
+            .CHECK_EG_MATCH => {
+                // CHECK_EG_MATCH - except* matching (PEP 654)
+                // TOS=exception type, TOS1=exception group
+                // Pops 2, pushes (non-matching group, matching group)
+                _ = self.stack.pop() orelse return error.StackUnderflow;
+                _ = self.stack.pop() orelse return error.StackUnderflow;
+                try self.stack.push(.unknown); // non-matching group
+                try self.stack.push(.unknown); // matching group
+            },
+
             .JUMP_IF_NOT_EXC_MATCH => {
                 // JUMP_IF_NOT_EXC_MATCH - pop two exception values
                 if (self.stack.pop()) |v| {
@@ -3904,7 +3914,23 @@ pub const SimContext = struct {
 
             .YIELD_VALUE => {
                 // YIELD_VALUE - yield TOS
-                const value = try self.stack.popExpr();
+                // In await loop (pending_await), just pop/push unknown
+                if (self.pending_await) {
+                    if (self.stack.pop()) |v| {
+                        var val = v;
+                        val.deinit(self.allocator);
+                    }
+                    try self.stack.push(.unknown);
+                    return;
+                }
+
+                const value = self.stack.popExpr() catch {
+                    // If we can't get an expr, push unknown and continue
+                    _ = self.stack.pop();
+                    try self.stack.push(.unknown);
+                    return;
+                };
+
                 if (self.comp_builder) |builder| {
                     if (builder.kind == .genexpr) {
                         if (builder.elt) |old| {
@@ -3953,14 +3979,50 @@ pub const SimContext = struct {
             .SEND => {
                 // SEND delta - send value to generator
                 // TOS is the value to send, TOS1 is the generator
+                // Pop value, push result; generator stays at TOS1
                 if (self.stack.pop()) |v| {
                     var val = v;
                     val.deinit(self.allocator);
-                } else {
-                    return error.StackUnderflow;
                 }
                 // Generator stays, received value pushed
                 try self.stack.push(.unknown);
+            },
+
+            .END_SEND => {
+                // END_SEND - end of await/yield from
+                // Stack: [awaitable/iterator, value] -> [value]
+                // Pop value (last received), pop awaitable, push final value
+                const value = self.stack.pop();
+                const awaitable = self.stack.pop();
+
+                if (self.pending_await) {
+                    self.pending_await = false;
+                    // Create await expression
+                    if (awaitable) |aw| {
+                        if (aw == .expr) {
+                            const expr = try self.allocator.create(Expr);
+                            expr.* = .{ .await_expr = .{ .value = aw.expr } };
+                            try self.stack.push(.{ .expr = expr });
+                            // Discard the value
+                            if (value) |v| {
+                                var val = v;
+                                val.deinit(self.allocator);
+                            }
+                            return;
+                        }
+                    }
+                }
+                // Not an await - push value (or unknown if nothing)
+                if (value) |v| {
+                    try self.stack.push(v);
+                } else {
+                    try self.stack.push(.unknown);
+                }
+                // Clean up awaitable if not used
+                if (awaitable) |aw| {
+                    var awv = aw;
+                    awv.deinit(self.allocator);
+                }
             },
 
             // Comprehension opcodes
@@ -4159,8 +4221,23 @@ pub const SimContext = struct {
                 self.pending_await = true;
             },
 
+            .GET_AITER => {
+                // GET_AITER - get async iterator from TOS
+                // Pops iterable, pushes async iterator
+                // Stack effect: 0 (pop 1, push 1)
+            },
+
+            .GET_ANEXT => {
+                // GET_ANEXT - get next awaitable from async iterator
+                // Stack effect: +1 (pushes awaitable, iterator stays)
+                try self.stack.push(.unknown);
+            },
+
             .END_ASYNC_FOR => {
                 // END_ASYNC_FOR - cleanup after async for loop
+                // Pops exception info and async iterator
+                _ = self.stack.pop();
+                _ = self.stack.pop();
             },
 
             .END_FOR => {
@@ -4308,6 +4385,21 @@ pub const SimContext = struct {
                 while (i < count) : (i += 1) {
                     try self.stack.push(.unknown);
                 }
+            },
+
+            .CALL_INTRINSIC_1 => {
+                // Pops 1 arg, pushes result (net: 0)
+                // IDs: 3=STOPITERATION_ERROR, 7=TYPEVAR, 11=TYPEALIAS
+                _ = self.stack.pop() orelse return error.StackUnderflow;
+                try self.stack.push(.unknown);
+            },
+
+            .CALL_INTRINSIC_2 => {
+                // Pops 2 args, pushes result (net: -1)
+                // IDs: 1=PREP_RERAISE_STAR, 4=SET_FUNCTION_TYPE_PARAMS
+                _ = self.stack.pop() orelse return error.StackUnderflow;
+                _ = self.stack.pop() orelse return error.StackUnderflow;
+                try self.stack.push(.unknown);
             },
 
             else => {
