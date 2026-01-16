@@ -3776,8 +3776,10 @@ pub const Decompiler = struct {
         var cases: std.ArrayList(ast.MatchCase) = .{};
         errdefer cases.deinit(self.allocator);
 
-        for (pattern.case_blocks) |case_block_id| {
-            const case = try self.decompileMatchCase(case_block_id);
+        for (pattern.case_blocks, 0..) |case_block_id, idx| {
+            // First case has COPY, subsequent cases reuse subject on stack
+            const has_copy = idx == 0;
+            const case = try self.decompileMatchCase(case_block_id, has_copy);
             try cases.append(self.allocator, case);
         }
 
@@ -3792,16 +3794,39 @@ pub const Decompiler = struct {
         return .{ .stmt = stmt, .next_block = pattern.exit_block orelse pattern.subject_block + 1 };
     }
 
-    fn decompileMatchCase(self: *Decompiler, block_id: u32) DecompileError!ast.MatchCase {
+    fn decompileMatchCase(self: *Decompiler, block_id: u32, has_copy: bool) DecompileError!ast.MatchCase {
         const block = &self.cfg.blocks[block_id];
 
         // Extract pattern from bytecode
-        const pat = try self.extractMatchPattern(block);
+        // If this block doesn't have COPY, subject is already on stack from previous case
+        const pat = try self.extractMatchPattern(block, !has_copy);
 
-        // Detect guard: STORE_NAME followed by LOAD_NAME (same var) ... POP_JUMP_IF_FALSE
+        // Detect guard: STORE_FAST_LOAD_FAST or (STORE followed by LOAD) ... POP_JUMP_IF_FALSE
         var guard: ?*Expr = null;
         for (block.instructions, 0..) |inst, i| {
-            if (inst.opcode == .STORE_NAME or inst.opcode == .STORE_FAST) {
+            if (inst.opcode == .STORE_FAST_LOAD_FAST) {
+                // Extract guard by simulating from after STORE_FAST_LOAD_FAST to POP_JUMP_IF_FALSE
+                // STORE_FAST_LOAD_FAST: pop TOS, store to var, push var
+                var sim = SimContext.init(self.allocator, self.code, self.version);
+                defer sim.deinit();
+
+                // Simulate STORE_FAST_LOAD_FAST: it pops subject from stack, stores, then loads back
+                // For guard extraction, we just need the loaded variable name on stack
+                const load_idx = inst.arg & 0xF;
+                if (load_idx < self.code.varnames.len) {
+                    const name = self.code.varnames[load_idx];
+                    const expr = try ast.makeName(self.allocator, name, .load);
+                    try sim.stack.push(.{ .expr = expr });
+
+                    // Simulate instructions after STORE_FAST_LOAD_FAST until POP_JUMP_IF_FALSE
+                    for (block.instructions[i + 1 ..]) |g_inst| {
+                        if (g_inst.opcode == .POP_JUMP_IF_FALSE or g_inst.opcode == .POP_JUMP_FORWARD_IF_FALSE) break;
+                        sim.simulate(g_inst) catch break;
+                    }
+                    guard = sim.stack.popExpr() catch null;
+                }
+                break;
+            } else if (inst.opcode == .STORE_NAME or inst.opcode == .STORE_FAST) {
                 // Look ahead for matching LOAD + guard condition
                 var found_guard = false;
                 for (block.instructions[i + 1 ..], i + 1..) |next_inst, j| {
@@ -3832,29 +3857,103 @@ pub const Decompiler = struct {
             }
         }
 
-        // Find body block (true branch of conditional)
-        var body_block: ?u32 = null;
-        for (block.successors) |edge| {
-            if (edge.edge_type == .conditional_true or edge.edge_type == .normal) {
-                body_block = edge.target;
-                break;
-            }
-        }
-
-        // Find end of body (next case or exit)
-        var body_end: u32 = block_id + 1;
-        for (block.successors) |edge| {
-            if (edge.edge_type == .conditional_false) {
-                body_end = edge.target;
-                break;
-            }
-        }
-
-        // Decompile body
+        // Find body: if guard exists and body is inline (no separate block), extract from current block
         var body: []const *Stmt = &.{};
-        if (body_block) |bid| {
-            if (bid < body_end) {
-                body = try self.decompileStructuredRange(bid, body_end);
+
+        if (guard != null) {
+            // Guard case: body might be inline after POP_TOP, or in a separate block
+            // Check if there's a conditional_true edge (separate body block)
+            var body_block: ?u32 = null;
+            for (block.successors) |edge| {
+                if (edge.edge_type == .conditional_true) {
+                    body_block = edge.target;
+                    break;
+                }
+            }
+
+            if (body_block) |bid| {
+                // Body in separate block
+                var body_end: u32 = block_id + 1;
+                for (block.successors) |edge| {
+                    if (edge.edge_type == .conditional_false) {
+                        body_end = edge.target;
+                        break;
+                    }
+                }
+                if (bid < body_end) {
+                    body = try self.decompileStructuredRange(bid, body_end);
+                }
+            } else {
+                // Body inline: find POP_TOP after guard check, decompile rest of block
+                var pop_idx: ?usize = null;
+                var found_jump = false;
+                for (block.instructions, 0..) |inst, idx| {
+                    if (inst.opcode == .POP_JUMP_IF_FALSE or inst.opcode == .POP_JUMP_FORWARD_IF_FALSE) {
+                        found_jump = true;
+                    } else if (found_jump and inst.opcode == .POP_TOP) {
+                        pop_idx = idx + 1; // Start after POP_TOP
+                        break;
+                    }
+                }
+
+                if (pop_idx) |start_idx| {
+                    // Create a temporary block with just the body instructions
+                    var body_insts: std.ArrayList(cfg_mod.Instruction) = .{};
+                    defer body_insts.deinit(self.allocator);
+                    try body_insts.appendSlice(self.allocator, block.instructions[start_idx..]);
+
+                    // Decompile inline using a sim starting from empty stack
+                    // The instructions after POP_TOP are the body
+                    var stmts: std.ArrayList(*Stmt) = .{};
+                    defer stmts.deinit(self.allocator);
+
+                    // Skip to just use decompileStructuredRange by treating rest as separate
+                    // Actually, these are terminal (RETURN_VALUE etc) so processBlock won't work
+                    // Just simulate and extract expressions/returns
+                    var sim = SimContext.init(self.allocator, self.code, self.version);
+                    defer sim.deinit();
+
+                    for (body_insts.items) |inst| {
+                        if (inst.opcode == .RETURN_VALUE) {
+                            const val = sim.stack.popExpr() catch blk: {
+                                const none_expr = try self.allocator.create(Expr);
+                                none_expr.* = .{ .constant = .{ .none = {} } };
+                                break :blk none_expr;
+                            };
+                            const stmt = try self.allocator.create(Stmt);
+                            stmt.* = .{ .return_stmt = .{ .value = val } };
+                            try stmts.append(self.allocator, stmt);
+                            break;
+                        } else {
+                            sim.simulate(inst) catch {};
+                        }
+                    }
+
+                    body = try stmts.toOwnedSlice(self.allocator);
+                }
+            }
+        } else {
+            // No guard: body in true branch
+            var body_block: ?u32 = null;
+            for (block.successors) |edge| {
+                if (edge.edge_type == .conditional_true or edge.edge_type == .normal) {
+                    body_block = edge.target;
+                    break;
+                }
+            }
+
+            var body_end: u32 = block_id + 1;
+            for (block.successors) |edge| {
+                if (edge.edge_type == .conditional_false) {
+                    body_end = edge.target;
+                    break;
+                }
+            }
+
+            if (body_block) |bid| {
+                if (bid < body_end) {
+                    body = try self.decompileStructuredRange(bid, body_end);
+                }
             }
         }
 
@@ -3865,9 +3964,16 @@ pub const Decompiler = struct {
         };
     }
 
-    fn extractMatchPattern(self: *Decompiler, block: *const cfg_mod.BasicBlock) DecompileError!*ast.Pattern {
+    fn extractMatchPattern(self: *Decompiler, block: *const cfg_mod.BasicBlock, subject_on_stack: bool) DecompileError!*ast.Pattern {
         var sim = SimContext.init(self.allocator, self.code, self.version);
         defer sim.deinit();
+
+        // If subject is already on stack (subsequent cases after first), push placeholder
+        if (subject_on_stack) {
+            const placeholder = try self.allocator.create(Expr);
+            placeholder.* = .{ .name = .{ .id = "<subject>", .ctx = .load } };
+            try sim.stack.push(.{ .expr = placeholder });
+        }
 
         var has_match_seq = false;
         var has_match_map = false;
