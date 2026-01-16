@@ -71,4 +71,27 @@ pub fn build(b: *std.Build) void {
     lldb.addArtifactArg(unit_tests);
     const lldb_step = b.step("debug", "Run tests under lldb");
     lldb_step.dependOn(&lldb.step);
+
+    // Opcode coverage tool
+    const opcodes_mod = b.createModule(.{
+        .root_source_file = b.path("src/opcodes.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+
+    const coverage_mod = b.createModule(.{
+        .root_source_file = b.path("tools/opcode_coverage.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    coverage_mod.addImport("opcodes", opcodes_mod);
+
+    const coverage_exe = b.addExecutable(.{
+        .name = "opcode_coverage",
+        .root_module = coverage_mod,
+    });
+
+    const coverage_run = b.addRunArtifact(coverage_exe);
+    const coverage_step = b.step("coverage", "Generate opcode coverage matrix");
+    coverage_step.dependOn(&coverage_run.step);
 }
