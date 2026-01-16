@@ -3500,6 +3500,8 @@ pub const Decompiler = struct {
         else
             &[_]*Stmt{};
 
+        const a = self.arena.allocator();
+
         var else_end: u32 = handler_start;
         if (else_start) |start| {
             if (finally_start) |final_start| {
@@ -3512,7 +3514,10 @@ pub const Decompiler = struct {
 
         const else_body = if (else_start) |start| blk: {
             if (start >= else_end) break :blk &[_]*Stmt{};
-            break :blk try self.decompileStructuredRange(start, else_end);
+            const body = try self.decompileStructuredRange(start, else_end);
+            defer self.allocator.free(body);
+            const arena_body = try a.dupe(*Stmt, body);
+            break :blk arena_body;
         } else &[_]*Stmt{};
 
         var final_end: u32 = pattern.exit_block orelse @as(u32, @intCast(self.cfg.blocks.len));
@@ -3524,17 +3529,18 @@ pub const Decompiler = struct {
 
         const final_body = if (finally_start) |start| blk: {
             if (start >= final_end) break :blk &[_]*Stmt{};
-            const a = self.arena.allocator();
             var exc_stack: [3]StackValue = undefined;
             for (&exc_stack) |*slot| {
                 const placeholder = try a.create(Expr);
                 placeholder.* = .{ .name = .{ .id = "__exception__", .ctx = .load } };
                 slot.* = .{ .expr = placeholder };
             }
-            break :blk try self.decompileStructuredRangeWithStack(start, final_end, &exc_stack);
+            const body = try self.decompileStructuredRangeWithStack(start, final_end, &exc_stack);
+            defer self.allocator.free(body);
+            const arena_body = try a.dupe(*Stmt, body);
+            break :blk arena_body;
         } else &[_]*Stmt{};
 
-        const a = self.arena.allocator();
         var handler_nodes = try a.alloc(ast.ExceptHandler, handler_blocks.items.len);
         var handler_count: usize = 0;
         errdefer {
@@ -4576,6 +4582,7 @@ pub const Decompiler = struct {
                 slot.* = .{ .expr = placeholder };
             }
             const rest = try self.decompileStructuredRangeWithStack(start + 1, end, &exc_stack);
+            defer self.allocator.free(rest);
             try stmts.appendSlice(a, rest);
         }
 
