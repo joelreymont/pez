@@ -159,6 +159,10 @@ fn dumpCodeCFG(allocator: std.mem.Allocator, code: *const pyc.Code, version: dec
                 .with_stmt => |p| {
                     try writer.print("  Block {d}: WITH (body={d}, cleanup={d})\n", .{ bid, p.body_block, p.cleanup_block });
                 },
+                .match_stmt => |p| {
+                    defer p.deinit(allocator);
+                    try writer.print("  Block {d}: MATCH (cases={d}, exit={?d})\n", .{ bid, p.case_blocks.len, p.exit_block });
+                },
                 else => {
                     if (block.is_loop_header) {
                         try writer.print("  Block {d}: LOOP_HEADER\n", .{bid});

@@ -3743,6 +3743,7 @@ pub const Decompiler = struct {
     }
 
     fn decompileMatch(self: *Decompiler, pattern: ctrl.MatchPattern) DecompileError!PatternResult {
+        defer pattern.deinit(self.allocator);
         // Get subject from subject block - simulate only until MATCH_* or COPY
         const subj_block = &self.cfg.blocks[pattern.subject_block];
         var sim = SimContext.init(self.allocator, self.code, self.version);

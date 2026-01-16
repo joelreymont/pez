@@ -126,6 +126,10 @@ pub const MatchPattern = struct {
     case_blocks: []const u32,
     /// Block after all cases (where they merge or wildcard).
     exit_block: ?u32,
+
+    pub fn deinit(self: *const MatchPattern, allocator: Allocator) void {
+        allocator.free(self.case_blocks);
+    }
 };
 
 /// Info about a single match case.
