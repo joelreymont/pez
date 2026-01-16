@@ -2582,6 +2582,12 @@ pub const Decompiler = struct {
                         block_idx += 1;
                         continue;
                     }
+                    // Skip exception table infrastructure blocks
+                    const term = block.terminator();
+                    if (term != null and term.?.opcode == .POP_JUMP_FORWARD_IF_NOT_NONE) {
+                        block_idx += 1;
+                        continue;
+                    }
                     // Process block as sequential statements
                     try self.decompileBlock(block_idx);
                     block_idx += 1;
@@ -3742,13 +3748,19 @@ pub const Decompiler = struct {
         var sim = SimContext.init(self.allocator, self.code, self.version);
         defer sim.deinit();
 
+        var prev_was_load = false;
         for (subj_block.instructions) |inst| {
-            // Stop before MATCH_* opcodes - subject is on stack now
+            // Stop before MATCH_* opcodes or COPY
             if (inst.opcode == .MATCH_SEQUENCE or inst.opcode == .MATCH_MAPPING or
                 inst.opcode == .MATCH_CLASS or inst.opcode == .COPY)
             {
                 break;
             }
+            // Stop before STORE if previous was LOAD (pattern binding, not assignment)
+            if ((inst.opcode == .STORE_NAME or inst.opcode == .STORE_FAST) and prev_was_load) {
+                break;
+            }
+            prev_was_load = inst.opcode == .LOAD_NAME or inst.opcode == .LOAD_FAST;
             sim.simulate(inst) catch {};
         }
 
@@ -3785,34 +3797,37 @@ pub const Decompiler = struct {
         // Extract pattern from bytecode
         const pat = try self.extractMatchPattern(block);
 
-        // Detect guard: STORE_NAME followed by LOAD_NAME + comparison + POP_JUMP_IF_FALSE
+        // Detect guard: STORE_NAME followed by LOAD_NAME (same var) ... POP_JUMP_IF_FALSE
         var guard: ?*Expr = null;
-        var i: usize = 0;
-        while (i + 3 < block.instructions.len) : (i += 1) {
-            const inst1 = block.instructions[i];
-            const inst2 = block.instructions[i + 1];
-            const inst3 = block.instructions[i + 2];
-            const inst4 = block.instructions[i + 3];
+        for (block.instructions, 0..) |inst, i| {
+            if (inst.opcode == .STORE_NAME or inst.opcode == .STORE_FAST) {
+                // Look ahead for matching LOAD + guard condition
+                var found_guard = false;
+                for (block.instructions[i + 1 ..], i + 1..) |next_inst, j| {
+                    if (next_inst.opcode == .LOAD_NAME or next_inst.opcode == .LOAD_FAST) {
+                        // Check if loading same variable
+                        const same_var = if (inst.opcode == .STORE_NAME and next_inst.opcode == .LOAD_NAME)
+                            inst.arg == next_inst.arg
+                        else if (inst.opcode == .STORE_FAST and next_inst.opcode == .LOAD_FAST)
+                            inst.arg == next_inst.arg
+                        else
+                            false;
 
-            if (inst1.opcode == .STORE_NAME and inst2.opcode == .LOAD_NAME and
-                (inst3.opcode == .COMPARE_OP or inst3.opcode == .LOAD_SMALL_INT or inst3.opcode == .LOAD_CONST) and
-                (inst4.opcode == .POP_JUMP_IF_FALSE or inst4.opcode == .POP_JUMP_FORWARD_IF_FALSE))
-            {
-                if (inst1.arg < self.code.names.len and inst2.arg < self.code.names.len) {
-                    if (std.mem.eql(u8, self.code.names[inst1.arg], self.code.names[inst2.arg])) {
-                        // Extract guard expression by simulating from LOAD_NAME to jump
-                        var sim = SimContext.init(self.allocator, self.code, self.version);
-                        defer sim.deinit();
-                        var j = i + 1;
-                        while (j < block.instructions.len) : (j += 1) {
-                            const g_inst = block.instructions[j];
-                            if (g_inst.opcode == .POP_JUMP_IF_FALSE or g_inst.opcode == .POP_JUMP_FORWARD_IF_FALSE) break;
-                            sim.simulate(g_inst) catch break;
+                        if (same_var) {
+                            // Extract guard by simulating from LOAD to POP_JUMP_IF_FALSE
+                            var sim = SimContext.init(self.allocator, self.code, self.version);
+                            defer sim.deinit();
+                            for (block.instructions[j..]) |g_inst| {
+                                if (g_inst.opcode == .POP_JUMP_IF_FALSE or g_inst.opcode == .POP_JUMP_FORWARD_IF_FALSE) break;
+                                sim.simulate(g_inst) catch break;
+                            }
+                            guard = sim.stack.popExpr() catch null;
+                            found_guard = true;
+                            break;
                         }
-                        guard = sim.stack.popExpr() catch null;
-                        break;
                     }
                 }
+                if (found_guard) break;
             }
         }
 
@@ -3857,15 +3872,22 @@ pub const Decompiler = struct {
         var has_match_map = false;
         var literal_val: ?*Expr = null;
 
+        var prev_was_load = false;
         for (block.instructions) |inst| {
             switch (inst.opcode) {
                 .MATCH_SEQUENCE => has_match_seq = true,
                 .MATCH_MAPPING => has_match_map = true,
+                .LOAD_NAME, .LOAD_FAST => {
+                    prev_was_load = true;
+                    try sim.simulate(inst);
+                },
                 .LOAD_CONST, .LOAD_SMALL_INT => {
+                    prev_was_load = false;
                     try sim.simulate(inst);
                     literal_val = sim.stack.popExpr() catch null;
                 },
                 .COMPARE_OP => {
+                    prev_was_load = false;
                     // Literal match - use the constant
                     if (literal_val) |val| {
                         const pat = try self.allocator.create(ast.Pattern);
@@ -3873,13 +3895,32 @@ pub const Decompiler = struct {
                         return pat;
                     }
                 },
+                .STORE_NAME, .STORE_FAST => {
+                    // Capture pattern only if previous was LOAD (subject load → pattern binding)
+                    if (prev_was_load) {
+                        const name = if (inst.opcode == .STORE_NAME)
+                            self.code.names[inst.arg]
+                        else
+                            self.code.varnames[inst.arg];
+
+                        const pat = try self.allocator.create(ast.Pattern);
+                        pat.* = .{ .match_as = .{ .pattern = null, .name = name } };
+                        return pat;
+                    }
+                    prev_was_load = false;
+                    try sim.simulate(inst);
+                },
                 .NOP => {
+                    prev_was_load = false;
                     // Wildcard pattern
                     const pat = try self.allocator.create(ast.Pattern);
                     pat.* = .{ .match_as = .{ .pattern = null, .name = null } };
                     return pat;
                 },
-                else => try sim.simulate(inst),
+                else => {
+                    prev_was_load = false;
+                    try sim.simulate(inst);
+                },
             }
         }
 

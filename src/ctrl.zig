@@ -236,6 +236,11 @@ pub const Analyzer = struct {
             return .unknown;
         }
 
+        // Skip exception table infrastructure (POP_JUMP_FORWARD_IF_NOT_NONE without preceding code)
+        if (term.opcode == .POP_JUMP_FORWARD_IF_NOT_NONE) {
+            return .unknown;
+        }
+
         // Check for match statement (before if, since match uses conditional jumps)
         if (self.isMatchSubjectBlock(block)) {
             if (try self.detectMatchPattern(block_id)) |pattern| {
@@ -251,7 +256,8 @@ pub const Analyzer = struct {
         }
 
         // Check for conditional jump (if statement pattern)
-        if (self.isConditionalJump(term.opcode)) {
+        // Skip POP_JUMP_FORWARD_IF_NOT_NONE - exception table infrastructure
+        if (self.isConditionalJump(term.opcode) and term.opcode != .POP_JUMP_FORWARD_IF_NOT_NONE) {
             if (try self.detectIfPattern(block_id)) |pattern| {
                 return .{ .if_stmt = pattern };
             }
@@ -1366,10 +1372,10 @@ pub const Analyzer = struct {
     /// Check if block looks like start of a match statement.
     /// Match starts with subject load, then MATCH_* or COPY+pattern in current or successor.
     fn isMatchSubjectBlock(self: *const Analyzer, block: *const BasicBlock) bool {
-        // Check if current block has MATCH_* opcode
-        if (self.hasMatchOpcode(block)) return true;
+        // Check if current block has MATCH_* opcode or pattern
+        if (self.hasMatchOpcode(block) or self.hasMatchPattern(block)) return true;
 
-        // Check if successor block starts with MATCH_* or COPY+MATCH
+        // Check if successor block starts with MATCH_* or pattern
         if (block.successors.len == 0) return false;
         const succ_id = block.successors[0].target;
         if (succ_id >= self.cfg.blocks.len) return false;
@@ -1394,7 +1400,6 @@ pub const Analyzer = struct {
 
     /// Check if block has a match pattern (COPY followed by MATCH_* or literal compare).
     fn hasMatchPattern(self: *const Analyzer, block: *const BasicBlock) bool {
-        _ = self;
         var has_copy = false;
         var has_match_op = false;
 
@@ -1411,6 +1416,32 @@ pub const Analyzer = struct {
                 has_match_op = true;
             }
         }
+        // Match pattern with guard (Python 3.10+ only): LOAD_NAME/LOAD_FAST (subject) followed by STORE_NAME/STORE_FAST (pattern binding)
+        // Check within block or across block boundary
+        if (self.cfg.version.major >= 3 and self.cfg.version.minor >= 10) {
+            for (block.instructions, 0..) |inst, i| {
+                if (inst.opcode == .STORE_NAME or inst.opcode == .STORE_FAST) {
+                    // Check if previous instruction is LOAD (subject load)
+                    const has_load_before = if (i > 0)
+                        block.instructions[i - 1].opcode == .LOAD_NAME or block.instructions[i - 1].opcode == .LOAD_FAST
+                    else blk: {
+                        // Check predecessor's last instruction
+                        if (block.predecessors.len > 0) {
+                            const pred_id = block.predecessors[0];
+                            if (pred_id < self.cfg.blocks.len) {
+                                const pred = &self.cfg.blocks[pred_id];
+                                if (pred.instructions.len > 0) {
+                                    const pred_last = pred.instructions[pred.instructions.len - 1];
+                                    break :blk pred_last.opcode == .LOAD_NAME or pred_last.opcode == .LOAD_FAST;
+                                }
+                            }
+                        }
+                        break :blk false;
+                    };
+                    if (has_load_before) return true;
+                }
+            }
+        }
         return has_copy and has_match_op;
     }
 
@@ -1421,8 +1452,8 @@ pub const Analyzer = struct {
         var case_blocks: std.ArrayList(u32) = .{};
         defer case_blocks.deinit(self.allocator);
 
-        // If current block has MATCH_*, it's both subject and first case
-        var current: u32 = if (self.hasMatchOpcode(block))
+        // If current block has MATCH_* or pattern, it's both subject and first case
+        var current: u32 = if (self.hasMatchOpcode(block) or self.hasMatchPattern(block))
             block_id
         else if (block.successors.len > 0)
             block.successors[0].target
