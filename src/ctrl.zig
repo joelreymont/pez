@@ -223,6 +223,11 @@ pub const Analyzer = struct {
     try_cache_checked: std.DynamicBitSet,
     /// Enclosing loop headers per block.
     enclosing_loops: []std.ArrayListUnmanaged(u32),
+    /// Merge-point scratch (generation-stamped visitation).
+    merge_then_seen: []u32,
+    merge_else_seen: []u32,
+    merge_gen: u32,
+    merge_queue: std.ArrayListUnmanaged(u32),
 
     pub fn init(allocator: Allocator, cfg_ptr: *const CFG, dom: *const dom_mod.DomTree) !Analyzer {
         const processed = try std.DynamicBitSet.initEmpty(allocator, cfg_ptr.blocks.len);
@@ -237,6 +242,13 @@ pub const Analyzer = struct {
             }
             allocator.free(enclosing_loops);
         }
+
+        const merge_then_seen = try allocator.alloc(u32, cfg_ptr.blocks.len);
+        errdefer allocator.free(merge_then_seen);
+        @memset(merge_then_seen, 0);
+        const merge_else_seen = try allocator.alloc(u32, cfg_ptr.blocks.len);
+        errdefer allocator.free(merge_else_seen);
+        @memset(merge_else_seen, 0);
 
         if (dom.num_blocks > 0) {
             const headers = try dom.getLoopHeaders();
@@ -258,6 +270,10 @@ pub const Analyzer = struct {
             .try_cache = try_cache,
             .try_cache_checked = try_cache_checked,
             .enclosing_loops = enclosing_loops,
+            .merge_then_seen = merge_then_seen,
+            .merge_else_seen = merge_else_seen,
+            .merge_gen = 1,
+            .merge_queue = .{},
         };
     }
 
@@ -276,6 +292,18 @@ pub const Analyzer = struct {
             list.deinit(self.allocator);
         }
         if (self.enclosing_loops.len > 0) self.allocator.free(self.enclosing_loops);
+        if (self.merge_then_seen.len > 0) self.allocator.free(self.merge_then_seen);
+        if (self.merge_else_seen.len > 0) self.allocator.free(self.merge_else_seen);
+        self.merge_queue.deinit(self.allocator);
+    }
+
+    fn nextMergeGen(self: *Analyzer) void {
+        self.merge_gen +%= 1;
+        if (self.merge_gen == 0) {
+            @memset(self.merge_then_seen, 0);
+            @memset(self.merge_else_seen, 0);
+            self.merge_gen = 1;
+        }
     }
 
     /// Detect the control flow pattern starting at a block.
@@ -1665,22 +1693,23 @@ pub const Analyzer = struct {
         }
 
         // Simple approach: follow each branch until we find a common successor
-        var then_visited = std.AutoHashMap(u32, void).init(self.allocator);
-        defer then_visited.deinit();
+        self.nextMergeGen();
+        const gen = self.merge_gen;
 
-        // Mark all blocks reachable from then-branch
-        var queue: std.ArrayList(u32) = .{};
-        defer queue.deinit(self.allocator);
+        var queue = &self.merge_queue;
+        queue.clearRetainingCapacity();
         try queue.append(self.allocator, then_block);
 
         while (queue.items.len > 0) {
-            const bid = queue.pop().?;
-            if (then_visited.contains(bid)) continue;
-            try then_visited.put(bid, {});
+            const bid = queue.items[queue.items.len - 1];
+            queue.items.len -= 1;
+            if (bid >= self.merge_then_seen.len) continue;
+            if (self.merge_then_seen[bid] == gen) continue;
+            self.merge_then_seen[bid] = gen;
 
             const blk = &self.cfg.blocks[bid];
             for (blk.successors) |edge| {
-                if (!then_visited.contains(edge.target)) {
+                if (edge.target < self.merge_then_seen.len and self.merge_then_seen[edge.target] != gen) {
                     try queue.append(self.allocator, edge.target);
                 }
             }
@@ -1688,24 +1717,22 @@ pub const Analyzer = struct {
 
         // Find first block reachable from else-branch that's also in then-visited
         queue.clearRetainingCapacity();
-        var else_visited = std.AutoHashMap(u32, void).init(self.allocator);
-        defer else_visited.deinit();
         try queue.append(self.allocator, else_id);
 
         while (queue.items.len > 0) {
-            const bid = queue.pop().?;
-            if (else_visited.contains(bid)) continue;
+            const bid = queue.items[queue.items.len - 1];
+            queue.items.len -= 1;
+            if (bid >= self.merge_else_seen.len) continue;
+            if (self.merge_else_seen[bid] == gen) continue;
+            self.merge_else_seen[bid] = gen;
 
-            // Check if this block is reachable from then-branch
-            if (then_visited.contains(bid)) {
+            if (bid < self.merge_then_seen.len and self.merge_then_seen[bid] == gen) {
                 return bid;
             }
 
-            try else_visited.put(bid, {});
-
             const blk = &self.cfg.blocks[bid];
             for (blk.successors) |edge| {
-                if (!else_visited.contains(edge.target)) {
+                if (edge.target < self.merge_else_seen.len and self.merge_else_seen[edge.target] != gen) {
                     try queue.append(self.allocator, edge.target);
                 }
             }
