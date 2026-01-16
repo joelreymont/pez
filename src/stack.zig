@@ -2843,11 +2843,22 @@ pub const SimContext = struct {
                 const defaults_count = inst.arg;
                 if (defaults_count > 0) {
                     var default_list: std.ArrayListUnmanaged(*Expr) = .empty;
+                    errdefer {
+                        for (default_list.items) |expr| {
+                            expr.deinit(self.allocator);
+                            self.allocator.destroy(expr);
+                        }
+                        default_list.deinit(self.allocator);
+                    }
                     var i: u32 = 0;
                     while (i < defaults_count) : (i += 1) {
                         if (self.stack.pop()) |def_val| {
                             if (def_val == .expr) {
-                                default_list.append(self.allocator, def_val.expr) catch {};
+                                default_list.append(self.allocator, def_val.expr) catch |err| {
+                                    def_val.expr.deinit(self.allocator);
+                                    self.allocator.destroy(def_val.expr);
+                                    return err;
+                                };
                             } else {
                                 var val = def_val;
                                 val.deinit(self.allocator);
