@@ -1422,10 +1422,11 @@ pub const Analyzer = struct {
         }
         // Match pattern with guard (Python 3.10+ only): LOAD_NAME/LOAD_FAST (subject) followed by STORE_NAME/STORE_FAST (pattern binding)
         // Or STORE_FAST_LOAD_FAST (Python 3.14+) which combines both
+        // Or STORE_FAST_STORE_FAST (Python 3.14+) which stores pattern vars
         if (self.cfg.version.major >= 3 and self.cfg.version.minor >= 10) {
             for (block.instructions, 0..) |inst, i| {
-                // Python 3.14+: STORE_FAST_LOAD_FAST is pattern match binding
-                if (inst.opcode == .STORE_FAST_LOAD_FAST) return true;
+                // Python 3.14+: STORE_FAST_LOAD_FAST or STORE_FAST_STORE_FAST is pattern match binding
+                if (inst.opcode == .STORE_FAST_LOAD_FAST or inst.opcode == .STORE_FAST_STORE_FAST) return true;
 
                 if (inst.opcode == .STORE_NAME or inst.opcode == .STORE_FAST) {
                     // Check if previous instruction is LOAD (subject load)
@@ -1475,7 +1476,24 @@ pub const Analyzer = struct {
 
             // Check if this is a case pattern block
             if (!self.hasMatchOpcode(cur_block) and !self.hasMatchPattern(cur_block) and !self.isWildcardCase(cur_block)) {
-                // Not a case block - this might be exit
+                // Not a case block - might be cleanup (POP_TOP) or exit
+                // If block starts with POP_TOP, it's likely a pattern failure cleanup block
+                // Skip it and check the next block (either successor or next in sequence)
+                if (cur_block.instructions.len > 0 and cur_block.instructions[0].opcode == .POP_TOP) {
+                    // Cleanup block - try successor, or next block if terminal
+                    if (cur_block.successors.len > 0 and cur_block.successors[0].edge_type == .normal) {
+                        current = cur_block.successors[0].target;
+                    } else {
+                        // Terminal cleanup (returns) - check next sequential block
+                        current = current + 1;
+                        if (current >= self.cfg.blocks.len) {
+                            exit_block = null;
+                            break;
+                        }
+                    }
+                    continue;
+                }
+                // Otherwise, this is exit
                 exit_block = current;
                 break;
             }

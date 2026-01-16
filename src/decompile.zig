@@ -3789,25 +3789,117 @@ pub const Decompiler = struct {
             },
         };
 
-        // Find the highest block ID used by any case (subject + all case blocks)
+        // Find the highest block ID used - must account for all blocks touched:
+        // - pattern blocks (multi-block patterns)
+        // - body blocks
+        // - fail blocks (conditional_false targets)
+        // Use exit_block if available, otherwise find max from all successors
+        if (pattern.exit_block) |exit| {
+            return .{ .stmt = stmt, .next_block = exit };
+        }
+
+        // No explicit exit - find max block by examining all case block successors
         var max_block = pattern.subject_block;
         for (pattern.case_blocks) |cb| {
             if (cb > max_block) max_block = cb;
+            const blk = &self.cfg.blocks[cb];
+            for (blk.successors) |edge| {
+                if (edge.target > max_block) max_block = edge.target;
+            }
         }
-        return .{ .stmt = stmt, .next_block = pattern.exit_block orelse (max_block + 1) };
+        return .{ .stmt = stmt, .next_block = max_block + 1 };
     }
 
     fn decompileMatchCase(self: *Decompiler, block_id: u32, has_copy: bool) DecompileError!ast.MatchCase {
-        const block = &self.cfg.blocks[block_id];
+        // Pattern matching with guards spans multiple blocks:
+        // Block N: MATCH_SEQUENCE, POP_JUMP -> pattern fail
+        // Block N+1: GET_LEN, COMPARE_OP, POP_JUMP -> pattern fail
+        // Block N+2: UNPACK, STORE_FAST_STORE_FAST, guard, POP_JUMP -> guard fail
+        // Block N+3: body
+        //
+        // Need to collect all pattern+guard blocks by following conditional_true edges
+        // until we reach the body block.
 
-        // Extract pattern from bytecode
-        // If this block doesn't have COPY, subject is already on stack from previous case
-        const pat = try self.extractMatchPattern(block, !has_copy);
+        var pattern_blocks: std.ArrayList(u32) = .{};
+        defer pattern_blocks.deinit(self.allocator);
 
-        // Detect guard: STORE_FAST_LOAD_FAST or (STORE followed by LOAD) ... POP_JUMP_IF_FALSE
+        var current_block_id = block_id;
+        var final_pattern_block_id = block_id;
+
+        // Follow conditional_true edges while blocks contain pattern/guard logic
+        while (current_block_id < self.cfg.blocks.len) {
+            const blk = &self.cfg.blocks[current_block_id];
+            try pattern_blocks.append(self.allocator, current_block_id);
+
+            // Check if this block has pattern opcodes or guard
+            var has_pattern = false;
+            var has_guard = false;
+            for (blk.instructions) |inst| {
+                if (inst.opcode == .MATCH_SEQUENCE or inst.opcode == .MATCH_MAPPING or
+                    inst.opcode == .MATCH_CLASS or inst.opcode == .COMPARE_OP or
+                    inst.opcode == .UNPACK_SEQUENCE or inst.opcode == .STORE_FAST_STORE_FAST)
+                {
+                    has_pattern = true;
+                }
+                if (inst.opcode == .LOAD_FAST_BORROW or inst.opcode == .STORE_FAST_LOAD_FAST) {
+                    has_guard = true;
+                }
+            }
+
+            // If block has guard, this is the final pattern block
+            if (has_guard) {
+                final_pattern_block_id = current_block_id;
+                break;
+            }
+
+            // If block has pattern logic, continue to next block via conditional_true
+            if (has_pattern) {
+                var found_next = false;
+                for (blk.successors) |edge| {
+                    if (edge.edge_type == .conditional_true) {
+                        current_block_id = edge.target;
+                        found_next = true;
+                        break;
+                    }
+                }
+                if (!found_next) {
+                    final_pattern_block_id = current_block_id;
+                    break;
+                }
+            } else {
+                // No pattern/guard - this is the body
+                break;
+            }
+        }
+
+        // Collect all instructions from pattern blocks for extraction
+        var all_insts: std.ArrayList(cfg_mod.Instruction) = .{};
+        defer all_insts.deinit(self.allocator);
+        for (pattern_blocks.items) |pid| {
+            const pb = &self.cfg.blocks[pid];
+            try all_insts.appendSlice(self.allocator, pb.instructions);
+        }
+
+        // Extract pattern from combined instruction stream
+        const block = &self.cfg.blocks[final_pattern_block_id];
+        const pat = try self.extractMatchPatternFromInsts(all_insts.items, !has_copy);
+
+        // Detect guard: STORE_FAST_STORE_FAST, STORE_FAST_LOAD_FAST, or (STORE followed by LOAD) ... POP_JUMP_IF_FALSE
         var guard: ?*Expr = null;
+        var guard_start_idx: ?usize = null;
         for (block.instructions, 0..) |inst, i| {
-            if (inst.opcode == .STORE_FAST_LOAD_FAST) {
+            if (inst.opcode == .STORE_FAST_STORE_FAST) {
+                // Python 3.14: STORE_FAST_STORE_FAST stores pattern vars, then guard uses LOAD_FAST_BORROW
+                // Pattern: STORE_FAST_STORE_FAST -> LOAD_FAST_BORROW -> ... -> POP_JUMP_IF_FALSE
+                // Find next LOAD_FAST_BORROW and extract guard from there
+                for (block.instructions[i + 1 ..], i + 1..) |next, j| {
+                    if (next.opcode == .LOAD_FAST_BORROW or next.opcode == .LOAD_FAST) {
+                        guard_start_idx = j;
+                        break;
+                    }
+                }
+                break;
+            } else if (inst.opcode == .STORE_FAST_LOAD_FAST) {
                 // Extract guard by simulating from after STORE_FAST_LOAD_FAST to POP_JUMP_IF_FALSE
                 // STORE_FAST_LOAD_FAST: pop TOS, store to var, push var
                 const a = self.arena.allocator();
@@ -3862,14 +3954,29 @@ pub const Decompiler = struct {
             }
         }
 
+        // If guard_start_idx is set (STORE_FAST_STORE_FAST case), extract guard
+        if (guard_start_idx) |start| {
+            const a = self.arena.allocator();
+            var sim = SimContext.init(a, self.code, self.version);
+            defer sim.deinit();
+            for (block.instructions[start..]) |g_inst| {
+                if (g_inst.opcode == .POP_JUMP_IF_FALSE or g_inst.opcode == .POP_JUMP_FORWARD_IF_FALSE) break;
+                sim.simulate(g_inst) catch break;
+            }
+            guard = sim.stack.popExpr() catch null;
+        }
+
         // Find body: if guard exists and body is inline (no separate block), extract from current block
         var body: []const *Stmt = &.{};
+
+        // Use final_pattern_block for body/guard edge lookup
+        const final_block = &self.cfg.blocks[final_pattern_block_id];
 
         if (guard != null) {
             // Guard case: body might be inline after POP_TOP, or in a separate block
             // Check if there's a conditional_true edge (separate body block)
             var body_block: ?u32 = null;
-            for (block.successors) |edge| {
+            for (final_block.successors) |edge| {
                 if (edge.edge_type == .conditional_true) {
                     body_block = edge.target;
                     break;
@@ -3878,20 +3985,29 @@ pub const Decompiler = struct {
 
             if (body_block) |bid| {
                 // Body in separate block
-                // When guard exists, subject is still on stack at body entry (will be popped by POP_TOP)
-                var body_end: u32 = block_id + 1;
-                for (block.successors) |edge| {
-                    if (edge.edge_type == .conditional_false) {
+                // Find the actual end: look for next case block or exit
+                var body_end: ?u32 = null;
+
+                // The body block should end when it:
+                // 1. Returns (no successors)
+                // 2. Jumps to next case/exit
+                const body_blk = &self.cfg.blocks[bid];
+                if (body_blk.successors.len == 0) {
+                    // Terminal block (RETURN_VALUE) - just this block
+                    body_end = bid + 1;
+                } else {
+                    // Body has successors - find where it goes
+                    for (body_blk.successors) |edge| {
+                        // Body typically jumps to exit or falls through to next case
                         body_end = edge.target;
                         break;
                     }
                 }
-                if (bid < body_end) {
-                    // Create placeholder for subject on stack (will be consumed by POP_TOP)
-                    const a = self.arena.allocator();
-                    const subj_expr = try a.create(Expr);
-                    subj_expr.* = .{ .name = .{ .id = "_", .ctx = .load } };
-                    body = try self.decompileStructuredRangeWithStack(bid, body_end, &.{.{ .expr = subj_expr }});
+
+                if (body_end) |end| {
+                    if (bid < end) {
+                        body = try self.decompileStructuredRange(bid, end);
+                    }
                 }
             } else {
                 // Body inline: find POP_TOP after guard check, decompile rest of block
@@ -4010,7 +4126,7 @@ pub const Decompiler = struct {
         };
     }
 
-    fn extractMatchPattern(self: *Decompiler, block: *const cfg_mod.BasicBlock, subject_on_stack: bool) DecompileError!*ast.Pattern {
+    fn extractMatchPatternFromInsts(self: *Decompiler, insts: []const cfg_mod.Instruction, subject_on_stack: bool) DecompileError!*ast.Pattern {
         const a = self.arena.allocator();
         var sim = SimContext.init(a, self.code, self.version);
         defer sim.deinit();
@@ -4027,27 +4143,73 @@ pub const Decompiler = struct {
         var literal_val: ?*Expr = null;
 
         var prev_was_load = false;
-        for (block.instructions) |inst| {
+        var unpack_count: ?u32 = null;
+        var prev_was_get_len = false;
+        for (insts) |inst| {
             switch (inst.opcode) {
                 .MATCH_SEQUENCE => has_match_seq = true,
                 .MATCH_MAPPING => has_match_map = true,
+                .GET_LEN => {
+                    prev_was_get_len = true;
+                    try sim.simulate(inst);
+                },
                 .LOAD_NAME, .LOAD_FAST => {
                     prev_was_load = true;
+                    prev_was_get_len = false;
                     try sim.simulate(inst);
                 },
                 .LOAD_CONST, .LOAD_SMALL_INT => {
                     prev_was_load = false;
-                    try sim.simulate(inst);
-                    literal_val = sim.stack.popExpr() catch null;
+                    // Only save as literal_val if not part of length check
+                    if (!prev_was_get_len) {
+                        try sim.simulate(inst);
+                        literal_val = sim.stack.popExpr() catch null;
+                    } else {
+                        try sim.simulate(inst);
+                    }
                 },
                 .COMPARE_OP => {
                     prev_was_load = false;
-                    // Literal match - use the constant
-                    if (literal_val) |val| {
+                    // Literal match - use the constant (only if we have one and not in length check)
+                    if (!prev_was_get_len and literal_val != null) {
                         const pat = try self.arena.allocator().create(ast.Pattern);
-                        pat.* = .{ .match_value = val };
+                        pat.* = .{ .match_value = literal_val.? };
                         return pat;
                     }
+                    prev_was_get_len = false;
+                    // Skip simulation of comparison - it produces bool which breaks subsequent pattern logic
+                },
+                .UNPACK_SEQUENCE => {
+                    unpack_count = inst.arg;
+                    try sim.simulate(inst);
+                },
+                .STORE_FAST_STORE_FAST => {
+                    // Python 3.14+: UNPACK_SEQUENCE followed by STORE_FAST_STORE_FAST
+                    // Build match_sequence pattern with bindings
+                    if (unpack_count) |count| {
+                        if (count == 2) {
+                            // arg packs indices: hi=first var, lo=second var
+                            const idx1 = (inst.arg >> 4) & 0xF;
+                            const idx2 = inst.arg & 0xF;
+                            const name1 = self.code.varnames[idx1];
+                            const name2 = self.code.varnames[idx2];
+
+                            const pat1 = try a.create(ast.Pattern);
+                            pat1.* = .{ .match_as = .{ .pattern = null, .name = name1 } };
+                            const pat2 = try a.create(ast.Pattern);
+                            pat2.* = .{ .match_as = .{ .pattern = null, .name = name2 } };
+
+                            const pats = try a.alloc(*ast.Pattern, 2);
+                            pats[0] = pat1;
+                            pats[1] = pat2;
+
+                            const pat = try a.create(ast.Pattern);
+                            pat.* = .{ .match_sequence = pats };
+                            return pat;
+                        }
+                    }
+                    // Fallback: continue simulation
+                    try sim.simulate(inst);
                 },
                 .STORE_FAST_LOAD_FAST => {
                     // Python 3.14+: combined store+load for pattern binding
