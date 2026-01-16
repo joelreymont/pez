@@ -75,7 +75,7 @@ test "match sequence pattern multiblock" {
     const oh = OhSnap{};
     try oh.snap(@src(),
         \\[]const u8
-        \\  "[]"
+        \\  "[y]"
     ).expectEqual(output);
 }
 
@@ -190,5 +190,70 @@ test "match STORE_FAST_STORE_FAST two vars" {
     try oh.snap(@src(),
         \\[]const u8
         \\  "[a, b]"
+    ).expectEqual(output);
+}
+
+test "match nested sequence with swap" {
+    const allocator = testing.allocator;
+    const version = Version.init(3, 14);
+
+    const varnames = try tu.dupeStrings(allocator, &[_][]const u8{ "x", "a", "b", "c" });
+    defer {
+        for (varnames) |v| allocator.free(v);
+        allocator.free(varnames);
+    }
+
+    const ops = [_]tu.OpArg{
+        .{ .op = .LOAD_FAST, .arg = 0 },
+        .{ .op = .MATCH_SEQUENCE, .arg = 0 },
+        .{ .op = .POP_JUMP_IF_FALSE, .arg = 60 },
+        .{ .op = .GET_LEN, .arg = 0 },
+        .{ .op = .LOAD_CONST, .arg = 2 },
+        .{ .op = .COMPARE_OP, .arg = 2 },
+        .{ .op = .POP_JUMP_IF_FALSE, .arg = 60 },
+        .{ .op = .UNPACK_SEQUENCE, .arg = 2 },
+        .{ .op = .SWAP, .arg = 2 },
+        .{ .op = .MATCH_SEQUENCE, .arg = 0 },
+        .{ .op = .POP_JUMP_IF_FALSE, .arg = 60 },
+        .{ .op = .GET_LEN, .arg = 0 },
+        .{ .op = .LOAD_CONST, .arg = 2 },
+        .{ .op = .COMPARE_OP, .arg = 2 },
+        .{ .op = .POP_JUMP_IF_FALSE, .arg = 60 },
+        .{ .op = .UNPACK_SEQUENCE, .arg = 2 },
+        .{ .op = .STORE_FAST_STORE_FAST, .arg = 0x23 },
+        .{ .op = .STORE_FAST_LOAD_FAST, .arg = 0x11 },
+    };
+
+    const insts = try buildInsts(allocator, &ops);
+    defer allocator.free(insts);
+
+    const bytecode = try tu.emitOpsOwned(allocator, version, &ops);
+    defer allocator.free(bytecode);
+
+    const name = try allocator.dupe(u8, "test_nested");
+    defer allocator.free(name);
+
+    var code = pyc.Code{
+        .allocator = allocator,
+        .varnames = varnames,
+        .name = name,
+        .code = bytecode,
+    };
+
+    var d = try decompile.Decompiler.init(allocator, &code, version);
+    defer d.deinit();
+
+    const pat = try d.extractMatchPatternFromInsts(insts, false);
+
+    var w = codegen.Writer.init(allocator);
+    defer w.deinit(allocator);
+    try w.writePattern(allocator, pat);
+    const output = try w.getOutput(allocator);
+    defer allocator.free(output);
+
+    const oh = OhSnap{};
+    try oh.snap(@src(),
+        \\[]const u8
+        \\  "[a, [b, c]]"
     ).expectEqual(output);
 }
