@@ -2981,7 +2981,13 @@ pub const SimContext = struct {
             // Stack manipulation opcodes
             .DUP_TOP => {
                 // DUP_TOP - duplicate top of stack
-                const top = self.stack.peek() orelse return error.StackUnderflow;
+                const top = self.stack.peek() orelse {
+                    if (self.lenient) {
+                        try self.stack.push(.unknown);
+                        return;
+                    }
+                    return error.StackUnderflow;
+                };
                 try self.stack.push(try self.cloneStackValue(top));
             },
 

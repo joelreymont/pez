@@ -368,7 +368,7 @@ pub const Analyzer = struct {
         var has_jump = false;
         for (block.instructions) |inst| {
             switch (inst.opcode) {
-                .CHECK_EXC_MATCH, .PUSH_EXC_INFO => return true,
+                .CHECK_EXC_MATCH, .PUSH_EXC_INFO, .JUMP_IF_NOT_EXC_MATCH => return true,
                 .DUP_TOP => has_dup = true,
                 .COMPARE_OP => {
                     if (inst.arg == 10) has_exc_cmp = true;

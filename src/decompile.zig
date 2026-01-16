@@ -14,6 +14,7 @@ const stack_mod = @import("stack.zig");
 const pyc = @import("pyc.zig");
 const codegen = @import("codegen.zig");
 const signature = @import("signature.zig");
+const test_utils = @import("test_utils.zig");
 
 pub const CFG = cfg_mod.CFG;
 pub const BasicBlock = cfg_mod.BasicBlock;
@@ -2832,6 +2833,16 @@ pub const Decompiler = struct {
         var sim = SimContext.init(self.arena.allocator(), self.code, self.version);
         defer sim.deinit();
 
+        const needs_exc = self.needsExceptionSeed(block_id, block);
+
+        if (needs_exc) {
+            for (0..3) |_| {
+                const placeholder = try self.arena.allocator().create(Expr);
+                placeholder.* = .{ .name = .{ .id = "__exception__", .ctx = .load } };
+                try sim.stack.push(.{ .expr = placeholder });
+            }
+        }
+
         // Inherit stack from fall-through predecessor if needed
         const term = block.terminator();
         const needs_predecessor = blk: {
@@ -2846,7 +2857,7 @@ pub const Decompiler = struct {
             break :blk false;
         };
 
-        if (needs_predecessor) {
+        if (!needs_exc and needs_predecessor) {
             // Recursively find the chain of fall-through predecessors
             // and simulate them to build up stack state
             var cur_id = block_id;
@@ -2962,7 +2973,14 @@ pub const Decompiler = struct {
             break :blk &.{};
         };
 
-        if (seed.len > 0) {
+        const needs_exc = self.needsExceptionSeed(block_id, block);
+        if (needs_exc) {
+            for (0..3) |_| {
+                const placeholder = try self.arena.allocator().create(Expr);
+                placeholder.* = .{ .name = .{ .id = "__exception__", .ctx = .load } };
+                try sim.stack.push(.{ .expr = placeholder });
+            }
+        } else if (seed.len > 0) {
             for (seed) |val| {
                 const cloned = try sim.cloneStackValue(val);
                 try sim.stack.push(cloned);
@@ -6876,11 +6894,21 @@ pub const Decompiler = struct {
                 if (scan_block > body_block + 10) break; // Safety limit
             }
 
-            // Decompile handler body
+            // Decompile handler body (seed exception stack for handler context)
+            const handler_seed = if (handler_block.is_exception_handler or self.cfg.blocks[body_block].is_exception_handler) blk: {
+                const e1 = try a.create(Expr);
+                e1.* = .{ .name = .{ .id = "__exception__", .ctx = .load } };
+                const e2 = try a.create(Expr);
+                e2.* = .{ .name = .{ .id = "__exception__", .ctx = .load } };
+                const e3 = try a.create(Expr);
+                e3.* = .{ .name = .{ .id = "__exception__", .ctx = .load } };
+                break :blk &[_]StackValue{ .{ .expr = e1 }, .{ .expr = e2 }, .{ .expr = e3 } };
+            } else &.{};
+
             const handler_body = try self.decompileBlockRangeWithStackAndSkip(
                 body_block,
                 handler_end_block,
-                &.{},
+                handler_seed,
                 body_skip,
             );
 
@@ -7313,7 +7341,7 @@ pub const Decompiler = struct {
         var has_jump = false;
         for (block.instructions) |inst| {
             switch (inst.opcode) {
-                .PUSH_EXC_INFO, .CHECK_EXC_MATCH, .POP_EXCEPT => return true,
+                .PUSH_EXC_INFO, .CHECK_EXC_MATCH, .POP_EXCEPT, .JUMP_IF_NOT_EXC_MATCH => return true,
                 .DUP_TOP => has_dup = true,
                 .COMPARE_OP => {
                     if (inst.arg == 10) has_exc_cmp = true;
@@ -7323,6 +7351,17 @@ pub const Decompiler = struct {
             }
         }
         return has_dup and has_exc_cmp and has_jump;
+    }
+
+    fn needsExceptionSeed(self: *Decompiler, block_id: u32, block: *const BasicBlock) bool {
+        _ = block_id;
+        if (block.is_exception_handler or self.hasExceptionHandlerOpcodes(block)) return true;
+        for (block.predecessors) |pred_id| {
+            if (pred_id >= self.cfg.blocks.len) continue;
+            const pred = &self.cfg.blocks[pred_id];
+            if (pred.is_exception_handler or self.hasExceptionHandlerOpcodes(pred)) return true;
+        }
+        return false;
     }
 
     /// Decompile a for loop pattern.
@@ -8891,4 +8930,42 @@ test "decompiler init" {
     defer decompiler.deinit();
 
     try testing.expectEqual(@as(usize, 0), decompiler.cfg.blocks.len);
+}
+
+test "exception seed handles JUMP_IF_NOT_EXC_MATCH" {
+    const testing = std.testing;
+    const allocator = testing.allocator;
+    const version = Version.init(3, 9);
+
+    const ops = [_]test_utils.OpArg{
+        .{ .op = .DUP_TOP, .arg = 0 },
+        .{ .op = .LOAD_GLOBAL, .arg = 0 },
+        .{ .op = .JUMP_IF_NOT_EXC_MATCH, .arg = 14 },
+        .{ .op = .POP_TOP, .arg = 0 },
+        .{ .op = .STORE_FAST, .arg = 0 },
+        .{ .op = .POP_TOP, .arg = 0 },
+        .{ .op = .LOAD_CONST, .arg = 0 },
+        .{ .op = .RETURN_VALUE, .arg = 0 },
+    };
+
+    const bytecode = try test_utils.emitOpsOwned(allocator, version, &ops);
+    const consts = [_]pyc.Object{ .{ .none = {} } };
+    const code = try test_utils.allocCodeWithNames(
+        allocator,
+        "exc_seed",
+        &[_][]const u8{ "e" },
+        &[_][]const u8{ "Exception" },
+        &consts,
+        bytecode,
+        0,
+    );
+    defer {
+        code.deinit();
+        allocator.destroy(code);
+    }
+
+    var out: std.ArrayList(u8) = .{};
+    defer out.deinit(allocator);
+    try decompileToSource(allocator, code, version, out.writer(allocator));
+    try testing.expect(out.items.len > 0);
 }
