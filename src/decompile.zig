@@ -170,7 +170,10 @@ pub const Decompiler = struct {
                 switch (val) {
                     .expr => |e| {
                         return self.makeExprStmt(e) catch |err| {
-                            if (err == error.SkipStatement) return null;
+                            if (err == error.SkipStatement) {
+                                // Skipped expression - arena-allocated, don't free
+                                return null;
+                            }
                             return err;
                         };
                     },
@@ -2974,14 +2977,12 @@ pub const Decompiler = struct {
 
         // Decompile the then body with inherited stack
         const then_end = pattern.else_block orelse pattern.merge_block;
-        const then_body_tmp = try self.decompileBranchRange(pattern.then_block, then_end, base_vals, skip);
-        defer self.allocator.free(then_body_tmp);
+        const then_body = try self.decompileBranchRange(pattern.then_block, then_end, base_vals, skip);
         const a = self.arena.allocator();
-        const then_body = try a.dupe(*Stmt, then_body_tmp);
 
         // Check for assert pattern: if cond: pass else: raise AssertionError
         if (pattern.else_block) |else_id| {
-            if (try self.tryDecompileAssert(pattern, condition, else_id, then_body_tmp, base_vals, skip)) |assert_stmt| {
+            if (try self.tryDecompileAssert(pattern, condition, else_id, then_body, base_vals, skip)) |assert_stmt| {
                 for (base_vals) |val| val.deinit(self.allocator);
                 self.allocator.free(base_vals);
                 return assert_stmt;
@@ -3014,9 +3015,7 @@ pub const Decompiler = struct {
                 for (base_vals) |val| val.deinit(self.allocator);
                 self.allocator.free(base_vals);
             }
-            const else_body_tmp = try self.decompileBranchRange(else_id, pattern.merge_block, base_vals, skip);
-            defer self.allocator.free(else_body_tmp);
-            break :blk try a.dupe(*Stmt, else_body_tmp);
+            break :blk try self.decompileBranchRange(else_id, pattern.merge_block, base_vals, skip);
         } else blk: {
             // No else block - clean up base_vals
             for (base_vals) |val| val.deinit(self.allocator);
@@ -3046,18 +3045,18 @@ pub const Decompiler = struct {
         if (start_block >= limit) return &[_]*Stmt{};
 
         if (skip_first > 0 or base_vals.len > 0) {
+            const a = self.arena.allocator();
             var stmts: std.ArrayList(*Stmt) = .{};
-            errdefer stmts.deinit(self.allocator);
+            errdefer stmts.deinit(a);
 
             try self.decompileBlockIntoWithStackAndSkip(start_block, &stmts, base_vals, skip_first);
 
             if (start_block + 1 < limit) {
                 const rest = try self.decompileStructuredRange(start_block + 1, limit);
-                defer self.allocator.free(rest);
-                try stmts.appendSlice(self.allocator, rest);
+                try stmts.appendSlice(a, rest);
             }
 
-            return stmts.toOwnedSlice(self.allocator);
+            return stmts.toOwnedSlice(a);
         }
 
         return self.decompileStructuredRange(start_block, limit);
@@ -3530,10 +3529,7 @@ pub const Decompiler = struct {
 
         const else_body = if (else_start) |start| blk: {
             if (start >= else_end) break :blk &[_]*Stmt{};
-            const body = try self.decompileStructuredRange(start, else_end);
-            defer self.allocator.free(body);
-            const arena_body = try a.dupe(*Stmt, body);
-            break :blk arena_body;
+            break :blk try self.decompileStructuredRange(start, else_end);
         } else &[_]*Stmt{};
 
         var final_end: u32 = pattern.exit_block orelse @as(u32, @intCast(self.cfg.blocks.len));
@@ -3712,7 +3708,7 @@ pub const Decompiler = struct {
             _ = body_blk;
         }
 
-        const body = try body_stmts.toOwnedSlice(self.allocator);
+        const body = try body_stmts.toOwnedSlice(self.arena.allocator());
 
         const a = self.arena.allocator();
         const stmt = try a.create(Stmt);
@@ -3746,7 +3742,8 @@ pub const Decompiler = struct {
         defer pattern.deinit(self.allocator);
         // Get subject from subject block - simulate only until MATCH_* or COPY
         const subj_block = &self.cfg.blocks[pattern.subject_block];
-        var sim = SimContext.init(self.allocator, self.code, self.version);
+        const a = self.arena.allocator();
+        var sim = SimContext.init(a, self.code, self.version);
         defer sim.deinit();
 
         var prev_was_load = false;
@@ -3771,27 +3768,27 @@ pub const Decompiler = struct {
 
         const subject = sim.stack.popExpr() catch {
             // Fallback: create unknown expression
-            const expr = try self.allocator.create(Expr);
+            const expr = try a.create(Expr);
             expr.* = .{ .name = .{ .id = "<unknown>", .ctx = .load } };
             return .{ .stmt = null, .next_block = pattern.exit_block orelse pattern.subject_block + 1 };
         };
 
         // Decompile each case
         var cases: std.ArrayList(ast.MatchCase) = .{};
-        errdefer cases.deinit(self.allocator);
+        errdefer cases.deinit(a);
 
         for (pattern.case_blocks, 0..) |case_block_id, idx| {
             // First case has COPY, subsequent cases reuse subject on stack
             const has_copy = idx == 0;
             const case = try self.decompileMatchCase(case_block_id, has_copy);
-            try cases.append(self.allocator, case);
+            try cases.append(a, case);
         }
 
-        const stmt = try self.allocator.create(Stmt);
+        const stmt = try a.create(Stmt);
         stmt.* = .{
             .match_stmt = .{
                 .subject = subject,
-                .cases = try cases.toOwnedSlice(self.allocator),
+                .cases = try cases.toOwnedSlice(self.arena.allocator()),
             },
         };
 
@@ -3816,7 +3813,8 @@ pub const Decompiler = struct {
             if (inst.opcode == .STORE_FAST_LOAD_FAST) {
                 // Extract guard by simulating from after STORE_FAST_LOAD_FAST to POP_JUMP_IF_FALSE
                 // STORE_FAST_LOAD_FAST: pop TOS, store to var, push var
-                var sim = SimContext.init(self.allocator, self.code, self.version);
+                const a = self.arena.allocator();
+                var sim = SimContext.init(a, self.code, self.version);
                 defer sim.deinit();
 
                 // Simulate STORE_FAST_LOAD_FAST: it pops subject from stack, stores, then loads back
@@ -3824,7 +3822,7 @@ pub const Decompiler = struct {
                 const load_idx = inst.arg & 0xF;
                 if (load_idx < self.code.varnames.len) {
                     const name = self.code.varnames[load_idx];
-                    const expr = try ast.makeName(self.allocator, name, .load);
+                    const expr = try ast.makeName(a, name, .load);
                     try sim.stack.push(.{ .expr = expr });
 
                     // Simulate instructions after STORE_FAST_LOAD_FAST until POP_JUMP_IF_FALSE
@@ -3850,7 +3848,8 @@ pub const Decompiler = struct {
 
                         if (same_var) {
                             // Extract guard by simulating from LOAD to POP_JUMP_IF_FALSE
-                            var sim = SimContext.init(self.allocator, self.code, self.version);
+                            const a = self.arena.allocator();
+                            var sim = SimContext.init(a, self.code, self.version);
                             defer sim.deinit();
                             for (block.instructions[j..]) |g_inst| {
                                 if (g_inst.opcode == .POP_JUMP_IF_FALSE or g_inst.opcode == .POP_JUMP_FORWARD_IF_FALSE) break;
@@ -3882,6 +3881,7 @@ pub const Decompiler = struct {
 
             if (body_block) |bid| {
                 // Body in separate block
+                // When guard exists, subject is still on stack at body entry (will be popped by POP_TOP)
                 var body_end: u32 = block_id + 1;
                 for (block.successors) |edge| {
                     if (edge.edge_type == .conditional_false) {
@@ -3890,7 +3890,11 @@ pub const Decompiler = struct {
                     }
                 }
                 if (bid < body_end) {
-                    body = try self.decompileStructuredRange(bid, body_end);
+                    // Create placeholder for subject on stack (will be consumed by POP_TOP)
+                    const a = self.arena.allocator();
+                    const subj_expr = try a.create(Expr);
+                    subj_expr.* = .{ .name = .{ .id = "_", .ctx = .load } };
+                    body = try self.decompileStructuredRangeWithStack(bid, body_end, &.{.{ .expr = subj_expr }});
                 }
             } else {
                 // Body inline: find POP_TOP after guard check, decompile rest of block
@@ -3938,7 +3942,8 @@ pub const Decompiler = struct {
                         }
                     }
 
-                    body = try stmts.toOwnedSlice(self.allocator);
+                    const a = self.arena.allocator();
+                    body = try stmts.toOwnedSlice(a);
                 }
             }
         } else {
@@ -3976,26 +3981,27 @@ pub const Decompiler = struct {
                     var stmts: std.ArrayList(*Stmt) = .{};
                     defer stmts.deinit(self.allocator);
 
-                    var sim = SimContext.init(self.allocator, self.code, self.version);
+                    const aa = self.arena.allocator();
+                    var sim = SimContext.init(aa, self.code, self.version);
                     defer sim.deinit();
 
                     for (block.instructions[start_idx..]) |inst| {
                         if (inst.opcode == .RETURN_VALUE) {
                             const val = sim.stack.popExpr() catch blk: {
-                                const none_expr = try self.allocator.create(Expr);
+                                const none_expr = try aa.create(Expr);
                                 none_expr.* = .{ .constant = .{ .none = {} } };
                                 break :blk none_expr;
                             };
-                            const stmt = try self.allocator.create(Stmt);
+                            const stmt = try aa.create(Stmt);
                             stmt.* = .{ .return_stmt = .{ .value = val } };
-                            try stmts.append(self.allocator, stmt);
+                            try stmts.append(aa, stmt);
                             break;
                         } else {
                             sim.simulate(inst) catch {};
                         }
                     }
 
-                    body = try stmts.toOwnedSlice(self.allocator);
+                    body = try stmts.toOwnedSlice(self.arena.allocator());
                 }
             }
         }
@@ -4008,12 +4014,13 @@ pub const Decompiler = struct {
     }
 
     fn extractMatchPattern(self: *Decompiler, block: *const cfg_mod.BasicBlock, subject_on_stack: bool) DecompileError!*ast.Pattern {
-        var sim = SimContext.init(self.allocator, self.code, self.version);
+        const a = self.arena.allocator();
+        var sim = SimContext.init(a, self.code, self.version);
         defer sim.deinit();
 
         // If subject is already on stack (subsequent cases after first), push placeholder
         if (subject_on_stack) {
-            const placeholder = try self.allocator.create(Expr);
+            const placeholder = try a.create(Expr);
             placeholder.* = .{ .name = .{ .id = "<subject>", .ctx = .load } };
             try sim.stack.push(.{ .expr = placeholder });
         }
@@ -4040,7 +4047,7 @@ pub const Decompiler = struct {
                     prev_was_load = false;
                     // Literal match - use the constant
                     if (literal_val) |val| {
-                        const pat = try self.allocator.create(ast.Pattern);
+                        const pat = try self.arena.allocator().create(ast.Pattern);
                         pat.* = .{ .match_value = val };
                         return pat;
                     }
@@ -4049,7 +4056,7 @@ pub const Decompiler = struct {
                     // Python 3.14+: combined store+load for pattern binding
                     const load_idx = inst.arg & 0xF;
                     const name = self.code.varnames[load_idx];
-                    const pat = try self.allocator.create(ast.Pattern);
+                    const pat = try self.arena.allocator().create(ast.Pattern);
                     pat.* = .{ .match_as = .{ .pattern = null, .name = name } };
                     return pat;
                 },
@@ -4061,7 +4068,7 @@ pub const Decompiler = struct {
                         else
                             self.code.varnames[inst.arg];
 
-                        const pat = try self.allocator.create(ast.Pattern);
+                        const pat = try self.arena.allocator().create(ast.Pattern);
                         pat.* = .{ .match_as = .{ .pattern = null, .name = name } };
                         return pat;
                     }
@@ -4071,7 +4078,7 @@ pub const Decompiler = struct {
                 .NOP => {
                     prev_was_load = false;
                     // Wildcard pattern
-                    const pat = try self.allocator.create(ast.Pattern);
+                    const pat = try self.arena.allocator().create(ast.Pattern);
                     pat.* = .{ .match_as = .{ .pattern = null, .name = null } };
                     return pat;
                 },
@@ -4083,7 +4090,7 @@ pub const Decompiler = struct {
         }
 
         // Default to wildcard if we can't determine pattern
-        const pat = try self.allocator.create(ast.Pattern);
+        const pat = try self.arena.allocator().create(ast.Pattern);
         if (has_match_seq) {
             pat.* = .{ .match_sequence = &.{} };
         } else if (has_match_map) {
@@ -4173,7 +4180,8 @@ pub const Decompiler = struct {
             }
         }
 
-        return stmts.toOwnedSlice(self.allocator);
+        const a = self.arena.allocator();
+        return stmts.toOwnedSlice(a);
     }
 
     /// Decompile try/except for Python 3.11+
@@ -6079,9 +6087,11 @@ pub const Decompiler = struct {
 
     /// Create an expression statement.
     fn makeExprStmt(self: *Decompiler, value: *Expr) DecompileError!*Stmt {
-        // Suppress __exception__ placeholders from appearing as statements
-        if (value.* == .name and std.mem.eql(u8, value.name.id, "__exception__")) {
-            return error.SkipStatement;
+        // Suppress placeholders from appearing as statements
+        if (value.* == .name) {
+            if (std.mem.eql(u8, value.name.id, "__exception__") or std.mem.eql(u8, value.name.id, "_")) {
+                return error.SkipStatement;
+            }
         }
         const a = self.arena.allocator();
         const stmt = try a.create(Stmt);

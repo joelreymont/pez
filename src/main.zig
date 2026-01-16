@@ -171,6 +171,25 @@ fn dumpCodeCFG(allocator: std.mem.Allocator, code: *const pyc.Code, version: dec
                     }
                 },
             }
+
+            // Dump instructions
+            i = 0;
+            while (i < indent + 1) : (i += 1) {
+                try writer.writeAll("  ");
+            }
+            try writer.print("  offset {d}-{d}, {d} instructions, successors: ", .{ block.start_offset, block.end_offset, block.instructions.len });
+            for (block.successors, 0..) |edge, ei| {
+                if (ei > 0) try writer.writeAll(", ");
+                try writer.print("{d}({s})", .{ edge.target, @tagName(edge.edge_type) });
+            }
+            try writer.writeAll("\n");
+            for (block.instructions) |inst| {
+                i = 0;
+                while (i < indent + 1) : (i += 1) {
+                    try writer.writeAll("  ");
+                }
+                try writer.print("    {d}: {s} {d}\n", .{ inst.offset, @tagName(inst.opcode), inst.arg });
+            }
         }
     }
 
