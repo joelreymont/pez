@@ -1491,29 +1491,28 @@ pub const SimContext = struct {
 
             .STORE_FAST_LOAD_FAST => {
                 // STORE_FAST_LOAD_FAST - store TOS into local and then push it back
-                // arg packs store and load indices in 4-bit nibbles (hi, lo)
-                if (self.stack.pop()) |v| {
-                    var val = v;
-                    val.deinit(self.allocator);
-                } else {
-                    return error.StackUnderflow;
-                }
-
+                // Used in match statements: COPY 1, STORE_FAST_LOAD_FAST stores subject and loads pattern var
+                const val = if (self.stack.pop()) |v| v else return error.StackUnderflow;
                 const store_idx = (inst.arg >> 4) & 0xF;
                 const load_idx = inst.arg & 0xF;
 
-                if (self.getLocal(load_idx)) |name| {
-                    const expr = try ast.makeName(self.allocator, name, .load);
-                    try self.stack.push(.{ .expr = expr });
-                } else {
-                    try self.stack.push(.unknown);
-                }
-
+                // Store the popped value into store_idx local
                 if (self.getLocal(store_idx)) |store_name| {
                     if (self.findActiveCompBuilder()) |builder| {
                         const target = try ast.makeName(self.allocator, store_name, .store);
                         try self.addCompTarget(builder, target);
                     }
+                }
+
+                // Deinit the value after storing
+                val.deinit(self.allocator);
+
+                // Load from load_idx and push to stack
+                if (self.getLocal(load_idx)) |name| {
+                    const expr = try ast.makeName(self.allocator, name, .load);
+                    try self.stack.push(.{ .expr = expr });
+                } else {
+                    try self.stack.push(.unknown);
                 }
             },
 
