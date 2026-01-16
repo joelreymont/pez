@@ -3547,10 +3547,7 @@ pub const Decompiler = struct {
                 placeholder.* = .{ .name = .{ .id = "__exception__", .ctx = .load } };
                 slot.* = .{ .expr = placeholder };
             }
-            const body = try self.decompileStructuredRangeWithStack(start, final_end, &exc_stack);
-            defer self.allocator.free(body);
-            const arena_body = try a.dupe(*Stmt, body);
-            break :blk arena_body;
+            break :blk try self.decompileStructuredRangeWithStack(start, final_end, &exc_stack);
         } else &[_]*Stmt{};
 
         var handler_nodes = try a.alloc(ast.ExceptHandler, handler_blocks.items.len);
@@ -4799,7 +4796,6 @@ pub const Decompiler = struct {
                 slot.* = .{ .expr = placeholder };
             }
             const rest = try self.decompileStructuredRangeWithStack(start + 1, end, &exc_stack);
-            defer self.allocator.free(rest);
             try stmts.appendSlice(a, rest);
         }
 
