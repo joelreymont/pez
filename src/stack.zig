@@ -4298,8 +4298,7 @@ pub const SimContext = struct {
             },
 
             .MATCH_KEYS => {
-                // Stack effect +1: pop keys tuple, push values tuple or None
-                // (subject and bool stay; net +1 from keys->values)
+                // Stack effect 0: pop keys tuple, push values tuple or None (subject stays)
                 if (self.stack.pop()) |v| {
                     var val = v;
                     val.deinit(self.allocator);
@@ -4307,7 +4306,6 @@ pub const SimContext = struct {
                     return error.StackUnderflow;
                 }
                 try self.stack.push(.unknown); // values tuple or None
-                try self.stack.push(.unknown); // success bool
             },
 
             .MATCH_CLASS => {

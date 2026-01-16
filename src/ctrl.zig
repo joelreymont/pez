@@ -1406,6 +1406,11 @@ pub const Analyzer = struct {
     fn hasMatchPattern(self: *const Analyzer, block: *const BasicBlock) bool {
         var has_copy = false;
         var has_match_op = false;
+        var has_cond = false;
+
+        if (block.terminator()) |term| {
+            has_cond = self.isConditionalJump(term.opcode);
+        }
 
         for (block.instructions) |inst| {
             if (inst.opcode == .COPY) has_copy = true;
@@ -1426,7 +1431,9 @@ pub const Analyzer = struct {
         if (self.cfg.version.major >= 3 and self.cfg.version.minor >= 10) {
             for (block.instructions, 0..) |inst, i| {
                 // Python 3.14+: STORE_FAST_LOAD_FAST or STORE_FAST_STORE_FAST is pattern match binding
-                if (inst.opcode == .STORE_FAST_LOAD_FAST or inst.opcode == .STORE_FAST_STORE_FAST) return true;
+                if (inst.opcode == .STORE_FAST_LOAD_FAST or inst.opcode == .STORE_FAST_STORE_FAST) {
+                    return has_cond or has_copy or has_match_op;
+                }
 
                 if (inst.opcode == .STORE_NAME or inst.opcode == .STORE_FAST) {
                     // Check if previous instruction is LOAD (subject load)
@@ -1446,11 +1453,57 @@ pub const Analyzer = struct {
                         }
                         break :blk false;
                     };
-                    if (has_load_before) return true;
+                    if (has_load_before and (has_cond or has_copy or has_match_op)) return true;
                 }
             }
         }
         return has_copy and has_match_op;
+    }
+
+    /// Check for literal compare case without COPY (subject already on stack).
+    fn isLitCaseNoCopy(self: *const Analyzer, block: *const BasicBlock) bool {
+        var has_cond = false;
+        if (block.terminator()) |term| {
+            has_cond = self.isConditionalJump(term.opcode);
+        }
+
+        var has_copy = false;
+        var has_match_op = false;
+        var has_subject_load = false;
+        var has_lit_cmp = false;
+        var prev_get_len = false;
+
+        const insts = block.instructions;
+        var i: usize = 0;
+        while (i < insts.len) : (i += 1) {
+            const op = insts[i].opcode;
+            if (op == .NOT_TAKEN or op == .CACHE) continue;
+            switch (op) {
+                .COPY => has_copy = true,
+                .MATCH_SEQUENCE, .MATCH_MAPPING, .MATCH_CLASS => has_match_op = true,
+                .LOAD_FAST, .LOAD_NAME, .LOAD_GLOBAL, .LOAD_DEREF => has_subject_load = true,
+                .GET_LEN => {
+                    prev_get_len = true;
+                },
+                .LOAD_CONST, .LOAD_SMALL_INT => {
+                    if (!prev_get_len) {
+                        var j = i + 1;
+                        while (j < insts.len) : (j += 1) {
+                            const next_op = insts[j].opcode;
+                            if (next_op == .NOT_TAKEN or next_op == .CACHE) continue;
+                            if (next_op == .COMPARE_OP) {
+                                has_lit_cmp = true;
+                            }
+                            break;
+                        }
+                    }
+                    prev_get_len = false;
+                },
+                else => prev_get_len = false,
+            }
+        }
+
+        return has_cond and !has_copy and !has_match_op and !has_subject_load and has_lit_cmp;
     }
 
     /// Detect match statement pattern.
@@ -1475,7 +1528,9 @@ pub const Analyzer = struct {
             const cur_block = &self.cfg.blocks[current];
 
             // Check if this is a case pattern block
-            if (!self.hasMatchOpcode(cur_block) and !self.hasMatchPattern(cur_block) and !self.isWildcardCase(cur_block)) {
+            if (!self.hasMatchOpcode(cur_block) and !self.hasMatchPattern(cur_block) and !self.isWildcardCase(cur_block) and
+                !(case_blocks.items.len > 0 and self.isLitCaseNoCopy(cur_block)))
+            {
                 // Not a case block - might be cleanup (POP_TOP) or exit
                 // If block starts with POP_TOP, it's likely a pattern failure cleanup block
                 // Skip it and check the next block (either successor or next in sequence)

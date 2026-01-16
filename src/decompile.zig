@@ -289,8 +289,9 @@ pub const Decompiler = struct {
         block: *const BasicBlock,
         sim: *SimContext,
         stmts: *std.ArrayList(*Stmt),
+        stmts_allocator: Allocator,
     ) DecompileError!void {
-        return self.processBlockWithSimAndSkip(block, sim, stmts, 0);
+        return self.processBlockWithSimAndSkip(block, sim, stmts, stmts_allocator, 0);
     }
 
     fn processBlockWithSimAndSkip(
@@ -298,6 +299,7 @@ pub const Decompiler = struct {
         block: *const BasicBlock,
         sim: *SimContext,
         stmts: *std.ArrayList(*Stmt),
+        stmts_allocator: Allocator,
         skip_first: usize,
     ) DecompileError!void {
         // Check for pending ternary expression from tryDecompileTernaryInto
@@ -480,13 +482,13 @@ pub const Decompiler = struct {
                                 .value = seq_expr,
                                 .type_comment = null,
                             } };
-                            try stmts.append(self.allocator, stmt);
+                            try stmts.append(stmts_allocator, stmt);
                             i += skip_count;
                             continue;
                         }
                         // Generate unpacking assignment: a, b, c = expr
                         const stmt = try self.makeUnpackAssignExprs(targets.items, seq_expr);
-                        try stmts.append(self.allocator, stmt);
+                        try stmts.append(stmts_allocator, stmt);
                         i += skip_count; // Skip the processed instructions
                     } else {
                         // Fallback: push unknown for each element
@@ -761,7 +763,7 @@ pub const Decompiler = struct {
                                 .value = value.expr,
                                 .type_comment = null,
                             } };
-                            try stmts.append(self.allocator, stmt);
+                            try stmts.append(stmts_allocator, stmt);
                         }
 
                         // Skip processed instructions
@@ -794,7 +796,7 @@ pub const Decompiler = struct {
                                 .value = binop.right,
                             } };
                             arena.destroy(value.expr);
-                            try stmts.append(self.allocator, stmt);
+                            try stmts.append(stmts_allocator, stmt);
                             continue;
                         }
                     }
@@ -814,13 +816,13 @@ pub const Decompiler = struct {
                                 .value = binop.right,
                             } };
                             arena.destroy(value.expr);
-                            try stmts.append(self.allocator, stmt);
+                            try stmts.append(stmts_allocator, stmt);
                             continue;
                         }
                     }
 
                     if (try self.handleStoreValue(name, value)) |stmt| {
-                        try stmts.append(self.allocator, stmt);
+                        try stmts.append(stmts_allocator, stmt);
                     }
                 },
                 .STORE_SUBSCR => {
@@ -1034,7 +1036,7 @@ pub const Decompiler = struct {
                                 .value = value.expr,
                                 .type_comment = null,
                             } };
-                            try stmts.append(self.allocator, stmt);
+                            try stmts.append(stmts_allocator, stmt);
                         }
                         i = j - 1;
                         continue;
@@ -1090,7 +1092,7 @@ pub const Decompiler = struct {
                             .value = assign_value,
                             .simple = true,
                         } };
-                        try stmts.append(self.allocator, stmt);
+                        try stmts.append(stmts_allocator, stmt);
                     } else {
                         const subscript = try a.create(Expr);
                         subscript.* = .{ .subscript = .{
@@ -1099,7 +1101,7 @@ pub const Decompiler = struct {
                             .ctx = .store,
                         } };
                         const stmt = try self.makeAssign(subscript, value);
-                        try stmts.append(self.allocator, stmt);
+                        try stmts.append(stmts_allocator, stmt);
                     }
                 },
                 .STORE_SLICE => {
@@ -1143,7 +1145,7 @@ pub const Decompiler = struct {
                         .ctx = .store,
                     } };
                     const stmt = try self.makeAssign(subscript, value);
-                    try stmts.append(self.allocator, stmt);
+                    try stmts.append(stmts_allocator, stmt);
                 },
                 .STORE_ATTR => {
                     // STORE_ATTR: TOS.attr = TOS1
@@ -1260,7 +1262,7 @@ pub const Decompiler = struct {
                                 .value = value.expr,
                                 .type_comment = null,
                             } };
-                            try stmts.append(self.allocator, stmt);
+                            try stmts.append(stmts_allocator, stmt);
                         }
                         i = j - 1;
                         continue;
@@ -1288,7 +1290,7 @@ pub const Decompiler = struct {
                         .ctx = .store,
                     } };
                     const stmt = try self.makeAssign(attr_expr, value);
-                    try stmts.append(self.allocator, stmt);
+                    try stmts.append(stmts_allocator, stmt);
                 },
                 .RETURN_VALUE => {
                     const value = try sim.stack.popExpr();
@@ -1297,7 +1299,7 @@ pub const Decompiler = struct {
                         continue;
                     }
                     const stmt = try self.makeReturn(value);
-                    try stmts.append(self.allocator, stmt);
+                    try stmts.append(stmts_allocator, stmt);
                 },
                 .RETURN_CONST => {
                     if (sim.getConst(inst.arg)) |obj| {
@@ -1307,7 +1309,7 @@ pub const Decompiler = struct {
                             continue;
                         }
                         const stmt = try self.makeReturn(value);
-                        try stmts.append(self.allocator, stmt);
+                        try stmts.append(stmts_allocator, stmt);
                     }
                 },
                 .POP_TOP => {
@@ -1319,7 +1321,7 @@ pub const Decompiler = struct {
                     switch (val) {
                         .expr => |e| {
                             if (self.makeExprStmt(e)) |stmt| {
-                                try stmts.append(self.allocator, stmt);
+                                try stmts.append(stmts_allocator, stmt);
                             } else |err| {
                                 if (err != error.SkipStatement) return err;
                             }
@@ -1341,7 +1343,7 @@ pub const Decompiler = struct {
                 .PRINT_NEWLINE => {
                     // Emit print statement with collected items
                     const stmt = try self.makePrintStmt(null, true);
-                    try stmts.append(self.allocator, stmt);
+                    try stmts.append(stmts_allocator, stmt);
                 },
                 .PRINT_ITEM_TO => {
                     // Stack: [..., file, value, file] after ROT_TWO
@@ -1362,11 +1364,11 @@ pub const Decompiler = struct {
                     const dest = self.print_dest orelse file;
                     self.print_dest = null;
                     const stmt = try self.makePrintStmt(dest, true);
-                    try stmts.append(self.allocator, stmt);
+                    try stmts.append(stmts_allocator, stmt);
                 },
                 .RAISE_VARARGS, .DELETE_NAME, .DELETE_FAST, .DELETE_GLOBAL, .DELETE_DEREF => {
                     if (try self.tryEmitStatement(inst, sim)) |stmt| {
-                        try stmts.append(self.allocator, stmt);
+                        try stmts.append(stmts_allocator, stmt);
                     }
                 },
                 else => {
@@ -1525,6 +1527,7 @@ pub const Decompiler = struct {
         self: *Decompiler,
         block_id: u32,
         stmts: *std.ArrayList(*Stmt),
+        stmts_allocator: Allocator,
     ) DecompileError!?CondSim {
         if (block_id >= self.cfg.blocks.len) return null;
         const cond_block = &self.cfg.blocks[block_id];
@@ -1541,7 +1544,7 @@ pub const Decompiler = struct {
             if (ctrl.Analyzer.isConditionalJump(undefined, inst.opcode)) break;
             if (isStatementOpcode(inst.opcode)) {
                 if (try self.tryEmitStatement(inst, &cond_sim)) |stmt| {
-                    try stmts.append(self.allocator, stmt);
+                    try stmts.append(stmts_allocator, stmt);
                 }
             } else {
                 cond_sim.simulate(inst) catch return null;
@@ -1887,10 +1890,11 @@ pub const Decompiler = struct {
         block_id: u32,
         limit: u32,
         stmts: *std.ArrayList(*Stmt),
+        stmts_allocator: Allocator,
     ) DecompileError!?u32 {
         const pattern = (try self.findTernaryLeaf(block_id, limit)) orelse return null;
 
-        const cond_res = (try self.initCondSim(block_id, stmts)) orelse return null;
+        const cond_res = (try self.initCondSim(block_id, stmts, stmts_allocator)) orelse return null;
         const base_vals = cond_res.base_vals;
         var base_owned = true;
         defer if (base_owned) deinitStackValuesSlice(self.allocator, base_vals);
@@ -1926,6 +1930,7 @@ pub const Decompiler = struct {
         block_id: u32,
         limit: u32,
         stmts: *std.ArrayList(*Stmt),
+        stmts_allocator: Allocator,
     ) DecompileError!?u32 {
         if (try self.analyzer.detectTernaryChain(block_id)) |chain| {
             defer self.allocator.free(chain.condition_blocks);
@@ -1949,7 +1954,7 @@ pub const Decompiler = struct {
                 }
             }
 
-            const cond_res = (try self.initCondSim(chain.condition_blocks[0], stmts)) orelse return null;
+            const cond_res = (try self.initCondSim(chain.condition_blocks[0], stmts, stmts_allocator)) orelse return null;
             try cond_list.append(self.allocator, cond_res.expr);
             base_vals = cond_res.base_vals;
             base_owned = true;
@@ -1986,7 +1991,7 @@ pub const Decompiler = struct {
             return chain.merge_block;
         }
 
-        if (try self.tryDecompileTernaryTreeInto(block_id, limit, stmts)) |next_block| {
+        if (try self.tryDecompileTernaryTreeInto(block_id, limit, stmts, stmts_allocator)) |next_block| {
             return next_block;
         }
 
@@ -2008,7 +2013,7 @@ pub const Decompiler = struct {
             }
         }
 
-        const cond_res = (try self.initCondSim(pattern.condition_block, stmts)) orelse return null;
+        const cond_res = (try self.initCondSim(pattern.condition_block, stmts, stmts_allocator)) orelse return null;
         const condition = cond_res.expr;
         base_vals = cond_res.base_vals;
         base_owned = true;
@@ -2282,6 +2287,7 @@ pub const Decompiler = struct {
         block_id: u32,
         limit: u32,
         stmts: *std.ArrayList(*Stmt),
+        stmts_allocator: Allocator,
     ) DecompileError!?u32 {
         const pattern = self.analyzer.detectBoolOp(block_id) orelse return null;
         if (pattern.second_block >= limit or pattern.merge_block >= limit) {
@@ -2336,7 +2342,7 @@ pub const Decompiler = struct {
         try merge_sim.stack.push(.{ .expr = bool_expr });
 
         const merge_block = &self.cfg.blocks[final_merge];
-        try self.processBlockWithSim(merge_block, &merge_sim, stmts);
+        try self.processBlockWithSim(merge_block, &merge_sim, stmts, stmts_allocator);
 
         return final_merge + 1;
     }
@@ -2482,6 +2488,7 @@ pub const Decompiler = struct {
                 block_idx,
                 @intCast(self.cfg.blocks.len),
                 &self.statements,
+                self.allocator,
             )) |next_block| {
                 block_idx = next_block;
                 continue;
@@ -2490,6 +2497,7 @@ pub const Decompiler = struct {
                 block_idx,
                 @intCast(self.cfg.blocks.len),
                 &self.statements,
+                self.allocator,
             )) |next_block| {
                 block_idx = next_block;
                 continue;
@@ -2572,6 +2580,7 @@ pub const Decompiler = struct {
                     block_idx = result.next_block;
                 },
                 .match_stmt => |p| {
+                    try self.emitMatchPrelude(p.subject_block, &self.statements, self.allocator);
                     const result = try self.decompileMatch(p);
                     if (result.stmt) |s| {
                         try self.statements.append(self.allocator, s);
@@ -2655,7 +2664,7 @@ pub const Decompiler = struct {
             }
         }
 
-        try self.processBlockWithSim(block, &sim, &self.statements);
+        try self.processBlockWithSim(block, &sim, &self.statements, self.allocator);
     }
 
     /// Decompile a range of blocks into a statement list.
@@ -2689,7 +2698,7 @@ pub const Decompiler = struct {
         var stmts: std.ArrayList(*Stmt) = .{};
         errdefer stmts.deinit(a);
 
-        try self.decompileBlockIntoWithStackAndSkip(start_block, &stmts, init_stack, skip_first);
+        try self.decompileBlockIntoWithStackAndSkip(start_block, &stmts, a, init_stack, skip_first);
 
         if (start_block + 1 < limit) {
             const rest = try self.decompileStructuredRange(start_block + 1, limit);
@@ -2700,8 +2709,8 @@ pub const Decompiler = struct {
     }
 
     /// Decompile a single block's statements into the provided list.
-    fn decompileBlockInto(self: *Decompiler, block_id: u32, stmts: *std.ArrayList(*Stmt)) DecompileError!void {
-        return self.decompileBlockIntoWithStack(block_id, stmts, &.{});
+    fn decompileBlockInto(self: *Decompiler, block_id: u32, stmts: *std.ArrayList(*Stmt), stmts_allocator: Allocator) DecompileError!void {
+        return self.decompileBlockIntoWithStack(block_id, stmts, stmts_allocator, &.{});
     }
 
     /// Decompile a single block with initial stack values.
@@ -2709,9 +2718,10 @@ pub const Decompiler = struct {
         self: *Decompiler,
         block_id: u32,
         stmts: *std.ArrayList(*Stmt),
+        stmts_allocator: Allocator,
         init_stack: []const StackValue,
     ) DecompileError!void {
-        return self.decompileBlockIntoWithStackAndSkip(block_id, stmts, init_stack, 0);
+        return self.decompileBlockIntoWithStackAndSkip(block_id, stmts, stmts_allocator, init_stack, 0);
     }
 
     /// Decompile a single block, optionally skipping first N instructions.
@@ -2719,6 +2729,7 @@ pub const Decompiler = struct {
         self: *Decompiler,
         block_id: u32,
         stmts: *std.ArrayList(*Stmt),
+        stmts_allocator: Allocator,
         init_stack: []const StackValue,
         skip_first: usize,
     ) DecompileError!void {
@@ -2781,7 +2792,7 @@ pub const Decompiler = struct {
             }
         }
 
-        try self.processBlockWithSimAndSkip(block, &sim, stmts, skip_first);
+        try self.processBlockWithSimAndSkip(block, &sim, stmts, stmts_allocator, skip_first);
     }
 
     const ChainResult = struct {
@@ -3125,7 +3136,7 @@ pub const Decompiler = struct {
             var stmts: std.ArrayList(*Stmt) = .{};
             errdefer stmts.deinit(a);
 
-            try self.decompileBlockIntoWithStackAndSkip(start_block, &stmts, base_vals, skip_first);
+            try self.decompileBlockIntoWithStackAndSkip(start_block, &stmts, a, base_vals, skip_first);
 
             if (start_block + 1 < limit) {
                 const rest = try self.decompileStructuredRange(start_block + 1, limit);
@@ -3689,8 +3700,9 @@ pub const Decompiler = struct {
     }
 
     fn decompileWith(self: *Decompiler, pattern: ctrl.WithPattern) DecompileError!PatternResult {
+        const a = self.arena.allocator();
         const setup = &self.cfg.blocks[pattern.setup_block];
-        var sim = SimContext.init(self.arena.allocator(), self.code, self.version);
+        var sim = SimContext.init(a, self.code, self.version);
         defer sim.deinit();
 
         var is_async = false;
@@ -3711,7 +3723,7 @@ pub const Decompiler = struct {
                 if (sim.stack.items.items.len > 0) {
                     const top = sim.stack.items.items[sim.stack.items.items.len - 1];
                     if (top == .expr) {
-                        context_expr = try ast.cloneExpr(self.arena.allocator(), top.expr);
+                        context_expr = try ast.cloneExpr(a, top.expr);
                     }
                 }
             }
@@ -3733,12 +3745,12 @@ pub const Decompiler = struct {
                 switch (first.opcode) {
                     .STORE_FAST => {
                         if (sim.getLocal(first.arg)) |name| {
-                            optional_vars = try ast.makeName(self.allocator, name, .store);
+                            optional_vars = try ast.makeName(a, name, .store);
                         }
                     },
                     .STORE_NAME, .STORE_GLOBAL => {
                         if (sim.getName(first.arg)) |name| {
-                            optional_vars = try ast.makeName(self.allocator, name, .store);
+                            optional_vars = try ast.makeName(a, name, .store);
                         }
                     },
                     else => {},
@@ -3748,7 +3760,7 @@ pub const Decompiler = struct {
 
         const ctx_expr = context_expr orelse try sim.stack.popExpr();
 
-        const item = try self.allocator.alloc(ast.WithItem, 1);
+        const item = try a.alloc(ast.WithItem, 1);
         item[0] = .{
             .context_expr = ctx_expr,
             .optional_vars = optional_vars,
@@ -3770,20 +3782,18 @@ pub const Decompiler = struct {
         // The body block may be detected as TRY (due to exception handling for with),
         // but it's not a user-written try/except - it's the with statement body
         var body_stmts: std.ArrayList(*Stmt) = .{};
-        errdefer body_stmts.deinit(self.allocator);
+        errdefer body_stmts.deinit(a);
 
         if (pattern.body_block < self.cfg.blocks.len) {
             const body_blk = &self.cfg.blocks[pattern.body_block];
             // Skip the STORE instruction for the "as" variable
             const skip_count: u32 = if (optional_vars != null) 1 else 0;
-            try self.decompileBlockIntoWithStackAndSkip(pattern.body_block, &body_stmts, &.{}, skip_count);
+            try self.decompileBlockIntoWithStackAndSkip(pattern.body_block, &body_stmts, a, &.{}, skip_count);
             // Mark body block as processed so it's not reprocessed
             _ = body_blk;
         }
 
-        const body = try body_stmts.toOwnedSlice(self.arena.allocator());
-
-        const a = self.arena.allocator();
+        const body = try body_stmts.toOwnedSlice(a);
         const stmt = try a.create(Stmt);
         stmt.* = .{
             .with_stmt = .{
@@ -3818,7 +3828,6 @@ pub const Decompiler = struct {
         const a = self.arena.allocator();
         var sim = SimContext.init(a, self.code, self.version);
         defer sim.deinit();
-
         var prev_was_load = false;
         for (subj_block.instructions) |inst| {
             // Stop before MATCH_* opcodes or COPY
@@ -3849,12 +3858,149 @@ pub const Decompiler = struct {
         // Decompile each case
         var cases: std.ArrayList(ast.MatchCase) = .{};
         errdefer cases.deinit(a);
+        var extra_blocks: std.ArrayList(u32) = .{};
+        defer extra_blocks.deinit(self.allocator);
 
-        for (pattern.case_blocks, 0..) |case_block_id, idx| {
+        var idx: usize = 0;
+        while (idx < pattern.case_blocks.len) {
+            const case_block_id = pattern.case_blocks[idx];
+            if (try self.tryMatchOrChain(pattern.case_blocks, idx)) |chain| {
+                const res = try self.decompileMatchCase(chain.guard_block, false);
+                var case = res.case;
+                const or_pat = try a.create(ast.Pattern);
+                or_pat.* = .{ .match_or = chain.patterns };
+                case.pattern = or_pat;
+                try cases.append(a, case);
+                const tail_res = try self.decompileMatchCase(chain.last_block, false);
+                try extra_blocks.append(self.allocator, chain.guard_block);
+                if (res.fallback_block) |fb| {
+                    try extra_blocks.append(self.allocator, fb);
+                }
+                var fb_body_opt = res.fallback_body;
+                var fb_block_opt = res.fallback_block;
+                if (fb_body_opt == null) {
+                    fb_body_opt = tail_res.fallback_body;
+                    fb_block_opt = tail_res.fallback_block;
+                }
+                if (fb_body_opt == null) {
+                    if (chain.fail_block) |fb| {
+                        var resolved = fb;
+                        if (self.jumpTargetIfJumpOnly(fb, true)) |target| {
+                            resolved = target;
+                        }
+                        if (indexOfBlock(pattern.case_blocks, resolved) == null) {
+                            var fb_end: u32 = resolved + 1;
+                            const fblk = &self.cfg.blocks[resolved];
+                            if (fblk.successors.len > 0) {
+                                fb_end = fblk.successors[0].target;
+                            }
+                            if (resolved < fb_end) {
+                                const pop_need = self.maxLeadPop(resolved, fb_end);
+                                if (pop_need > 0) {
+                                    if (pop_need == 1) {
+                                        var init_stack = [_]StackValue{ .unknown };
+                                        fb_body_opt = try self.decompileStructuredRangeWithStack(resolved, fb_end, init_stack[0..]);
+                                    } else {
+                                        const init_stack = try self.allocator.alloc(StackValue, pop_need);
+                                        defer self.allocator.free(init_stack);
+                                        for (init_stack) |*sv| sv.* = .unknown;
+                                        fb_body_opt = try self.decompileStructuredRangeWithStack(resolved, fb_end, init_stack);
+                                    }
+                                } else {
+                                    fb_body_opt = try self.decompileStructuredRange(resolved, fb_end);
+                                }
+                                fb_block_opt = resolved;
+                            }
+                        }
+                    }
+                }
+                if (fb_body_opt) |fb_body| {
+                    if (fb_block_opt != null and pattern.exit_block != null and
+                        fb_block_opt.? == pattern.exit_block.? and
+                        fb_body.len == 1 and Decompiler.isReturnNone(fb_body[0]))
+                    {
+                        idx = chain.next_idx;
+                        continue;
+                    }
+                    if (fb_block_opt) |fb| {
+                        const is_case = indexOfBlock(pattern.case_blocks, fb) != null and fb != chain.last_block;
+                        if (!is_case) {
+                            const p = try a.create(ast.Pattern);
+                            p.* = .{ .match_as = .{ .pattern = null, .name = null } };
+                            try cases.append(a, .{
+                                .pattern = p,
+                                .guard = null,
+                                .body = fb_body,
+                            });
+                        }
+                    } else {
+                        var has_wc = false;
+                        for (cases.items) |c| {
+                            if (isWildcardPattern(c.pattern)) {
+                                has_wc = true;
+                                break;
+                            }
+                        }
+                        if (!has_wc) {
+                            const p = try a.create(ast.Pattern);
+                            p.* = .{ .match_as = .{ .pattern = null, .name = null } };
+                            try cases.append(a, .{
+                                .pattern = p,
+                                .guard = null,
+                                .body = fb_body,
+                            });
+                        }
+                    }
+                }
+                idx = chain.next_idx;
+                continue;
+            }
+
             // First case has COPY, subsequent cases reuse subject on stack
             const has_copy = idx == 0;
-            const case = try self.decompileMatchCase(case_block_id, has_copy);
-            try cases.append(a, case);
+            const res = try self.decompileMatchCase(case_block_id, has_copy);
+            try cases.append(a, res.case);
+            if (res.fallback_block) |fb| {
+                try extra_blocks.append(self.allocator, fb);
+            }
+            if (res.fallback_body) |fb_body| {
+                if (res.fallback_block != null and pattern.exit_block != null and
+                    res.fallback_block.? == pattern.exit_block.? and
+                    fb_body.len == 1 and Decompiler.isReturnNone(fb_body[0]))
+                {
+                    idx += 1;
+                    continue;
+                }
+                if (res.fallback_block) |fb| {
+                    if (indexOfBlock(pattern.case_blocks, fb) == null) {
+                        const p = try a.create(ast.Pattern);
+                        p.* = .{ .match_as = .{ .pattern = null, .name = null } };
+                        try cases.append(a, .{
+                            .pattern = p,
+                            .guard = null,
+                            .body = fb_body,
+                        });
+                    }
+                } else {
+                    var has_wc = false;
+                    for (cases.items) |c| {
+                        if (isWildcardPattern(c.pattern)) {
+                            has_wc = true;
+                            break;
+                        }
+                    }
+                    if (!has_wc) {
+                        const p = try a.create(ast.Pattern);
+                        p.* = .{ .match_as = .{ .pattern = null, .name = null } };
+                        try cases.append(a, .{
+                            .pattern = p,
+                            .guard = null,
+                            .body = fb_body,
+                        });
+                    }
+                }
+            }
+            idx += 1;
         }
 
         const stmt = try a.create(Stmt);
@@ -3883,136 +4029,118 @@ pub const Decompiler = struct {
                 if (edge.target > max_block) max_block = edge.target;
             }
         }
+        for (extra_blocks.items) |cb| {
+            if (cb > max_block) max_block = cb;
+            const blk = &self.cfg.blocks[cb];
+            for (blk.successors) |edge| {
+                if (edge.target > max_block) max_block = edge.target;
+            }
+        }
         return .{ .stmt = stmt, .next_block = max_block + 1 };
     }
 
-    fn decompileMatchCase(self: *Decompiler, block_id: u32, has_copy: bool) DecompileError!ast.MatchCase {
-        // Pattern matching with guards spans multiple blocks:
-        // Block N: MATCH_SEQUENCE, POP_JUMP -> pattern fail
-        // Block N+1: GET_LEN, COMPARE_OP, POP_JUMP -> pattern fail
-        // Block N+2: UNPACK, STORE_FAST_STORE_FAST, guard, POP_JUMP -> guard fail
-        // Block N+3: body
-        //
-        // Need to collect all pattern+guard blocks by following conditional_true edges
-        // until we reach the body block.
-
-        var pattern_blocks: std.ArrayList(u32) = .{};
-        defer pattern_blocks.deinit(self.allocator);
-
-        var current_block_id = block_id;
-        var final_pattern_block_id = block_id;
-
-        // Follow conditional_true edges while blocks contain pattern/guard logic
-        while (current_block_id < self.cfg.blocks.len) {
-            const blk = &self.cfg.blocks[current_block_id];
-            try pattern_blocks.append(self.allocator, current_block_id);
-
-            // Check if this block has pattern opcodes or guard
-            var has_pattern = false;
-            var has_guard = false;
-            for (blk.instructions) |inst| {
-                if (inst.opcode == .MATCH_SEQUENCE or inst.opcode == .MATCH_MAPPING or
-                    inst.opcode == .MATCH_CLASS or inst.opcode == .COMPARE_OP or
-                    inst.opcode == .UNPACK_SEQUENCE or inst.opcode == .STORE_FAST_STORE_FAST)
-                {
-                    has_pattern = true;
-                }
-                if (inst.opcode == .LOAD_FAST_BORROW or inst.opcode == .STORE_FAST_LOAD_FAST) {
-                    has_guard = true;
-                }
+    fn matchPreludeEnd(self: *Decompiler, block: *const cfg_mod.BasicBlock) usize {
+        _ = self;
+        var prev_was_load = false;
+        for (block.instructions, 0..) |inst, i| {
+            if (inst.opcode == .MATCH_SEQUENCE or inst.opcode == .MATCH_MAPPING or
+                inst.opcode == .MATCH_CLASS or inst.opcode == .MATCH_KEYS or inst.opcode == .COPY)
+            {
+                return i;
             }
-
-            // If block has guard, this is the final pattern block
-            if (has_guard) {
-                final_pattern_block_id = current_block_id;
-                break;
+            if ((inst.opcode == .STORE_NAME or inst.opcode == .STORE_FAST) and prev_was_load) {
+                return i;
             }
-
-            // If block has pattern logic, continue to next block via conditional_true
-            if (has_pattern) {
-                var found_next = false;
-                for (blk.successors) |edge| {
-                    if (edge.edge_type == .conditional_true) {
-                        current_block_id = edge.target;
-                        found_next = true;
-                        break;
-                    }
-                }
-                if (!found_next) {
-                    final_pattern_block_id = current_block_id;
-                    break;
-                }
-            } else {
-                // No pattern/guard - this is the body
-                break;
+            if (inst.opcode == .STORE_FAST_LOAD_FAST) {
+                return i;
             }
+            prev_was_load = inst.opcode == .LOAD_NAME or inst.opcode == .LOAD_FAST or
+                inst.opcode == .LOAD_GLOBAL or inst.opcode == .LOAD_DEREF or
+                inst.opcode == .LOAD_FAST_BORROW;
         }
+        return block.instructions.len;
+    }
 
-        // Collect all instructions from pattern blocks for extraction
-        var all_insts: std.ArrayList(cfg_mod.Instruction) = .{};
-        defer all_insts.deinit(self.allocator);
-        for (pattern_blocks.items) |pid| {
-            const pb = &self.cfg.blocks[pid];
-            try all_insts.appendSlice(self.allocator, pb.instructions);
+    fn emitMatchPrelude(
+        self: *Decompiler,
+        block_id: u32,
+        stmts: *std.ArrayList(*Stmt),
+        stmts_allocator: Allocator,
+    ) DecompileError!void {
+        if (block_id >= self.cfg.blocks.len) return;
+        const block = &self.cfg.blocks[block_id];
+        var first_idx: ?usize = null;
+        for (block.instructions, 0..) |inst, i| {
+            if (inst.opcode == .NOT_TAKEN or inst.opcode == .CACHE) continue;
+            first_idx = i;
+            break;
         }
+        if (first_idx == null) return;
+        const first_op = block.instructions[first_idx.?].opcode;
+        if (first_op == .POP_TOP or first_op == .JUMP_FORWARD or first_op == .JUMP_BACKWARD or
+            first_op == .JUMP_BACKWARD_NO_INTERRUPT or first_op == .JUMP_ABSOLUTE)
+        {
+            return;
+        }
+        const end_idx = self.matchPreludeEnd(block);
+        if (end_idx == 0 or end_idx <= first_idx.?) return;
+        var tmp = block.*;
+        tmp.instructions = block.instructions[0..end_idx];
+        var sim = SimContext.init(self.arena.allocator(), self.code, self.version);
+        defer sim.deinit();
+        try self.processBlockWithSimAndSkip(&tmp, &sim, stmts, stmts_allocator, 0);
+    }
 
-        // Extract pattern from combined instruction stream
-        const block = &self.cfg.blocks[final_pattern_block_id];
-        const pat = try self.extractMatchPatternFromInsts(all_insts.items, !has_copy);
-
-        // Detect guard: STORE_FAST_STORE_FAST, STORE_FAST_LOAD_FAST, or (STORE followed by LOAD) ... POP_JUMP_IF_FALSE
+    fn guardExprFromBlock(self: *Decompiler, block: *const cfg_mod.BasicBlock) DecompileError!?*Expr {
         var guard: ?*Expr = null;
-        var guard_start_idx: ?usize = null;
+        var guard_start: ?usize = null;
+
+        // Store-based guard patterns
         for (block.instructions, 0..) |inst, i| {
             if (inst.opcode == .STORE_FAST_STORE_FAST) {
-                // Python 3.14: STORE_FAST_STORE_FAST stores pattern vars, then guard uses LOAD_FAST_BORROW
-                // Pattern: STORE_FAST_STORE_FAST -> LOAD_FAST_BORROW -> ... -> POP_JUMP_IF_FALSE
-                // Find next LOAD_FAST_BORROW and extract guard from there
                 for (block.instructions[i + 1 ..], i + 1..) |next, j| {
-                    if (next.opcode == .LOAD_FAST_BORROW or next.opcode == .LOAD_FAST) {
-                        guard_start_idx = j;
+                    if (next.opcode == .LOAD_GLOBAL or next.opcode == .LOAD_NAME or
+                        next.opcode == .LOAD_FAST_BORROW or next.opcode == .LOAD_FAST or
+                        next.opcode == .LOAD_FAST_BORROW_LOAD_FAST_BORROW or next.opcode == .LOAD_FAST_LOAD_FAST)
+                    {
+                        guard_start = j;
                         break;
                     }
                 }
                 break;
             } else if (inst.opcode == .STORE_FAST_LOAD_FAST) {
-                // Extract guard by simulating from after STORE_FAST_LOAD_FAST to POP_JUMP_IF_FALSE
-                // STORE_FAST_LOAD_FAST: pop TOS, store to var, push var
                 const a = self.arena.allocator();
                 var sim = SimContext.init(a, self.code, self.version);
                 defer sim.deinit();
 
-                // Simulate STORE_FAST_LOAD_FAST: it pops subject from stack, stores, then loads back
-                // For guard extraction, we just need the loaded variable name on stack
                 const load_idx = inst.arg & 0xF;
                 if (load_idx < self.code.varnames.len) {
                     const name = self.code.varnames[load_idx];
                     const expr = try ast.makeName(a, name, .load);
                     try sim.stack.push(.{ .expr = expr });
 
-                    // Simulate instructions after STORE_FAST_LOAD_FAST until POP_JUMP_IF_FALSE
                     for (block.instructions[i + 1 ..]) |g_inst| {
                         if (g_inst.opcode == .POP_JUMP_IF_FALSE or g_inst.opcode == .POP_JUMP_FORWARD_IF_FALSE) break;
                         sim.simulate(g_inst) catch break;
                     }
                     guard = sim.stack.popExpr() catch null;
                 }
-                break;
+                return guard;
             } else if (inst.opcode == .STORE_NAME or inst.opcode == .STORE_FAST) {
-                // Look ahead for matching LOAD + guard condition
                 var found_guard = false;
                 for (block.instructions[i + 1 ..], i + 1..) |next_inst, j| {
-                    if (next_inst.opcode == .LOAD_NAME or next_inst.opcode == .LOAD_FAST) {
-                        // Check if loading same variable
+                    if (next_inst.opcode == .LOAD_NAME or next_inst.opcode == .LOAD_FAST or
+                        next_inst.opcode == .LOAD_FAST_BORROW or next_inst.opcode == .LOAD_FAST_BORROW_LOAD_FAST_BORROW or
+                        next_inst.opcode == .LOAD_FAST_LOAD_FAST)
+                    {
                         const same_var = if (inst.opcode == .STORE_NAME and next_inst.opcode == .LOAD_NAME)
                             inst.arg == next_inst.arg
-                        else if (inst.opcode == .STORE_FAST and next_inst.opcode == .LOAD_FAST)
+                        else if (inst.opcode == .STORE_FAST and (next_inst.opcode == .LOAD_FAST or next_inst.opcode == .LOAD_FAST_BORROW))
                             inst.arg == next_inst.arg
                         else
                             false;
 
                         if (same_var) {
-                            // Extract guard by simulating from LOAD to POP_JUMP_IF_FALSE
                             const a = self.arena.allocator();
                             var sim = SimContext.init(a, self.code, self.version);
                             defer sim.deinit();
@@ -4026,12 +4154,11 @@ pub const Decompiler = struct {
                         }
                     }
                 }
-                if (found_guard) break;
+                if (found_guard) return guard;
             }
         }
 
-        // If guard_start_idx is set (STORE_FAST_STORE_FAST case), extract guard
-        if (guard_start_idx) |start| {
+        if (guard_start) |start| {
             const a = self.arena.allocator();
             var sim = SimContext.init(a, self.code, self.version);
             defer sim.deinit();
@@ -4040,141 +4167,1586 @@ pub const Decompiler = struct {
                 sim.simulate(g_inst) catch break;
             }
             guard = sim.stack.popExpr() catch null;
+            if (guard != null) return guard;
         }
+
+        // Guard-only block: no pattern ops, no GET_LEN, but has conditional jump
+        var has_get_len = false;
+        var has_pat_op = false;
+        var has_cond = false;
+        if (block.terminator()) |term| {
+            has_cond = ctrl.Analyzer.isConditionalJump(undefined, term.opcode);
+        }
+        for (block.instructions) |inst| {
+            switch (inst.opcode) {
+                .GET_LEN => has_get_len = true,
+                .MATCH_SEQUENCE, .MATCH_MAPPING, .MATCH_CLASS, .MATCH_KEYS,
+                .UNPACK_SEQUENCE, .STORE_FAST_STORE_FAST, .STORE_FAST_LOAD_FAST,
+                .STORE_FAST, .STORE_NAME => has_pat_op = true,
+                else => {},
+            }
+        }
+
+        if (!has_cond or has_pat_op or has_get_len) return null;
+
+        var start_idx: ?usize = null;
+        for (block.instructions, 0..) |inst, i| {
+            if (inst.opcode == .NOT_TAKEN or inst.opcode == .CACHE) continue;
+            start_idx = i;
+            break;
+        }
+        if (start_idx == null) return null;
+
+        const a = self.arena.allocator();
+        var sim = SimContext.init(a, self.code, self.version);
+        defer sim.deinit();
+        for (block.instructions[start_idx.? ..]) |g_inst| {
+            if (g_inst.opcode == .POP_JUMP_IF_FALSE or g_inst.opcode == .POP_JUMP_FORWARD_IF_FALSE) break;
+            sim.simulate(g_inst) catch break;
+        }
+        return sim.stack.popExpr() catch null;
+    }
+
+    fn guardStartInBlock(self: *Decompiler, block: *const cfg_mod.BasicBlock) ?GuardStart {
+        var has_cond = false;
+        if (block.terminator()) |term| {
+            has_cond = ctrl.Analyzer.isConditionalJump(undefined, term.opcode);
+        }
+
+        var seen_match = false;
+        for (block.instructions, 0..) |inst, i| {
+            switch (inst.opcode) {
+                .MATCH_SEQUENCE, .MATCH_MAPPING, .MATCH_CLASS, .MATCH_KEYS,
+                .UNPACK_SEQUENCE, .COPY, .GET_LEN,
+                .STORE_FAST_LOAD_FAST, .STORE_FAST_STORE_FAST => seen_match = true,
+                .COMPARE_OP => seen_match = true,
+                else => {},
+            }
+            if (inst.opcode == .STORE_FAST_LOAD_FAST) {
+                if (!seen_match) continue;
+                const load_idx = inst.arg & 0xF;
+                if (load_idx >= self.code.varnames.len) return null;
+                const name = self.code.varnames[load_idx];
+                const expr = ast.makeName(self.arena.allocator(), name, .load) catch return null;
+                return .{ .idx = i + 1, .preload = expr };
+            }
+            if (inst.opcode == .STORE_FAST_STORE_FAST) {
+                if (!seen_match) continue;
+                var preload: ?*Expr = null;
+                var j = i + 1;
+                while (j < block.instructions.len) : (j += 1) {
+                    const op = block.instructions[j].opcode;
+                    if (op == .STORE_FAST_LOAD_FAST) {
+                        const load_idx = block.instructions[j].arg & 0xF;
+                        if (load_idx < self.code.varnames.len) {
+                            const name = self.code.varnames[load_idx];
+                            preload = ast.makeName(self.arena.allocator(), name, .load) catch null;
+                        }
+                        continue;
+                    }
+                    if (op == .LOAD_GLOBAL or op == .LOAD_NAME or op == .LOAD_FAST or
+                        op == .LOAD_FAST_BORROW or op == .LOAD_FAST_LOAD_FAST or
+                        op == .LOAD_FAST_BORROW_LOAD_FAST_BORROW)
+                    {
+                        return .{ .idx = j, .preload = preload };
+                    }
+                    if (ctrl.Analyzer.isConditionalJump(undefined, op)) break;
+                }
+                return null;
+            }
+            if (inst.opcode == .STORE_FAST or inst.opcode == .STORE_NAME) {
+                if (!seen_match) continue;
+                const store_idx = inst.arg;
+                var j = i + 1;
+                while (j < block.instructions.len) : (j += 1) {
+                    const op = block.instructions[j].opcode;
+                    if (inst.opcode == .STORE_FAST and (op == .LOAD_FAST or op == .LOAD_FAST_BORROW) and block.instructions[j].arg == store_idx) {
+                        return .{ .idx = j, .preload = null };
+                    }
+                    if (inst.opcode == .STORE_NAME and op == .LOAD_NAME and block.instructions[j].arg == store_idx) {
+                        return .{ .idx = j, .preload = null };
+                    }
+                    if (ctrl.Analyzer.isConditionalJump(undefined, op)) break;
+                }
+            }
+        }
+
+        // Guard-only block: no pattern ops, no GET_LEN, but has conditional jump
+        var has_pat_op = false;
+        var has_match_op = false;
+        var has_get_len = false;
+        var has_lit_cmp = false;
+        var has_copy = false;
+        var has_subject_load = false;
+        var prev_get_len = false;
+        for (block.instructions, 0..) |inst, idx| {
+            switch (inst.opcode) {
+                .GET_LEN => {
+                    has_get_len = true;
+                    prev_get_len = true;
+                },
+                .COPY => has_copy = true,
+                .LOAD_FAST, .LOAD_FAST_BORROW,
+                .LOAD_FAST_LOAD_FAST, .LOAD_FAST_BORROW_LOAD_FAST_BORROW,
+                .LOAD_NAME, .LOAD_GLOBAL, .LOAD_DEREF => has_subject_load = true,
+                .MATCH_SEQUENCE, .MATCH_MAPPING, .MATCH_CLASS, .MATCH_KEYS => {
+                    has_match_op = true;
+                    has_pat_op = true;
+                },
+                .UNPACK_SEQUENCE, .STORE_FAST_STORE_FAST, .STORE_FAST_LOAD_FAST,
+                .STORE_FAST, .STORE_NAME => has_pat_op = true,
+                .LOAD_CONST, .LOAD_SMALL_INT => {
+                    if (!prev_get_len) {
+                        var j = idx + 1;
+                        while (j < block.instructions.len) : (j += 1) {
+                            const op = block.instructions[j].opcode;
+                            if (op == .NOT_TAKEN or op == .CACHE) continue;
+                            if (op == .COMPARE_OP) has_lit_cmp = true;
+                            break;
+                        }
+                    }
+                    prev_get_len = false;
+                },
+                else => prev_get_len = false,
+            }
+        }
+        if (has_lit_cmp and (has_copy or !has_subject_load)) {
+            has_pat_op = true;
+        }
+        if (has_cond and has_lit_cmp and !has_match_op and !has_get_len) {
+            var seen_match2 = false;
+            var first_jump: ?usize = null;
+            for (block.instructions, 0..) |inst, i| {
+                if (inst.opcode == .NOT_TAKEN or inst.opcode == .CACHE) continue;
+                switch (inst.opcode) {
+                    .COMPARE_OP, .COPY, .LOAD_CONST, .LOAD_SMALL_INT => seen_match2 = true,
+                    else => {},
+                }
+                if (ctrl.Analyzer.isConditionalJump(undefined, inst.opcode) and seen_match2) {
+                    first_jump = i;
+                    break;
+                }
+            }
+            if (first_jump) |fj| {
+                var has_second = false;
+                var k = fj + 1;
+                while (k < block.instructions.len) : (k += 1) {
+                    const op = block.instructions[k].opcode;
+                    if (op == .NOT_TAKEN or op == .CACHE) continue;
+                    if (ctrl.Analyzer.isConditionalJump(undefined, op)) {
+                        has_second = true;
+                        break;
+                    }
+                }
+                if (has_second) {
+                    var j = fj + 1;
+                    while (j < block.instructions.len) : (j += 1) {
+                        const op = block.instructions[j].opcode;
+                        if (op == .NOT_TAKEN or op == .CACHE) continue;
+                        return .{ .idx = j, .preload = null };
+                    }
+                }
+            }
+        }
+        if (!has_cond or has_pat_op or has_get_len) return null;
+
+        for (block.instructions, 0..) |inst, i| {
+            if (inst.opcode == .NOT_TAKEN or inst.opcode == .CACHE) continue;
+            return .{ .idx = i, .preload = null };
+        }
+        return null;
+    }
+
+    fn guardCondFromJump(self: *Decompiler, cond: *Expr, op: Opcode) DecompileError!*Expr {
+        return switch (op) {
+            .POP_JUMP_IF_TRUE,
+            .POP_JUMP_FORWARD_IF_TRUE,
+            .POP_JUMP_BACKWARD_IF_TRUE,
+            => try ast.makeUnaryOp(self.arena.allocator(), .not_, cond),
+            .POP_JUMP_IF_NONE,
+            .POP_JUMP_FORWARD_IF_NONE,
+            .POP_JUMP_BACKWARD_IF_NONE,
+            => try self.makeIsNoneCompare(cond, true),
+            .POP_JUMP_IF_NOT_NONE,
+            .POP_JUMP_FORWARD_IF_NOT_NONE,
+            .POP_JUMP_BACKWARD_IF_NOT_NONE,
+            => try self.makeIsNoneCompare(cond, false),
+            else => cond,
+        };
+    }
+
+    fn guardExprsFromBlocks(self: *Decompiler, blocks: []const u32) DecompileError![]const *Expr {
+        var guard_exprs: std.ArrayList(*Expr) = .{};
+        errdefer guard_exprs.deinit(self.allocator);
+
+        var sim = SimContext.init(self.arena.allocator(), self.code, self.version);
+        defer sim.deinit();
+
+        for (blocks) |bid| {
+            const blk = &self.cfg.blocks[bid];
+            const start = self.guardStartInBlock(blk) orelse continue;
+            if (start.preload) |e| {
+                try sim.stack.push(.{ .expr = e });
+            }
+
+            var i = start.idx;
+            while (i < blk.instructions.len) : (i += 1) {
+                const inst = blk.instructions[i];
+                switch (inst.opcode) {
+                    .NOT_TAKEN, .CACHE => continue,
+                    .STORE_FAST_LOAD_FAST => {
+                        const load_idx = inst.arg & 0xF;
+                        if (load_idx < self.code.varnames.len) {
+                            const name = self.code.varnames[load_idx];
+                            const expr = try ast.makeName(self.arena.allocator(), name, .load);
+                            try sim.stack.push(.{ .expr = expr });
+                        } else {
+                            try sim.stack.push(.unknown);
+                        }
+                        continue;
+                    },
+                    .STORE_FAST_STORE_FAST, .MATCH_SEQUENCE, .MATCH_MAPPING, .MATCH_CLASS, .MATCH_KEYS,
+                    .UNPACK_SEQUENCE, .GET_LEN, .STORE_FAST, .STORE_NAME => continue,
+                    .POP_TOP => {
+                        if (sim.stack.len() > 0) {
+                            _ = sim.stack.pop();
+                        }
+                        continue;
+                    },
+                    .POP_JUMP_IF_TRUE,
+                    .POP_JUMP_IF_FALSE,
+                    .POP_JUMP_IF_NONE,
+                    .POP_JUMP_IF_NOT_NONE,
+                    .POP_JUMP_FORWARD_IF_TRUE,
+                    .POP_JUMP_FORWARD_IF_FALSE,
+                    .POP_JUMP_FORWARD_IF_NONE,
+                    .POP_JUMP_FORWARD_IF_NOT_NONE,
+                    .POP_JUMP_BACKWARD_IF_TRUE,
+                    .POP_JUMP_BACKWARD_IF_FALSE,
+                    .POP_JUMP_BACKWARD_IF_NONE,
+                    .POP_JUMP_BACKWARD_IF_NOT_NONE,
+                    => {
+                        const cond = sim.stack.popExpr() catch continue;
+                        const final_cond = try self.guardCondFromJump(cond, inst.opcode);
+                        try guard_exprs.append(self.allocator, final_cond);
+                        continue;
+                    },
+                    .JUMP_FORWARD, .JUMP_BACKWARD, .JUMP_ABSOLUTE => continue,
+                    else => {
+                        sim.simulate(inst) catch {};
+                    },
+                }
+            }
+        }
+
+        const out = try self.arena.allocator().dupe(*Expr, guard_exprs.items);
+        guard_exprs.deinit(self.allocator);
+        return out;
+    }
+
+    fn isSimpleReturnBlock(self: *Decompiler, block_id: u32) bool {
+        if (block_id >= self.cfg.blocks.len) return false;
+        const blk = &self.cfg.blocks[block_id];
+        var has_return = false;
+        for (blk.instructions) |inst| {
+            if (ctrl.Analyzer.isConditionalJump(undefined, inst.opcode)) return false;
+            switch (inst.opcode) {
+                .MATCH_SEQUENCE, .MATCH_MAPPING, .MATCH_CLASS, .MATCH_KEYS, .COPY,
+                .STORE_FAST_LOAD_FAST, .STORE_FAST_STORE_FAST => return false,
+                .RETURN_VALUE, .RETURN_CONST => has_return = true,
+                else => {},
+            }
+        }
+        return has_return;
+    }
+
+    fn succEdgeForJump(op: Opcode) cfg_mod.EdgeType {
+        return switch (op) {
+            .POP_JUMP_IF_TRUE,
+            .POP_JUMP_FORWARD_IF_TRUE,
+            .POP_JUMP_BACKWARD_IF_TRUE,
+            .POP_JUMP_IF_NOT_NONE,
+            .POP_JUMP_FORWARD_IF_NOT_NONE,
+            .POP_JUMP_BACKWARD_IF_NOT_NONE,
+            .JUMP_IF_TRUE_OR_POP,
+            .JUMP_IF_TRUE,
+            => .conditional_false,
+            else => .conditional_true,
+        };
+    }
+
+    fn failEdgeForJump(op: Opcode) cfg_mod.EdgeType {
+        return if (succEdgeForJump(op) == .conditional_true) .conditional_false else .conditional_true;
+    }
+
+    fn maxLeadPop(self: *Decompiler, start: u32, end: u32) usize {
+        var max: usize = 0;
+        var b = start;
+        const limit = @min(end, @as(u32, @intCast(self.cfg.blocks.len)));
+        while (b < limit) : (b += 1) {
+            const blk = &self.cfg.blocks[b];
+            var cnt: usize = 0;
+            for (blk.instructions) |inst| {
+                if (inst.opcode == .NOT_TAKEN or inst.opcode == .CACHE) continue;
+                if (inst.opcode == .POP_TOP) {
+                    cnt += 1;
+                    continue;
+                }
+                break;
+            }
+            if (cnt > max) max = cnt;
+        }
+        return max;
+    }
+
+    const GuardStart = struct {
+        idx: usize,
+        preload: ?*Expr,
+    };
+
+    fn makeIsNoneCompare(self: *Decompiler, value: *Expr, is_not: bool) DecompileError!*Expr {
+        const a = self.arena.allocator();
+        const none_expr = try ast.makeConstant(a, .{ .none = {} });
+        const comparators = try a.alloc(*Expr, 1);
+        comparators[0] = none_expr;
+        const ops = try a.alloc(ast.CmpOp, 1);
+        ops[0] = if (is_not) .is_not else .is;
+        const expr = try a.create(Expr);
+        expr.* = .{ .compare = .{ .left = value, .ops = ops, .comparators = comparators } };
+        return expr;
+    }
+
+    fn sameExpr(self: *Decompiler, left: *const Expr, right: *const Expr) bool {
+        _ = self;
+        return switch (left.*) {
+            .name => |l| switch (right.*) {
+                .name => |r| std.mem.eql(u8, l.id, r.id),
+                else => false,
+            },
+            else => false,
+        };
+    }
+
+    fn mergeCompareChain(self: *Decompiler, left: *Expr, right: *Expr) DecompileError!?*Expr {
+        if (left.* != .compare or right.* != .compare) return null;
+        const l = left.compare;
+        const r = right.compare;
+        if (l.comparators.len == 0 or r.comparators.len == 0) return null;
+        const last = l.comparators[l.comparators.len - 1];
+        if (!self.sameExpr(last, r.left)) return null;
+
+        const a = self.arena.allocator();
+        const ops = try a.alloc(ast.CmpOp, l.ops.len + r.ops.len);
+        const comps = try a.alloc(*Expr, l.comparators.len + r.comparators.len);
+        std.mem.copyForwards(ast.CmpOp, ops[0..l.ops.len], l.ops);
+        std.mem.copyForwards(ast.CmpOp, ops[l.ops.len..], r.ops);
+        std.mem.copyForwards(*Expr, comps[0..l.comparators.len], l.comparators);
+        std.mem.copyForwards(*Expr, comps[l.comparators.len..], r.comparators);
+
+        const expr = try a.create(Expr);
+        expr.* = .{ .compare = .{ .left = l.left, .ops = ops, .comparators = comps } };
+        return expr;
+    }
+
+    const ClassInfo = struct {
+        cls: *Expr,
+        attrs: []const []const u8,
+    };
+
+    const MatchCaseResult = struct {
+        case: ast.MatchCase,
+        fallback_body: ?[]const *Stmt,
+        fallback_block: ?u32,
+    };
+
+    const SeqBuild = struct {
+        expected: usize,
+        items: std.ArrayListUnmanaged(*ast.Pattern) = .{},
+        swap: bool = false,
+    };
+
+    fn constExprFromObj(self: *Decompiler, obj: pyc.Object) DecompileError!*Expr {
+        const a = self.arena.allocator();
+        return switch (obj) {
+            .none => ast.makeConstant(a, .{ .none = {} }),
+            .true_val => ast.makeConstant(a, .{ .true_ = {} }),
+            .false_val => ast.makeConstant(a, .{ .false_ = {} }),
+            .ellipsis => ast.makeConstant(a, .{ .ellipsis = {} }),
+            .string => |s| ast.makeConstant(a, .{ .string = s }),
+            .bytes => |b| ast.makeConstant(a, .{ .bytes = b }),
+            .int => |i| switch (i) {
+                .small => |v| ast.makeConstant(a, .{ .int = v }),
+                .big => |b| ast.makeConstant(a, .{ .big_int = try b.clone(a) }),
+            },
+            .float => |f| ast.makeConstant(a, .{ .float = f }),
+            .complex => |c| ast.makeConstant(a, .{ .complex = .{ .real = c.real, .imag = c.imag } }),
+            else => error.InvalidBlock,
+        };
+    }
+
+    fn keyExprsFromObj(self: *Decompiler, obj: pyc.Object) DecompileError!?[]const *Expr {
+        const a = self.arena.allocator();
+        switch (obj) {
+            .tuple => |items| {
+                const exprs = try a.alloc(*Expr, items.len);
+                for (items, 0..) |item, i| {
+                    exprs[i] = self.constExprFromObj(item) catch return null;
+                }
+                return exprs;
+            },
+            else => return null,
+        }
+    }
+
+    fn attrNamesFromObj(self: *Decompiler, obj: pyc.Object) ?[]const []const u8 {
+        const a = self.arena.allocator();
+        switch (obj) {
+            .tuple => |items| {
+                const names = a.alloc([]const u8, items.len) catch return null;
+                for (items, 0..) |item, i| {
+                    switch (item) {
+                        .string => |s| names[i] = s,
+                        else => return null,
+                    }
+                }
+                return names;
+            },
+            else => return null,
+        }
+    }
+
+    fn findAsName(self: *Decompiler, insts: []const cfg_mod.Instruction, start_idx: usize) ?[]const u8 {
+        var i = start_idx + 1;
+        while (i < insts.len) : (i += 1) {
+            const op = insts[i].opcode;
+            if (op == .NOT_TAKEN or op == .CACHE) continue;
+            switch (op) {
+                .POP_JUMP_IF_FALSE, .POP_JUMP_FORWARD_IF_FALSE,
+                .POP_JUMP_IF_TRUE, .POP_JUMP_FORWARD_IF_TRUE,
+                .POP_JUMP_IF_NONE, .POP_JUMP_FORWARD_IF_NONE,
+                => break,
+                .LOAD_FAST_BORROW, .LOAD_FAST_BORROW_LOAD_FAST_BORROW,
+                .LOAD_FAST_LOAD_FAST, .LOAD_FAST, .LOAD_GLOBAL, .LOAD_NAME,
+                => break,
+                .STORE_FAST => return self.code.varnames[insts[i].arg],
+                .STORE_NAME => return self.code.names[insts[i].arg],
+                else => {},
+            }
+        }
+        return null;
+    }
+
+    fn nextOp(insts: []const cfg_mod.Instruction, idx: usize) ?Opcode {
+        var j = idx + 1;
+        while (j < insts.len) : (j += 1) {
+            const op = insts[j].opcode;
+            if (op == .CACHE or op == .NOT_TAKEN) continue;
+            return op;
+        }
+        return null;
+    }
+
+    fn indexOfBlock(blocks: []const u32, id: u32) ?usize {
+        for (blocks, 0..) |b, i| {
+            if (b == id) return i;
+        }
+        return null;
+    }
+
+    fn jumpTargetIfJumpOnly(self: *Decompiler, block_id: u32, allow_pop: bool) ?u32 {
+        if (block_id >= self.cfg.blocks.len) return null;
+        const blk = &self.cfg.blocks[block_id];
+        if (blk.instructions.len == 0) {
+            for (blk.successors) |edge| {
+                if (edge.edge_type == .normal) return edge.target;
+            }
+            return null;
+        }
+        var saw_jump = false;
+        for (blk.instructions) |inst| {
+            switch (inst.opcode) {
+                .NOT_TAKEN, .CACHE => continue,
+                .POP_TOP => {
+                    if (allow_pop) continue;
+                    return null;
+                },
+                .JUMP_FORWARD, .JUMP_BACKWARD, .JUMP_ABSOLUTE => {
+                    if (saw_jump) return null;
+                    saw_jump = true;
+                    continue;
+                },
+                else => return null,
+            }
+        }
+        if (!saw_jump) return null;
+        for (blk.successors) |edge| {
+            if (edge.edge_type == .normal) return edge.target;
+        }
+        return null;
+    }
+
+    fn literalPatternFromBlock(self: *Decompiler, blk: *const cfg_mod.BasicBlock) DecompileError!?*ast.Pattern {
+        const a = self.arena.allocator();
+        var lit_expr: ?*Expr = null;
+        for (blk.instructions) |inst| {
+            switch (inst.opcode) {
+                .MATCH_SEQUENCE, .MATCH_MAPPING, .MATCH_CLASS, .MATCH_KEYS, .GET_LEN => return null,
+                .LOAD_SMALL_INT => {
+                    lit_expr = try ast.makeConstant(a, .{ .int = @intCast(inst.arg) });
+                },
+                .LOAD_CONST => {
+                    lit_expr = self.constExprFromObj(self.code.consts[inst.arg]) catch return null;
+                },
+                .COMPARE_OP => {
+                    if (lit_expr) |v| {
+                        const pat = try a.create(ast.Pattern);
+                        pat.* = .{ .match_value = v };
+                        return pat;
+                    }
+                },
+                else => {},
+            }
+        }
+        return null;
+    }
+
+    fn blocksEq(self: *Decompiler, a_id: u32, b_id: u32) bool {
+        if (a_id >= self.cfg.blocks.len or b_id >= self.cfg.blocks.len) return false;
+        const a_blk = &self.cfg.blocks[a_id];
+        const b_blk = &self.cfg.blocks[b_id];
+        var ai: usize = 0;
+        var bi: usize = 0;
+        while (true) {
+            while (ai < a_blk.instructions.len) : (ai += 1) {
+                const op = a_blk.instructions[ai].opcode;
+                if (op == .NOT_TAKEN or op == .CACHE) continue;
+                break;
+            }
+            while (bi < b_blk.instructions.len) : (bi += 1) {
+                const op = b_blk.instructions[bi].opcode;
+                if (op == .NOT_TAKEN or op == .CACHE) continue;
+                break;
+            }
+            const a_end = ai >= a_blk.instructions.len;
+            const b_end = bi >= b_blk.instructions.len;
+            if (a_end or b_end) return a_end and b_end;
+            const a_inst = a_blk.instructions[ai];
+            const b_inst = b_blk.instructions[bi];
+            if (a_inst.opcode != b_inst.opcode or a_inst.arg != b_inst.arg) return false;
+            ai += 1;
+            bi += 1;
+        }
+    }
+
+    const OrChain = struct {
+        guard_block: u32,
+        next_idx: usize,
+        patterns: []const *ast.Pattern,
+        last_block: u32,
+        fail_block: ?u32,
+    };
+
+    fn tryMatchOrChain(self: *Decompiler, case_blocks: []const u32, start_idx: usize) DecompileError!?OrChain {
+        const a = self.arena.allocator();
+        var patterns: std.ArrayList(*ast.Pattern) = .{};
+        defer patterns.deinit(a);
+
+        var success_target: ?u32 = null;
+        var next_case_id: ?u32 = null;
+        var last_fail: ?u32 = null;
+        var idx = start_idx;
+        while (idx < case_blocks.len) {
+            const bid = case_blocks[idx];
+            const blk = &self.cfg.blocks[bid];
+            const pat = try self.literalPatternFromBlock(blk) orelse break;
+            const term = blk.terminator() orelse break;
+            if (!ctrl.Analyzer.isConditionalJump(undefined, term.opcode)) break;
+
+            const succ_edge = succEdgeForJump(term.opcode);
+            const fail_edge = failEdgeForJump(term.opcode);
+            var true_block: ?u32 = null;
+            var false_block: ?u32 = null;
+            for (blk.successors) |edge| {
+                if (edge.edge_type == succ_edge) true_block = edge.target;
+                if (edge.edge_type == fail_edge) false_block = edge.target;
+            }
+            if (true_block == null or false_block == null) break;
+            last_fail = false_block.?;
+
+            var true_target: u32 = true_block.?;
+            if (self.jumpTargetIfJumpOnly(true_block.?, false)) |target| {
+                true_target = target;
+            }
+            if (success_target == null) {
+                success_target = true_target;
+            } else if (!self.blocksEq(success_target.?, true_target)) {
+                break;
+            }
+
+            try patterns.append(a, pat);
+
+            const next_idx = indexOfBlock(case_blocks, false_block.?) orelse {
+                if (self.jumpTargetIfJumpOnly(false_block.?, true)) |target| {
+                    next_case_id = target;
+                }
+                break;
+            };
+            if (next_idx <= idx) break;
+            idx = next_idx;
+        }
+
+        if (patterns.items.len < 2 or success_target == null) return null;
+        var next_idx: usize = case_blocks.len;
+        if (next_case_id) |next_id| {
+            next_idx = indexOfBlock(case_blocks, next_id) orelse case_blocks.len;
+        } else if (idx + 1 <= case_blocks.len) {
+            next_idx = idx + 1;
+        }
+        const pats = try patterns.toOwnedSlice(a);
+        return OrChain{
+            .guard_block = success_target.?,
+            .next_idx = next_idx,
+            .patterns = pats,
+            .last_block = case_blocks[idx],
+            .fail_block = last_fail,
+        };
+    }
+
+    fn isWildcardPattern(pat: *const ast.Pattern) bool {
+        return switch (pat.*) {
+            .match_as => |a| a.pattern == null and a.name == null,
+            else => false,
+        };
+    }
+
+    fn mapPatternFromBlocks(self: *Decompiler, blocks: []const u32) DecompileError!?*ast.Pattern {
+        const a = self.arena.allocator();
+        var keys: ?[]const *Expr = null;
+        var val_block: ?u32 = null;
+
+        for (blocks) |bid| {
+            const blk = &self.cfg.blocks[bid];
+            for (blk.instructions, 0..) |inst, i| {
+                if (inst.opcode != .MATCH_KEYS) continue;
+                var j = i;
+                while (j > 0) {
+                    j -= 1;
+                    const op = blk.instructions[j].opcode;
+                    if (op == .NOT_TAKEN or op == .CACHE) continue;
+                    if (op == .LOAD_CONST) {
+                        const obj = self.code.consts[blk.instructions[j].arg];
+                        keys = try self.keyExprsFromObj(obj);
+                        break;
+                    }
+                    if (op == .MATCH_MAPPING) break;
+                }
+                if (blk.terminator()) |term| {
+                    const succ_edge = succEdgeForJump(term.opcode);
+                    for (blk.successors) |edge| {
+                        if (edge.edge_type == succ_edge) {
+                            val_block = edge.target;
+                            break;
+                        }
+                    }
+                }
+                break;
+            }
+            if (keys != null and val_block != null) break;
+        }
+
+        if (keys == null or val_block == null) return null;
+        const k = keys.?;
+        if (k.len == 0) return null;
+
+        const vblk = &self.cfg.blocks[val_block.?];
+        var unpack_idx: ?usize = null;
+        var count: usize = 0;
+        for (vblk.instructions, 0..) |inst, i| {
+            if (inst.opcode == .UNPACK_SEQUENCE) {
+                unpack_idx = i;
+                count = @intCast(inst.arg);
+                break;
+            }
+        }
+        if (unpack_idx == null or count != k.len) return null;
+
+        const pats = try a.alloc(*ast.Pattern, k.len);
+        var filled: usize = 0;
+        var i = unpack_idx.? + 1;
+        while (i < vblk.instructions.len and filled < k.len) : (i += 1) {
+            const op = vblk.instructions[i].opcode;
+            if (op == .NOT_TAKEN or op == .CACHE or op == .POP_TOP) continue;
+            if (op == .STORE_FAST or op == .STORE_NAME) {
+                const name = if (op == .STORE_NAME)
+                    self.code.names[vblk.instructions[i].arg]
+                else
+                    self.code.varnames[vblk.instructions[i].arg];
+                const p = try a.create(ast.Pattern);
+                p.* = .{ .match_as = .{ .pattern = null, .name = name } };
+                pats[filled] = p;
+                filled += 1;
+                continue;
+            }
+            if (op == .STORE_FAST_STORE_FAST) {
+                const idx1 = (vblk.instructions[i].arg >> 4) & 0xF;
+                const idx2 = vblk.instructions[i].arg & 0xF;
+                if (filled < k.len) {
+                    const name1 = self.code.varnames[idx1];
+                    const p1 = try a.create(ast.Pattern);
+                    p1.* = .{ .match_as = .{ .pattern = null, .name = name1 } };
+                    pats[filled] = p1;
+                    filled += 1;
+                }
+                if (filled < k.len) {
+                    const name2 = self.code.varnames[idx2];
+                    const p2 = try a.create(ast.Pattern);
+                    p2.* = .{ .match_as = .{ .pattern = null, .name = name2 } };
+                    pats[filled] = p2;
+                    filled += 1;
+                }
+                continue;
+            }
+            if (op == .LOAD_SMALL_INT or op == .LOAD_CONST) {
+                const next_op = nextOp(vblk.instructions, i);
+                if (next_op == .COMPARE_OP) {
+                    const val_expr = if (op == .LOAD_SMALL_INT)
+                        try ast.makeConstant(a, .{ .int = @intCast(vblk.instructions[i].arg) })
+                    else
+                        try self.constExprFromObj(self.code.consts[vblk.instructions[i].arg]);
+                    const p = try a.create(ast.Pattern);
+                    p.* = .{ .match_value = val_expr };
+                    pats[filled] = p;
+                    filled += 1;
+                    continue;
+                }
+            }
+            break;
+        }
+
+        if (filled != k.len) return null;
+        const pat = try a.create(ast.Pattern);
+        pat.* = .{ .match_mapping = .{ .keys = k, .patterns = pats, .rest = null } };
+        return pat;
+    }
+
+    fn classPatternFromBlocks(self: *Decompiler, blocks: []const u32) DecompileError!?*ast.Pattern {
+        const a = self.arena.allocator();
+        var cls_expr: ?*Expr = null;
+        var attrs: ?[]const []const u8 = null;
+        var val_block: ?u32 = null;
+
+        for (blocks) |bid| {
+            const blk = &self.cfg.blocks[bid];
+            var last_cls: ?*Expr = null;
+            var last_attrs: ?[]const []const u8 = null;
+            for (blk.instructions, 0..) |inst, i| {
+                switch (inst.opcode) {
+                    .LOAD_GLOBAL => {
+                        if (inst.arg < self.code.names.len) {
+                            const name = self.code.names[inst.arg];
+                            last_cls = try ast.makeName(a, name, .load);
+                        }
+                    },
+                    .LOAD_NAME => {
+                        if (inst.arg < self.code.names.len) {
+                            const name = self.code.names[inst.arg];
+                            last_cls = try ast.makeName(a, name, .load);
+                        }
+                    },
+                    .LOAD_FAST, .LOAD_FAST_BORROW => {
+                        if (inst.arg < self.code.varnames.len) {
+                            const name = self.code.varnames[inst.arg];
+                            last_cls = try ast.makeName(a, name, .load);
+                        }
+                    },
+                    .LOAD_CONST => {
+                        const obj = self.code.consts[inst.arg];
+                        last_attrs = self.attrNamesFromObj(obj);
+                    },
+                    .MATCH_CLASS => {
+                        if (last_cls != null and last_attrs != null) {
+                            cls_expr = last_cls;
+                            attrs = last_attrs;
+                            if (blk.terminator()) |term| {
+                                const succ_edge = succEdgeForJump(term.opcode);
+                                for (blk.successors) |edge| {
+                                    if (edge.edge_type == succ_edge) {
+                                        val_block = edge.target;
+                                        break;
+                                    }
+                                }
+                            }
+                        }
+                        _ = i;
+                        break;
+                    },
+                    else => {},
+                }
+            }
+            if (cls_expr != null and attrs != null and val_block != null) break;
+        }
+
+        if (cls_expr == null or attrs == null or val_block == null) return null;
+        const attr_list = attrs.?;
+        if (attr_list.len == 0) return null;
+
+        const vblk = &self.cfg.blocks[val_block.?];
+        var unpack_idx: ?usize = null;
+        var count: usize = 0;
+        for (vblk.instructions, 0..) |inst, i| {
+            if (inst.opcode == .UNPACK_SEQUENCE) {
+                unpack_idx = i;
+                count = @intCast(inst.arg);
+                break;
+            }
+        }
+        if (unpack_idx == null or count != attr_list.len) return null;
+
+        const pats = try a.alloc(*ast.Pattern, attr_list.len);
+        var filled: usize = 0;
+        var i = unpack_idx.? + 1;
+        while (i < vblk.instructions.len and filled < attr_list.len) : (i += 1) {
+            const op = vblk.instructions[i].opcode;
+            if (op == .NOT_TAKEN or op == .CACHE or op == .POP_TOP) continue;
+            if (op == .STORE_FAST or op == .STORE_NAME) {
+                const name = if (op == .STORE_NAME)
+                    self.code.names[vblk.instructions[i].arg]
+                else
+                    self.code.varnames[vblk.instructions[i].arg];
+                const p = try a.create(ast.Pattern);
+                p.* = .{ .match_as = .{ .pattern = null, .name = name } };
+                pats[filled] = p;
+                filled += 1;
+                continue;
+            }
+            if (op == .STORE_FAST_STORE_FAST and attr_list.len == 2) {
+                const idx1 = (vblk.instructions[i].arg >> 4) & 0xF;
+                const idx2 = vblk.instructions[i].arg & 0xF;
+                const name1 = self.code.varnames[idx1];
+                const name2 = self.code.varnames[idx2];
+                const p1 = try a.create(ast.Pattern);
+                p1.* = .{ .match_as = .{ .pattern = null, .name = name1 } };
+                const p2 = try a.create(ast.Pattern);
+                p2.* = .{ .match_as = .{ .pattern = null, .name = name2 } };
+                pats[filled] = p1;
+                pats[filled + 1] = p2;
+                filled += 2;
+                continue;
+            }
+            if (op == .LOAD_SMALL_INT or op == .LOAD_CONST) {
+                const next_op = nextOp(vblk.instructions, i);
+                if (next_op == .COMPARE_OP) {
+                    const val_expr = if (op == .LOAD_SMALL_INT)
+                        try ast.makeConstant(a, .{ .int = @intCast(vblk.instructions[i].arg) })
+                    else
+                        try self.constExprFromObj(self.code.consts[vblk.instructions[i].arg]);
+                    const p = try a.create(ast.Pattern);
+                    p.* = .{ .match_value = val_expr };
+                    pats[filled] = p;
+                    filled += 1;
+                    continue;
+                }
+            }
+            break;
+        }
+
+        if (filled != attr_list.len) {
+            var all_insts: std.ArrayList(cfg_mod.Instruction) = .{};
+            defer all_insts.deinit(self.allocator);
+            for (blocks) |bid| {
+                const blk = &self.cfg.blocks[bid];
+                try all_insts.appendSlice(self.allocator, blk.instructions);
+            }
+
+            var u_idx: ?usize = null;
+            var u_count: usize = 0;
+            for (all_insts.items, 0..) |inst, j| {
+                if (inst.opcode == .UNPACK_SEQUENCE) {
+                    u_idx = j;
+                    u_count = @intCast(inst.arg);
+                    break;
+                }
+            }
+            if (u_idx == null or u_count != attr_list.len) return null;
+
+            const pats2 = try a.alloc(*ast.Pattern, attr_list.len);
+            var filled2: usize = 0;
+            var k: usize = u_idx.? + 1;
+            while (k < all_insts.items.len and filled2 < attr_list.len) : (k += 1) {
+                const op = all_insts.items[k].opcode;
+                if (op == .NOT_TAKEN or op == .CACHE or op == .POP_TOP) continue;
+                if (op == .COMPARE_OP or ctrl.Analyzer.isConditionalJump(undefined, op)) continue;
+                if (op == .STORE_FAST or op == .STORE_NAME) {
+                    const name = if (op == .STORE_NAME)
+                        self.code.names[all_insts.items[k].arg]
+                    else
+                        self.code.varnames[all_insts.items[k].arg];
+                    const p = try a.create(ast.Pattern);
+                    p.* = .{ .match_as = .{ .pattern = null, .name = name } };
+                    pats2[filled2] = p;
+                    filled2 += 1;
+                    continue;
+                }
+                if (op == .STORE_FAST_STORE_FAST and attr_list.len >= 2) {
+                    const idx1 = (all_insts.items[k].arg >> 4) & 0xF;
+                    const idx2 = all_insts.items[k].arg & 0xF;
+                    const name1 = self.code.varnames[idx1];
+                    const name2 = self.code.varnames[idx2];
+                    const p1 = try a.create(ast.Pattern);
+                    p1.* = .{ .match_as = .{ .pattern = null, .name = name1 } };
+                    const p2 = try a.create(ast.Pattern);
+                    p2.* = .{ .match_as = .{ .pattern = null, .name = name2 } };
+                    if (filled2 < attr_list.len) {
+                        pats2[filled2] = p1;
+                        filled2 += 1;
+                    }
+                    if (filled2 < attr_list.len) {
+                        pats2[filled2] = p2;
+                        filled2 += 1;
+                    }
+                    continue;
+                }
+                if (op == .LOAD_SMALL_INT or op == .LOAD_CONST) {
+                    const next_op = nextOp(all_insts.items, k);
+                    if (next_op == .COMPARE_OP) {
+                        const val_expr = if (op == .LOAD_SMALL_INT)
+                            try ast.makeConstant(a, .{ .int = @intCast(all_insts.items[k].arg) })
+                        else
+                            try self.constExprFromObj(self.code.consts[all_insts.items[k].arg]);
+                        const p = try a.create(ast.Pattern);
+                        p.* = .{ .match_value = val_expr };
+                        pats2[filled2] = p;
+                        filled2 += 1;
+                        continue;
+                    }
+                }
+                break;
+            }
+            if (filled2 != attr_list.len) return null;
+
+            const pat = try a.create(ast.Pattern);
+            pat.* = .{ .match_class = .{
+                .cls = cls_expr.?,
+                .patterns = &.{},
+                .kwd_attrs = attr_list,
+                .kwd_patterns = pats2,
+            } };
+            return pat;
+        }
+        const pat = try a.create(ast.Pattern);
+        pat.* = .{ .match_class = .{
+            .cls = cls_expr.?,
+            .patterns = &.{},
+            .kwd_attrs = attr_list,
+            .kwd_patterns = pats,
+        } };
+        return pat;
+    }
+
+    fn finishSeq(self: *Decompiler, seq_stack: *std.ArrayListUnmanaged(SeqBuild)) DecompileError!?*ast.Pattern {
+        const a = self.arena.allocator();
+        var out: ?*ast.Pattern = null;
+        while (seq_stack.items.len > 0) {
+            const last_idx = seq_stack.items.len - 1;
+            const sb = &seq_stack.items[last_idx];
+            if (sb.items.items.len != sb.expected) break;
+
+            const seq_items = try a.alloc(*ast.Pattern, sb.items.items.len);
+            std.mem.copyForwards(*ast.Pattern, seq_items, sb.items.items);
+            if (sb.swap and seq_items.len == 2) {
+                const tmp = seq_items[0];
+                seq_items[0] = seq_items[1];
+                seq_items[1] = tmp;
+            }
+
+            const seq_pat = try a.create(ast.Pattern);
+            seq_pat.* = .{ .match_sequence = seq_items };
+
+            sb.items.deinit(self.allocator);
+            seq_stack.items.len -= 1;
+
+            if (seq_stack.items.len == 0) {
+                out = seq_pat;
+                break;
+            } else {
+                try seq_stack.items[seq_stack.items.len - 1].items.append(self.allocator, seq_pat);
+            }
+        }
+        return out;
+    }
+
+    fn decompileMatchCase(self: *Decompiler, block_id: u32, has_copy: bool) DecompileError!MatchCaseResult {
+        // Pattern matching with guards spans multiple blocks:
+        // Block N: MATCH_SEQUENCE, POP_JUMP -> pattern fail
+        // Block N+1: GET_LEN, COMPARE_OP, POP_JUMP -> pattern fail
+        // Block N+2: UNPACK, STORE_FAST_STORE_FAST, guard, POP_JUMP -> guard fail
+        // Block N+3: body
+        //
+        // Need to collect all pattern+guard blocks by following conditional_true edges
+        // until we reach the body block.
+
+        var pattern_blocks: std.ArrayList(u32) = .{};
+        defer pattern_blocks.deinit(self.allocator);
+
+        var current_block_id = block_id;
+        var last_test: u32 = block_id;
+        var test_blocks: std.ArrayList(u32) = .{};
+        defer test_blocks.deinit(self.allocator);
+
+        // Follow conditional edges while blocks contain pattern/guard logic
+        while (current_block_id < self.cfg.blocks.len) {
+            const blk = &self.cfg.blocks[current_block_id];
+
+            // Stop if this looks like body (subject cleanup)
+            var starts_body = false;
+            var has_cond = false;
+            var first_op: ?Opcode = null;
+            for (blk.instructions) |inst| {
+                if (inst.opcode == .NOT_TAKEN or inst.opcode == .CACHE) continue;
+                if (first_op == null) first_op = inst.opcode;
+                if (ctrl.Analyzer.isConditionalJump(undefined, inst.opcode)) {
+                    has_cond = true;
+                }
+            }
+            if (first_op) |op| {
+                if (op == .POP_TOP or op == .RETURN_VALUE) {
+                    starts_body = !has_cond;
+                }
+            }
+            if (starts_body) break;
+
+            // Check if this block has pattern opcodes or guard-ish ops
+            var has_pattern = false;
+            var has_guard_ops = false;
+            var has_literal_load = false;
+            for (blk.instructions) |inst| {
+                if (inst.opcode == .LOAD_SMALL_INT or inst.opcode == .LOAD_CONST) {
+                    has_literal_load = true;
+                }
+                if (inst.opcode == .MATCH_SEQUENCE or inst.opcode == .MATCH_MAPPING or
+                    inst.opcode == .MATCH_CLASS or inst.opcode == .MATCH_KEYS or
+                    inst.opcode == .UNPACK_SEQUENCE or
+                    inst.opcode == .STORE_FAST_STORE_FAST or inst.opcode == .STORE_FAST_LOAD_FAST or
+                    inst.opcode == .STORE_FAST or inst.opcode == .STORE_NAME or
+                    inst.opcode == .POP_JUMP_IF_NONE or inst.opcode == .POP_JUMP_FORWARD_IF_NONE or
+                    inst.opcode == .GET_LEN)
+                {
+                    has_pattern = true;
+                }
+                if (inst.opcode == .COMPARE_OP and has_literal_load) {
+                    has_pattern = true;
+                }
+                if (inst.opcode == .LOAD_FAST_BORROW or inst.opcode == .LOAD_FAST_BORROW_LOAD_FAST_BORROW or
+                    inst.opcode == .LOAD_FAST_LOAD_FAST or inst.opcode == .LOAD_FAST or
+                    inst.opcode == .STORE_FAST_LOAD_FAST)
+                {
+                    has_guard_ops = true;
+                }
+            }
+
+            var has_cond_term = false;
+            if (blk.terminator()) |term| {
+                has_cond_term = ctrl.Analyzer.isConditionalJump(undefined, term.opcode);
+            }
+            has_cond = has_cond or has_cond_term;
+
+            if (!has_pattern and !has_guard_ops and !has_cond) break;
+
+            if (has_pattern) {
+                try pattern_blocks.append(self.allocator, current_block_id);
+            }
+            try test_blocks.append(self.allocator, current_block_id);
+            last_test = current_block_id;
+
+            if (blk.terminator()) |term| {
+                const next_edge = succEdgeForJump(term.opcode);
+                var found_next = false;
+                for (blk.successors) |edge| {
+                    if (edge.edge_type == next_edge) {
+                        current_block_id = edge.target;
+                        found_next = true;
+                        break;
+                    }
+                }
+                if (!found_next) break;
+            } else {
+                break;
+            }
+        }
+
+        // Collect all instructions from pattern blocks for extraction
+        var all_insts: std.ArrayList(cfg_mod.Instruction) = .{};
+        defer all_insts.deinit(self.allocator);
+        for (pattern_blocks.items) |pid| {
+            const pb = &self.cfg.blocks[pid];
+            try all_insts.appendSlice(self.allocator, pb.instructions);
+        }
+
+        // Extract pattern from combined instruction stream
+        var pat = if (try self.classPatternFromBlocks(pattern_blocks.items)) |cpat|
+            cpat
+        else if (try self.mapPatternFromBlocks(pattern_blocks.items)) |mpat|
+            mpat
+        else
+            try self.extractMatchPatternFromInsts(all_insts.items, !has_copy);
+        if (isWildcardPattern(pat)) {
+            if (try self.literalPatternFromBlock(&self.cfg.blocks[block_id])) |lit_pat| {
+                pat = lit_pat;
+            }
+        }
+
+        var guard: ?*Expr = null;
+        const guard_exprs = try self.guardExprsFromBlocks(test_blocks.items);
+        if (guard_exprs.len > 0) {
+            guard = guard_exprs[0];
+            for (guard_exprs[1..]) |g| {
+                if (guard) |cur| {
+                    if (try self.mergeCompareChain(cur, g)) |merged| {
+                        guard = merged;
+                        continue;
+                    }
+                }
+                guard = try self.makeBoolPair(guard.?, g, .and_);
+            }
+        }
+
+        var fallback_body: ?[]const *Stmt = null;
+        var fallback_block: ?u32 = null;
 
         // Find body: if guard exists and body is inline (no separate block), extract from current block
         var body: []const *Stmt = &.{};
 
-        // Use final_pattern_block for body/guard edge lookup
-        const final_block = &self.cfg.blocks[final_pattern_block_id];
+        // Use last test block for body/guard edge lookup
+        const final_block = &self.cfg.blocks[last_test];
 
         if (guard != null) {
+            var fail_block: ?u32 = null;
+            if (final_block.terminator()) |term| {
+                const fail_edge = failEdgeForJump(term.opcode);
+                for (final_block.successors) |edge| {
+                    if (edge.edge_type == fail_edge) {
+                        fail_block = edge.target;
+                        break;
+                    }
+                }
+            }
+
             // Guard case: body might be inline after POP_TOP, or in a separate block
+            var inline_body = false;
+            var seen_jump = false;
+            for (final_block.instructions) |inst| {
+                if (ctrl.Analyzer.isConditionalJump(undefined, inst.opcode)) {
+                    seen_jump = true;
+                    continue;
+                }
+                if (!seen_jump) continue;
+                if (inst.opcode == .NOT_TAKEN or inst.opcode == .CACHE) continue;
+                if (inst.opcode == .STORE_FAST or inst.opcode == .STORE_NAME or inst.opcode == .STORE_DEREF or
+                    inst.opcode == .STORE_FAST_STORE_FAST or inst.opcode == .STORE_FAST_LOAD_FAST)
+                {
+                    continue;
+                }
+                if (inst.opcode == .POP_TOP or inst.opcode == .RETURN_VALUE) {
+                    inline_body = true;
+                    break;
+                }
+                break;
+            }
+
             // Check if there's a conditional_true edge (separate body block)
             var body_block: ?u32 = null;
-            for (final_block.successors) |edge| {
-                if (edge.edge_type == .conditional_true) {
-                    body_block = edge.target;
-                    break;
+            if (!inline_body) {
+                for (final_block.successors) |edge| {
+                    if (edge.edge_type == .conditional_true) {
+                        body_block = edge.target;
+                        break;
+                    }
+                }
+                if (body_block == null) {
+                    for (final_block.successors) |edge| {
+                        if (edge.edge_type == .normal) {
+                            body_block = edge.target;
+                            break;
+                        }
+                    }
+                }
+            }
+
+            if (body_block) |bid| {
+                var resolved = bid;
+                if (self.jumpTargetIfJumpOnly(bid, true)) |target| {
+                    resolved = target;
+                }
+                if (self.cfg.blocks[resolved].instructions.len == 0) {
+                    body_block = null;
+                } else {
+                    body_block = resolved;
                 }
             }
 
             if (body_block) |bid| {
                 // Body in separate block
-                // Find the actual end: look for next case block or exit
                 var body_end: ?u32 = null;
-
-                // The body block should end when it:
-                // 1. Returns (no successors)
-                // 2. Jumps to next case/exit
                 const body_blk = &self.cfg.blocks[bid];
-                if (body_blk.successors.len == 0) {
-                    // Terminal block (RETURN_VALUE) - just this block
+                if (self.isSimpleReturnBlock(bid)) {
+                    body_end = bid + 1;
+                } else if (body_blk.successors.len == 0) {
                     body_end = bid + 1;
                 } else {
-                    // Body has successors - find where it goes
-                    for (body_blk.successors) |edge| {
-                        // Body typically jumps to exit or falls through to next case
-                        body_end = edge.target;
-                        break;
+                    if (final_block.terminator()) |term| {
+                        const fail_edge = failEdgeForJump(term.opcode);
+                        for (final_block.successors) |edge| {
+                            if (edge.edge_type == fail_edge) {
+                                body_end = edge.target;
+                                break;
+                            }
+                        }
+                    }
+                    if (body_end == null) {
+                        for (body_blk.successors) |edge| {
+                            body_end = edge.target;
+                            break;
+                        }
                     }
                 }
 
                 if (body_end) |end| {
                     if (bid < end) {
-                        body = try self.decompileStructuredRange(bid, end);
+                        const pop_need = self.maxLeadPop(bid, end);
+                        if (pop_need > 0) {
+                            if (pop_need == 1) {
+                                var init_stack = [_]StackValue{ .unknown };
+                                body = try self.decompileStructuredRangeWithStack(bid, end, init_stack[0..]);
+                            } else {
+                                const init_stack = try self.allocator.alloc(StackValue, pop_need);
+                                defer self.allocator.free(init_stack);
+                                for (init_stack) |*sv| sv.* = .unknown;
+                                body = try self.decompileStructuredRangeWithStack(bid, end, init_stack);
+                            }
+                        } else {
+                            body = try self.decompileStructuredRange(bid, end);
+                        }
                     }
                 }
             } else {
                 // Body inline: find POP_TOP after guard check, decompile rest of block
-                var pop_idx: ?usize = null;
-                var found_jump = false;
-                for (block.instructions, 0..) |inst, idx| {
-                    if (inst.opcode == .POP_JUMP_IF_FALSE or inst.opcode == .POP_JUMP_FORWARD_IF_FALSE) {
-                        found_jump = true;
-                    } else if (found_jump and inst.opcode == .POP_TOP) {
-                        pop_idx = idx + 1; // Start after POP_TOP
+                var body_start_idx: ?usize = null;
+                var fallback_start_idx: ?usize = null;
+                var pop_jump_idx: ?usize = null;
+                for (final_block.instructions, 0..) |inst, idx| {
+                    if (ctrl.Analyzer.isConditionalJump(undefined, inst.opcode)) {
+                        pop_jump_idx = idx;
                         break;
                     }
                 }
 
-                if (pop_idx) |start_idx| {
+                if (pop_jump_idx) |pj| {
+                    const pop_inst = final_block.instructions[pj];
+                    if (pop_inst.jumpTarget(self.version)) |fail_off| {
+                        var best: ?usize = null;
+                        for (final_block.instructions, 0..) |inst, idx| {
+                            if (inst.offset >= fail_off) {
+                                if (best == null or inst.offset < final_block.instructions[best.?].offset) {
+                                    best = idx;
+                                }
+                            }
+                        }
+                        fallback_start_idx = best;
+                    }
+
+                    var j = pj + 1;
+                    while (j < final_block.instructions.len) : (j += 1) {
+                        const inst = final_block.instructions[j];
+                        if (inst.opcode == .JUMP_FORWARD or inst.opcode == .JUMP_ABSOLUTE) {
+                            if (inst.jumpTarget(self.version)) |succ_off| {
+                                var best: ?usize = null;
+                                for (final_block.instructions, 0..) |iinst, idx| {
+                                    if (iinst.offset >= succ_off) {
+                                        if (best == null or iinst.offset < final_block.instructions[best.?].offset) {
+                                            best = idx;
+                                        }
+                                    }
+                                }
+                                body_start_idx = best;
+                            }
+                            break;
+                        }
+                        if (fallback_start_idx) |fb| {
+                            if (j >= fb) break;
+                        }
+                    }
+                }
+
+                if (body_start_idx == null) {
+                    var found_jump = false;
+                    for (final_block.instructions, 0..) |inst, idx| {
+                        if (ctrl.Analyzer.isConditionalJump(undefined, inst.opcode)) {
+                            found_jump = true;
+                            continue;
+                        }
+                        if (!found_jump) continue;
+                        if (inst.opcode == .NOT_TAKEN or inst.opcode == .CACHE) continue;
+                        if (inst.opcode == .STORE_FAST or inst.opcode == .STORE_NAME or inst.opcode == .STORE_DEREF or
+                            inst.opcode == .STORE_FAST_STORE_FAST or inst.opcode == .STORE_FAST_LOAD_FAST)
+                        {
+                            continue;
+                        }
+                        if (inst.opcode == .POP_TOP) {
+                            body_start_idx = idx + 1; // Start after POP_TOP
+                            break;
+                        }
+                        body_start_idx = idx; // Start at first non-POP_TOP after jump
+                        break;
+                    }
+                }
+                if (body_start_idx == null) {
+                    if (fallback_start_idx) |fb| {
+                        var k = fb;
+                        while (k < final_block.instructions.len) : (k += 1) {
+                            if (final_block.instructions[k].opcode == .RETURN_VALUE) {
+                                k += 1;
+                                while (k < final_block.instructions.len) : (k += 1) {
+                                    const op = final_block.instructions[k].opcode;
+                                    if (op == .NOT_TAKEN or op == .CACHE or op == .POP_TOP) continue;
+                                    body_start_idx = k;
+                                    break;
+                                }
+                                break;
+                            }
+                        }
+                    }
+                }
+
+                if (body_start_idx) |start_idx| {
                     // Create a temporary block with just the body instructions
                     var body_insts: std.ArrayList(cfg_mod.Instruction) = .{};
                     defer body_insts.deinit(self.allocator);
-                    try body_insts.appendSlice(self.allocator, block.instructions[start_idx..]);
+                    try body_insts.appendSlice(self.allocator, final_block.instructions[start_idx..]);
 
-                    // Decompile inline using a sim starting from empty stack
-                    // The instructions after POP_TOP are the body
+                    const a = self.arena.allocator();
                     var stmts: std.ArrayList(*Stmt) = .{};
-                    defer stmts.deinit(self.allocator);
+                    defer stmts.deinit(a);
 
-                    // Skip to just use decompileStructuredRange by treating rest as separate
-                    // Actually, these are terminal (RETURN_VALUE etc) so processBlock won't work
-                    // Just simulate and extract expressions/returns
-                    var sim = SimContext.init(self.allocator, self.code, self.version);
+                    var sim = SimContext.init(a, self.code, self.version);
                     defer sim.deinit();
 
                     for (body_insts.items) |inst| {
                         if (inst.opcode == .RETURN_VALUE) {
                             const val = sim.stack.popExpr() catch blk: {
-                                const none_expr = try self.allocator.create(Expr);
+                                const none_expr = try a.create(Expr);
                                 none_expr.* = .{ .constant = .{ .none = {} } };
                                 break :blk none_expr;
                             };
-                            const stmt = try self.allocator.create(Stmt);
+                            const stmt = try a.create(Stmt);
                             stmt.* = .{ .return_stmt = .{ .value = val } };
-                            try stmts.append(self.allocator, stmt);
+                            try stmts.append(a, stmt);
                             break;
                         } else {
                             sim.simulate(inst) catch {};
                         }
                     }
 
-                    const a = self.arena.allocator();
                     body = try stmts.toOwnedSlice(a);
+                }
+
+                if (fallback_body == null) {
+                    if (fallback_start_idx) |fb_start| {
+                        var fb_insts: std.ArrayList(cfg_mod.Instruction) = .{};
+                        defer fb_insts.deinit(self.allocator);
+                        try fb_insts.appendSlice(self.allocator, final_block.instructions[fb_start..]);
+
+                        const a = self.arena.allocator();
+                        var stmts: std.ArrayList(*Stmt) = .{};
+                        defer stmts.deinit(a);
+
+                        var sim = SimContext.init(a, self.code, self.version);
+                        defer sim.deinit();
+
+                        for (fb_insts.items) |inst| {
+                            if (inst.opcode == .NOT_TAKEN or inst.opcode == .CACHE or inst.opcode == .POP_TOP) continue;
+                            if (inst.opcode == .RETURN_VALUE) {
+                                const val = sim.stack.popExpr() catch blk: {
+                                    const none_expr = try a.create(Expr);
+                                    none_expr.* = .{ .constant = .{ .none = {} } };
+                                    break :blk none_expr;
+                                };
+                                const stmt = try a.create(Stmt);
+                                stmt.* = .{ .return_stmt = .{ .value = val } };
+                                try stmts.append(a, stmt);
+                                break;
+                            } else {
+                                sim.simulate(inst) catch {};
+                            }
+                        }
+
+                        if (stmts.items.len > 0) {
+                            fallback_body = try stmts.toOwnedSlice(a);
+                        }
+                    }
+                }
+            }
+
+            if (fallback_block == null) {
+                fallback_block = fail_block;
+            }
+            if (fallback_body == null) {
+                if (fallback_block) |fb| {
+                    if (self.isSimpleReturnBlock(fb)) {
+                        var fb_end: u32 = fb + 1;
+                        const fblk = &self.cfg.blocks[fb];
+                        if (fblk.successors.len > 0) {
+                            fb_end = fblk.successors[0].target;
+                        }
+                        if (fb < fb_end) {
+                            const pop_need = self.maxLeadPop(fb, fb_end);
+                            if (pop_need > 0) {
+                                if (pop_need == 1) {
+                                    var init_stack = [_]StackValue{ .unknown };
+                                    fallback_body = try self.decompileStructuredRangeWithStack(fb, fb_end, init_stack[0..]);
+                                } else {
+                                    const init_stack = try self.allocator.alloc(StackValue, pop_need);
+                                    defer self.allocator.free(init_stack);
+                                    for (init_stack) |*sv| sv.* = .unknown;
+                                    fallback_body = try self.decompileStructuredRangeWithStack(fb, fb_end, init_stack);
+                                }
+                            } else {
+                                fallback_body = try self.decompileStructuredRange(fb, fb_end);
+                            }
+                        }
+                    }
                 }
             }
         } else {
             // No guard: body in true branch or inline
-            var body_block: ?u32 = null;
-            for (block.successors) |edge| {
-                if (edge.edge_type == .conditional_true or edge.edge_type == .normal) {
-                    body_block = edge.target;
+            var inline_body = false;
+            var seen_jump = false;
+            for (final_block.instructions) |inst| {
+                if (ctrl.Analyzer.isConditionalJump(undefined, inst.opcode)) {
+                    seen_jump = true;
+                    continue;
+                }
+                if (!seen_jump) continue;
+                if (inst.opcode == .NOT_TAKEN or inst.opcode == .CACHE) continue;
+                if (inst.opcode == .STORE_FAST or inst.opcode == .STORE_NAME or inst.opcode == .STORE_DEREF or
+                    inst.opcode == .STORE_FAST_STORE_FAST or inst.opcode == .STORE_FAST_LOAD_FAST)
+                {
+                    continue;
+                }
+                if (inst.opcode == .POP_TOP or inst.opcode == .RETURN_VALUE) {
+                    inline_body = true;
                     break;
+                }
+                break;
+            }
+
+            var body_block: ?u32 = null;
+            if (!inline_body) {
+                for (final_block.successors) |edge| {
+                    if (edge.edge_type == .conditional_true or edge.edge_type == .normal) {
+                        body_block = edge.target;
+                        break;
+                    }
                 }
             }
 
             if (body_block) |bid| {
-                var body_end: u32 = block_id + 1;
-                for (block.successors) |edge| {
-                    if (edge.edge_type == .conditional_false) {
-                        body_end = edge.target;
-                        break;
+                if (self.cfg.blocks[bid].instructions.len == 0) {
+                    body_block = null;
+                }
+            }
+
+            if (body_block) |bid| {
+                var body_end: u32 = last_test + 1;
+                const body_blk = &self.cfg.blocks[bid];
+                if (body_blk.successors.len == 0) {
+                    body_end = bid + 1;
+                } else if (final_block.terminator()) |term| {
+                    const fail_edge = failEdgeForJump(term.opcode);
+                    for (final_block.successors) |edge| {
+                        if (edge.edge_type == fail_edge) {
+                            body_end = edge.target;
+                            break;
+                        }
                     }
                 }
                 if (bid < body_end) {
-                    body = try self.decompileStructuredRange(bid, body_end);
+                    const pop_need = self.maxLeadPop(bid, body_end);
+                    if (pop_need > 0) {
+                        if (pop_need == 1) {
+                            var init_stack = [_]StackValue{ .unknown };
+                            body = try self.decompileStructuredRangeWithStack(bid, body_end, init_stack[0..]);
+                        } else {
+                            const init_stack = try self.allocator.alloc(StackValue, pop_need);
+                            defer self.allocator.free(init_stack);
+                            for (init_stack) |*sv| sv.* = .unknown;
+                            body = try self.decompileStructuredRangeWithStack(bid, body_end, init_stack);
+                        }
+                    } else {
+                        body = try self.decompileStructuredRange(bid, body_end);
+                    }
                 }
             } else {
-                // Body inline: extract instructions after NOP
-                var nop_idx: ?usize = null;
-                for (block.instructions, 0..) |inst, idx| {
+                // Body inline: find POP_TOP after guard check or NOP (fallback)
+                var start_idx: ?usize = null;
+                var fallback_start_idx: ?usize = null;
+                var jump_idx: ?usize = null;
+                var found_jump = false;
+                for (final_block.instructions, 0..) |inst, idx| {
+                    if (ctrl.Analyzer.isConditionalJump(undefined, inst.opcode)) {
+                        if (jump_idx == null) jump_idx = idx;
+                        found_jump = true;
+                        continue;
+                    }
+                    if (!found_jump) continue;
+                    if (inst.opcode == .NOT_TAKEN or inst.opcode == .CACHE) continue;
+                    if (inst.opcode == .STORE_FAST or inst.opcode == .STORE_NAME or inst.opcode == .STORE_DEREF or
+                        inst.opcode == .STORE_FAST_STORE_FAST or inst.opcode == .STORE_FAST_LOAD_FAST)
+                    {
+                        continue;
+                    }
+                    if (inst.opcode == .POP_TOP) {
+                        start_idx = idx + 1;
+                        break;
+                    }
                     if (inst.opcode == .NOP) {
-                        nop_idx = idx + 1;
+                        start_idx = idx + 1;
+                        break;
+                    }
+                }
+                if (jump_idx) |pj| {
+                    const jinst = final_block.instructions[pj];
+                    if (jinst.jumpTarget(self.version)) |fail_off| {
+                        var best: ?usize = null;
+                        for (final_block.instructions, 0..) |inst, idx| {
+                            if (inst.offset >= fail_off) {
+                                if (best == null or inst.offset < final_block.instructions[best.?].offset) {
+                                    best = idx;
+                                }
+                            }
+                        }
+                        fallback_start_idx = best;
+                    }
+                }
+                if (start_idx == null and !found_jump) {
+                    for (final_block.instructions, 0..) |inst, idx| {
+                        if (inst.opcode == .NOT_TAKEN or inst.opcode == .CACHE) continue;
+                        if (inst.opcode == .NOP) {
+                            start_idx = idx + 1;
+                            break;
+                        }
+                        start_idx = idx;
                         break;
                     }
                 }
 
-                if (nop_idx) |start_idx| {
-                    var stmts: std.ArrayList(*Stmt) = .{};
-                    defer stmts.deinit(self.allocator);
-
+                if (start_idx) |start| {
                     const aa = self.arena.allocator();
+                    var stmts: std.ArrayList(*Stmt) = .{};
+                    defer stmts.deinit(aa);
                     var sim = SimContext.init(aa, self.code, self.version);
                     defer sim.deinit();
 
-                    for (block.instructions[start_idx..]) |inst| {
+                    for (final_block.instructions[start..]) |inst| {
                         if (inst.opcode == .RETURN_VALUE) {
                             const val = sim.stack.popExpr() catch blk: {
                                 const none_expr = try aa.create(Expr);
@@ -4190,15 +5762,91 @@ pub const Decompiler = struct {
                         }
                     }
 
-                    body = try stmts.toOwnedSlice(self.arena.allocator());
+                    body = try stmts.toOwnedSlice(aa);
+                }
+                if (fallback_body == null) {
+                    if (fallback_start_idx) |fb_start| {
+                        var fb_insts: std.ArrayList(cfg_mod.Instruction) = .{};
+                        defer fb_insts.deinit(self.allocator);
+                        try fb_insts.appendSlice(self.allocator, final_block.instructions[fb_start..]);
+
+                        const aa = self.arena.allocator();
+                        var stmts: std.ArrayList(*Stmt) = .{};
+                        defer stmts.deinit(aa);
+                        var sim = SimContext.init(aa, self.code, self.version);
+                        defer sim.deinit();
+
+                        for (fb_insts.items) |inst| {
+                            if (inst.opcode == .NOT_TAKEN or inst.opcode == .CACHE or inst.opcode == .POP_TOP) continue;
+                            if (inst.opcode == .RETURN_VALUE) {
+                                const val = sim.stack.popExpr() catch blk: {
+                                    const none_expr = try aa.create(Expr);
+                                    none_expr.* = .{ .constant = .{ .none = {} } };
+                                    break :blk none_expr;
+                                };
+                                const stmt = try aa.create(Stmt);
+                                stmt.* = .{ .return_stmt = .{ .value = val } };
+                                try stmts.append(aa, stmt);
+                                break;
+                            } else {
+                                sim.simulate(inst) catch {};
+                            }
+                        }
+
+                        if (stmts.items.len > 0) {
+                            fallback_body = try stmts.toOwnedSlice(aa);
+                        }
+                    }
+                }
+            }
+            if (fallback_block == null) {
+                if (final_block.terminator()) |term| {
+                    const fail_edge = failEdgeForJump(term.opcode);
+                    for (final_block.successors) |edge| {
+                        if (edge.edge_type == fail_edge) {
+                            fallback_block = edge.target;
+                            break;
+                        }
+                    }
+                }
+            }
+            if (fallback_body == null) {
+                if (fallback_block) |fb| {
+                    if (self.isSimpleReturnBlock(fb)) {
+                        var fb_end: u32 = fb + 1;
+                        const fblk = &self.cfg.blocks[fb];
+                        if (fblk.successors.len > 0) {
+                            fb_end = fblk.successors[0].target;
+                        }
+                        if (fb < fb_end) {
+                            const pop_need = self.maxLeadPop(fb, fb_end);
+                            if (pop_need > 0) {
+                                if (pop_need == 1) {
+                                    var init_stack = [_]StackValue{ .unknown };
+                                    fallback_body = try self.decompileStructuredRangeWithStack(fb, fb_end, init_stack[0..]);
+                                } else {
+                                    const init_stack = try self.allocator.alloc(StackValue, pop_need);
+                                    defer self.allocator.free(init_stack);
+                                    for (init_stack) |*sv| sv.* = .unknown;
+                                    fallback_body = try self.decompileStructuredRangeWithStack(fb, fb_end, init_stack);
+                                }
+                            } else {
+                                fallback_body = try self.decompileStructuredRange(fb, fb_end);
+                            }
+                        }
+                    }
                 }
             }
         }
 
-        return ast.MatchCase{
-            .pattern = pat,
-            .guard = guard,
-            .body = body,
+        return MatchCaseResult{
+            .case = .{
+                .pattern = pat,
+                .guard = guard,
+                .body = body,
+            },
+            .fallback_body = fallback_body,
+            .fallback_block = fallback_block,
         };
     }
 
@@ -4207,39 +5855,186 @@ pub const Decompiler = struct {
         var sim = SimContext.init(a, self.code, self.version);
         defer sim.deinit();
 
-        // If subject is already on stack (subsequent cases after first), push placeholder
+        var subject_expr: ?*Expr = null;
         if (subject_on_stack) {
             const placeholder = try a.create(Expr);
             placeholder.* = .{ .name = .{ .id = "<subject>", .ctx = .load } };
             try sim.stack.push(.{ .expr = placeholder });
+            subject_expr = placeholder;
         }
 
         var has_match_seq = false;
         var has_match_map = false;
         var literal_val: ?*Expr = null;
+        var map_keys: ?[]const *Expr = null;
+        var class_info: ?ClassInfo = null;
+        var last_cls: ?*Expr = null;
+        var last_attrs: ?[]const []const u8 = null;
+        var seq_stack: std.ArrayListUnmanaged(SeqBuild) = .{};
+        defer {
+            for (seq_stack.items) |*sb| {
+                sb.items.deinit(self.allocator);
+            }
+            seq_stack.deinit(self.allocator);
+        }
+
+        // Pre-scan for mapping keys so UNPACK_SEQUENCE can use them
+        var scan_idx: usize = 0;
+        while (scan_idx < insts.len) : (scan_idx += 1) {
+            if (insts[scan_idx].opcode != .MATCH_KEYS) continue;
+            var j = scan_idx;
+            while (j > 0) {
+                j -= 1;
+                const op = insts[j].opcode;
+                if (op == .NOT_TAKEN or op == .CACHE) continue;
+                if (op == .LOAD_CONST) {
+                    const obj = self.code.consts[insts[j].arg];
+                    map_keys = try self.keyExprsFromObj(obj);
+                    break;
+                }
+                if (op == .MATCH_MAPPING) break;
+            }
+            break;
+        }
 
         var prev_was_load = false;
         var unpack_count: ?u32 = null;
+        var first_unpack: ?usize = null;
         var prev_was_get_len = false;
-        for (insts) |inst| {
+        var unpack_ex_before: usize = 0;
+        var unpack_ex_after: usize = 0;
+        var unpack_ex_seen: usize = 0;
+        var unpack_ex_active = false;
+        for (insts, 0..) |inst, idx| {
             switch (inst.opcode) {
                 .MATCH_SEQUENCE => has_match_seq = true,
                 .MATCH_MAPPING => has_match_map = true,
+                .COPY => {
+                    if (sim.stack.len() == 0) {
+                        const placeholder = try a.create(Expr);
+                        placeholder.* = .{ .name = .{ .id = "<subject>", .ctx = .load } };
+                        try sim.stack.push(.{ .expr = placeholder });
+                        if (subject_expr == null) subject_expr = placeholder;
+                    } else if (subject_expr == null) {
+                        const items = sim.stack.items.items;
+                        switch (items[items.len - 1]) {
+                            .expr => |e| subject_expr = e,
+                            else => {},
+                        }
+                    }
+                },
+                .MATCH_KEYS => {
+                    if (map_keys == null) {
+                        var j = idx;
+                        while (j > 0) {
+                            j -= 1;
+                            const op = insts[j].opcode;
+                            if (op == .NOT_TAKEN or op == .CACHE) continue;
+                            if (op == .LOAD_CONST) {
+                                const obj = self.code.consts[insts[j].arg];
+                                map_keys = try self.keyExprsFromObj(obj);
+                                break;
+                            }
+                            if (op == .MATCH_MAPPING) break;
+                        }
+                    }
+                    try sim.simulate(inst);
+                },
+                .MATCH_CLASS => {
+                    if (last_cls != null and last_attrs != null) {
+                        class_info = .{ .cls = last_cls.?, .attrs = last_attrs.? };
+                    }
+                    last_attrs = null;
+                    try sim.simulate(inst);
+                },
                 .GET_LEN => {
                     prev_was_get_len = true;
                     try sim.simulate(inst);
                 },
-                .LOAD_NAME, .LOAD_FAST => {
+                .LOAD_NAME => {
+                    prev_was_load = true;
+                    prev_was_get_len = false;
+                    const name = self.code.names[inst.arg];
+                    last_cls = try ast.makeName(a, name, .load);
+                    try sim.simulate(inst);
+                    if (subject_expr == null) {
+                        const items = sim.stack.items.items;
+                        if (items.len > 0) {
+                            switch (items[items.len - 1]) {
+                                .expr => |e| subject_expr = e,
+                                else => {},
+                            }
+                        }
+                    }
+                },
+                .LOAD_FAST => {
                     prev_was_load = true;
                     prev_was_get_len = false;
                     try sim.simulate(inst);
+                    if (subject_expr == null) {
+                        const items = sim.stack.items.items;
+                        if (items.len > 0) {
+                            switch (items[items.len - 1]) {
+                                .expr => |e| subject_expr = e,
+                                else => {},
+                            }
+                        }
+                    }
+                },
+                .LOAD_GLOBAL => {
+                    prev_was_load = false;
+                    prev_was_get_len = false;
+                    const name = self.code.names[inst.arg];
+                    last_cls = try ast.makeName(a, name, .load);
+                    try sim.simulate(inst);
+                    if (subject_expr == null) {
+                        const items = sim.stack.items.items;
+                        if (items.len > 0) {
+                            switch (items[items.len - 1]) {
+                                .expr => |e| subject_expr = e,
+                                else => {},
+                            }
+                        }
+                    }
                 },
                 .LOAD_CONST, .LOAD_SMALL_INT => {
                     prev_was_load = false;
-                    // Only save as literal_val if not part of length check
-                    if (!prev_was_get_len) {
+                    // Look ahead: only treat as literal when directly compared
+                    const next_op = nextOp(insts, idx);
+                    if (inst.opcode == .LOAD_CONST and next_op == .MATCH_KEYS) {
+                        const obj = self.code.consts[inst.arg];
+                        map_keys = try self.keyExprsFromObj(obj);
                         try sim.simulate(inst);
-                        literal_val = sim.stack.popExpr() catch null;
+                        break;
+                    }
+                    if (inst.opcode == .LOAD_CONST and next_op == .MATCH_CLASS) {
+                        const obj = self.code.consts[inst.arg];
+                        last_attrs = self.attrNamesFromObj(obj);
+                        try sim.simulate(inst);
+                        break;
+                    }
+                    if (!prev_was_get_len and next_op == .COMPARE_OP) {
+                        try sim.simulate(inst);
+                        const lit = sim.stack.popExpr() catch null;
+                        if (seq_stack.items.len > 0) {
+                            literal_val = lit;
+                        } else {
+                            var is_subject = false;
+                            const items = sim.stack.items.items;
+                            if (items.len >= 2) {
+                                switch (items[items.len - 2]) {
+                                    .expr => |e| {
+                                        if (subject_expr == null or e == subject_expr.?) is_subject = true;
+                                    },
+                                    else => {},
+                                }
+                            }
+                            if (is_subject) {
+                                literal_val = lit;
+                            } else {
+                                literal_val = null;
+                            }
+                        }
                     } else {
                         try sim.simulate(inst);
                     }
@@ -4248,20 +6043,131 @@ pub const Decompiler = struct {
                     prev_was_load = false;
                     // Literal match - use the constant (only if we have one and not in length check)
                     if (!prev_was_get_len and literal_val != null) {
-                        const pat = try self.arena.allocator().create(ast.Pattern);
-                        pat.* = .{ .match_value = literal_val.? };
-                        return pat;
+                        if (seq_stack.items.len > 0) {
+                            const pat = try self.arena.allocator().create(ast.Pattern);
+                            pat.* = .{ .match_value = literal_val.? };
+                            var top = &seq_stack.items[seq_stack.items.len - 1];
+                            try top.items.append(self.allocator, pat);
+                            literal_val = null;
+                            if (try self.finishSeq(&seq_stack)) |seq_pat| return seq_pat;
+                        } else {
+                            const pat = try self.arena.allocator().create(ast.Pattern);
+                            pat.* = .{ .match_value = literal_val.? };
+                            return pat;
+                        }
                     }
                     prev_was_get_len = false;
                     // Skip simulation of comparison - it produces bool which breaks subsequent pattern logic
                 },
                 .UNPACK_SEQUENCE => {
                     unpack_count = inst.arg;
+                    if (first_unpack == null) first_unpack = idx;
+                    if (map_keys) |keys| {
+                        if (keys.len == @as(usize, inst.arg)) {
+                            const pats = try a.alloc(*ast.Pattern, keys.len);
+                            var filled: usize = 0;
+                            var j = idx + 1;
+                            while (j < insts.len and filled < keys.len) : (j += 1) {
+                                const op = insts[j].opcode;
+                                if (op == .NOT_TAKEN or op == .CACHE or op == .POP_TOP) continue;
+                                if (op == .STORE_FAST or op == .STORE_NAME) {
+                                    const name = if (op == .STORE_NAME)
+                                        self.code.names[insts[j].arg]
+                                    else
+                                        self.code.varnames[insts[j].arg];
+                                    const p = try a.create(ast.Pattern);
+                                    p.* = .{ .match_as = .{ .pattern = null, .name = name } };
+                                    pats[filled] = p;
+                                    filled += 1;
+                                    continue;
+                                }
+                                if (op == .LOAD_SMALL_INT or op == .LOAD_CONST) {
+                                    const next_op = nextOp(insts, j);
+                                    if (next_op == .COMPARE_OP) {
+                                        const val_expr = if (op == .LOAD_SMALL_INT)
+                                            try ast.makeConstant(a, .{ .int = @intCast(insts[j].arg) })
+                                        else
+                                            try self.constExprFromObj(self.code.consts[insts[j].arg]);
+                                        const p = try a.create(ast.Pattern);
+                                        p.* = .{ .match_value = val_expr };
+                                        pats[filled] = p;
+                                        filled += 1;
+                                        continue;
+                                    }
+                                }
+                                break;
+                            }
+                            if (filled == keys.len) {
+                                const pat = try a.create(ast.Pattern);
+                                pat.* = .{ .match_mapping = .{ .keys = keys, .patterns = pats, .rest = null } };
+                                return pat;
+                            }
+                        }
+                    }
+                    if (map_keys == null and class_info == null) {
+                        try seq_stack.append(self.allocator, .{ .expected = @intCast(inst.arg) });
+                    }
+                    try sim.simulate(inst);
+                },
+                .UNPACK_EX => {
+                    const before = @as(usize, inst.arg & 0xFF);
+                    const after = @as(usize, inst.arg >> 8);
+                    unpack_ex_before = before;
+                    unpack_ex_after = after;
+                    unpack_ex_seen = 0;
+                    unpack_ex_active = true;
+                    if (map_keys == null and class_info == null) {
+                        try seq_stack.append(self.allocator, .{ .expected = before + after + 1 });
+                    }
+                },
+                .SWAP => {
+                    if (seq_stack.items.len > 0 and inst.arg == 2) {
+                        var top = &seq_stack.items[seq_stack.items.len - 1];
+                        if (top.expected == 2 and top.items.items.len == 0) {
+                            top.swap = true;
+                            continue;
+                        }
+                    }
                     try sim.simulate(inst);
                 },
                 .STORE_FAST_STORE_FAST => {
                     // Python 3.14+: UNPACK_SEQUENCE followed by STORE_FAST_STORE_FAST
                     // Build match_sequence pattern with bindings
+                    if (seq_stack.items.len > 0) {
+                        const idx1 = (inst.arg >> 4) & 0xF;
+                        const idx2 = inst.arg & 0xF;
+                        const name1 = self.code.varnames[idx1];
+                        const name2 = self.code.varnames[idx2];
+                        const pat1 = try a.create(ast.Pattern);
+                        const pat2 = try a.create(ast.Pattern);
+                        if (unpack_ex_active and unpack_ex_seen == unpack_ex_before) {
+                            pat1.* = .{ .match_star = name1 };
+                        } else {
+                            pat1.* = .{ .match_as = .{ .pattern = null, .name = name1 } };
+                        }
+                        unpack_ex_seen += 1;
+                        if (unpack_ex_active and unpack_ex_seen == unpack_ex_before) {
+                            pat2.* = .{ .match_star = name2 };
+                        } else {
+                            pat2.* = .{ .match_as = .{ .pattern = null, .name = name2 } };
+                        }
+                        unpack_ex_seen += 1;
+                        if (unpack_ex_active and unpack_ex_seen >= unpack_ex_before + unpack_ex_after + 1) {
+                            unpack_ex_active = false;
+                        }
+                        var top = &seq_stack.items[seq_stack.items.len - 1];
+                        try top.items.append(self.allocator, pat1);
+                        try top.items.append(self.allocator, pat2);
+                        if (try self.finishSeq(&seq_stack)) |seq_pat| {
+                            if (self.findAsName(insts, idx)) |as_name| {
+                                const as_pat = try a.create(ast.Pattern);
+                                as_pat.* = .{ .match_as = .{ .pattern = seq_pat, .name = as_name } };
+                                return as_pat;
+                            }
+                            return seq_pat;
+                        }
+                        continue;
+                    }
                     if (unpack_count) |count| {
                         if (count == 2) {
                             // arg packs indices: hi=first var, lo=second var
@@ -4275,19 +6181,61 @@ pub const Decompiler = struct {
                             const pat2 = try a.create(ast.Pattern);
                             pat2.* = .{ .match_as = .{ .pattern = null, .name = name2 } };
 
-                            const pats = try a.alloc(*ast.Pattern, 2);
-                            pats[0] = pat1;
-                            pats[1] = pat2;
+                            if (class_info) |ci| {
+                                const pats = try a.alloc(*ast.Pattern, 2);
+                                pats[0] = pat1;
+                                pats[1] = pat2;
+                                const pat = try a.create(ast.Pattern);
+                                pat.* = .{ .match_class = .{
+                                    .cls = ci.cls,
+                                    .patterns = &.{},
+                                    .kwd_attrs = ci.attrs,
+                                    .kwd_patterns = pats,
+                                } };
+                                return pat;
+                            }
 
-                            const pat = try a.create(ast.Pattern);
-                            pat.* = .{ .match_sequence = pats };
-                            return pat;
+                            if (seq_stack.items.len > 0) {
+                                var top = &seq_stack.items[seq_stack.items.len - 1];
+                                try top.items.append(self.allocator, pat1);
+                                try top.items.append(self.allocator, pat2);
+                                if (try self.finishSeq(&seq_stack)) |seq_pat| {
+                                    if (self.findAsName(insts, idx)) |as_name| {
+                                        const as_pat = try a.create(ast.Pattern);
+                                        as_pat.* = .{ .match_as = .{ .pattern = seq_pat, .name = as_name } };
+                                        return as_pat;
+                                    }
+                                    return seq_pat;
+                                }
+                            } else {
+                                const pats = try a.alloc(*ast.Pattern, 2);
+                                pats[0] = pat1;
+                                pats[1] = pat2;
+                                const pat = try a.create(ast.Pattern);
+                                pat.* = .{ .match_sequence = pats };
+                                if (self.findAsName(insts, idx)) |as_name| {
+                                    const as_pat = try a.create(ast.Pattern);
+                                    as_pat.* = .{ .match_as = .{ .pattern = pat, .name = as_name } };
+                                    return as_pat;
+                                }
+                                return pat;
+                            }
                         }
                     }
                     // Don't simulate - this would pop from empty stack
                 },
                 .STORE_FAST_LOAD_FAST => {
                     // Python 3.14+: combined store+load for pattern binding
+                    if (seq_stack.items.len > 0) {
+                        const load_idx = inst.arg & 0xF;
+                        const name = self.code.varnames[load_idx];
+                        const pat = try a.create(ast.Pattern);
+                        pat.* = .{ .match_as = .{ .pattern = null, .name = name } };
+                        var top = &seq_stack.items[seq_stack.items.len - 1];
+                        try top.items.append(self.allocator, pat);
+                        if (try self.finishSeq(&seq_stack)) |seq_pat| return seq_pat;
+                        continue;
+                    }
                     if (unpack_count) |count| {
                         if (count == 1) {
                             const load_idx = inst.arg & 0xF;
@@ -4302,9 +6250,35 @@ pub const Decompiler = struct {
                             pat.* = .{ .match_sequence = pats };
                             return pat;
                         }
+                    } else {
+                        const load_idx = inst.arg & 0xF;
+                        const name = self.code.varnames[load_idx];
+                        const pat = try a.create(ast.Pattern);
+                        pat.* = .{ .match_as = .{ .pattern = null, .name = name } };
+                        return pat;
                     }
                 },
                 .STORE_NAME, .STORE_FAST => {
+                    if (seq_stack.items.len > 0) {
+                        const name = if (inst.opcode == .STORE_NAME)
+                            self.code.names[inst.arg]
+                        else
+                            self.code.varnames[inst.arg];
+                        const pat = try a.create(ast.Pattern);
+                        if (unpack_ex_active and unpack_ex_seen == unpack_ex_before) {
+                            pat.* = .{ .match_star = name };
+                        } else {
+                            pat.* = .{ .match_as = .{ .pattern = null, .name = name } };
+                        }
+                        var top = &seq_stack.items[seq_stack.items.len - 1];
+                        try top.items.append(self.allocator, pat);
+                        unpack_ex_seen += 1;
+                        if (unpack_ex_active and unpack_ex_seen >= unpack_ex_before + unpack_ex_after + 1) {
+                            unpack_ex_active = false;
+                        }
+                        if (try self.finishSeq(&seq_stack)) |seq_pat| return seq_pat;
+                        continue;
+                    }
                     // Capture pattern only if previous was LOAD (subject load → pattern binding)
                     if (prev_was_load) {
                         const name = if (inst.opcode == .STORE_NAME)
@@ -4337,6 +6311,55 @@ pub const Decompiler = struct {
             }
         }
 
+        if (map_keys) |keys| {
+            if (first_unpack) |u_idx| {
+                if (keys.len > 0) {
+                    const pats = try a.alloc(*ast.Pattern, keys.len);
+                    var filled: usize = 0;
+                    var j = u_idx + 1;
+                    while (j < insts.len and filled < keys.len) : (j += 1) {
+                        const op = insts[j].opcode;
+                        if (op == .NOT_TAKEN or op == .CACHE or op == .POP_TOP) continue;
+                        if (op == .STORE_FAST or op == .STORE_NAME) {
+                            const name = if (op == .STORE_NAME)
+                                self.code.names[insts[j].arg]
+                            else
+                                self.code.varnames[insts[j].arg];
+                            const p = try a.create(ast.Pattern);
+                            p.* = .{ .match_as = .{ .pattern = null, .name = name } };
+                            pats[filled] = p;
+                            filled += 1;
+                            continue;
+                        }
+                        if (op == .LOAD_SMALL_INT or op == .LOAD_CONST) {
+                            const next_op = nextOp(insts, j);
+                            if (next_op == .COMPARE_OP) {
+                                const val_expr = if (op == .LOAD_SMALL_INT)
+                                    try ast.makeConstant(a, .{ .int = @intCast(insts[j].arg) })
+                                else
+                                    try self.constExprFromObj(self.code.consts[insts[j].arg]);
+                                const p = try a.create(ast.Pattern);
+                                p.* = .{ .match_value = val_expr };
+                                pats[filled] = p;
+                                filled += 1;
+                                continue;
+                            }
+                        }
+                        break;
+                    }
+                    if (filled == keys.len) {
+                        const pat = try a.create(ast.Pattern);
+                        pat.* = .{ .match_mapping = .{ .keys = keys, .patterns = pats, .rest = null } };
+                        return pat;
+                    }
+                }
+            }
+        }
+
+        if (seq_stack.items.len > 0) {
+            if (try self.finishSeq(&seq_stack)) |seq_pat| return seq_pat;
+        }
+
         // Default to wildcard if we can't determine pattern
         const pat = try self.arena.allocator().create(ast.Pattern);
         if (has_match_seq) {
@@ -4357,8 +6380,9 @@ pub const Decompiler = struct {
         // Handle empty range (start == end)
         if (start >= end) return &[_]*Stmt{};
 
+        const a = self.arena.allocator();
         var stmts: std.ArrayList(*Stmt) = .{};
-        errdefer stmts.deinit(self.allocator);
+        errdefer stmts.deinit(a);
 
         var block_idx = start;
         const limit = @min(end, @as(u32, @intCast(self.cfg.blocks.len)));
@@ -4370,14 +6394,14 @@ pub const Decompiler = struct {
                 .if_stmt => |p| {
                     const stmt = try self.decompileIf(p);
                     if (stmt) |s| {
-                        try stmts.append(self.allocator, s);
+                        try stmts.append(a, s);
                     }
                     block_idx = try self.findIfChainEnd(p);
                 },
                 .while_loop => |p| {
                     const stmt = try self.decompileWhile(p);
                     if (stmt) |s| {
-                        try stmts.append(self.allocator, s);
+                        try stmts.append(a, s);
                     }
                     block_idx = p.exit_block;
                 },
@@ -4389,46 +6413,46 @@ pub const Decompiler = struct {
                     }
                     const stmt = try self.decompileFor(p);
                     if (stmt) |s| {
-                        try stmts.append(self.allocator, s);
+                        try stmts.append(a, s);
                     }
                     block_idx = p.exit_block;
                 },
                 .try_stmt => |p| {
                     if (try self.tryDecompileAsyncFor(p)) |result| {
                         if (result.stmt) |s| {
-                            try stmts.append(self.allocator, s);
+                            try stmts.append(a, s);
                         }
                         block_idx = result.next_block;
                         continue;
                     }
                     const result = try self.decompileTry(p);
                     if (result.stmt) |s| {
-                        try stmts.append(self.allocator, s);
+                        try stmts.append(a, s);
                     }
                     block_idx = result.next_block;
                 },
                 .with_stmt => |p| {
                     const result = try self.decompileWith(p);
                     if (result.stmt) |s| {
-                        try stmts.append(self.allocator, s);
+                        try stmts.append(a, s);
                     }
                     block_idx = result.next_block;
                 },
                 .match_stmt => |p| {
+                    try self.emitMatchPrelude(p.subject_block, &stmts, a);
                     const result = try self.decompileMatch(p);
                     if (result.stmt) |s| {
-                        try stmts.append(self.allocator, s);
+                        try stmts.append(a, s);
                     }
                     block_idx = result.next_block;
                 },
                 else => {
-                    try self.decompileBlockIntoWithStack(block_idx, &stmts, init_stack);
+                    try self.decompileBlockIntoWithStack(block_idx, &stmts, a, init_stack);
                     block_idx += 1;
                 },
             }
         }
 
-        const a = self.arena.allocator();
         return stmts.toOwnedSlice(a);
     }
 
@@ -5254,7 +7278,7 @@ pub const Decompiler = struct {
             switch (pattern) {
                 .if_stmt => |p| {
                     // Process statements before the condition
-                    try self.processPartialBlock(block, &stmts, &skip_first_store);
+                    try self.processPartialBlock(block, &stmts, a, &skip_first_store);
 
                     // Handle nested if
                     const if_stmt = try self.decompileLoopIf(p, header_block_id, &visited);
@@ -5634,6 +7658,7 @@ pub const Decompiler = struct {
         self: *Decompiler,
         block: *const cfg_mod.BasicBlock,
         stmts: *std.ArrayList(*Stmt),
+        stmts_allocator: Allocator,
         skip_first_store: *bool,
     ) DecompileError!void {
         var sim = SimContext.init(self.arena.allocator(), self.code, self.version);
@@ -5653,7 +7678,7 @@ pub const Decompiler = struct {
                     const name = sim.getLocal(inst.arg) orelse "<unknown>";
                     const value = sim.stack.pop() orelse return error.StackUnderflow;
                     if (try self.handleStoreValue(name, value)) |stmt| {
-                        try stmts.append(self.allocator, stmt);
+                        try stmts.append(stmts_allocator, stmt);
                     }
                 },
                 else => {
@@ -5805,7 +7830,7 @@ pub const Decompiler = struct {
 
             switch (pattern) {
                 .if_stmt => |p| {
-                    try self.processPartialBlock(block, &stmts, skip_first_store);
+                    try self.processPartialBlock(block, &stmts, a, skip_first_store);
 
                     const if_stmt = try self.decompileLoopIf(p, loop_header, visited);
                     if (if_stmt) |s| {
