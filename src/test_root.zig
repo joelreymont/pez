@@ -18,6 +18,7 @@ pub const decompile = @import("decompile.zig");
 pub const snapshot_tests = @import("snapshot_tests.zig");
 pub const ternary_boolop_tests = @import("ternary_boolop_tests.zig");
 pub const list_extend_tests = @import("list_extend_tests.zig");
+pub const test_match_multiblock = @import("test_match_multiblock.zig");
 
 // Property testing
 pub const zcheck = @import("zcheck");
@@ -41,6 +42,7 @@ comptime {
     _ = snapshot_tests;
     _ = ternary_boolop_tests;
     _ = list_extend_tests;
+    _ = test_match_multiblock;
 }
 
 test "pez test root" {

@@ -4126,7 +4126,7 @@ pub const Decompiler = struct {
         };
     }
 
-    fn extractMatchPatternFromInsts(self: *Decompiler, insts: []const cfg_mod.Instruction, subject_on_stack: bool) DecompileError!*ast.Pattern {
+    pub fn extractMatchPatternFromInsts(self: *Decompiler, insts: []const cfg_mod.Instruction, subject_on_stack: bool) DecompileError!*ast.Pattern {
         const a = self.arena.allocator();
         var sim = SimContext.init(a, self.code, self.version);
         defer sim.deinit();
@@ -4208,16 +4208,25 @@ pub const Decompiler = struct {
                             return pat;
                         }
                     }
-                    // Fallback: continue simulation
-                    try sim.simulate(inst);
+                    // Don't simulate - this would pop from empty stack
                 },
                 .STORE_FAST_LOAD_FAST => {
                     // Python 3.14+: combined store+load for pattern binding
-                    const load_idx = inst.arg & 0xF;
-                    const name = self.code.varnames[load_idx];
-                    const pat = try self.arena.allocator().create(ast.Pattern);
-                    pat.* = .{ .match_as = .{ .pattern = null, .name = name } };
-                    return pat;
+                    if (unpack_count) |count| {
+                        if (count == 1) {
+                            const load_idx = inst.arg & 0xF;
+                            const name = self.code.varnames[load_idx];
+                            const pat1 = try a.create(ast.Pattern);
+                            pat1.* = .{ .match_as = .{ .pattern = null, .name = name } };
+
+                            const pats = try a.alloc(*ast.Pattern, 1);
+                            pats[0] = pat1;
+
+                            const pat = try a.create(ast.Pattern);
+                            pat.* = .{ .match_sequence = pats };
+                            return pat;
+                        }
+                    }
                 },
                 .STORE_NAME, .STORE_FAST => {
                     // Capture pattern only if previous was LOAD (subject load → pattern binding)
@@ -4241,9 +4250,13 @@ pub const Decompiler = struct {
                     pat.* = .{ .match_as = .{ .pattern = null, .name = null } };
                     return pat;
                 },
+                .POP_JUMP_IF_FALSE, .POP_JUMP_FORWARD_IF_FALSE, .POP_JUMP_IF_TRUE, .TO_BOOL => {
+                    // Skip - these are control flow, not pattern
+                    prev_was_load = false;
+                },
                 else => {
                     prev_was_load = false;
-                    try sim.simulate(inst);
+                    sim.simulate(inst) catch {};
                 },
             }
         }
