@@ -10,6 +10,7 @@ const codegen = @import("codegen.zig");
 const decoder = @import("decoder.zig");
 const opcodes = @import("opcodes.zig");
 const pyc = @import("pyc.zig");
+const signature = @import("signature.zig");
 
 pub const Expr = ast.Expr;
 pub const Instruction = decoder.Instruction;
@@ -30,18 +31,12 @@ pub const SimError = Allocator.Error || error{
     InvalidConstKeyMap,
 };
 
-/// Annotation for a function parameter or return type.
-pub const Annotation = struct {
-    name: []const u8, // Parameter name or "return" for return type
-    value: *Expr, // Annotation expression
-};
-
 pub const FunctionValue = struct {
     code: *const pyc.Code,
     decorators: std.ArrayList(*Expr),
     defaults: []const *Expr = &.{},
     kw_defaults: []const ?*Expr = &.{},
-    annotations: []const Annotation = &.{},
+    annotations: []const signature.Annotation = &.{},
 
     pub fn deinit(self: *FunctionValue, allocator: Allocator) void {
         // Arena-allocated, no cleanup needed
@@ -991,7 +986,7 @@ pub const SimContext = struct {
 
     /// Parse annotations tuple from MAKE_FUNCTION.
     /// Annotations are a tuple of (name, annotation, ...) pairs.
-    fn parseAnnotations(self: *SimContext, val: StackValue) SimError![]const Annotation {
+    fn parseAnnotations(self: *SimContext, val: StackValue) SimError![]const signature.Annotation {
         switch (val) {
             .expr => |expr| {
                 if (expr.* == .tuple) {
@@ -1000,7 +995,7 @@ pub const SimContext = struct {
                     const count = elts.len / 2;
                     if (count == 0) return &.{};
 
-                    const result = try self.allocator.alloc(Annotation, count);
+                    const result = try self.allocator.alloc(signature.Annotation, count);
                     errdefer self.allocator.free(result);
 
                     var i: usize = 0;
@@ -2643,7 +2638,7 @@ pub const SimContext = struct {
 
                 var defaults: []const *Expr = &.{};
                 var kw_defaults: []const ?*Expr = &.{};
-                var annotations: []const Annotation = &.{};
+                var annotations: []const signature.Annotation = &.{};
 
                 // Python 3.3+ has qualname on TOS (PEP 3155) until 3.11
                 if (self.version.gte(3, 3) and self.version.lt(3, 11)) {
@@ -4520,7 +4515,7 @@ pub fn buildLambdaExpr(allocator: Allocator, code: *const pyc.Code, version: Ver
         allocator.destroy(body);
     }
 
-    const args = try codegen.extractFunctionSignature(allocator, code, &.{}, &.{}, &.{});
+    const args = try signature.extractFunctionSignature(allocator, code, &.{}, &.{}, &.{});
     errdefer {
         args.deinit(allocator);
         allocator.destroy(args);

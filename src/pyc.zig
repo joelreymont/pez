@@ -156,13 +156,13 @@ pub const BigInt = struct {
             temp |= @as(u32, digit) << shift;
             shift += BigInt.DIGIT_BITS;
             if (shift >= 32) {
-                bits.append(std.heap.page_allocator, temp) catch return;
+                try bits.append(std.heap.page_allocator, temp);
                 shift -= 32;
                 temp = @as(u32, digit) >> (BigInt.DIGIT_BITS - shift);
             }
         }
         if (temp != 0 or bits.items.len == 0) {
-            bits.append(std.heap.page_allocator, temp) catch return;
+            try bits.append(std.heap.page_allocator, temp);
         }
 
         // Print from most significant to least

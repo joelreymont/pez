@@ -3,6 +3,7 @@ const fs = std.fs;
 const pyc = @import("pyc.zig");
 const cfg_mod = @import("cfg.zig");
 const ctrl = @import("ctrl.zig");
+const dom_mod = @import("dom.zig");
 const decoder = @import("decoder.zig");
 const codegen = @import("codegen.zig");
 const decompile = @import("decompile.zig");
@@ -130,8 +131,11 @@ fn dumpCodeCFG(allocator: std.mem.Allocator, code: *const pyc.Code, version: dec
         }
         try writer.print("  Blocks: {d}, Entry: {d}\n", .{ cfg.blocks.len, cfg.entry });
 
+        var dom = try dom_mod.DomTree.init(allocator, &cfg);
+        defer dom.deinit();
+
         // Analyze control flow patterns
-        var analyzer = try ctrl.Analyzer.init(allocator, &cfg);
+        var analyzer = try ctrl.Analyzer.init(allocator, &cfg, &dom);
         defer analyzer.deinit();
 
         for (cfg.blocks, 0..) |block, block_idx| {

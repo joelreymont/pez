@@ -13,6 +13,7 @@ const dom_mod = @import("dom.zig");
 const stack_mod = @import("stack.zig");
 const pyc = @import("pyc.zig");
 const codegen = @import("codegen.zig");
+const signature = @import("signature.zig");
 
 pub const CFG = cfg_mod.CFG;
 pub const BasicBlock = cfg_mod.BasicBlock;
@@ -49,7 +50,7 @@ pub const Decompiler = struct {
     version: Version,
     cfg: *CFG,
     analyzer: Analyzer,
-    dom: dom_mod.DomTree,
+    dom: *dom_mod.DomTree,
 
     /// Accumulated statements.
     statements: std.ArrayList(*Stmt),
@@ -85,11 +86,13 @@ pub const Decompiler = struct {
             try cfg_mod.buildCFG(a, code.code, version);
         errdefer cfg.deinit();
 
-        var analyzer = try Analyzer.init(allocator, cfg);
-        errdefer analyzer.deinit();
-
-        var dom = try dom_mod.DomTree.init(allocator, cfg);
+        const dom = try allocator.create(dom_mod.DomTree);
+        errdefer allocator.destroy(dom);
+        dom.* = try dom_mod.DomTree.init(allocator, cfg);
         errdefer dom.deinit();
+
+        var analyzer = try Analyzer.init(allocator, cfg, dom);
+        errdefer analyzer.deinit();
 
         var decomp = Decompiler{
             .allocator = allocator,
@@ -126,6 +129,7 @@ pub const Decompiler = struct {
         if (self.stack_in.len > 0) self.allocator.free(self.stack_in);
         self.analyzer.deinit();
         self.dom.deinit();
+        self.allocator.destroy(self.dom);
         self.arena.deinit();
         self.statements.deinit(self.allocator);
     }
@@ -8202,7 +8206,7 @@ pub const Decompiler = struct {
             }
         }
 
-        const args = try codegen.extractFunctionSignature(a, func.code, func.defaults, func.kw_defaults, func.annotations);
+        const args = try signature.extractFunctionSignature(a, func.code, func.defaults, func.kw_defaults, func.annotations);
 
         // Find return annotation
         var returns: ?*Expr = null;

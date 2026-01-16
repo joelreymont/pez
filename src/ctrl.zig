@@ -12,6 +12,7 @@ const cfg_mod = @import("cfg.zig");
 const ast = @import("ast.zig");
 const decoder = @import("decoder.zig");
 const opcodes = @import("opcodes.zig");
+const dom_mod = @import("dom.zig");
 
 pub const CFG = cfg_mod.CFG;
 pub const BasicBlock = cfg_mod.BasicBlock;
@@ -212,6 +213,7 @@ pub const BoolOpPattern = struct {
 /// Control flow analyzer.
 pub const Analyzer = struct {
     cfg: *const CFG,
+    dom: *const dom_mod.DomTree,
     allocator: Allocator,
     /// Blocks that have been processed/claimed by a pattern.
     processed: std.DynamicBitSet,
@@ -219,18 +221,43 @@ pub const Analyzer = struct {
     try_cache: []?TryPattern,
     /// Blocks with try pattern computed.
     try_cache_checked: std.DynamicBitSet,
+    /// Enclosing loop headers per block.
+    enclosing_loops: []std.ArrayListUnmanaged(u32),
 
-    pub fn init(allocator: Allocator, cfg_ptr: *const CFG) !Analyzer {
+    pub fn init(allocator: Allocator, cfg_ptr: *const CFG, dom: *const dom_mod.DomTree) !Analyzer {
         const processed = try std.DynamicBitSet.initEmpty(allocator, cfg_ptr.blocks.len);
         const try_cache = try allocator.alloc(?TryPattern, cfg_ptr.blocks.len);
         @memset(try_cache, null);
         const try_cache_checked = try std.DynamicBitSet.initEmpty(allocator, cfg_ptr.blocks.len);
+        const enclosing_loops = try allocator.alloc(std.ArrayListUnmanaged(u32), cfg_ptr.blocks.len);
+        @memset(enclosing_loops, .{});
+        errdefer {
+            for (enclosing_loops) |*list| {
+                list.deinit(allocator);
+            }
+            allocator.free(enclosing_loops);
+        }
+
+        if (dom.num_blocks > 0) {
+            const headers = try dom.getLoopHeaders();
+            defer allocator.free(headers);
+            for (headers) |header| {
+                const body = dom.getLoopBody(header) orelse continue;
+                var it = body.iterator(.{});
+                while (it.next()) |idx| {
+                    if (idx >= enclosing_loops.len) continue;
+                    try enclosing_loops[idx].append(allocator, header);
+                }
+            }
+        }
         return .{
             .cfg = cfg_ptr,
+            .dom = dom,
             .allocator = allocator,
             .processed = processed,
             .try_cache = try_cache,
             .try_cache_checked = try_cache_checked,
+            .enclosing_loops = enclosing_loops,
         };
     }
 
@@ -245,6 +272,10 @@ pub const Analyzer = struct {
         }
         if (self.try_cache.len > 0) self.allocator.free(self.try_cache);
         self.try_cache_checked.deinit();
+        for (self.enclosing_loops) |*list| {
+            list.deinit(self.allocator);
+        }
+        if (self.enclosing_loops.len > 0) self.allocator.free(self.enclosing_loops);
     }
 
     /// Detect the control flow pattern starting at a block.
@@ -1717,22 +1748,15 @@ pub const Analyzer = struct {
                 }
             }
 
-            // Check if jumping past the innermost loop's exit = break
-            // For simplicity, if we jump forward and out of the loop body, it's a break
+            // Break if jump target leaves the innermost loop body.
             if (loop_headers.len > 0) {
                 const innermost_header = loop_headers[loop_headers.len - 1];
-                const header_block = &self.cfg.blocks[innermost_header];
-
-                // Find the loop's exit block
-                for (header_block.successors) |edge| {
-                    if (edge.edge_type == .conditional_false) {
-                        // This is the exit block - if we're jumping to it or past, it's a break
-                        if (target_block >= edge.target) {
-                            return .{ .break_stmt = .{
-                                .block = block_id,
-                                .loop_header = innermost_header,
-                            } };
-                        }
+                if (self.dom.getLoopBody(innermost_header)) |body| {
+                    if (!body.isSet(@intCast(target_block))) {
+                        return .{ .break_stmt = .{
+                            .block = block_id,
+                            .loop_header = innermost_header,
+                        } };
                     }
                 }
             }
@@ -1742,58 +1766,9 @@ pub const Analyzer = struct {
     }
 
     /// Find all loop headers that contain a given block.
-    pub fn findEnclosingLoops(self: *const Analyzer, block_id: u32) ![]u32 {
-        var loops: std.ArrayList(u32) = .{};
-        errdefer loops.deinit(self.allocator);
-
-        // Simple approach: a block is in a loop if there's a path from a loop header
-        // to the block and a back edge from somewhere after the block to the header
-        for (self.cfg.blocks, 0..) |block, i| {
-            if (block.is_loop_header) {
-                // Check if block_id is reachable from this loop header
-                // and if there's a back edge to this header from a block >= block_id
-                const header_id: u32 = @intCast(i);
-                if (self.isInLoop(block_id, header_id)) {
-                    try loops.append(self.allocator, header_id);
-                }
-            }
-        }
-
-        return loops.toOwnedSlice(self.allocator);
-    }
-
-    /// Check if a block is within a loop.
-    fn isInLoop(self: *const Analyzer, block_id: u32, loop_header: u32) bool {
-        // A block is in a loop if:
-        // 1. It's reachable from the loop header via normal/true edges
-        // 2. There's a back edge to the loop header from some block after it
-
-        if (block_id == loop_header) return true;
-        if (block_id < loop_header) return false;
-
-        // Check if this block can reach the loop header via a back edge
-        const block = &self.cfg.blocks[block_id];
-        for (block.successors) |edge| {
-            if (edge.edge_type == .loop_back and edge.target == loop_header) {
-                return true;
-            }
-        }
-
-        // Check if any successor is in the loop (without going through back edges)
-        // This is approximate - for precise analysis we'd need dominance info
-        const header = &self.cfg.blocks[loop_header];
-        for (header.successors) |edge| {
-            if (edge.edge_type == .conditional_true or edge.edge_type == .normal) {
-                // The loop body starts here
-                const body_start = edge.target;
-                if (block_id >= body_start and block_id < loop_header + 10) {
-                    // Approximate: block is between body start and some blocks after
-                    return true;
-                }
-            }
-        }
-
-        return false;
+    pub fn findEnclosingLoops(self: *const Analyzer, block_id: u32) []const u32 {
+        if (block_id >= self.enclosing_loops.len) return &.{};
+        return self.enclosing_loops[block_id].items;
     }
 };
 
@@ -1840,10 +1815,94 @@ test "analyzer init" {
         .version = Version.init(3, 12),
     };
 
-    var analyzer = try Analyzer.init(allocator, &cfg_val);
+    var dom = try dom_mod.DomTree.init(allocator, &cfg_val);
+    defer dom.deinit();
+    var analyzer = try Analyzer.init(allocator, &cfg_val, &dom);
     defer analyzer.deinit();
 
     try testing.expectEqual(@as(usize, 2), cfg_val.blocks.len);
+}
+
+test "analyzer loop membership uses dom" {
+    const testing = std.testing;
+    const allocator = testing.allocator;
+
+    const version = cfg_mod.Version.init(3, 12);
+    const block_offsets = &[_]u32{ 0, 10, 20, 30 };
+
+    var succ_0 = [_]cfg_mod.Edge{.{ .target = 1, .edge_type = .normal }};
+    var succ_1 = [_]cfg_mod.Edge{
+        .{ .target = 2, .edge_type = .conditional_true },
+        .{ .target = 3, .edge_type = .conditional_false },
+    };
+    var succ_2 = [_]cfg_mod.Edge{.{ .target = 1, .edge_type = .loop_back }};
+    var succ_3 = [_]cfg_mod.Edge{};
+
+    var preds_0 = [_]u32{};
+    var preds_1 = [_]u32{ 0, 2 };
+    var preds_2 = [_]u32{ 1 };
+    var preds_3 = [_]u32{ 1 };
+
+    var blocks: [4]cfg_mod.BasicBlock = undefined;
+    blocks[0] = .{
+        .id = 0,
+        .start_offset = 0,
+        .end_offset = 0,
+        .instructions = &.{},
+        .successors = succ_0[0..],
+        .predecessors = preds_0[0..],
+        .is_exception_handler = false,
+        .is_loop_header = false,
+    };
+    blocks[1] = .{
+        .id = 1,
+        .start_offset = 10,
+        .end_offset = 0,
+        .instructions = &.{},
+        .successors = succ_1[0..],
+        .predecessors = preds_1[0..],
+        .is_exception_handler = false,
+        .is_loop_header = true,
+    };
+    blocks[2] = .{
+        .id = 2,
+        .start_offset = 20,
+        .end_offset = 0,
+        .instructions = &.{},
+        .successors = succ_2[0..],
+        .predecessors = preds_2[0..],
+        .is_exception_handler = false,
+        .is_loop_header = false,
+    };
+    blocks[3] = .{
+        .id = 3,
+        .start_offset = 30,
+        .end_offset = 0,
+        .instructions = &.{},
+        .successors = succ_3[0..],
+        .predecessors = preds_3[0..],
+        .is_exception_handler = false,
+        .is_loop_header = false,
+    };
+
+    var cfg = cfg_mod.CFG{
+        .allocator = allocator,
+        .blocks = blocks[0..],
+        .block_offsets = @constCast(block_offsets),
+        .entry = 0,
+        .instructions = &.{},
+        .version = version,
+    };
+
+    var dom = try dom_mod.DomTree.init(allocator, &cfg);
+    defer dom.deinit();
+
+    var analyzer = try Analyzer.init(allocator, &cfg, &dom);
+    defer analyzer.deinit();
+
+    const loops = analyzer.findEnclosingLoops(2);
+    try testing.expectEqual(@as(usize, 1), loops.len);
+    try testing.expectEqual(@as(u32, 1), loops[0]);
 }
 
 test "isConditionalJump" {
@@ -1861,7 +1920,9 @@ test "isConditionalJump" {
         .version = Version.init(3, 12),
     };
 
-    var analyzer = try Analyzer.init(allocator, &cfg_val);
+    var dom = try dom_mod.DomTree.init(allocator, &cfg_val);
+    defer dom.deinit();
+    var analyzer = try Analyzer.init(allocator, &cfg_val, &dom);
     defer analyzer.deinit();
 
     try testing.expect(analyzer.isConditionalJump(.POP_JUMP_IF_TRUE));
