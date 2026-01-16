@@ -2717,6 +2717,16 @@ pub const Decompiler = struct {
         if (sim.stack.len() == 0) return null;
         if (pattern.then_block >= self.cfg.blocks.len) return null;
 
+        // Check if then-block starts with POP_TOP (chained comparison pattern)
+        const then_block = &self.cfg.blocks[pattern.then_block];
+        if (then_block.instructions.len < 3) return null;
+        var pop_idx: usize = 0;
+        if (then_block.instructions[0].opcode == .NOT_TAKEN) {
+            if (then_block.instructions.len < 4) return null;
+            pop_idx = 1;
+        }
+        if (then_block.instructions[pop_idx].opcode != .POP_TOP) return null;
+
         // Build the chain recursively
         var ops_list: std.ArrayListUnmanaged(ast.CmpOp) = .{};
         var comparators_list: std.ArrayListUnmanaged(*Expr) = .{};
