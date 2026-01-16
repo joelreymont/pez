@@ -90,6 +90,8 @@ pub const TryPattern = struct {
     try_block: u32,
     /// Exception handler blocks (each except clause).
     handlers: []const HandlerInfo,
+    /// True if caller owns handlers slice.
+    handlers_owned: bool,
     /// First block of the else clause (if any).
     else_block: ?u32,
     /// First block of the finally clause (if any).
@@ -213,18 +215,36 @@ pub const Analyzer = struct {
     allocator: Allocator,
     /// Blocks that have been processed/claimed by a pattern.
     processed: std.DynamicBitSet,
+    /// Cached try patterns per block (null if none).
+    try_cache: []?TryPattern,
+    /// Blocks with try pattern computed.
+    try_cache_checked: std.DynamicBitSet,
 
     pub fn init(allocator: Allocator, cfg_ptr: *const CFG) !Analyzer {
         const processed = try std.DynamicBitSet.initEmpty(allocator, cfg_ptr.blocks.len);
+        const try_cache = try allocator.alloc(?TryPattern, cfg_ptr.blocks.len);
+        @memset(try_cache, null);
+        const try_cache_checked = try std.DynamicBitSet.initEmpty(allocator, cfg_ptr.blocks.len);
         return .{
             .cfg = cfg_ptr,
             .allocator = allocator,
             .processed = processed,
+            .try_cache = try_cache,
+            .try_cache_checked = try_cache_checked,
         };
     }
 
     pub fn deinit(self: *Analyzer) void {
         self.processed.deinit();
+        for (self.try_cache) |entry_opt| {
+            if (entry_opt) |entry| {
+                if (entry.handlers.len > 0 and entry.handlers_owned == false) {
+                    self.allocator.free(entry.handlers);
+                }
+            }
+        }
+        if (self.try_cache.len > 0) self.allocator.free(self.try_cache);
+        self.try_cache_checked.deinit();
     }
 
     /// Detect the control flow pattern starting at a block.
@@ -835,6 +855,10 @@ pub const Analyzer = struct {
     /// Detect try/except/finally pattern.
     fn detectTryPattern(self: *Analyzer, block_id: u32) !?TryPattern {
         if (block_id >= self.cfg.blocks.len) return null;
+        if (self.try_cache_checked.isSet(block_id)) {
+            return self.try_cache[block_id];
+        }
+        self.try_cache_checked.set(block_id);
         const block = &self.cfg.blocks[block_id];
         if (block.is_exception_handler) return null;
 
@@ -899,13 +923,16 @@ pub const Analyzer = struct {
             finally_block = try self.detectFinallyBlockLegacy(block_id, handler_list.items, else_block, exit_block);
         }
 
-        return TryPattern{
+        const pattern = TryPattern{
             .try_block = block_id,
             .handlers = handlers,
+            .handlers_owned = false,
             .else_block = else_block,
             .finally_block = finally_block,
             .exit_block = exit_block,
         };
+        self.try_cache[block_id] = pattern;
+        return pattern;
     }
 
     fn detectElseBlock311(
@@ -1803,9 +1830,11 @@ test "analyzer init" {
         .is_loop_header = false,
     };
 
+    const block_offsets = &[_]u32{ 0, 4 };
     var cfg_val = CFG{
         .allocator = allocator,
         .blocks = blocks,
+        .block_offsets = @constCast(block_offsets),
         .entry = 0,
         .instructions = &.{},
         .version = Version.init(3, 12),
@@ -1822,9 +1851,11 @@ test "isConditionalJump" {
     const allocator = testing.allocator;
 
     const blocks: []BasicBlock = &.{};
+    const block_offsets = &[_]u32{};
     var cfg_val = CFG{
         .allocator = allocator,
         .blocks = blocks,
+        .block_offsets = @constCast(block_offsets),
         .entry = 0,
         .instructions = &.{},
         .version = Version.init(3, 12),

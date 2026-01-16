@@ -3648,7 +3648,9 @@ pub const Decompiler = struct {
     }
 
     fn decompileTry(self: *Decompiler, pattern: ctrl.TryPattern) DecompileError!PatternResult {
-        defer self.allocator.free(pattern.handlers);
+        if (pattern.handlers_owned) {
+            defer self.allocator.free(pattern.handlers);
+        }
 
         var handler_blocks: std.ArrayList(u32) = .{};
         defer handler_blocks.deinit(self.allocator);

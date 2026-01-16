@@ -71,6 +71,8 @@ pub const CFG = struct {
     allocator: Allocator,
     /// All basic blocks, indexed by their id.
     blocks: []BasicBlock,
+    /// Sorted block start offsets (same order as blocks).
+    block_offsets: []u32,
     /// Entry block id (always 0).
     entry: u32,
     /// All instructions in order.
@@ -84,6 +86,7 @@ pub const CFG = struct {
             if (block.predecessors.len > 0) self.allocator.free(block.predecessors);
         }
         if (self.blocks.len > 0) self.allocator.free(self.blocks);
+        if (self.block_offsets.len > 0) self.allocator.free(self.block_offsets);
         if (self.instructions.len > 0) self.allocator.free(self.instructions);
     }
 
@@ -124,19 +127,39 @@ pub const CFG = struct {
 
     /// Find the block containing a given byte offset.
     pub fn blockContaining(self: *const CFG, offset: u32) ?*const BasicBlock {
-        for (self.blocks) |*block| {
-            if (offset >= block.start_offset and offset < block.end_offset) {
-                return block;
+        if (self.block_offsets.len == 0) return null;
+        var lo: usize = 0;
+        var hi: usize = self.block_offsets.len;
+        while (lo < hi) {
+            const mid = lo + (hi - lo) / 2;
+            if (self.block_offsets[mid] <= offset) {
+                lo = mid + 1;
+            } else {
+                hi = mid;
             }
+        }
+        if (lo == 0) return null;
+        const idx = lo - 1;
+        const block = &self.blocks[idx];
+        if (offset >= block.start_offset and offset < block.end_offset) {
+            return block;
         }
         return null;
     }
 
     /// Find block by start offset (for jump targets).
     pub fn blockAtOffset(self: *const CFG, offset: u32) ?u32 {
-        for (self.blocks, 0..) |block, i| {
-            if (block.start_offset == offset) {
-                return @intCast(i);
+        if (self.block_offsets.len == 0) return null;
+        var lo: usize = 0;
+        var hi: usize = self.block_offsets.len;
+        while (lo < hi) {
+            const mid = lo + (hi - lo) / 2;
+            const mid_off = self.block_offsets[mid];
+            if (mid_off == offset) return @intCast(mid);
+            if (mid_off < offset) {
+                lo = mid + 1;
+            } else {
+                hi = mid;
             }
         }
         return null;
@@ -174,6 +197,7 @@ fn buildCFGWithLeaders(
         return CFG{
             .allocator = allocator,
             .blocks = &.{},
+            .block_offsets = &.{},
             .entry = 0,
             .instructions = instructions,
             .version = version,
@@ -398,9 +422,16 @@ fn buildCFGWithLeaders(
         }
     }
 
+    const block_offsets = try allocator.alloc(u32, blocks.len);
+    errdefer allocator.free(block_offsets);
+    for (blocks, 0..) |block, i| {
+        block_offsets[i] = block.start_offset;
+    }
+
     var cfg = CFG{
         .allocator = allocator,
         .blocks = blocks,
+        .block_offsets = block_offsets,
         .entry = 0,
         .instructions = instructions,
         .version = version,
@@ -446,7 +477,8 @@ fn collectLegacyExceptionEntries(
                 const target = inst.offset + inst.size + inst.arg * multiplier;
                 try stack.append(allocator, .{
                     .kind = .except,
-                    .start = inst.offset + inst.size,
+                    // Include SETUP_EXCEPT in protected range to keep try header in same block
+                    .start = inst.offset,
                     .target = target,
                 });
             },
@@ -454,7 +486,8 @@ fn collectLegacyExceptionEntries(
                 const target = inst.offset + inst.size + inst.arg * multiplier;
                 try stack.append(allocator, .{
                     .kind = .finally,
-                    .start = inst.offset + inst.size,
+                    // Include SETUP_FINALLY in protected range to keep try header in same block
+                    .start = inst.offset,
                     .target = target,
                 });
             },

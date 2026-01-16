@@ -279,9 +279,11 @@ test "dominator simple" {
     const version = cfg_mod.Version.init(3, 12);
 
     // Build a simple CFG: 0 → 1 → 2
+    const block_offsets = &[_]u32{ 0, 0, 0 };
     var cfg = cfg_mod.CFG{
         .allocator = allocator,
         .blocks = &.{},
+        .block_offsets = @constCast(block_offsets),
         .entry = 0,
         .instructions = &.{},
         .version = version,
@@ -351,9 +353,11 @@ test "dominator unreachable block" {
     const version = cfg_mod.Version.init(3, 12);
 
     // CFG: 0 → 1, block 2 is unreachable.
+    const block_offsets = &[_]u32{ 0, 0, 0 };
     var cfg = cfg_mod.CFG{
         .allocator = allocator,
         .blocks = &.{},
+        .block_offsets = @constCast(block_offsets),
         .entry = 0,
         .instructions = &.{},
         .version = version,
@@ -411,9 +415,11 @@ test "dominator with loop" {
     const version = cfg_mod.Version.init(3, 12);
 
     // CFG with loop: 0 → 1 → 2 → 1 (back edge), 1 → 3
+    const block_offsets = &[_]u32{ 0, 0, 0, 0 };
     var cfg = cfg_mod.CFG{
         .allocator = allocator,
         .blocks = &.{},
+        .block_offsets = @constCast(block_offsets),
         .entry = 0,
         .instructions = &.{},
         .version = version,
