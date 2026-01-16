@@ -1421,9 +1421,12 @@ pub const Analyzer = struct {
             }
         }
         // Match pattern with guard (Python 3.10+ only): LOAD_NAME/LOAD_FAST (subject) followed by STORE_NAME/STORE_FAST (pattern binding)
-        // Check within block or across block boundary
+        // Or STORE_FAST_LOAD_FAST (Python 3.14+) which combines both
         if (self.cfg.version.major >= 3 and self.cfg.version.minor >= 10) {
             for (block.instructions, 0..) |inst, i| {
+                // Python 3.14+: STORE_FAST_LOAD_FAST is pattern match binding
+                if (inst.opcode == .STORE_FAST_LOAD_FAST) return true;
+
                 if (inst.opcode == .STORE_NAME or inst.opcode == .STORE_FAST) {
                     // Check if previous instruction is LOAD (subject load)
                     const has_load_before = if (i > 0)
@@ -1513,8 +1516,8 @@ pub const Analyzer = struct {
         // Wildcard is just NOP (always matches)
         for (block.instructions) |inst| {
             if (inst.opcode == .NOP) {
-                // Check if it's followed by body (no conditional jump)
-                if (block.successors.len == 1) return true;
+                // Wildcard: no conditional jump (0 or 1 successors)
+                return block.successors.len <= 1;
             }
         }
         return false;

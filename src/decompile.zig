@@ -3761,6 +3761,10 @@ pub const Decompiler = struct {
             if ((inst.opcode == .STORE_NAME or inst.opcode == .STORE_FAST) and prev_was_load) {
                 break;
             }
+            // Stop before STORE_FAST_LOAD_FAST (pattern binding in Python 3.14+)
+            if (inst.opcode == .STORE_FAST_LOAD_FAST) {
+                break;
+            }
             prev_was_load = inst.opcode == .LOAD_NAME or inst.opcode == .LOAD_FAST;
             sim.simulate(inst) catch {};
         }
@@ -3791,7 +3795,12 @@ pub const Decompiler = struct {
             },
         };
 
-        return .{ .stmt = stmt, .next_block = pattern.exit_block orelse pattern.subject_block + 1 };
+        // Find the highest block ID used by any case (subject + all case blocks)
+        var max_block = pattern.subject_block;
+        for (pattern.case_blocks) |cb| {
+            if (cb > max_block) max_block = cb;
+        }
+        return .{ .stmt = stmt, .next_block = pattern.exit_block orelse (max_block + 1) };
     }
 
     fn decompileMatchCase(self: *Decompiler, block_id: u32, has_copy: bool) DecompileError!ast.MatchCase {
@@ -3933,7 +3942,7 @@ pub const Decompiler = struct {
                 }
             }
         } else {
-            // No guard: body in true branch
+            // No guard: body in true branch or inline
             var body_block: ?u32 = null;
             for (block.successors) |edge| {
                 if (edge.edge_type == .conditional_true or edge.edge_type == .normal) {
@@ -3942,17 +3951,51 @@ pub const Decompiler = struct {
                 }
             }
 
-            var body_end: u32 = block_id + 1;
-            for (block.successors) |edge| {
-                if (edge.edge_type == .conditional_false) {
-                    body_end = edge.target;
-                    break;
-                }
-            }
-
             if (body_block) |bid| {
+                var body_end: u32 = block_id + 1;
+                for (block.successors) |edge| {
+                    if (edge.edge_type == .conditional_false) {
+                        body_end = edge.target;
+                        break;
+                    }
+                }
                 if (bid < body_end) {
                     body = try self.decompileStructuredRange(bid, body_end);
+                }
+            } else {
+                // Body inline: extract instructions after NOP
+                var nop_idx: ?usize = null;
+                for (block.instructions, 0..) |inst, idx| {
+                    if (inst.opcode == .NOP) {
+                        nop_idx = idx + 1;
+                        break;
+                    }
+                }
+
+                if (nop_idx) |start_idx| {
+                    var stmts: std.ArrayList(*Stmt) = .{};
+                    defer stmts.deinit(self.allocator);
+
+                    var sim = SimContext.init(self.allocator, self.code, self.version);
+                    defer sim.deinit();
+
+                    for (block.instructions[start_idx..]) |inst| {
+                        if (inst.opcode == .RETURN_VALUE) {
+                            const val = sim.stack.popExpr() catch blk: {
+                                const none_expr = try self.allocator.create(Expr);
+                                none_expr.* = .{ .constant = .{ .none = {} } };
+                                break :blk none_expr;
+                            };
+                            const stmt = try self.allocator.create(Stmt);
+                            stmt.* = .{ .return_stmt = .{ .value = val } };
+                            try stmts.append(self.allocator, stmt);
+                            break;
+                        } else {
+                            sim.simulate(inst) catch {};
+                        }
+                    }
+
+                    body = try stmts.toOwnedSlice(self.allocator);
                 }
             }
         }
@@ -4001,6 +4044,14 @@ pub const Decompiler = struct {
                         pat.* = .{ .match_value = val };
                         return pat;
                     }
+                },
+                .STORE_FAST_LOAD_FAST => {
+                    // Python 3.14+: combined store+load for pattern binding
+                    const load_idx = inst.arg & 0xF;
+                    const name = self.code.varnames[load_idx];
+                    const pat = try self.allocator.create(ast.Pattern);
+                    pat.* = .{ .match_as = .{ .pattern = null, .name = name } };
+                    return pat;
                 },
                 .STORE_NAME, .STORE_FAST => {
                     // Capture pattern only if previous was LOAD (subject load → pattern binding)
