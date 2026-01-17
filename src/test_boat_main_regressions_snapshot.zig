@@ -102,6 +102,18 @@ test "snapshot module if prelude 3.9" {
     );
 }
 
+test "snapshot if return fallthrough 3.9" {
+    try runSnapshot(@src(), "test/corpus/if_return_fallthrough.3.9.pyc",
+        \\[]u8
+        \\  "def f(x):
+        \\    if x:
+        \\        return 1
+        \\    else:
+        \\        return 2
+        \\"
+    );
+}
+
 test "snapshot try import 3.9" {
     try runSnapshot(@src(), "test/corpus/try_import.3.9.pyc",
         \\[]u8

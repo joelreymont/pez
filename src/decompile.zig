@@ -3101,6 +3101,10 @@ pub const Decompiler = struct {
         var block_idx: u32 = 0;
         while (block_idx < self.cfg.blocks.len) {
             const prev_idx = block_idx;
+            if (block_idx != self.cfg.entry and self.cfg.blocks[block_idx].predecessors.len == 0) {
+                block_idx += 1;
+                continue;
+            }
             // Try BoolOp pattern first (x and y, x or y)
             if (try self.tryDecompileBoolOpInto(
                 block_idx,
@@ -3824,9 +3828,11 @@ pub const Decompiler = struct {
         var sim = SimContext.init(self.arena.allocator(), self.code, self.version);
         defer sim.deinit();
 
-        for (header.instructions) |inst| {
+        var cond_idx: usize = header.instructions.len;
+        for (header.instructions, 0..) |inst, idx| {
             if (ctrl.Analyzer.isConditionalJump(undefined, inst.opcode)) break;
             try sim.simulate(inst);
+            cond_idx = idx + 1;
         }
 
         var condition = try sim.stack.popExpr();
@@ -3838,7 +3844,8 @@ pub const Decompiler = struct {
                 const guard = body_pattern.if_stmt;
                 if (guard.condition_block == body_block_id and guard.else_block != null) {
                     const else_id = guard.else_block.?;
-                    const merge_is_then = guard.merge_block != null and guard.merge_block.? == guard.then_block;
+                    const merge_is_then = guard.merge_block != null and
+                        (guard.merge_block.? == guard.then_block or guard.merge_block.? == pattern.header_block);
                     const else_is_exit = else_id == pattern.exit_block;
                     const then_in_loop = self.dom.isInLoop(guard.then_block, pattern.header_block);
                     if (merge_is_then and else_is_exit and then_in_loop) {
@@ -3881,11 +3888,55 @@ pub const Decompiler = struct {
         );
 
         const a = self.arena.allocator();
+        var header_stmts: std.ArrayList(*Stmt) = .{};
+        errdefer header_stmts.deinit(a);
+        var skip_first_store = false;
+        if (cond_idx > 0) {
+            try self.processPartialBlock(header, &header_stmts, a, &skip_first_store, cond_idx);
+        }
+
+        var final_condition = condition;
+        var final_body = body;
+        if (header_stmts.items.len > 0 and condition.* == .name) {
+            const cond_name = condition.name.id;
+            const last_stmt = header_stmts.items[header_stmts.items.len - 1];
+            const assigns_cond = switch (last_stmt.*) {
+                .assign => |asgn| blk: {
+                    if (asgn.targets.len != 1) break :blk false;
+                    if (asgn.targets[0].* != .name) break :blk false;
+                    break :blk std.mem.eql(u8, asgn.targets[0].name.id, cond_name);
+                },
+                else => false,
+            };
+            if (assigns_cond) {
+                const true_expr = try ast.makeConstant(a, .true_);
+                const not_cond = try ast.makeUnaryOp(a, .not_, condition);
+                const break_stmt = try self.makeBreak();
+                const break_body = try a.alloc(*Stmt, 1);
+                break_body[0] = break_stmt;
+                const guard_stmt = try a.create(Stmt);
+                guard_stmt.* = .{ .if_stmt = .{
+                    .condition = not_cond,
+                    .body = break_body,
+                    .else_body = &.{},
+                } };
+
+                const new_body = try a.alloc(*Stmt, header_stmts.items.len + 1 + body.len);
+                std.mem.copyForwards(*Stmt, new_body[0..header_stmts.items.len], header_stmts.items);
+                new_body[header_stmts.items.len] = guard_stmt;
+                if (body.len > 0) {
+                    std.mem.copyForwards(*Stmt, new_body[header_stmts.items.len + 1 ..], body);
+                }
+                final_condition = true_expr;
+                final_body = new_body;
+            }
+        }
+
         const stmt = try a.create(Stmt);
         stmt.* = .{
             .while_stmt = .{
-                .condition = condition,
-                .body = body,
+                .condition = final_condition,
+                .body = final_body,
                 .else_body = &.{},
             },
         };
@@ -7310,6 +7361,10 @@ pub const Decompiler = struct {
         while (block_idx < limit) {
             const prev_idx = block_idx;
             const stmts_len = stmts.items.len;
+            if (block_idx != start and self.cfg.blocks[block_idx].predecessors.len == 0) {
+                block_idx += 1;
+                continue;
+            }
             if (self.cfg.blocks[block_idx].is_exception_handler) {
                 block_idx += 1;
                 continue;
@@ -9188,7 +9243,10 @@ pub const Decompiler = struct {
             // Use dominator tree for membership check
             if (!self.dom.isInLoop(block_idx, loop_header)) break;
             if (block_idx == loop_header and block_idx != start_block) break;
-            if (visited.isSet(block_idx)) break;
+            if (visited.isSet(block_idx)) {
+                block_idx += 1;
+                continue;
+            }
             visited.set(block_idx);
 
             const block = &self.cfg.blocks[block_idx];
@@ -9214,7 +9272,15 @@ pub const Decompiler = struct {
                         continue;
                     }
 
-                    break;
+                    const next_id = try self.findIfChainEnd(p);
+                    if (stop_block) |stop_id| {
+                        if (next_id == stop_id) break;
+                    }
+                    if (next_id == loop_header) break;
+                    if (!self.dom.isInLoop(next_id, loop_header)) break;
+                    if (next_id <= block_idx) break;
+                    block_idx = next_id;
+                    continue;
                 },
                 else => {
                     // Process statements, stopping at back edge

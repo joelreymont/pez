@@ -853,7 +853,7 @@ pub const Analyzer = struct {
         const then_id = then_block orelse return null;
 
         // Find merge point - where both branches converge
-        const merge = try self.findMergePoint(then_id, else_block);
+        const merge = try self.findMergePoint(block_id, then_id, else_block);
 
         // Check if else block is actually an elif
         var is_elif = false;
@@ -1796,13 +1796,57 @@ pub const Analyzer = struct {
     }
 
     /// Find the merge point where two branches converge.
-    fn findMergePoint(self: *Analyzer, then_block: u32, else_block: ?u32) !?u32 {
+    fn findMergePoint(self: *Analyzer, cond_block: u32, then_block: u32, else_block: ?u32) !?u32 {
         const else_id = else_block orelse return null;
 
-        // If else block doesn't return (no successors), merge is the then target
+        // If else block returns (no successors), merge is after the then branch (if any).
         const else_blk = &self.cfg.blocks[else_id];
         if (else_blk.successors.len == 0) {
-            return then_block;
+            const cond_blk = &self.cfg.blocks[cond_block];
+            const term = cond_blk.terminator() orelse return null;
+            var else_edge: ?EdgeType = null;
+            for (cond_blk.successors) |edge| {
+                if (edge.target == else_id) {
+                    else_edge = edge.edge_type;
+                    break;
+                }
+            }
+            const jump_on_true = switch (term.opcode) {
+                .POP_JUMP_IF_TRUE,
+                .POP_JUMP_IF_NOT_NONE,
+                .POP_JUMP_FORWARD_IF_TRUE,
+                .POP_JUMP_FORWARD_IF_NOT_NONE,
+                .POP_JUMP_BACKWARD_IF_TRUE,
+                .POP_JUMP_BACKWARD_IF_NOT_NONE,
+                .JUMP_IF_TRUE,
+                .JUMP_IF_TRUE_OR_POP,
+                => true,
+                .POP_JUMP_IF_FALSE,
+                .POP_JUMP_IF_NONE,
+                .POP_JUMP_FORWARD_IF_FALSE,
+                .POP_JUMP_FORWARD_IF_NONE,
+                .POP_JUMP_BACKWARD_IF_FALSE,
+                .POP_JUMP_BACKWARD_IF_NONE,
+                .JUMP_IF_FALSE,
+                .JUMP_IF_FALSE_OR_POP,
+                .JUMP_IF_NOT_EXC_MATCH,
+                => false,
+                else => false,
+            };
+            if (else_edge != null) {
+                const else_is_jump_target = if (jump_on_true)
+                    else_edge.? == .conditional_true
+                else
+                    else_edge.? == .conditional_false;
+                if (!else_is_jump_target) {
+                    return then_block;
+                }
+            }
+            const then_blk = &self.cfg.blocks[then_block];
+            if (then_blk.successors.len == 1) {
+                return then_blk.successors[0].target;
+            }
+            return null;
         }
 
         // Simple approach: follow each branch until we find a common successor
