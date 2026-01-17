@@ -803,6 +803,7 @@ pub const Analyzer = struct {
             .JUMP_IF_FALSE_OR_POP,
             .JUMP_IF_TRUE, // Python 3.0
             .JUMP_IF_FALSE, // Python 3.0
+            .JUMP_IF_NOT_EXC_MATCH,
             => true,
             else => false,
         };
@@ -2143,6 +2144,7 @@ test "isConditionalJump" {
     try testing.expect(analyzer.isConditionalJump(.POP_JUMP_IF_TRUE));
     try testing.expect(analyzer.isConditionalJump(.POP_JUMP_IF_FALSE));
     try testing.expect(analyzer.isConditionalJump(.POP_JUMP_IF_NONE));
+    try testing.expect(analyzer.isConditionalJump(.JUMP_IF_NOT_EXC_MATCH));
     try testing.expect(!analyzer.isConditionalJump(.JUMP_FORWARD));
     try testing.expect(!analyzer.isConditionalJump(.LOAD_CONST));
 }

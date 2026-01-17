@@ -319,6 +319,7 @@ fn buildCFGWithLeaders(
                             .FOR_LOOP,
                             .JUMP_IF_FALSE, // Python 3.0
                             .JUMP_IF_FALSE_OR_POP,
+                            .JUMP_IF_NOT_EXC_MATCH,
                             => .conditional_false,
                             .POP_JUMP_IF_TRUE,
                             .POP_JUMP_IF_NOT_NONE,
@@ -356,6 +357,7 @@ fn buildCFGWithLeaders(
                             .POP_JUMP_BACKWARD_IF_NONE,
                             .JUMP_IF_FALSE, // Python 3.0
                             .JUMP_IF_FALSE_OR_POP,
+                            .JUMP_IF_NOT_EXC_MATCH,
                             => .conditional_true,
                             .POP_JUMP_IF_TRUE,
                             .POP_JUMP_IF_NOT_NONE,

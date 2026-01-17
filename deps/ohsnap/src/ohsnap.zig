@@ -214,7 +214,7 @@ pub const Snap = struct {
         {
             var lines = std.mem.splitScalar(u8, got, '\n');
             while (lines.next()) |line| {
-                try file_text_updated.writer(allocator).print("{s}\\\\{s}\n", .{ indent, line });
+                try file_text_updated.writer(arena_allocator).print("{s}\\\\{s}\n", .{ indent, line });
             }
         }
         try file_text_updated.appendSlice(arena_allocator, snapshot_suffix);

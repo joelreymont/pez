@@ -77,3 +77,30 @@ test "snapshot future docstring 3.9" {
         \\"
     );
 }
+
+test "snapshot module if prelude 3.9" {
+    try runSnapshot(@src(), "test/corpus/module_if_prelude.3.9.pyc",
+        \\[]u8
+        \\  "x = 1
+        \\y = 2
+        \\if x:
+        \\    y = 3
+        \\else:
+        \\    y = 4
+        \\"
+    );
+}
+
+test "snapshot try import 3.9" {
+    try runSnapshot(@src(), "test/corpus/try_import.3.9.pyc",
+        \\[]u8
+        \\  "try:
+        \\    import zlib
+        \\except ImportError as err:
+        \\    zlib = None
+        \\    err = None
+        \\else:
+        \\    zlib = zlib
+        \\"
+    );
+}

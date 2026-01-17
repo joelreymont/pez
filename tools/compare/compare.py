@@ -319,7 +319,7 @@ def main() -> None:
             },
         }
 
-        report = {"summary": summary, "rows": rows}
+        report = {"verdict": verdict, "summary": summary, "rows": rows}
         out = json.dumps(report, indent=2)
         if args.out:
             Path(args.out).write_text(out)
