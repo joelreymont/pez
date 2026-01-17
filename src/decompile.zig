@@ -1861,7 +1861,7 @@ pub const Decompiler = struct {
             if (inst.isConditionalJump()) return null;
             if (inst.isUnconditionalJump()) break;
             if (isStatementOpcode(inst.opcode)) return null;
-            sim.simulate(inst) catch return null;
+            try sim.simulate(inst);
         }
 
         if (sim.stack.len() != base_vals.len + 1) return null;
@@ -1887,10 +1887,10 @@ pub const Decompiler = struct {
         for (block.instructions) |inst| {
             if (ctrl.Analyzer.isConditionalJump(undefined, inst.opcode)) break;
             if (isStatementOpcode(inst.opcode)) return null;
-            sim.simulate(inst) catch return null;
+            try sim.simulate(inst);
         }
 
-        const expr = sim.stack.popExpr() catch return null;
+        const expr = try sim.stack.popExpr();
         if (sim.stack.len() != base_vals.len) return null;
         return expr;
     }
@@ -1916,11 +1916,11 @@ pub const Decompiler = struct {
             if (ctrl.Analyzer.isConditionalJump(undefined, inst.opcode)) break;
             if (inst.isUnconditionalJump()) break;
             if (isStatementOpcode(inst.opcode)) break;
-            sim.simulate(inst) catch return null;
+            try sim.simulate(inst);
         }
 
         if (sim.stack.len() != base_vals.len + 1) return null;
-        const expr = sim.stack.popExpr() catch return null;
+        const expr = try sim.stack.popExpr();
         return expr;
     }
 
@@ -1955,10 +1955,10 @@ pub const Decompiler = struct {
             }
             if (ctrl.Analyzer.isConditionalJump(undefined, inst.opcode)) break;
             if (isStatementOpcode(inst.opcode)) return null;
-            sim.simulate(inst) catch return null;
+            try sim.simulate(inst);
         }
 
-        const expr = sim.stack.popExpr() catch return null;
+        const expr = try sim.stack.popExpr();
         if (sim.stack.len() != base_vals.len) return null;
         return expr;
     }
@@ -2008,19 +2008,16 @@ pub const Decompiler = struct {
         for (cond_block.instructions) |inst| {
             if (ctrl.Analyzer.isConditionalJump(undefined, inst.opcode)) break;
             if (isStatementOpcode(inst.opcode)) {
-                const stmt_opt = self.tryEmitStatement(inst, &cond_sim) catch |err| {
-                    if (err == error.OutOfMemory) return err;
-                    return null;
-                };
+                const stmt_opt = try self.tryEmitStatement(inst, &cond_sim);
                 if (stmt_opt) |stmt| {
                     try stmts.append(stmts_allocator, stmt);
                 }
             } else {
-                cond_sim.simulate(inst) catch return null;
+                try cond_sim.simulate(inst);
             }
         }
 
-        const expr = cond_sim.stack.popExpr() catch return null;
+        const expr = try cond_sim.stack.popExpr();
         const base_vals = try self.cloneStackValues(&cond_sim, cond_sim.stack.items.items);
         return .{ .expr = expr, .base_vals = base_vals };
     }
@@ -2670,7 +2667,7 @@ pub const Decompiler = struct {
         while (iter.next()) |inst| {
             if (inst.offset < sim_start) continue;
             if (inst.offset >= exit_offset) break;
-            sim.simulate(inst) catch return null;
+            try sim.simulate(inst);
         }
 
         const expr = sim.buildInlineCompExpr() catch |err| {
@@ -10326,6 +10323,37 @@ test "decompiler init" {
 
     try testing.expectEqual(@as(usize, 0), decompiler.cfg.blocks.len);
 }
+
+test "simulate condition expr propagates errors" {
+    const testing = std.testing;
+    const allocator = testing.allocator;
+    const version = Version.init(3, 9);
+
+    const ops = [_]test_utils.OpArg{
+        .{ .op = .BINARY_ADD, .arg = 0 },
+        .{ .op = .RETURN_VALUE, .arg = 0 },
+    };
+
+    const bytecode = try test_utils.emitOpsOwned(allocator, version, &ops);
+    const code = try test_utils.allocCode(
+        allocator,
+        "bad_cond",
+        &[_][]const u8{},
+        &[_]pyc.Object{},
+        bytecode,
+        0,
+    );
+    defer {
+        code.deinit();
+        allocator.destroy(code);
+    }
+
+    var decompiler = try Decompiler.init(allocator, code, version);
+    defer decompiler.deinit();
+
+    try testing.expectError(error.StackUnderflow, decompiler.simulateConditionExpr(0, &.{}));
+}
+
 
 test "exception seed handles JUMP_IF_NOT_EXC_MATCH" {
     const testing = std.testing;
