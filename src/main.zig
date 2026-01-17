@@ -9,6 +9,7 @@ const codegen = @import("codegen.zig");
 const decompile = @import("decompile.zig");
 const test_harness = @import("test_harness.zig");
 const version = @import("util/version.zig");
+const debug_dump = @import("debug_dump.zig");
 
 pub fn main() !void {
     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
@@ -27,14 +28,24 @@ pub fn main() !void {
     const stderr = &stderr_writer.interface;
 
     // Parse command line
-    var mode: enum { disasm, decompile, cfgdump, test_suite, golden } = .decompile;
+    var mode: enum { disasm, decompile, cfgdump, dump, test_suite, golden } = .decompile;
     var filename: ?[]const u8 = null;
+    var dump_sections: ?[]const u8 = null;
+    var dump_json: ?[]const u8 = null;
 
     for (args[1..]) |arg| {
         if (std.mem.eql(u8, arg, "-d") or std.mem.eql(u8, arg, "--disasm")) {
             mode = .disasm;
         } else if (std.mem.eql(u8, arg, "--cfg")) {
             mode = .cfgdump;
+        } else if (std.mem.startsWith(u8, arg, "--dump=")) {
+            mode = .dump;
+            dump_sections = arg["--dump=".len..];
+        } else if (std.mem.eql(u8, arg, "--dump")) {
+            mode = .dump;
+        } else if (std.mem.startsWith(u8, arg, "--dump-json=")) {
+            mode = .dump;
+            dump_json = arg["--dump-json=".len..];
         } else if (std.mem.eql(u8, arg, "--test")) {
             mode = .test_suite;
         } else if (std.mem.eql(u8, arg, "--golden")) {
@@ -71,9 +82,11 @@ pub fn main() !void {
     }
 
     if (filename == null) {
-        try stderr.print("Usage: {s} [-d|--disasm|--cfg|--test|--golden] <file.pyc>\n", .{args[0]});
+        try stderr.print("Usage: {s} [-d|--disasm|--cfg|--dump|--test|--golden] <file.pyc>\n", .{args[0]});
         try stderr.print("  -d, --disasm  Disassemble only\n", .{});
         try stderr.print("  --cfg         Dump CFG analysis\n", .{});
+        try stderr.print("  --dump[=list] Dump JSON (bytecode,cfg,dom,loops,patterns,passes)\n", .{});
+        try stderr.print("  --dump-json=PATH  Write dump JSON to PATH\n", .{});
         try stderr.print("  --test        Run test suite (decompile check)\n", .{});
         try stderr.print("  --golden      Compare with golden .py files\n", .{});
         try stderr.print("  -V, --version Show version\n", .{});
@@ -109,6 +122,22 @@ pub fn main() !void {
             try stdout.print("# Decompiled by pez {s}\n\n", .{version.full});
             if (module.code) |code| {
                 try decompile.decompileToSourceWithContext(allocator, code, py_ver, stdout, std.fs.File.stderr());
+            }
+        },
+        .dump => {
+            const sections = try debug_dump.parseSections(dump_sections);
+            if (module.code) |code| {
+                if (dump_json) |path| {
+                    var file = try std.fs.cwd().createFile(path, .{ .truncate = true });
+                    defer file.close();
+                    var buf: [8192]u8 = undefined;
+                    var writer = file.writer(&buf);
+                    const file_out = &writer.interface;
+                    try debug_dump.dumpModule(allocator, code, py_ver, sections, file_out);
+                    try file_out.flush();
+                } else {
+                    try debug_dump.dumpModule(allocator, code, py_ver, sections, stdout);
+                }
             }
         },
         .test_suite, .golden => unreachable, // Handled earlier
