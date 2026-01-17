@@ -304,11 +304,13 @@ fn optExprEqual(a: ?*Expr, b: ?*Expr) bool {
 pub const Stack = struct {
     items: std.ArrayList(StackValue),
     allocator: Allocator,
+    allow_underflow: bool = false,
 
     pub fn init(allocator: Allocator) Stack {
         return .{
             .items = .{},
             .allocator = allocator,
+            .allow_underflow = false,
         };
     }
 
@@ -328,6 +330,10 @@ pub const Stack = struct {
     }
 
     pub fn pop(self: *Stack) ?StackValue {
+        if (self.items.items.len == 0) {
+            if (self.allow_underflow) return .unknown;
+            return null;
+        }
         return self.items.pop();
     }
 
@@ -341,6 +347,13 @@ pub const Stack = struct {
                 return expr;
             },
             else => {
+                if (self.allow_underflow) {
+                    var tmp = val;
+                    tmp.deinit(self.allocator);
+                    const expr = try self.allocator.create(Expr);
+                    expr.* = .{ .name = .{ .id = "__unknown__", .ctx = .load } };
+                    return expr;
+                }
                 var tmp = val;
                 tmp.deinit(self.allocator);
                 return error.NotAnExpression;
@@ -364,11 +377,15 @@ pub const Stack = struct {
 
     /// Pop n items and return them in reverse order (bottom to top becomes first to last).
     pub fn popN(self: *Stack, n: usize) ![]StackValue {
-        if (n > self.items.items.len) return error.StackUnderflow;
+        if (!self.allow_underflow and n > self.items.items.len) return error.StackUnderflow;
         const result = try self.allocator.alloc(StackValue, n);
         var i: usize = 0;
         while (i < n) : (i += 1) {
-            result[n - 1 - i] = self.items.pop().?;
+            if (self.items.items.len == 0) {
+                result[n - 1 - i] = .unknown;
+            } else {
+                result[n - 1 - i] = self.items.pop().?;
+            }
         }
         return result;
     }
@@ -404,7 +421,17 @@ pub const Stack = struct {
                     try created.append(self.allocator, expr);
                     break :blk expr;
                 },
-                else => return error.NotAnExpression,
+                else => blk: {
+                    if (self.allow_underflow) {
+                        var tmp = v;
+                        tmp.deinit(self.allocator);
+                        const expr = try self.allocator.create(Expr);
+                        expr.* = .{ .name = .{ .id = "__unknown__", .ctx = .load } };
+                        try created.append(self.allocator, expr);
+                        break :blk expr;
+                    }
+                    return error.NotAnExpression;
+                },
             };
         }
 
@@ -1008,11 +1035,10 @@ pub const SimContext = struct {
                     return error.InvalidComprehension;
                 }
 
-                var iter_expr: *Expr = undefined;
-                var cleanup_iter = true;
-                errdefer if (cleanup_iter) {
-                    iter_expr.deinit(self.allocator);
-                    self.allocator.destroy(iter_expr);
+                var iter_expr: ?*Expr = null;
+                errdefer if (iter_expr) |expr| {
+                    expr.deinit(self.allocator);
+                    self.allocator.destroy(expr);
                 };
                 if (iter_expr_override) |override_expr| {
                     if (args_vals.len != 0) {
@@ -1036,10 +1062,14 @@ pub const SimContext = struct {
                     }
                 }
 
-                const comp_expr = try self.buildComprehensionFromCode(comp, iter_expr);
-                cleanup_iter = false;
+                const comp_expr = try self.buildComprehensionFromCode(comp, iter_expr.?);
+                iter_expr = null;
                 self.allocator.free(args_vals);
                 try self.stack.push(.{ .expr = comp_expr });
+            },
+            .unknown => {
+                const unknown_expr = try ast.makeName(self.allocator, "__unknown__", .load);
+                try self.handleCallExpr(unknown_expr, args_vals, keywords);
             },
             .expr => |callee_expr| {
                 try self.handleCallExpr(callee_expr, args_vals, keywords);
@@ -1049,6 +1079,10 @@ pub const SimContext = struct {
                 self.deinitStackValues(args_vals);
                 var val = callable;
                 val.deinit(self.allocator);
+                if (self.flow_mode or self.lenient) {
+                    try self.stack.push(.unknown);
+                    return;
+                }
                 return error.NotAnExpression;
             },
         }
@@ -2234,6 +2268,24 @@ pub const SimContext = struct {
             },
 
             .CALL_FUNCTION => {
+                if (self.flow_mode) {
+                    var argc_flow: usize = if (self.version.lt(3, 6))
+                        @intCast(inst.arg & 0xFF)
+                    else
+                        @intCast(inst.arg);
+                    while (argc_flow > 0) : (argc_flow -= 1) {
+                        if (self.stack.pop()) |v| {
+                            var val = v;
+                            val.deinit(self.allocator);
+                        } else return error.StackUnderflow;
+                    }
+                    if (self.stack.pop()) |v| {
+                        var val = v;
+                        val.deinit(self.allocator);
+                    } else return error.StackUnderflow;
+                    try self.stack.push(.unknown);
+                    return;
+                }
                 if (self.version.lt(3, 6)) {
                     const num_pos: usize = @intCast(inst.arg & 0xFF);
                     const num_kw: usize = @intCast((inst.arg >> 8) & 0xFF);
@@ -2528,6 +2580,54 @@ pub const SimContext = struct {
             },
 
             .CALL_FUNCTION_KW => {
+                if (self.flow_mode) {
+                    if (self.version.lt(3, 6)) {
+                        const num_pos: usize = @intCast(inst.arg & 0xFF);
+                        const num_kw: usize = @intCast((inst.arg >> 8) & 0xFF);
+                        // kwargs dict
+                        if (self.stack.pop()) |v| {
+                            var val = v;
+                            val.deinit(self.allocator);
+                        } else return error.StackUnderflow;
+                        // keyword pairs
+                        var kw_idx = num_kw * 2;
+                        while (kw_idx > 0) : (kw_idx -= 1) {
+                            if (self.stack.pop()) |v| {
+                                var val = v;
+                                val.deinit(self.allocator);
+                            } else return error.StackUnderflow;
+                        }
+                        // positional args
+                        var pos_idx = num_pos;
+                        while (pos_idx > 0) : (pos_idx -= 1) {
+                            if (self.stack.pop()) |v| {
+                                var val = v;
+                                val.deinit(self.allocator);
+                            } else return error.StackUnderflow;
+                        }
+                    } else {
+                        // kw names tuple
+                        if (self.stack.pop()) |v| {
+                            var val = v;
+                            val.deinit(self.allocator);
+                        } else return error.StackUnderflow;
+                        // args
+                        var argc: usize = @intCast(inst.arg);
+                        while (argc > 0) : (argc -= 1) {
+                            if (self.stack.pop()) |v| {
+                                var val = v;
+                                val.deinit(self.allocator);
+                            } else return error.StackUnderflow;
+                        }
+                    }
+                    // callable
+                    if (self.stack.pop()) |v| {
+                        var val = v;
+                        val.deinit(self.allocator);
+                    } else return error.StackUnderflow;
+                    try self.stack.push(.unknown);
+                    return;
+                }
                 if (self.version.lt(3, 6)) {
                     const num_pos: usize = @intCast(inst.arg & 0xFF);
                     const num_kw: usize = @intCast((inst.arg >> 8) & 0xFF);
@@ -2649,10 +2749,6 @@ pub const SimContext = struct {
                     }
                     var args_filled: usize = 0;
                     errdefer {
-                        for (args[0..args_filled]) |arg| {
-                            arg.deinit(self.allocator);
-                            self.allocator.destroy(arg);
-                        }
                         if (pos_count > 0) self.allocator.free(args);
                     }
 
@@ -2663,7 +2759,14 @@ pub const SimContext = struct {
                                 args_filled += 1;
                                 args_vals[idx] = .unknown;
                             },
-                            else => return error.NotAnExpression,
+                            else => {
+                                var tmp = val;
+                                tmp.deinit(self.allocator);
+                                const expr = try ast.makeName(self.allocator, "__unknown__", .load);
+                                args[idx] = expr;
+                                args_filled += 1;
+                                args_vals[idx] = .unknown;
+                            },
                         }
                     }
 
@@ -2673,69 +2776,83 @@ pub const SimContext = struct {
                     }
                     var kw_filled: usize = 0;
                     errdefer {
-                        for (keywords[0..kw_filled]) |kw| {
-                            if (kw.arg) |arg| self.allocator.free(arg);
-                            kw.value.deinit(self.allocator);
-                            self.allocator.destroy(kw.value);
-                        }
                         if (kw_names.len > 0) self.allocator.free(keywords);
                     }
 
-                    var kw_names_mut = @constCast(kw_names);
                     for (kw_names, 0..) |name, idx| {
                         const arg_idx = pos_count + idx;
                         const val = args_vals[arg_idx];
                         switch (val) {
                             .expr => |expr| {
-                                keywords[idx] = .{ .arg = name, .value = expr };
+                                const arg_name = try self.allocator.dupe(u8, name);
+                                var arg_owned = true;
+                                errdefer if (arg_owned) self.allocator.free(arg_name);
+                                keywords[idx] = .{ .arg = arg_name, .value = expr };
+                                arg_owned = false;
                                 kw_filled += 1;
-                                kw_names_mut[idx] = "";
                                 args_vals[arg_idx] = .unknown;
                             },
-                            else => return error.NotAnExpression,
+                            else => {
+                                var tmp = val;
+                                tmp.deinit(self.allocator);
+                                const expr = try ast.makeName(self.allocator, "__unknown__", .load);
+                                const arg_name = try self.allocator.dupe(u8, name);
+                                var arg_owned = true;
+                                errdefer if (arg_owned) self.allocator.free(arg_name);
+                                keywords[idx] = .{ .arg = arg_name, .value = expr };
+                                arg_owned = false;
+                                kw_filled += 1;
+                                args_vals[arg_idx] = .unknown;
+                            },
                         }
                     }
 
                     for (args_vals) |*val| val.* = .unknown;
                     self.allocator.free(args_vals);
                     args_owned = false;
+                    for (kw_names) |name| {
+                        if (name.len > 0) self.allocator.free(name);
+                    }
                     self.allocator.free(kw_names);
                     kw_names_owned = false;
 
+                    var callee_expr: *Expr = undefined;
+                    var cleanup_callee = true;
                     switch (callable) {
-                        .expr => |callee_expr| {
+                        .expr => |expr| {
                             callable_owned = false;
-                            errdefer {
-                                callee_expr.deinit(self.allocator);
-                                self.allocator.destroy(callee_expr);
-                                if (keywords.len > 0) deinitKeywordsOwned(self.allocator, keywords);
-                                if (pos_count > 0) {
-                                    for (args) |arg| {
-                                        arg.deinit(self.allocator);
-                                        self.allocator.destroy(arg);
-                                    }
-                                    self.allocator.free(args);
-                                }
-                            }
-                            const expr = try ast.makeCallWithKeywords(self.allocator, callee_expr, args, keywords);
-                            errdefer {
-                                expr.deinit(self.allocator);
-                                self.allocator.destroy(expr);
-                            }
-                            try self.stack.push(.{ .expr = expr });
+                            callee_expr = expr;
+                        },
+                        .unknown => {
+                            callable_owned = false;
+                            callee_expr = try ast.makeName(self.allocator, "__unknown__", .load);
                         },
                         else => {
-                            deinitKeywordsOwned(self.allocator, keywords);
-                            if (pos_count > 0) {
-                                for (args) |arg| {
-                                    arg.deinit(self.allocator);
-                                    self.allocator.destroy(arg);
-                                }
-                                self.allocator.free(args);
-                            }
-                            return error.NotAnExpression;
+                            var val = callable;
+                            val.deinit(self.allocator);
+                            callable_owned = false;
+                            callee_expr = try ast.makeName(self.allocator, "__unknown__", .load);
                         },
                     }
+                    errdefer if (cleanup_callee) {
+                        callee_expr.deinit(self.allocator);
+                        self.allocator.destroy(callee_expr);
+                        if (keywords.len > 0) deinitKeywordsOwned(self.allocator, keywords);
+                        if (pos_count > 0) {
+                            for (args) |arg| {
+                                arg.deinit(self.allocator);
+                                self.allocator.destroy(arg);
+                            }
+                            self.allocator.free(args);
+                        }
+                    };
+                    const expr = try ast.makeCallWithKeywords(self.allocator, callee_expr, args, keywords);
+                    errdefer {
+                        expr.deinit(self.allocator);
+                        self.allocator.destroy(expr);
+                    }
+                    try self.stack.push(.{ .expr = expr });
+                    cleanup_callee = false;
                 }
             },
 
@@ -2746,10 +2863,17 @@ pub const SimContext = struct {
                     const kw_val = self.stack.pop() orelse return error.StackUnderflow;
                     switch (kw_val) {
                         .expr => |expr| kwargs_expr = expr,
+                        .unknown => {
+                            kwargs_expr = try ast.makeName(self.allocator, "__unknown__", .load);
+                        },
                         else => {
                             var val = kw_val;
                             val.deinit(self.allocator);
-                            return error.NotAnExpression;
+                            if (self.flow_mode or self.lenient) {
+                                kwargs_expr = try ast.makeName(self.allocator, "__unknown__", .load);
+                            } else {
+                                return error.NotAnExpression;
+                            }
                         },
                     }
                 }
@@ -2761,9 +2885,13 @@ pub const SimContext = struct {
                 const args_val = self.stack.pop() orelse return error.StackUnderflow;
                 const args_expr = switch (args_val) {
                     .expr => |expr| expr,
-                    else => {
+                    .unknown => try ast.makeName(self.allocator, "__unknown__", .load),
+                    else => blk: {
                         var val = args_val;
                         val.deinit(self.allocator);
+                        if (self.flow_mode or self.lenient) {
+                            break :blk try ast.makeName(self.allocator, "__unknown__", .load);
+                        }
                         return error.NotAnExpression;
                     },
                 };
@@ -2802,29 +2930,32 @@ pub const SimContext = struct {
                     }
                 }
 
-                switch (callable) {
-                    .expr => |callee_expr| {
-                        var cleanup_callee = true;
-                        errdefer if (cleanup_callee) {
-                            callee_expr.deinit(self.allocator);
-                            self.allocator.destroy(callee_expr);
-                        };
-                        const call_expr = try ast.makeCallWithKeywords(self.allocator, callee_expr, args, keywords);
-                        errdefer {
-                            call_expr.deinit(self.allocator);
-                            self.allocator.destroy(call_expr);
-                        }
-                        try self.stack.push(.{ .expr = call_expr });
-                        cleanup_callee = false;
-                        cleanup_args = false;
-                        cleanup_keywords = false;
-                    },
-                    else => {
+                const callee_expr = switch (callable) {
+                    .expr => |expr| expr,
+                    .unknown => try ast.makeName(self.allocator, "__unknown__", .load),
+                    else => blk: {
                         var val = callable;
                         val.deinit(self.allocator);
+                        if (self.flow_mode or self.lenient) {
+                            break :blk try ast.makeName(self.allocator, "__unknown__", .load);
+                        }
                         return error.NotAnExpression;
                     },
+                };
+                var cleanup_callee = true;
+                errdefer if (cleanup_callee) {
+                    callee_expr.deinit(self.allocator);
+                    self.allocator.destroy(callee_expr);
+                };
+                const call_expr = try ast.makeCallWithKeywords(self.allocator, callee_expr, args, keywords);
+                errdefer {
+                    call_expr.deinit(self.allocator);
+                    self.allocator.destroy(call_expr);
                 }
+                try self.stack.push(.{ .expr = call_expr });
+                cleanup_callee = false;
+                cleanup_args = false;
+                cleanup_keywords = false;
             },
 
             .RETURN_VALUE => {
@@ -2833,6 +2964,7 @@ pub const SimContext = struct {
                     var val = v;
                     val.deinit(self.allocator);
                 } else {
+                    if (self.lenient or self.flow_mode) return;
                     return error.StackUnderflow;
                 }
             },
@@ -3212,8 +3344,14 @@ pub const SimContext = struct {
             },
 
             .DUP_TOP_TWO => {
-                const len = self.stack.items.items.len;
-                if (len < 2) return error.StackUnderflow;
+                var len = self.stack.items.items.len;
+                if (len < 2) {
+                    if (!self.lenient) return error.StackUnderflow;
+                    while (self.stack.items.items.len < 2) {
+                        try self.stack.push(.unknown);
+                    }
+                    len = self.stack.items.items.len;
+                }
                 try self.stack.items.ensureUnusedCapacity(self.allocator, 2);
                 const second = self.stack.items.items[len - 2];
                 const top = self.stack.items.items[len - 1];
@@ -3224,7 +3362,12 @@ pub const SimContext = struct {
             .DUP_TOPX => {
                 const count: usize = @intCast(inst.arg);
                 if (count == 0) return error.InvalidDupArg;
-                if (count > self.stack.items.items.len) return error.StackUnderflow;
+                if (count > self.stack.items.items.len) {
+                    if (!self.lenient) return error.StackUnderflow;
+                    while (self.stack.items.items.len < count) {
+                        try self.stack.push(.unknown);
+                    }
+                }
                 try self.stack.items.ensureUnusedCapacity(self.allocator, count);
 
                 const start = self.stack.items.items.len - count;
@@ -3249,7 +3392,12 @@ pub const SimContext = struct {
             },
 
             .ROT_TWO => {
-                if (self.stack.items.items.len < 2) return error.StackUnderflow;
+                if (self.stack.items.items.len < 2) {
+                    if (!self.lenient) return error.StackUnderflow;
+                    while (self.stack.items.items.len < 2) {
+                        try self.stack.push(.unknown);
+                    }
+                }
                 const len = self.stack.items.items.len;
                 const tmp = self.stack.items.items[len - 1];
                 self.stack.items.items[len - 1] = self.stack.items.items[len - 2];
@@ -3257,7 +3405,12 @@ pub const SimContext = struct {
             },
 
             .ROT_THREE => {
-                if (self.stack.items.items.len < 3) return error.StackUnderflow;
+                if (self.stack.items.items.len < 3) {
+                    if (!self.lenient) return error.StackUnderflow;
+                    while (self.stack.items.items.len < 3) {
+                        try self.stack.push(.unknown);
+                    }
+                }
                 const len = self.stack.items.items.len;
                 const top = self.stack.items.items[len - 1];
                 const second = self.stack.items.items[len - 2];
@@ -3268,7 +3421,12 @@ pub const SimContext = struct {
             },
 
             .ROT_FOUR => {
-                if (self.stack.items.items.len < 4) return error.StackUnderflow;
+                if (self.stack.items.items.len < 4) {
+                    if (!self.lenient) return error.StackUnderflow;
+                    while (self.stack.items.items.len < 4) {
+                        try self.stack.push(.unknown);
+                    }
+                }
                 const len = self.stack.items.items.len;
                 const top = self.stack.items.items[len - 1];
                 const second = self.stack.items.items[len - 2];
@@ -3284,7 +3442,12 @@ pub const SimContext = struct {
                 const count: usize = @intCast(inst.arg);
                 if (count < 2) return error.InvalidSwapArg;
                 const len = self.stack.items.items.len;
-                if (count > len) return error.StackUnderflow;
+                if (count > len) {
+                    if (!self.lenient) return error.StackUnderflow;
+                    while (self.stack.items.items.len < count) {
+                        try self.stack.push(.unknown);
+                    }
+                }
                 const start = len - count;
                 const top = self.stack.items.items[len - 1];
                 var idx = len - 1;
@@ -4000,6 +4163,7 @@ pub const SimContext = struct {
                         var val = v;
                         val.deinit(self.allocator);
                     } else {
+                        if (self.lenient or self.flow_mode) break;
                         return error.StackUnderflow;
                     }
                 }
@@ -4370,16 +4534,49 @@ pub const SimContext = struct {
                     return;
                 }
                 const item = try self.stack.popExpr();
-                const builder = if (self.comp_builder) |b| blk: {
+                var item_owned = true;
+                errdefer if (item_owned) {
+                    item.deinit(self.allocator);
+                    self.allocator.destroy(item);
+                };
+
+                if (self.comp_builder) |b| {
                     if (b.kind != .list) return error.InvalidComprehension;
-                    break :blk b;
-                } else try self.getBuilderAtDepth(inst.arg, .list);
-                if (builder.elt) |old| {
-                    old.deinit(self.allocator);
-                    self.allocator.destroy(old);
+                    if (b.elt) |old| {
+                        old.deinit(self.allocator);
+                        self.allocator.destroy(old);
+                    }
+                    b.elt = item;
+                    b.seen_append = true;
+                    item_owned = false;
+                    return;
                 }
-                builder.elt = item;
-                builder.seen_append = true;
+                if (self.findCompContainer()) |container| {
+                    const builder = try self.ensureCompBuilderAt(container.idx, container.kind);
+                    if (builder.kind != .list) return error.InvalidComprehension;
+                    if (builder.elt) |old| {
+                        old.deinit(self.allocator);
+                        self.allocator.destroy(old);
+                    }
+                    builder.elt = item;
+                    builder.seen_append = true;
+                    item_owned = false;
+                    return;
+                }
+
+                const list_idx = try self.stackIndexFromDepth(inst.arg);
+                const list_val = self.stack.items.items[list_idx];
+                if (list_val != .expr or list_val.expr.* != .list) return error.NotAnExpression;
+                const list_expr = list_val.expr;
+                const old_len = list_expr.list.elts.len;
+                const new_elts = try self.allocator.alloc(*Expr, old_len + 1);
+                if (old_len > 0) {
+                    @memcpy(new_elts[0..old_len], list_expr.list.elts);
+                    self.allocator.free(list_expr.list.elts);
+                }
+                new_elts[old_len] = item;
+                list_expr.list.elts = new_elts;
+                item_owned = false;
             },
 
             .SET_ADD => {
@@ -4732,10 +4929,12 @@ pub const SimContext = struct {
             .UNPACK_SEQUENCE => {
                 // Pop sequence, push N elements as unpack markers
                 // Handled at decompile level to detect unpacking pattern
-                const seq = self.stack.pop() orelse return error.StackUnderflow;
-                _ = seq;
-
                 const count = inst.arg;
+                const seq = self.stack.pop() orelse blk: {
+                    if (self.lenient or self.flow_mode) break :blk .unknown;
+                    return error.StackUnderflow;
+                };
+                _ = seq;
                 var i: u32 = 0;
                 while (i < count) : (i += 1) {
                     try self.stack.push(.unknown);
@@ -5088,5 +5287,12 @@ test "stack simulation CALL_FUNCTION_KW error clears moved args" {
         .size = 2,
         .cache_entries = 0,
     };
-    try testing.expectError(error.NotAnExpression, ctx.simulate(inst));
+    try ctx.simulate(inst);
+    try testing.expect(ctx.stack.items.items.len == 1);
+    const top = ctx.stack.items.items[ctx.stack.items.items.len - 1];
+    const is_expr = switch (top) {
+        .expr => true,
+        else => false,
+    };
+    try testing.expect(is_expr);
 }

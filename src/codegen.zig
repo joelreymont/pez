@@ -125,6 +125,23 @@ pub const Writer = struct {
         try self.writeExprPrec(allocator, expr, 0);
     }
 
+    fn writeSubscriptSlice(self: *Writer, allocator: std.mem.Allocator, slice: *const Expr) WriteError!void {
+        if (slice.* == .tuple and slice.tuple.ctx == .load) {
+            const items = slice.tuple.elts;
+            if (items.len == 0) {
+                try self.write(allocator, "()");
+                return;
+            }
+            for (items, 0..) |item, i| {
+                if (i > 0) try self.write(allocator, ", ");
+                try self.writeExpr(allocator, item);
+            }
+            if (items.len == 1) try self.writeByte(allocator, ',');
+            return;
+        }
+        try self.writeExpr(allocator, slice);
+    }
+
     /// Write a match pattern.
     pub fn writePattern(self: *Writer, allocator: std.mem.Allocator, pat: *const ast.Pattern) WriteError!void {
         switch (pat.*) {
@@ -208,8 +225,12 @@ pub const Writer = struct {
                 if (needs_parens) try self.writeByte(allocator, ')');
             },
             .unary_op => |u| {
+                const prec: u8 = if (u.op == .not_) 5 else 14;
+                const needs_parens = prec < parent_prec;
+                if (needs_parens) try self.writeByte(allocator, '(');
                 try self.write(allocator, u.op.symbol());
-                try self.writeExprPrec(allocator, u.operand, 14); // Unary has high precedence
+                try self.writeExprPrec(allocator, u.operand, prec);
+                if (needs_parens) try self.writeByte(allocator, ')');
             },
             .compare => |c| {
                 try self.writeExprPrec(allocator, c.left, 0);
@@ -278,7 +299,7 @@ pub const Writer = struct {
             .subscript => |s| {
                 try self.writeExprPrec(allocator, s.value, 15);
                 try self.writeByte(allocator, '[');
-                try self.writeExpr(allocator, s.slice);
+                try self.writeSubscriptSlice(allocator, s.slice);
                 try self.writeByte(allocator, ']');
             },
             .slice => |s| {
@@ -601,7 +622,10 @@ pub const Writer = struct {
 
     /// Write a joined_str (f-string).
     fn writeJoinedStr(self: *Writer, allocator: std.mem.Allocator, j: anytype) WriteError!void {
-        const quote = pickFstringQuote(j.values);
+        const quote: u8 = if (self.fstring_quote) |fq|
+            @as(u8, if (fq == '\'') '"' else '\'')
+        else
+            pickFstringQuote(j.values);
         const saved_fstring_quote = self.fstring_quote;
         self.fstring_quote = quote;
         defer self.fstring_quote = saved_fstring_quote;
@@ -1116,6 +1140,7 @@ pub const Writer = struct {
                 self.indent_level -= 1;
 
                 for (t.handlers) |h| {
+                    if (h.type == null) continue;
                     try self.writeIndent(allocator);
                     try self.write(allocator, "except");
                     if (h.type) |exc| {
@@ -1126,6 +1151,15 @@ pub const Writer = struct {
                             try self.write(allocator, name);
                         }
                     }
+                    try self.write(allocator, ":\n");
+                    self.indent_level += 1;
+                    try self.writeBody(allocator, h.body);
+                    self.indent_level -= 1;
+                }
+                for (t.handlers) |h| {
+                    if (h.type != null) continue;
+                    try self.writeIndent(allocator);
+                    try self.write(allocator, "except");
                     try self.write(allocator, ":\n");
                     self.indent_level += 1;
                     try self.writeBody(allocator, h.body);
@@ -1145,6 +1179,13 @@ pub const Writer = struct {
                     try self.write(allocator, "finally:\n");
                     self.indent_level += 1;
                     try self.writeBody(allocator, t.finalbody);
+                    self.indent_level -= 1;
+                } else if (t.handlers.len == 0 and t.else_body.len == 0) {
+                    try self.writeIndent(allocator);
+                    try self.write(allocator, "finally:\n");
+                    self.indent_level += 1;
+                    try self.writeIndent(allocator);
+                    try self.write(allocator, "pass\n");
                     self.indent_level -= 1;
                 }
             },

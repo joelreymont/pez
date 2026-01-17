@@ -71,12 +71,12 @@ pub const BigInt = struct {
         if (self.digits.len > 5) return null;
 
         var result: u64 = 0;
-        var shift: u6 = 0;
+        var shift: u8 = 0;
         for (self.digits) |digit| {
-            const contribution = @as(u64, digit) << shift;
-            // Check for overflow before adding
             if (shift >= 64) return null;
-            result |= contribution;
+            const avail: u8 = @intCast(64 - shift);
+            if (avail < DIGIT_BITS and (@as(u64, digit) >> @as(u6, @intCast(avail))) != 0) return null;
+            result |= @as(u64, digit) << @as(u6, @intCast(shift));
             shift += DIGIT_BITS;
         }
 
@@ -99,10 +99,12 @@ pub const BigInt = struct {
         if (self.digits.len > 9) return null;
 
         var result: u128 = 0;
-        var shift: u7 = 0;
+        var shift: u8 = 0;
         for (self.digits) |digit| {
             if (shift >= 128) return null;
-            result |= @as(u128, digit) << shift;
+            const avail: u8 = @intCast(128 - shift);
+            if (avail < DIGIT_BITS and (@as(u128, digit) >> @as(u7, @intCast(avail))) != 0) return null;
+            result |= @as(u128, digit) << @as(u7, @intCast(shift));
             shift += DIGIT_BITS;
         }
 

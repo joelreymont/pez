@@ -857,10 +857,13 @@ pub const Analyzer = struct {
         // Check if else block is actually an elif
         var is_elif = false;
         if (else_block) |else_id| {
-            const else_blk = &self.cfg.blocks[else_id];
-            if (else_blk.terminator()) |else_term| {
-                if (self.isConditionalJump(else_term.opcode)) {
-                    is_elif = true;
+            const merge_id = merge;
+            if (merge_id == null or merge_id.? != else_id) {
+                const else_blk = &self.cfg.blocks[else_id];
+                if (else_blk.terminator()) |else_term| {
+                    if (self.isConditionalJump(else_term.opcode)) {
+                        is_elif = true;
+                    }
                 }
             }
         }
@@ -991,6 +994,7 @@ pub const Analyzer = struct {
         for (handler_targets.items) |hid| {
             if (hid >= self.cfg.blocks.len) continue;
             const handler_block = &self.cfg.blocks[hid];
+            if (self.isWithCleanupHandler(handler_block)) continue;
             // Skip generator StopIteration handlers (CALL_INTRINSIC_1 + RERAISE)
             if (self.isStopIterHandler(handler_block)) continue;
             const is_bare = !self.hasExceptionTypeCheck(handler_block);
@@ -1038,6 +1042,17 @@ pub const Analyzer = struct {
         };
         self.try_cache[block_id] = pattern;
         return pattern;
+    }
+
+    fn isWithCleanupHandler(self: *const Analyzer, block: *const BasicBlock) bool {
+        _ = self;
+        for (block.instructions) |inst| {
+            switch (inst.opcode) {
+                .WITH_EXCEPT_START, .WITH_CLEANUP_START, .WITH_CLEANUP_FINISH => return true,
+                else => {},
+            }
+        }
+        return false;
     }
 
     fn detectElseBlock311(
@@ -1118,21 +1133,62 @@ pub const Analyzer = struct {
         if (try_block >= self.cfg.blocks.len) return null;
         if (handlers.len == 0) return null;
 
-        // Find normal exit from try body (not exception edges)
-        const try_blk = &self.cfg.blocks[try_block];
-        var try_normal_succ: ?u32 = null;
-        for (try_blk.successors) |edge| {
-            if (edge.edge_type == .normal) {
-                try_normal_succ = edge.target;
+        var first_handler: u32 = handlers[0].handler_block;
+        for (handlers) |h| {
+            if (h.handler_block < first_handler) first_handler = h.handler_block;
+        }
+
+        // Walk normal edges through try body until just before first handler
+        var last_try_block = try_block;
+        var cur = try_block;
+        while (cur < first_handler) {
+            const blk = &self.cfg.blocks[cur];
+            var next: ?u32 = null;
+            for (blk.successors) |edge| {
+                if (edge.edge_type != .normal) continue;
+                if (edge.target >= first_handler) continue;
+                var is_handler = false;
+                for (handlers) |h| {
+                    if (edge.target == h.handler_block) {
+                        is_handler = true;
+                        break;
+                    }
+                }
+                if (is_handler) continue;
+                next = edge.target;
                 break;
             }
+            if (next) |nxt| {
+                last_try_block = nxt;
+                cur = nxt;
+                continue;
+            }
+            break;
         }
-        if (try_normal_succ == null) return null;
-        const candidate = try_normal_succ.?;
+
+        // Candidate else block is normal successor after the handlers
+        const last_blk = &self.cfg.blocks[last_try_block];
+        var candidate: ?u32 = null;
+        for (last_blk.successors) |edge| {
+            if (edge.edge_type != .normal) continue;
+            if (edge.target <= first_handler) continue;
+            var is_handler = false;
+            for (handlers) |h| {
+                if (edge.target == h.handler_block) {
+                    is_handler = true;
+                    break;
+                }
+            }
+            if (is_handler) continue;
+            candidate = edge.target;
+            break;
+        }
+        if (candidate == null) return null;
+        const cand = candidate.?;
 
         // Verify not a handler
         for (handlers) |h| {
-            if (candidate == h.handler_block) return null;
+            if (cand == h.handler_block) return null;
         }
 
         // Verify not reachable from handlers via exception path
@@ -1140,7 +1196,7 @@ pub const Analyzer = struct {
             if (h.handler_block >= self.cfg.blocks.len) continue;
             const h_blk = &self.cfg.blocks[h.handler_block];
             for (h_blk.successors) |edge| {
-                if (edge.target == candidate) {
+                if (edge.target == cand) {
                     // Handler reaches candidate - could be exit, check if it's exception edge
                     if (edge.edge_type == .exception) return null;
                 }
@@ -1149,13 +1205,13 @@ pub const Analyzer = struct {
 
         // Verify candidate comes before exit
         if (exit_block) |exit| {
-            if (candidate >= exit) return null;
+            if (cand >= exit) return null;
         }
 
         // Verify candidate comes after try block
-        if (candidate <= try_block) return null;
+        if (cand <= try_block) return null;
 
-        return candidate;
+        return cand;
     }
 
     fn detectFinallyBlock311(
@@ -1429,6 +1485,7 @@ pub const Analyzer = struct {
         for (block.instructions) |inst| {
             if (inst.opcode == .CHECK_EXC_MATCH) return true;
             if (inst.opcode == .COMPARE_OP and inst.arg == 10) return true;
+            if (inst.opcode == .JUMP_IF_NOT_EXC_MATCH) return true;
         }
         return false;
     }
