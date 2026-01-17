@@ -809,6 +809,12 @@ pub const Decompiler = struct {
                     .opcode = inst.opcode.name(),
                 };
             };
+            if (inst.opcode == .IMPORT_NAME) {
+                if (try self.tryDecompileImportFromGroup(sim, instructions, i, stmts, stmts_allocator)) |end_idx| {
+                    i = end_idx;
+                    continue;
+                }
+            }
             switch (inst.opcode) {
                 .UNPACK_SEQUENCE, .UNPACK_EX => {
                     // Look ahead for N store targets to generate unpacking assignment
@@ -9565,6 +9571,101 @@ pub const Decompiler = struct {
         };
 
         return try self.makeFunctionDef(name, func);
+    }
+
+    fn tryDecompileImportFromGroup(
+        self: *Decompiler,
+        sim: *SimContext,
+        instructions: []const decoder.Instruction,
+        start_idx: usize,
+        stmts: *std.ArrayList(*Stmt),
+        stmts_allocator: Allocator,
+    ) DecompileError!?usize {
+        if (start_idx >= instructions.len) return null;
+        const inst = instructions[start_idx];
+        if (inst.opcode != .IMPORT_NAME) return null;
+
+        const module_name = sim.getName(inst.arg) orelse return null;
+        if (sim.stack.len() == 0) return null;
+        const stack_items = sim.stack.items.items;
+        const fromlist_val = stack_items[stack_items.len - 1];
+        var level: u32 = 0;
+        if (self.version.gte(2, 5)) {
+            if (stack_items.len < 2) return null;
+            const level_val = stack_items[stack_items.len - 2];
+            if (level_val == .expr and level_val.expr.* == .constant) {
+                if (level_val.expr.constant == .int and level_val.expr.constant.int >= 0) {
+                    level = @intCast(level_val.expr.constant.int);
+                }
+            }
+        }
+
+        if (fromlist_val == .expr and fromlist_val.expr.* == .tuple) {
+            if (fromlist_val.expr.tuple.elts.len == 0) return null;
+        } else {
+            return null;
+        }
+
+        var idx = start_idx + 1;
+        var aliases: std.ArrayList(ast.Alias) = .{};
+        defer aliases.deinit(self.allocator);
+
+        if (idx < instructions.len and instructions[idx].opcode == .IMPORT_STAR) {
+            const a = self.arena.allocator();
+            const list = try a.alloc(ast.Alias, 1);
+            list[0] = .{ .name = "*", .asname = null };
+            const stmt = try a.create(Stmt);
+            stmt.* = .{ .import_from = .{
+                .module = if (module_name.len == 0) null else module_name,
+                .names = list,
+                .level = level,
+            } };
+            try stmts.append(stmts_allocator, stmt);
+
+            while (idx < instructions.len) : (idx += 1) {
+                try sim.simulate(instructions[idx]);
+                if (instructions[idx].opcode == .POP_TOP) return idx;
+            }
+            return null;
+        }
+
+        while (idx + 1 < instructions.len) {
+            const from_inst = instructions[idx];
+            const store_inst = instructions[idx + 1];
+            if (from_inst.opcode != .IMPORT_FROM) break;
+            const attr_name = sim.getName(from_inst.arg) orelse break;
+            const store_name: ?[]const u8 = switch (store_inst.opcode) {
+                .STORE_NAME, .STORE_GLOBAL => sim.getName(store_inst.arg),
+                .STORE_FAST => sim.getLocal(store_inst.arg),
+                .STORE_DEREF => sim.getDeref(store_inst.arg),
+                else => null,
+            };
+            if (store_name == null) break;
+            const asname = if (std.mem.eql(u8, attr_name, store_name.?)) null else store_name.?;
+            try aliases.append(self.allocator, .{ .name = attr_name, .asname = asname });
+            idx += 2;
+        }
+
+        if (aliases.items.len == 0) return null;
+        if (idx >= instructions.len or instructions[idx].opcode != .POP_TOP) return null;
+
+        const a = self.arena.allocator();
+        const alias_list = try a.alloc(ast.Alias, aliases.items.len);
+        std.mem.copyForwards(ast.Alias, alias_list, aliases.items);
+        const stmt = try a.create(Stmt);
+        stmt.* = .{ .import_from = .{
+            .module = if (module_name.len == 0) null else module_name,
+            .names = alias_list,
+            .level = level,
+        } };
+        try stmts.append(stmts_allocator, stmt);
+
+        var sim_idx: usize = start_idx;
+        while (sim_idx <= idx) : (sim_idx += 1) {
+            try sim.simulate(instructions[sim_idx]);
+        }
+
+        return idx;
     }
 
     fn makeImport(self: *Decompiler, alias_name: []const u8, imp: stack_mod.ImportModule) DecompileError!*Stmt {

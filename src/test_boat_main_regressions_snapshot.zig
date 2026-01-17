@@ -68,6 +68,17 @@ test "snapshot relative import 3.9" {
     );
 }
 
+test "snapshot import from group 3.9" {
+    try runSnapshot(@src(), "test/corpus/import_from_group.3.9.pyc",
+        \\[]u8
+        \\  "from pkg import a, b as c, d
+        \\from . import local_a, local_b as lb
+        \\from ..parent import x, y as yy
+        \\from mod import *
+        \\"
+    );
+}
+
 test "snapshot future docstring 3.9" {
     try runSnapshot(@src(), "test/corpus/future_docstring.3.9.pyc",
         \\[]u8
