@@ -247,7 +247,38 @@ def main() -> None:
         orig_data = disassemble_with_xdis(xdis_py, orig, args.timeout)
         comp_data = disassemble_with_xdis(xdis_py, compiled_pyc, args.timeout)
 
-        comp_map = {u["path"]: u for u in comp_data["units"]}
+        version_mismatch = orig_data["version"] != comp_data["version"]
+        if version_mismatch:
+            summary = {
+                "orig_version": orig_data["version"],
+                "compiled_version": comp_data["version"],
+                "version_mismatch": True,
+                "units_compared": 0,
+                "units_missing": [],
+                "avg_seq_ratio": 0.0,
+                "avg_count_jaccard": 0.0,
+                "min_seq_ratio": 0.0,
+                "min_count_jaccard": 0.0,
+                "exact_units": 0,
+                "verdict": "mismatch",
+                "thresholds": {
+                    "avg_ratio": args.avg_ratio,
+                    "min_unit_ratio": args.min_unit_ratio,
+                    "min_count_jaccard": args.min_count_jaccard,
+                },
+            }
+            report = {"verdict": "mismatch", "summary": summary, "rows": []}
+            out = json.dumps(report, indent=2)
+            if args.out:
+                Path(args.out).write_text(out)
+            else:
+                print(out)
+            return
+
+        comp_map: dict[str, list[dict]] = {}
+        for unit in comp_data["units"]:
+            comp_map.setdefault(unit["path"], []).append(unit)
+        comp_seen: dict[str, int] = {}
         rows = []
         total_ratio = 0.0
         total_jaccard = 0.0
@@ -258,10 +289,13 @@ def main() -> None:
         exact_units = 0
         for unit in orig_data["units"]:
             path = unit["path"]
-            other = comp_map.get(path)
-            if other is None:
+            idx = comp_seen.get(path, 0)
+            comp_seen[path] = idx + 1
+            candidates = comp_map.get(path)
+            if not candidates or idx >= len(candidates):
                 missing.append(path)
                 continue
+            other = candidates[idx]
             ratio = seq_ratio(unit["norm_ops"], other["norm_ops"])
             jac = count_jaccard(unit["counts"], other["counts"])
             exact = unit["norm_ops"] == other["norm_ops"]
