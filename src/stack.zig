@@ -125,6 +125,7 @@ const CompBuilder = struct {
 pub const ImportModule = struct {
     module: []const u8,
     fromlist: []const []const u8,
+    level: u32,
 };
 
 /// A value on the simulated stack.
@@ -165,6 +166,139 @@ pub const StackValue = union(enum) {
         }
     }
 };
+
+pub fn stackValueEqual(a: StackValue, b: StackValue) bool {
+    return switch (a) {
+        .expr => |ae| switch (b) {
+            .expr => |be| ast.exprEqual(ae, be),
+            else => false,
+        },
+        .function_obj => |af| switch (b) {
+            .function_obj => |bf| functionValueEqual(af, bf),
+            else => false,
+        },
+        .class_obj => |ac| switch (b) {
+            .class_obj => |bc| classValueEqual(ac, bc),
+            else => false,
+        },
+        .comp_builder => |ab| switch (b) {
+            .comp_builder => |bb| compBuilderEqual(ab, bb),
+            else => false,
+        },
+        .comp_obj => |aco| switch (b) {
+            .comp_obj => |bco| aco.code == bco.code and aco.kind == bco.kind,
+            else => false,
+        },
+        .code_obj => |acode| switch (b) {
+            .code_obj => |bcode| acode == bcode,
+            else => false,
+        },
+        .import_module => |aimp| switch (b) {
+            .import_module => |bimp| blk: {
+                if (!std.mem.eql(u8, aimp.module, bimp.module)) break :blk false;
+                if (aimp.level != bimp.level) break :blk false;
+                if (aimp.fromlist.len != bimp.fromlist.len) break :blk false;
+                for (aimp.fromlist, 0..) |name, idx| {
+                    if (!std.mem.eql(u8, name, bimp.fromlist[idx])) break :blk false;
+                }
+                break :blk true;
+            },
+            else => false,
+        },
+        .null_marker => switch (b) {
+            .null_marker => true,
+            else => false,
+        },
+        .saved_local => |name| switch (b) {
+            .saved_local => |other| std.mem.eql(u8, name, other),
+            else => false,
+        },
+        .unknown => switch (b) {
+            .unknown => true,
+            else => false,
+        },
+    };
+}
+
+fn exprSliceEqual(a: []const *Expr, b: []const *Expr) bool {
+    if (a.len != b.len) return false;
+    for (a, 0..) |ae, idx| {
+        if (!ast.exprEqual(ae, b[idx])) return false;
+    }
+    return true;
+}
+
+fn optExprSliceEqual(a: []const ?*Expr, b: []const ?*Expr) bool {
+    if (a.len != b.len) return false;
+    for (a, 0..) |ae, idx| {
+        const be = b[idx];
+        if (ae == null or be == null) {
+            if (ae != null or be != null) return false;
+            continue;
+        }
+        if (!ast.exprEqual(ae.?, be.?)) return false;
+    }
+    return true;
+}
+
+fn annotationsEqual(a: []const signature.Annotation, b: []const signature.Annotation) bool {
+    if (a.len != b.len) return false;
+    for (a, 0..) |ann, idx| {
+        const other = b[idx];
+        if (!std.mem.eql(u8, ann.name, other.name)) return false;
+        if (!ast.exprEqual(ann.value, other.value)) return false;
+    }
+    return true;
+}
+
+fn functionValueEqual(a: *const FunctionValue, b: *const FunctionValue) bool {
+    if (a.code != b.code) return false;
+    if (!exprSliceEqual(a.defaults, b.defaults)) return false;
+    if (!optExprSliceEqual(a.kw_defaults, b.kw_defaults)) return false;
+    if (!exprSliceEqual(a.decorators.items, b.decorators.items)) return false;
+    if (!annotationsEqual(a.annotations, b.annotations)) return false;
+    return true;
+}
+
+fn classValueEqual(a: *const ClassValue, b: *const ClassValue) bool {
+    if (a.code != b.code) return false;
+    if (!std.mem.eql(u8, a.name, b.name)) return false;
+    if (!exprSliceEqual(a.bases, b.bases)) return false;
+    if (!exprSliceEqual(a.decorators.items, b.decorators.items)) return false;
+    return true;
+}
+
+fn compBuilderEqual(a: *const CompBuilder, b: *const CompBuilder) bool {
+    if (a.kind != b.kind) return false;
+    if (a.seen_append != b.seen_append) return false;
+    if (!optExprEqual(a.elt, b.elt)) return false;
+    if (!optExprEqual(a.key, b.key)) return false;
+    if (!optExprEqual(a.value, b.value)) return false;
+    if (a.generators.items.len != b.generators.items.len) return false;
+    for (a.generators.items, 0..) |gen, idx| {
+        if (!pendingCompEqual(gen, b.generators.items[idx])) return false;
+    }
+    if (a.loop_stack.items.len != b.loop_stack.items.len) return false;
+    for (a.loop_stack.items, 0..) |idx_val, idx| {
+        if (idx_val != b.loop_stack.items[idx]) return false;
+    }
+    return true;
+}
+
+fn pendingCompEqual(a: PendingComp, b: PendingComp) bool {
+    if (a.is_async != b.is_async) return false;
+    if (!optExprEqual(a.target, b.target)) return false;
+    if (!optExprEqual(a.iter, b.iter)) return false;
+    if (!exprSliceEqual(a.ifs.items, b.ifs.items)) return false;
+    return true;
+}
+
+fn optExprEqual(a: ?*Expr, b: ?*Expr) bool {
+    if (a == null or b == null) {
+        return a == null and b == null;
+    }
+    return ast.exprEqual(a.?, b.?);
+}
 
 /// Simulated Python evaluation stack.
 pub const Stack = struct {
@@ -936,14 +1070,15 @@ pub const SimContext = struct {
     }
 
     pub fn cloneStackValueFlow(self: *SimContext, value: StackValue) !StackValue {
+        _ = self;
         return switch (value) {
-            .expr => |e| .{ .expr = e },
-            .function_obj => |func| .{ .function_obj = try self.cloneFunctionValue(func) },
-            .class_obj => |cls| .{ .class_obj = try self.cloneClassValue(cls) },
-            .comp_builder => |builder| .{ .comp_builder = try self.cloneCompBuilder(builder) },
+            .expr => .unknown,
+            .function_obj => .unknown,
+            .class_obj => .unknown,
+            .comp_builder => .unknown,
             .comp_obj => |comp| .{ .comp_obj = comp },
             .code_obj => |code| .{ .code_obj = code },
-            .import_module => |imp| .{ .import_module = imp },
+            .import_module => .unknown,
             .null_marker => .null_marker,
             .saved_local => |name| .{ .saved_local = name },
             .unknown => .unknown,
@@ -3274,11 +3409,20 @@ pub const SimContext = struct {
                 // Stack (Python 2.0-2.4): fromlist -> module
                 // Stack (Python < 2.0): -> module (no stack arguments)
                 var fromlist_val: ?StackValue = null;
+                var level: u32 = 0;
                 if (self.version.gte(2, 0)) {
                     fromlist_val = self.stack.pop() orelse return error.StackUnderflow;
                     if (self.version.gte(2, 5)) {
-                        const level = self.stack.pop() orelse return error.StackUnderflow;
-                        defer level.deinit(self.allocator);
+                        const level_val = self.stack.pop() orelse return error.StackUnderflow;
+                        defer level_val.deinit(self.allocator);
+                        if (level_val == .expr and level_val.expr.* == .constant) {
+                            switch (level_val.expr.constant) {
+                                .int => |v| {
+                                    if (v >= 0) level = @intCast(v);
+                                },
+                                else => {},
+                            }
+                        }
                     }
                 }
                 defer if (fromlist_val) |fv| fv.deinit(self.allocator);
@@ -3302,6 +3446,7 @@ pub const SimContext = struct {
                     try self.stack.push(.{ .import_module = .{
                         .module = module_name,
                         .fromlist = fromlist,
+                        .level = level,
                     } });
                 } else {
                     try self.stack.push(.unknown);
@@ -3323,10 +3468,12 @@ pub const SimContext = struct {
                         self.stack.items.items[top_idx] = .{ .import_module = .{
                             .module = imp.module,
                             .fromlist = try new_fromlist.toOwnedSlice(self.allocator),
+                            .level = imp.level,
                         } };
                         try self.stack.push(.{ .import_module = .{
                             .module = imp.module,
                             .fromlist = &.{attr_name},
+                            .level = imp.level,
                         } });
                     } else {
                         try self.stack.push(.unknown);
@@ -3881,6 +4028,29 @@ pub const SimContext = struct {
                 // No stack effect
             },
 
+            .DELETE_SUBSCR => {
+                // DELETE_SUBSCR - delete container[key]
+                const key = self.stack.pop() orelse return error.StackUnderflow;
+                const container = self.stack.pop() orelse {
+                    var v = key;
+                    v.deinit(self.allocator);
+                    return error.StackUnderflow;
+                };
+                var key_val = key;
+                var container_val = container;
+                key_val.deinit(self.allocator);
+                container_val.deinit(self.allocator);
+            },
+            .DELETE_ATTR => {
+                // DELETE_ATTR namei - delete attribute from TOS
+                if (self.stack.pop()) |v| {
+                    var val = v;
+                    val.deinit(self.allocator);
+                } else {
+                    return error.StackUnderflow;
+                }
+            },
+
             .CONVERT_VALUE => {
                 // CONVERT_VALUE conversion - applies str/repr/ascii to TOS
                 // arg: 1=str(), 2=repr(), 3=ascii()
@@ -4113,7 +4283,7 @@ pub const SimContext = struct {
 
             .YIELD_FROM => {
                 // YIELD_FROM - yield from iterable, or await if preceded by GET_AWAITABLE
-                const value = try self.stack.popExpr();
+                const send_val = try self.stack.popExpr();
 
                 // Check if this is an await (GET_AWAITABLE was seen)
                 if (self.pending_await) {
@@ -4121,15 +4291,18 @@ pub const SimContext = struct {
                     // Get the awaitable from stack (GET_AWAITABLE left it there)
                     const awaitable = try self.stack.popExpr();
                     // Discard the None value from LOAD_CONST
-                    value.deinit(self.allocator);
-                    self.allocator.destroy(value);
+                    send_val.deinit(self.allocator);
+                    self.allocator.destroy(send_val);
                     // Create await expression
                     const expr = try self.allocator.create(Expr);
                     expr.* = .{ .await_expr = .{ .value = awaitable } };
                     try self.stack.push(.{ .expr = expr });
                 } else {
+                    const iter_val = try self.stack.popExpr();
+                    send_val.deinit(self.allocator);
+                    self.allocator.destroy(send_val);
                     const expr = try self.allocator.create(Expr);
-                    expr.* = .{ .yield_from = .{ .value = value } };
+                    expr.* = .{ .yield_from = .{ .value = iter_val } };
                     try self.stack.push(.{ .expr = expr });
                 }
             },
@@ -4413,6 +4586,7 @@ pub const SimContext = struct {
             .GET_ANEXT => {
                 // GET_ANEXT - get next awaitable from async iterator
                 // Stack effect: +1 (pushes awaitable, iterator stays)
+                self.pending_await = true;
                 try self.stack.push(.unknown);
             },
 

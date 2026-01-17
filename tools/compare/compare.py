@@ -117,7 +117,6 @@ import json
 import sys
 from xdis import load
 from xdis import op_imports
-from xdis.op_imports import PythonImplementation
 from xdis.bytecode import Bytecode
 
 IGNORE = set(""" + json.dumps(sorted(IGNORE_OPS)) + r""")
@@ -168,14 +167,22 @@ def main():
     res = load.load_module(pyc)
     ver = res[0]
     code = res[3]
-    impl = None
-    for item in res:
-        if isinstance(item, PythonImplementation):
-            impl = item
-            break
-    if impl is None:
-        impl = PythonImplementation.CPython
-    opc = op_imports.get_opcode_module(ver, impl)
+    try:
+        from xdis.op_imports import PythonImplementation
+    except Exception:
+        PythonImplementation = None
+
+    if PythonImplementation is None:
+        opc = op_imports.get_opcode_module(ver)
+    else:
+        impl = None
+        for item in res:
+            if isinstance(item, PythonImplementation):
+                impl = item
+                break
+        if impl is None:
+            impl = PythonImplementation.CPython
+        opc = op_imports.get_opcode_module(ver, impl)
     out = []
     walk(code, opc, code.co_name, out)
     print(json.dumps({"version": list(ver), "units": out}))

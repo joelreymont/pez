@@ -22,6 +22,7 @@ pub const test_match_multiblock = @import("test_match_multiblock.zig");
 pub const test_match_guards_snapshot = @import("test_match_guards_snapshot.zig");
 pub const test_with_legacy_snapshot = @import("test_with_legacy_snapshot.zig");
 pub const test_kw_defaults_snapshot = @import("test_kw_defaults_snapshot.zig");
+pub const test_boat_main_regressions_snapshot = @import("test_boat_main_regressions_snapshot.zig");
 pub const stack_flow_tests = @import("stack_flow_tests.zig");
 
 // Property testing
@@ -50,6 +51,7 @@ comptime {
     _ = test_match_guards_snapshot;
     _ = test_with_legacy_snapshot;
     _ = test_kw_defaults_snapshot;
+    _ = test_boat_main_regressions_snapshot;
     _ = stack_flow_tests;
 }
 
