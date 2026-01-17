@@ -210,6 +210,14 @@ pub const BoolOpPattern = struct {
     kind: BoolOpKind,
 };
 
+const BlockFlags = struct {
+    has_exception_edge: bool = false,
+    has_with_setup: bool = false,
+    has_check_exc_match: bool = false,
+    has_match_opcode: bool = false,
+    has_match_pattern: bool = false,
+};
+
 /// Control flow analyzer.
 pub const Analyzer = struct {
     cfg: *const CFG,
@@ -223,6 +231,8 @@ pub const Analyzer = struct {
     try_cache_checked: std.DynamicBitSet,
     /// Enclosing loop headers per block.
     enclosing_loops: []std.ArrayListUnmanaged(u32),
+    /// Per-block cached flags for pattern detection.
+    block_flags: []BlockFlags,
     /// Merge-point scratch (generation-stamped visitation).
     merge_then_seen: []u32,
     merge_else_seen: []u32,
@@ -249,6 +259,9 @@ pub const Analyzer = struct {
         const merge_else_seen = try allocator.alloc(u32, cfg_ptr.blocks.len);
         errdefer allocator.free(merge_else_seen);
         @memset(merge_else_seen, 0);
+        const block_flags = try allocator.alloc(BlockFlags, cfg_ptr.blocks.len);
+        errdefer allocator.free(block_flags);
+        @memset(block_flags, .{});
 
         if (dom.num_blocks > 0) {
             const headers = try dom.getLoopHeaders();
@@ -262,7 +275,7 @@ pub const Analyzer = struct {
                 }
             }
         }
-        return .{
+        var analyzer = Analyzer{
             .cfg = cfg_ptr,
             .dom = dom,
             .allocator = allocator,
@@ -274,7 +287,10 @@ pub const Analyzer = struct {
             .merge_else_seen = merge_else_seen,
             .merge_gen = 1,
             .merge_queue = .{},
+            .block_flags = block_flags,
         };
+        analyzer.computeBlockFlags();
+        return analyzer;
     }
 
     pub fn deinit(self: *Analyzer) void {
@@ -295,6 +311,49 @@ pub const Analyzer = struct {
         if (self.merge_then_seen.len > 0) self.allocator.free(self.merge_then_seen);
         if (self.merge_else_seen.len > 0) self.allocator.free(self.merge_else_seen);
         self.merge_queue.deinit(self.allocator);
+        if (self.block_flags.len > 0) self.allocator.free(self.block_flags);
+    }
+
+    fn computeBlockFlags(self: *Analyzer) void {
+        for (self.cfg.blocks, 0..) |*block, idx| {
+            var flags = BlockFlags{};
+
+            for (block.successors) |edge| {
+                if (edge.edge_type == .exception) {
+                    flags.has_exception_edge = true;
+                    break;
+                }
+            }
+
+            var has_dup = false;
+            var has_exc_cmp = false;
+            var has_jump = false;
+            for (block.instructions) |inst| {
+                switch (inst.opcode) {
+                    .BEFORE_WITH, .BEFORE_ASYNC_WITH, .LOAD_SPECIAL, .SETUP_WITH, .SETUP_ASYNC_WITH => {
+                        flags.has_with_setup = true;
+                    },
+                    .CHECK_EXC_MATCH, .PUSH_EXC_INFO, .JUMP_IF_NOT_EXC_MATCH => {
+                        flags.has_check_exc_match = true;
+                    },
+                    .DUP_TOP => has_dup = true,
+                    .COMPARE_OP => {
+                        if (inst.arg == 10) has_exc_cmp = true;
+                    },
+                    .JUMP_IF_FALSE, .POP_JUMP_IF_FALSE => has_jump = true,
+                    .MATCH_SEQUENCE, .MATCH_MAPPING, .MATCH_CLASS => flags.has_match_opcode = true,
+                    else => {},
+                }
+            }
+
+            if (!flags.has_check_exc_match and has_dup and has_exc_cmp and has_jump) {
+                flags.has_check_exc_match = true;
+            }
+
+            flags.has_match_pattern = self.computeMatchPattern(@intCast(idx), block, flags.has_match_opcode);
+
+            self.block_flags[idx] = flags;
+        }
     }
 
     fn nextMergeGen(self: *Analyzer) void {
@@ -376,41 +435,20 @@ pub const Analyzer = struct {
 
     /// Check if block has any exception edges.
     fn hasExceptionEdge(self: *const Analyzer, block: *const BasicBlock) bool {
-        _ = self;
-        for (block.successors) |edge| {
-            if (edge.edge_type == .exception) return true;
-        }
-        return false;
+        if (block.id >= self.block_flags.len) return false;
+        return self.block_flags[block.id].has_exception_edge;
     }
 
     /// Check if block has BEFORE_WITH setup.
     fn hasWithSetup(self: *const Analyzer, block: *const BasicBlock) bool {
-        _ = self;
-        for (block.instructions) |inst| {
-            if (inst.opcode == .BEFORE_WITH or inst.opcode == .BEFORE_ASYNC_WITH or inst.opcode == .LOAD_SPECIAL) return true;
-            if (inst.opcode == .SETUP_WITH or inst.opcode == .SETUP_ASYNC_WITH) return true;
-        }
-        return false;
+        if (block.id >= self.block_flags.len) return false;
+        return self.block_flags[block.id].has_with_setup;
     }
 
     /// Check if block has CHECK_EXC_MATCH (exception handler).
     fn hasCheckExcMatch(self: *const Analyzer, block: *const BasicBlock) bool {
-        _ = self;
-        var has_dup = false;
-        var has_exc_cmp = false;
-        var has_jump = false;
-        for (block.instructions) |inst| {
-            switch (inst.opcode) {
-                .CHECK_EXC_MATCH, .PUSH_EXC_INFO, .JUMP_IF_NOT_EXC_MATCH => return true,
-                .DUP_TOP => has_dup = true,
-                .COMPARE_OP => {
-                    if (inst.arg == 10) has_exc_cmp = true;
-                },
-                .JUMP_IF_FALSE, .POP_JUMP_IF_FALSE => has_jump = true,
-                else => {},
-            }
-        }
-        return has_dup and has_exc_cmp and has_jump;
+        if (block.id >= self.block_flags.len) return false;
+        return self.block_flags[block.id].has_check_exc_match;
     }
 
     /// Detect ternary expression pattern.
@@ -1500,22 +1538,13 @@ pub const Analyzer = struct {
 
     /// Check if block has a MATCH_* opcode.
     fn hasMatchOpcode(self: *const Analyzer, block: *const BasicBlock) bool {
-        _ = self;
-        for (block.instructions) |inst| {
-            if (inst.opcode == .MATCH_SEQUENCE or
-                inst.opcode == .MATCH_MAPPING or
-                inst.opcode == .MATCH_CLASS)
-            {
-                return true;
-            }
-        }
-        return false;
+        if (block.id >= self.block_flags.len) return false;
+        return self.block_flags[block.id].has_match_opcode;
     }
 
-    /// Check if block has a match pattern (COPY followed by MATCH_* or literal compare).
-    fn hasMatchPattern(self: *const Analyzer, block: *const BasicBlock) bool {
+    fn computeMatchPattern(self: *const Analyzer, block_id: u32, block: *const BasicBlock, has_match_opcode: bool) bool {
         var has_copy = false;
-        var has_match_op = false;
+        var has_match_op = has_match_opcode;
         var has_cond = false;
 
         if (block.terminator()) |term| {
@@ -1530,27 +1559,21 @@ pub const Analyzer = struct {
             {
                 has_match_op = true;
             }
-            // COPY + COMPARE_OP is literal case match
             if (has_copy and inst.opcode == .COMPARE_OP) {
                 has_match_op = true;
             }
         }
-        // Match pattern with guard (Python 3.10+ only): LOAD_NAME/LOAD_FAST (subject) followed by STORE_NAME/STORE_FAST (pattern binding)
-        // Or STORE_FAST_LOAD_FAST (Python 3.14+) which combines both
-        // Or STORE_FAST_STORE_FAST (Python 3.14+) which stores pattern vars
+
         if (self.cfg.version.major >= 3 and self.cfg.version.minor >= 10) {
             for (block.instructions, 0..) |inst, i| {
-                // Python 3.14+: STORE_FAST_LOAD_FAST or STORE_FAST_STORE_FAST is pattern match binding
                 if (inst.opcode == .STORE_FAST_LOAD_FAST or inst.opcode == .STORE_FAST_STORE_FAST) {
                     return has_cond or has_copy or has_match_op;
                 }
 
                 if (inst.opcode == .STORE_NAME or inst.opcode == .STORE_FAST) {
-                    // Check if previous instruction is LOAD (subject load)
                     const has_load_before = if (i > 0)
                         block.instructions[i - 1].opcode == .LOAD_NAME or block.instructions[i - 1].opcode == .LOAD_FAST
                     else blk: {
-                        // Check predecessor's last instruction
                         if (block.predecessors.len > 0) {
                             const pred_id = block.predecessors[0];
                             if (pred_id < self.cfg.blocks.len) {
@@ -1567,7 +1590,15 @@ pub const Analyzer = struct {
                 }
             }
         }
+
+        _ = block_id;
         return has_copy and has_match_op;
+    }
+
+    /// Check if block has a match pattern (COPY followed by MATCH_* or literal compare).
+    fn hasMatchPattern(self: *const Analyzer, block: *const BasicBlock) bool {
+        if (block.id >= self.block_flags.len) return false;
+        return self.block_flags[block.id].has_match_pattern;
     }
 
     /// Check for literal compare case without COPY (subject already on stack).

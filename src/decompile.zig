@@ -419,7 +419,7 @@ pub const Decompiler = struct {
     fn stackValueEqual(a: StackValue, b: StackValue) bool {
         return switch (a) {
             .expr => |ae| switch (b) {
-                .expr => |be| ae == be,
+                .expr => |be| ast.exprEqual(ae, be),
                 else => false,
             },
             .function_obj => |af| switch (b) {
@@ -485,13 +485,34 @@ pub const Decompiler = struct {
         return out;
     }
 
+    fn cloneStackValuesArenaFlow(
+        self: *Decompiler,
+        sim: *SimContext,
+        values: []const StackValue,
+    ) DecompileError![]StackValue {
+        if (values.len == 0) return &.{};
+
+        const out = try self.allocator.alloc(StackValue, values.len);
+        errdefer self.allocator.free(out);
+
+        for (values, 0..) |val, idx| {
+            out[idx] = try sim.cloneStackValueFlow(val);
+        }
+
+        return out;
+    }
+
     fn mergeStackEntry(
         self: *Decompiler,
         existing_opt: ?[]StackValue,
         incoming: []const StackValue,
         clone_sim: *SimContext,
+        flow_mode: bool,
     ) DecompileError!?[]StackValue {
         if (existing_opt == null) {
+            if (flow_mode) {
+                return try self.cloneStackValuesArenaFlow(clone_sim, incoming);
+            }
             return try self.cloneStackValuesArena(clone_sim, incoming);
         }
 
@@ -568,6 +589,7 @@ pub const Decompiler = struct {
         try worklist.append(self.allocator, 0);
 
         var clone_sim = SimContext.init(self.arena.allocator(), self.code, self.version);
+        clone_sim.flow_mode = true;
         defer clone_sim.deinit();
 
         while (worklist.items.len > 0) {
@@ -579,9 +601,10 @@ pub const Decompiler = struct {
             var sim = SimContext.init(self.arena.allocator(), self.code, self.version);
             defer sim.deinit();
             sim.lenient = true;
+            sim.flow_mode = true;
 
             for (entry) |val| {
-                const cloned = try clone_sim.cloneStackValue(val);
+                const cloned = try clone_sim.cloneStackValueFlow(val);
                 try sim.stack.push(cloned);
             }
 
@@ -598,7 +621,7 @@ pub const Decompiler = struct {
             }
             if (simulate_failed) continue;
 
-            const exit = try self.cloneStackValuesArena(&clone_sim, sim.stack.items.items);
+            const exit = try self.cloneStackValuesArenaFlow(&clone_sim, sim.stack.items.items);
             defer if (exit.len > 0) self.allocator.free(exit);
 
             for (block.successors) |edge| {
@@ -607,7 +630,7 @@ pub const Decompiler = struct {
                 if (succ >= block_count) continue;
                 if (self.cfg.blocks[succ].is_exception_handler) continue;
 
-                const merged = try self.mergeStackEntry(self.stack_in[succ], exit, &clone_sim);
+                const merged = try self.mergeStackEntry(self.stack_in[succ], exit, &clone_sim, true);
                 if (merged) |new_entry| {
                     if (self.stack_in[succ]) |old| {
                         if (old.len > 0) self.allocator.free(old);
@@ -1724,7 +1747,7 @@ pub const Decompiler = struct {
         }
 
         if (sim.stack.len() != base_vals.len + 1) return null;
-        const expr = sim.stack.popExpr() catch return null;
+        const expr = try sim.stack.popExpr();
         return expr;
     }
 
@@ -1749,7 +1772,7 @@ pub const Decompiler = struct {
             try sim.simulate(inst);
         }
 
-        const expr = sim.stack.popExpr() catch return null;
+        const expr = try sim.stack.popExpr();
         if (sim.stack.len() != base_vals.len) return null;
         return expr;
     }
@@ -1779,7 +1802,7 @@ pub const Decompiler = struct {
         }
 
         if (sim.stack.len() != base_vals.len + 1) return null;
-        const expr = sim.stack.popExpr() catch return null;
+        const expr = try sim.stack.popExpr();
         return expr;
     }
 
@@ -1817,7 +1840,7 @@ pub const Decompiler = struct {
             try sim.simulate(inst);
         }
 
-        const expr = sim.stack.popExpr() catch return null;
+        const expr = try sim.stack.popExpr();
         if (sim.stack.len() != base_vals.len) return null;
         return expr;
     }
@@ -1870,11 +1893,11 @@ pub const Decompiler = struct {
                     try stmts.append(stmts_allocator, stmt);
                 }
             } else {
-                cond_sim.simulate(inst) catch return null;
+                try cond_sim.simulate(inst);
             }
         }
 
-        const expr = cond_sim.stack.popExpr() catch return null;
+        const expr = try cond_sim.stack.popExpr();
         const base_vals = try self.cloneStackValues(&cond_sim, cond_sim.stack.items.items);
         return .{ .expr = expr, .base_vals = base_vals };
     }
@@ -2645,7 +2668,7 @@ pub const Decompiler = struct {
         }
 
         // First operand is on stack
-        const first = cond_sim.stack.popExpr() catch return null;
+        const first = try cond_sim.stack.popExpr();
         errdefer {
             first.deinit(self.allocator);
             self.allocator.destroy(first);
@@ -3035,7 +3058,7 @@ pub const Decompiler = struct {
                 i -= 1;
                 const pred = &self.cfg.blocks[to_simulate[i]];
                 for (pred.instructions) |inst| {
-                    sim.simulate(inst) catch {};
+                    try sim.simulate(inst);
                 }
             }
         }
@@ -3215,7 +3238,7 @@ pub const Decompiler = struct {
                 try then_sim.simulate(inst);
             }
 
-            const cmp_expr = then_sim.stack.popExpr() catch break;
+            const cmp_expr = try then_sim.stack.popExpr();
             if (cmp_expr.* != .compare) {
                 cmp_expr.deinit(self.allocator);
                 self.allocator.destroy(cmp_expr);
@@ -3233,7 +3256,7 @@ pub const Decompiler = struct {
                 ctrl.Analyzer.isConditionalJump(undefined, blk.instructions[cmp_idx + 3].opcode))
             {
                 // More chain - get the next middle value from stack
-                current_mid = then_sim.stack.popExpr() catch break;
+                current_mid = try then_sim.stack.popExpr();
                 // Next block is the fallthrough
                 var found_next = false;
                 for (blk.successors) |edge| {
@@ -3687,7 +3710,7 @@ pub const Decompiler = struct {
             if (inst.opcode == .GET_AITER) break;
             try sim.simulate(inst);
         }
-        const iter_expr = sim.stack.popExpr() catch return null;
+        const iter_expr = try sim.stack.popExpr();
 
         const a = self.arena.allocator();
         var target: *Expr = undefined;
@@ -4124,11 +4147,8 @@ pub const Decompiler = struct {
 
             // Capture context expression right before COPY/LOAD_SPECIAL/SETUP_WITH (clone, don't pop)
             if ((inst.opcode == .COPY or inst.opcode == .LOAD_SPECIAL or inst.opcode == .SETUP_WITH or inst.opcode == .SETUP_ASYNC_WITH) and context_expr == null) {
-                if (sim.stack.items.items.len > 0) {
-                    const top = sim.stack.items.items[sim.stack.items.items.len - 1];
-                    if (top == .expr) {
-                        context_expr = try ast.cloneExpr(a, top.expr);
-                    }
+                if (sim.stack.peekExpr()) |top_expr| {
+                    context_expr = try ast.cloneExpr(a, top_expr);
                 }
             }
 
@@ -4292,15 +4312,10 @@ pub const Decompiler = struct {
                 break;
             }
             prev_was_load = inst.opcode == .LOAD_NAME or inst.opcode == .LOAD_FAST;
-            sim.simulate(inst) catch {};
+            try sim.simulate(inst);
         }
 
-        const subject = sim.stack.popExpr() catch {
-            // Fallback: create unknown expression
-            const expr = try a.create(Expr);
-            expr.* = .{ .name = .{ .id = "<unknown>", .ctx = .load } };
-            return .{ .stmt = null, .next_block = pattern.exit_block orelse pattern.subject_block + 1 };
-        };
+        const subject = try sim.stack.popExpr();
 
         // Decompile each case
         var cases: std.ArrayList(ast.MatchCase) = .{};
@@ -4568,9 +4583,9 @@ pub const Decompiler = struct {
 
                     for (block.instructions[i + 1 ..]) |g_inst| {
                         if (g_inst.opcode == .POP_JUMP_IF_FALSE or g_inst.opcode == .POP_JUMP_FORWARD_IF_FALSE) break;
-                        sim.simulate(g_inst) catch break;
+                        try sim.simulate(g_inst);
                     }
-                    guard = sim.stack.popExpr() catch null;
+                    guard = try sim.stack.popExpr();
                 }
                 return guard;
             } else if (inst.opcode == .STORE_NAME or inst.opcode == .STORE_FAST) {
@@ -4593,9 +4608,9 @@ pub const Decompiler = struct {
                             defer sim.deinit();
                             for (block.instructions[j..]) |g_inst| {
                                 if (g_inst.opcode == .POP_JUMP_IF_FALSE or g_inst.opcode == .POP_JUMP_FORWARD_IF_FALSE) break;
-                                sim.simulate(g_inst) catch break;
+                                try sim.simulate(g_inst);
                             }
-                            guard = sim.stack.popExpr() catch null;
+                            guard = try sim.stack.popExpr();
                             found_guard = true;
                             break;
                         }
@@ -4611,9 +4626,9 @@ pub const Decompiler = struct {
             defer sim.deinit();
             for (block.instructions[start..]) |g_inst| {
                 if (g_inst.opcode == .POP_JUMP_IF_FALSE or g_inst.opcode == .POP_JUMP_FORWARD_IF_FALSE) break;
-                sim.simulate(g_inst) catch break;
+                try sim.simulate(g_inst);
             }
-            guard = sim.stack.popExpr() catch null;
+            guard = try sim.stack.popExpr();
             if (guard != null) return guard;
         }
 
@@ -4647,12 +4662,12 @@ pub const Decompiler = struct {
         defer sim.deinit();
         for (block.instructions[start_idx.?..]) |g_inst| {
             if (g_inst.opcode == .POP_JUMP_IF_FALSE or g_inst.opcode == .POP_JUMP_FORWARD_IF_FALSE) break;
-            sim.simulate(g_inst) catch break;
+            try sim.simulate(g_inst);
         }
-        return sim.stack.popExpr() catch null;
+        return try sim.stack.popExpr();
     }
 
-    fn guardStartInBlock(self: *Decompiler, block: *const cfg_mod.BasicBlock) ?GuardStart {
+    fn guardStartInBlock(self: *Decompiler, block: *const cfg_mod.BasicBlock) DecompileError!?GuardStart {
         var has_cond = false;
         if (block.terminator()) |term| {
             has_cond = ctrl.Analyzer.isConditionalJump(undefined, term.opcode);
@@ -4670,7 +4685,7 @@ pub const Decompiler = struct {
                 const load_idx = inst.arg & 0xF;
                 if (load_idx >= self.code.varnames.len) return null;
                 const name = self.code.varnames[load_idx];
-                const expr = ast.makeName(self.arena.allocator(), name, .load) catch return null;
+                const expr = try ast.makeName(self.arena.allocator(), name, .load);
                 return .{ .idx = i + 1, .preload = expr };
             }
             if (inst.opcode == .STORE_FAST_STORE_FAST) {
@@ -4683,7 +4698,7 @@ pub const Decompiler = struct {
                         const load_idx = block.instructions[j].arg & 0xF;
                         if (load_idx < self.code.varnames.len) {
                             const name = self.code.varnames[load_idx];
-                            preload = ast.makeName(self.arena.allocator(), name, .load) catch null;
+                            preload = try ast.makeName(self.arena.allocator(), name, .load);
                         }
                         continue;
                     }
@@ -4824,7 +4839,7 @@ pub const Decompiler = struct {
 
         for (blocks) |bid| {
             const blk = &self.cfg.blocks[bid];
-            const start = self.guardStartInBlock(blk) orelse continue;
+            const start = (try self.guardStartInBlock(blk)) orelse continue;
             if (start.preload) |e| {
                 try sim.stack.push(.{ .expr = e });
             }
@@ -4865,14 +4880,14 @@ pub const Decompiler = struct {
                     .POP_JUMP_BACKWARD_IF_NONE,
                     .POP_JUMP_BACKWARD_IF_NOT_NONE,
                     => {
-                        const cond = sim.stack.popExpr() catch continue;
+                        const cond = try sim.stack.popExpr();
                         const final_cond = try self.guardCondFromJump(cond, inst.opcode);
                         try guard_exprs.append(self.allocator, final_cond);
                         continue;
                     },
                     .JUMP_FORWARD, .JUMP_BACKWARD, .JUMP_ABSOLUTE => continue,
                     else => {
-                        sim.simulate(inst) catch {};
+                        try sim.simulate(inst);
                     },
                 }
             }
@@ -4956,13 +4971,7 @@ pub const Decompiler = struct {
 
     fn sameExpr(self: *Decompiler, left: *const Expr, right: *const Expr) bool {
         _ = self;
-        return switch (left.*) {
-            .name => |l| switch (right.*) {
-                .name => |r| std.mem.eql(u8, l.id, r.id),
-                else => false,
-            },
-            else => false,
-        };
+        return ast.exprEqual(left, right);
     }
 
     fn mergeCompareChain(self: *Decompiler, left: *Expr, right: *Expr) DecompileError!?*Expr {
@@ -5028,7 +5037,7 @@ pub const Decompiler = struct {
             .tuple => |items| {
                 const exprs = try a.alloc(*Expr, items.len);
                 for (items, 0..) |item, i| {
-                    exprs[i] = self.constExprFromObj(item) catch return null;
+                    exprs[i] = try self.constExprFromObj(item);
                 }
                 return exprs;
             },
@@ -5036,11 +5045,11 @@ pub const Decompiler = struct {
         }
     }
 
-    fn attrNamesFromObj(self: *Decompiler, obj: pyc.Object) ?[]const []const u8 {
+    fn attrNamesFromObj(self: *Decompiler, obj: pyc.Object) DecompileError!?[]const []const u8 {
         const a = self.arena.allocator();
         switch (obj) {
             .tuple => |items| {
-                const names = a.alloc([]const u8, items.len) catch return null;
+                const names = try a.alloc([]const u8, items.len);
                 for (items, 0..) |item, i| {
                     switch (item) {
                         .string => |s| names[i] = s,
@@ -5140,7 +5149,13 @@ pub const Decompiler = struct {
                     lit_expr = try ast.makeConstant(a, .{ .int = @intCast(inst.arg) });
                 },
                 .LOAD_CONST => {
-                    lit_expr = self.constExprFromObj(self.code.consts[inst.arg]) catch return null;
+                    const obj = self.code.consts[inst.arg];
+                    if (self.constExprFromObj(obj)) |expr| {
+                        lit_expr = expr;
+                    } else |err| switch (err) {
+                        error.InvalidBlock => return null,
+                        else => return err,
+                    }
                 },
                 .COMPARE_OP => {
                     if (lit_expr) |v| {
@@ -5406,7 +5421,7 @@ pub const Decompiler = struct {
                     },
                     .LOAD_CONST => {
                         const obj = self.code.consts[inst.arg];
-                        last_attrs = self.attrNamesFromObj(obj);
+                        last_attrs = try self.attrNamesFromObj(obj);
                     },
                     .MATCH_CLASS => {
                         if (last_cls != null and last_attrs != null) {
@@ -5977,17 +5992,20 @@ pub const Decompiler = struct {
 
                     for (body_insts.items) |inst| {
                         if (inst.opcode == .RETURN_VALUE) {
-                            const val = sim.stack.popExpr() catch blk: {
-                                const none_expr = try a.create(Expr);
-                                none_expr.* = .{ .constant = .{ .none = {} } };
-                                break :blk none_expr;
+                            const val = if (sim.stack.popExpr()) |expr| expr else |err| switch (err) {
+                                error.StackUnderflow => blk: {
+                                    const none_expr = try a.create(Expr);
+                                    none_expr.* = .{ .constant = .{ .none = {} } };
+                                    break :blk none_expr;
+                                },
+                                else => return err,
                             };
                             const stmt = try a.create(Stmt);
                             stmt.* = .{ .return_stmt = .{ .value = val } };
                             try stmts.append(a, stmt);
                             break;
                         } else {
-                            sim.simulate(inst) catch {};
+                            try sim.simulate(inst);
                         }
                     }
 
@@ -6010,17 +6028,20 @@ pub const Decompiler = struct {
                         for (fb_insts.items) |inst| {
                             if (inst.opcode == .NOT_TAKEN or inst.opcode == .CACHE or inst.opcode == .POP_TOP) continue;
                             if (inst.opcode == .RETURN_VALUE) {
-                                const val = sim.stack.popExpr() catch blk: {
-                                    const none_expr = try a.create(Expr);
-                                    none_expr.* = .{ .constant = .{ .none = {} } };
-                                    break :blk none_expr;
+                                const val = if (sim.stack.popExpr()) |expr| expr else |err| switch (err) {
+                                    error.StackUnderflow => blk: {
+                                        const none_expr = try a.create(Expr);
+                                        none_expr.* = .{ .constant = .{ .none = {} } };
+                                        break :blk none_expr;
+                                    },
+                                    else => return err,
                                 };
                                 const stmt = try a.create(Stmt);
                                 stmt.* = .{ .return_stmt = .{ .value = val } };
                                 try stmts.append(a, stmt);
                                 break;
                             } else {
-                                sim.simulate(inst) catch {};
+                                try sim.simulate(inst);
                             }
                         }
 
@@ -6193,17 +6214,20 @@ pub const Decompiler = struct {
 
                     for (final_block.instructions[start..]) |inst| {
                         if (inst.opcode == .RETURN_VALUE) {
-                            const val = sim.stack.popExpr() catch blk: {
-                                const none_expr = try aa.create(Expr);
-                                none_expr.* = .{ .constant = .{ .none = {} } };
-                                break :blk none_expr;
+                            const val = if (sim.stack.popExpr()) |expr| expr else |err| switch (err) {
+                                error.StackUnderflow => blk: {
+                                    const none_expr = try aa.create(Expr);
+                                    none_expr.* = .{ .constant = .{ .none = {} } };
+                                    break :blk none_expr;
+                                },
+                                else => return err,
                             };
                             const stmt = try aa.create(Stmt);
                             stmt.* = .{ .return_stmt = .{ .value = val } };
                             try stmts.append(aa, stmt);
                             break;
                         } else {
-                            sim.simulate(inst) catch {};
+                            try sim.simulate(inst);
                         }
                     }
 
@@ -6224,17 +6248,20 @@ pub const Decompiler = struct {
                         for (fb_insts.items) |inst| {
                             if (inst.opcode == .NOT_TAKEN or inst.opcode == .CACHE or inst.opcode == .POP_TOP) continue;
                             if (inst.opcode == .RETURN_VALUE) {
-                                const val = sim.stack.popExpr() catch blk: {
-                                    const none_expr = try aa.create(Expr);
-                                    none_expr.* = .{ .constant = .{ .none = {} } };
-                                    break :blk none_expr;
+                                const val = if (sim.stack.popExpr()) |expr| expr else |err| switch (err) {
+                                    error.StackUnderflow => blk: {
+                                        const none_expr = try aa.create(Expr);
+                                        none_expr.* = .{ .constant = .{ .none = {} } };
+                                        break :blk none_expr;
+                                    },
+                                    else => return err,
                                 };
                                 const stmt = try aa.create(Stmt);
                                 stmt.* = .{ .return_stmt = .{ .value = val } };
                                 try stmts.append(aa, stmt);
                                 break;
                             } else {
-                                sim.simulate(inst) catch {};
+                                try sim.simulate(inst);
                             }
                         }
 
@@ -6454,13 +6481,13 @@ pub const Decompiler = struct {
                     }
                     if (inst.opcode == .LOAD_CONST and next_op == .MATCH_CLASS) {
                         const obj = self.code.consts[inst.arg];
-                        last_attrs = self.attrNamesFromObj(obj);
+                        last_attrs = try self.attrNamesFromObj(obj);
                         try sim.simulate(inst);
                         break;
                     }
                     if (!prev_was_get_len and next_op == .COMPARE_OP) {
                         try sim.simulate(inst);
-                        const lit = sim.stack.popExpr() catch null;
+                        const lit = try sim.stack.popExpr();
                         if (seq_stack.items.len > 0) {
                             literal_val = lit;
                         } else {
@@ -6751,7 +6778,7 @@ pub const Decompiler = struct {
                 },
                 else => {
                     prev_was_load = false;
-                    sim.simulate(inst) catch {};
+                    try sim.simulate(inst);
                 },
             }
         }
@@ -7093,7 +7120,7 @@ pub const Decompiler = struct {
                         break;
                     },
                     else => {
-                        sim.simulate(inst) catch {};
+                        try sim.simulate(inst);
                     },
                 }
             }
@@ -8704,7 +8731,7 @@ pub const Decompiler = struct {
             const def_inst = instructions[inst_idx - 4];
             if (def_inst.opcode != .LOAD_CONST) return null;
             if (sim.getConst(def_inst.arg)) |def_obj| {
-                const def_expr = sim.objToExpr(def_obj) catch return null;
+                const def_expr = try sim.objToExpr(def_obj);
                 if (def_expr.* == .tuple) {
                     defaults = def_expr.tuple.elts;
                 } else {
@@ -9094,17 +9121,17 @@ pub fn decompileToSourceWithContext(
             if (err_writer) |ew| {
                 if (decompiler.last_error_ctx) |ctx| {
                     var buf: [256]u8 = undefined;
-                    const msg = std.fmt.bufPrint(&buf, "Error in {s} at offset {d} ({s}): {s}\n", .{
+                    const msg = try std.fmt.bufPrint(&buf, "Error in {s} at offset {d} ({s}): {s}\n", .{
                         ctx.code_name,
                         ctx.offset,
                         ctx.opcode,
                         @errorName(err),
-                    }) catch "Error context unavailable\n";
-                    _ = ew.write(msg) catch {};
+                    });
+                    _ = try ew.write(msg);
                 } else {
                     var buf: [128]u8 = undefined;
-                    const msg = std.fmt.bufPrint(&buf, "Error: {s}\n", .{@errorName(err)}) catch "Error\n";
-                    _ = ew.write(msg) catch {};
+                    const msg = try std.fmt.bufPrint(&buf, "Error: {s}\n", .{@errorName(err)});
+                    _ = try ew.write(msg);
                 }
             }
             return err;

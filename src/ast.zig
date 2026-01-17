@@ -1129,6 +1129,260 @@ pub fn cloneExpr(allocator: Allocator, expr: *const Expr) CloneError!*Expr {
     return out;
 }
 
+fn bigIntEq(a: BigInt, b: BigInt) bool {
+    if (a.negative != b.negative) return false;
+    return std.mem.eql(u16, a.digits, b.digits);
+}
+
+fn constSliceEq(a: []const Constant, b: []const Constant) bool {
+    if (a.len != b.len) return false;
+    for (a, 0..) |item, idx| {
+        if (!constantEqual(item, b[idx])) return false;
+    }
+    return true;
+}
+
+pub fn constantEqual(a: Constant, b: Constant) bool {
+    return switch (a) {
+        .none => b == .none,
+        .true_ => b == .true_,
+        .false_ => b == .false_,
+        .ellipsis => b == .ellipsis,
+        .int => |av| switch (b) {
+            .int => |bv| av == bv,
+            else => false,
+        },
+        .big_int => |av| switch (b) {
+            .big_int => |bv| bigIntEq(av, bv),
+            else => false,
+        },
+        .float => |av| switch (b) {
+            .float => |bv| av == bv,
+            else => false,
+        },
+        .complex => |av| switch (b) {
+            .complex => |bv| av.real == bv.real and av.imag == bv.imag,
+            else => false,
+        },
+        .string => |av| switch (b) {
+            .string => |bv| std.mem.eql(u8, av, bv),
+            else => false,
+        },
+        .bytes => |av| switch (b) {
+            .bytes => |bv| std.mem.eql(u8, av, bv),
+            else => false,
+        },
+        .tuple => |av| switch (b) {
+            .tuple => |bv| constSliceEq(av, bv),
+            else => false,
+        },
+        .code => |av| switch (b) {
+            .code => |bv| av == bv,
+            else => false,
+        },
+    };
+}
+
+fn exprSliceEq(a: []const *Expr, b: []const *Expr) bool {
+    if (a.len != b.len) return false;
+    for (a, 0..) |item, idx| {
+        if (!exprEqual(item, b[idx])) return false;
+    }
+    return true;
+}
+
+fn optExprEq(a: ?*Expr, b: ?*Expr) bool {
+    if (a == null and b == null) return true;
+    if (a == null or b == null) return false;
+    return exprEqual(a.?, b.?);
+}
+
+fn optExprSliceEq(a: []const ?*Expr, b: []const ?*Expr) bool {
+    if (a.len != b.len) return false;
+    for (a, 0..) |item, idx| {
+        if (!optExprEq(item, b[idx])) return false;
+    }
+    return true;
+}
+
+fn kwSliceEq(a: []const Keyword, b: []const Keyword) bool {
+    if (a.len != b.len) return false;
+    for (a, 0..) |item, idx| {
+        const other = b[idx];
+        if (item.arg == null and other.arg != null) return false;
+        if (item.arg != null and other.arg == null) return false;
+        if (item.arg) |arg| {
+            if (!std.mem.eql(u8, arg, other.arg.?)) return false;
+        }
+        if (!exprEqual(item.value, other.value)) return false;
+    }
+    return true;
+}
+
+fn compSliceEq(a: []const Comprehension, b: []const Comprehension) bool {
+    if (a.len != b.len) return false;
+    for (a, 0..) |item, idx| {
+        const other = b[idx];
+        if (!exprEqual(item.target, other.target)) return false;
+        if (!exprEqual(item.iter, other.iter)) return false;
+        if (!exprSliceEq(item.ifs, other.ifs)) return false;
+        if (item.is_async != other.is_async) return false;
+    }
+    return true;
+}
+
+fn argEq(a: Arg, b: Arg) bool {
+    if (!std.mem.eql(u8, a.arg, b.arg)) return false;
+    if (!optExprEq(a.annotation, b.annotation)) return false;
+    if (a.type_comment == null and b.type_comment != null) return false;
+    if (a.type_comment != null and b.type_comment == null) return false;
+    if (a.type_comment) |tc| {
+        if (!std.mem.eql(u8, tc, b.type_comment.?)) return false;
+    }
+    return true;
+}
+
+fn argSliceEq(a: []const Arg, b: []const Arg) bool {
+    if (a.len != b.len) return false;
+    for (a, 0..) |item, idx| {
+        if (!argEq(item, b[idx])) return false;
+    }
+    return true;
+}
+
+fn argsEq(a: *const Arguments, b: *const Arguments) bool {
+    if (!argSliceEq(a.posonlyargs, b.posonlyargs)) return false;
+    if (!argSliceEq(a.args, b.args)) return false;
+    if (!argSliceEq(a.kwonlyargs, b.kwonlyargs)) return false;
+    if (!optExprSliceEq(a.kw_defaults, b.kw_defaults)) return false;
+    if (!exprSliceEq(a.defaults, b.defaults)) return false;
+    if (a.vararg == null and b.vararg != null) return false;
+    if (a.vararg != null and b.vararg == null) return false;
+    if (a.vararg) |va| {
+        if (!argEq(va, b.vararg.?)) return false;
+    }
+    if (a.kwarg == null and b.kwarg != null) return false;
+    if (a.kwarg != null and b.kwarg == null) return false;
+    if (a.kwarg) |ka| {
+        if (!argEq(ka, b.kwarg.?)) return false;
+    }
+    return true;
+}
+
+pub fn exprEqual(left: *const Expr, right: *const Expr) bool {
+    if (left == right) return true;
+    return switch (left.*) {
+        .bool_op => |l| switch (right.*) {
+            .bool_op => |r| l.op == r.op and exprSliceEq(l.values, r.values),
+            else => false,
+        },
+        .named_expr => |l| switch (right.*) {
+            .named_expr => |r| exprEqual(l.target, r.target) and exprEqual(l.value, r.value),
+            else => false,
+        },
+        .bin_op => |l| switch (right.*) {
+            .bin_op => |r| l.op == r.op and exprEqual(l.left, r.left) and exprEqual(l.right, r.right),
+            else => false,
+        },
+        .unary_op => |l| switch (right.*) {
+            .unary_op => |r| l.op == r.op and exprEqual(l.operand, r.operand),
+            else => false,
+        },
+        .lambda => |l| switch (right.*) {
+            .lambda => |r| argsEq(l.args, r.args) and exprEqual(l.body, r.body),
+            else => false,
+        },
+        .if_exp => |l| switch (right.*) {
+            .if_exp => |r| exprEqual(l.condition, r.condition) and exprEqual(l.body, r.body) and exprEqual(l.else_body, r.else_body),
+            else => false,
+        },
+        .dict => |l| switch (right.*) {
+            .dict => |r| optExprSliceEq(l.keys, r.keys) and exprSliceEq(l.values, r.values),
+            else => false,
+        },
+        .set => |l| switch (right.*) {
+            .set => |r| exprSliceEq(l.elts, r.elts),
+            else => false,
+        },
+        .list_comp => |l| switch (right.*) {
+            .list_comp => |r| exprEqual(l.elt, r.elt) and compSliceEq(l.generators, r.generators),
+            else => false,
+        },
+        .set_comp => |l| switch (right.*) {
+            .set_comp => |r| exprEqual(l.elt, r.elt) and compSliceEq(l.generators, r.generators),
+            else => false,
+        },
+        .dict_comp => |l| switch (right.*) {
+            .dict_comp => |r| exprEqual(l.key, r.key) and exprEqual(l.value, r.value) and compSliceEq(l.generators, r.generators),
+            else => false,
+        },
+        .generator_exp => |l| switch (right.*) {
+            .generator_exp => |r| exprEqual(l.elt, r.elt) and compSliceEq(l.generators, r.generators),
+            else => false,
+        },
+        .await_expr => |l| switch (right.*) {
+            .await_expr => |r| exprEqual(l.value, r.value),
+            else => false,
+        },
+        .yield_expr => |l| switch (right.*) {
+            .yield_expr => |r| optExprEq(l.value, r.value),
+            else => false,
+        },
+        .yield_from => |l| switch (right.*) {
+            .yield_from => |r| exprEqual(l.value, r.value),
+            else => false,
+        },
+        .compare => |l| switch (right.*) {
+            .compare => |r| exprEqual(l.left, r.left) and std.mem.eql(CmpOp, l.ops, r.ops) and exprSliceEq(l.comparators, r.comparators),
+            else => false,
+        },
+        .call => |l| switch (right.*) {
+            .call => |r| exprEqual(l.func, r.func) and exprSliceEq(l.args, r.args) and kwSliceEq(l.keywords, r.keywords),
+            else => false,
+        },
+        .formatted_value => |l| switch (right.*) {
+            .formatted_value => |r| l.conversion == r.conversion and exprEqual(l.value, r.value) and optExprEq(l.format_spec, r.format_spec),
+            else => false,
+        },
+        .joined_str => |l| switch (right.*) {
+            .joined_str => |r| exprSliceEq(l.values, r.values),
+            else => false,
+        },
+        .constant => |l| switch (right.*) {
+            .constant => |r| constantEqual(l, r),
+            else => false,
+        },
+        .attribute => |l| switch (right.*) {
+            .attribute => |r| l.ctx == r.ctx and std.mem.eql(u8, l.attr, r.attr) and exprEqual(l.value, r.value),
+            else => false,
+        },
+        .subscript => |l| switch (right.*) {
+            .subscript => |r| l.ctx == r.ctx and exprEqual(l.value, r.value) and exprEqual(l.slice, r.slice),
+            else => false,
+        },
+        .starred => |l| switch (right.*) {
+            .starred => |r| l.ctx == r.ctx and exprEqual(l.value, r.value),
+            else => false,
+        },
+        .name => |l| switch (right.*) {
+            .name => |r| l.ctx == r.ctx and std.mem.eql(u8, l.id, r.id),
+            else => false,
+        },
+        .list => |l| switch (right.*) {
+            .list => |r| l.ctx == r.ctx and exprSliceEq(l.elts, r.elts),
+            else => false,
+        },
+        .tuple => |l| switch (right.*) {
+            .tuple => |r| l.ctx == r.ctx and exprSliceEq(l.elts, r.elts),
+            else => false,
+        },
+        .slice => |l| switch (right.*) {
+            .slice => |r| optExprEq(l.lower, r.lower) and optExprEq(l.upper, r.upper) and optExprEq(l.step, r.step),
+            else => false,
+        },
+    };
+}
+
 /// Statement node types.
 pub const Stmt = union(enum) {
     /// Function definition
@@ -1590,4 +1844,47 @@ test "ast create binop" {
     }
 
     try testing.expectEqual(BinOp.add, binop.bin_op.op);
+}
+
+test "ast expr equality" {
+    const testing = std.testing;
+    const allocator = testing.allocator;
+
+    const n1 = try makeName(allocator, "x", .load);
+    const n2 = try makeName(allocator, "x", .load);
+    const n3 = try makeName(allocator, "y", .load);
+    defer {
+        n1.deinit(allocator);
+        allocator.destroy(n1);
+        n2.deinit(allocator);
+        allocator.destroy(n2);
+        n3.deinit(allocator);
+        allocator.destroy(n3);
+    }
+
+    try testing.expect(exprEqual(n1, n2));
+    try testing.expect(!exprEqual(n1, n3));
+
+    const a1 = try makeConstant(allocator, .{ .int = 1 });
+    const b1 = try makeConstant(allocator, .{ .int = 2 });
+    const elts1 = try allocator.alloc(*Expr, 2);
+    elts1[0] = a1;
+    elts1[1] = b1;
+    const list1 = try makeList(allocator, elts1, .load);
+
+    const a2 = try makeConstant(allocator, .{ .int = 1 });
+    const b2 = try makeConstant(allocator, .{ .int = 2 });
+    const elts2 = try allocator.alloc(*Expr, 2);
+    elts2[0] = a2;
+    elts2[1] = b2;
+    const list2 = try makeList(allocator, elts2, .load);
+
+    defer {
+        list1.deinit(allocator);
+        allocator.destroy(list1);
+        list2.deinit(allocator);
+        allocator.destroy(list2);
+    }
+
+    try testing.expect(exprEqual(list1, list2));
 }

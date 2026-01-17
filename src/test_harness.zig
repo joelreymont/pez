@@ -101,9 +101,9 @@ fn computeDiff(allocator: Allocator, expected: []const u8, actual: []const u8) !
 }
 
 /// Parse Python version from filename like "test.3.11.pyc".
-fn parseVersion(filename: []const u8) ?Version {
-    const idx = std.mem.lastIndexOfScalar(u8, filename, '.') orelse return null;
-    if (idx == 0) return null;
+fn parseVersion(filename: []const u8) !Version {
+    const idx = std.mem.lastIndexOfScalar(u8, filename, '.') orelse return error.InvalidFilename;
+    if (idx == 0) return error.InvalidFilename;
 
     // Find version part before .pyc
     const end = idx;
@@ -119,15 +119,15 @@ fn parseVersion(filename: []const u8) ?Version {
         }
     }
 
-    if (dots < 1) return null;
+    if (dots < 1) return error.InvalidFilename;
 
     const ver_str = filename[start..end];
     var it = std.mem.splitScalar(u8, ver_str, '.');
-    const major_str = it.next() orelse return null;
-    const minor_str = it.next() orelse return null;
+    const major_str = it.next() orelse return error.InvalidFilename;
+    const minor_str = it.next() orelse return error.InvalidFilename;
 
-    const major = std.fmt.parseInt(u8, major_str, 10) catch return null;
-    const minor = std.fmt.parseInt(u8, minor_str, 10) catch return null;
+    const major = if (std.fmt.parseInt(u8, major_str, 10)) |value| value else |_| return error.InvalidFilename;
+    const minor = if (std.fmt.parseInt(u8, minor_str, 10)) |value| value else |_| return error.InvalidFilename;
 
     return Version.init(major, minor);
 }
@@ -196,7 +196,7 @@ fn normalizeSource(allocator: Allocator, source: []const u8) ![]const u8 {
 pub fn runSingleTest(allocator: Allocator, pyc_path: []const u8, writer: anytype) !bool {
     const basename = std.fs.path.basename(pyc_path);
 
-    const version = parseVersion(basename) orelse {
+    const version = if (parseVersion(basename)) |ver| ver else |_| {
         try writer.print("SKIP {s} (no version)\n", .{basename});
         return false;
     };
@@ -246,7 +246,7 @@ pub fn runGoldenTest(
     const basename = std.fs.path.basename(pyc_path);
     const base_name = getBaseName(basename);
 
-    const version = parseVersion(basename) orelse {
+    const version = if (parseVersion(basename)) |ver| ver else |_| {
         try writer.print("SKIP {s} (no version)\n", .{basename});
         return .no_golden;
     };
@@ -346,10 +346,10 @@ pub fn runAllTests(allocator: Allocator, test_dir: []const u8, writer: anytype) 
         if (runSingleTest(allocator, full_path, writer) catch false) {
             stats.passed += 1;
         } else {
-            if (parseVersion(entry.name) == null) {
-                stats.skipped += 1;
-            } else {
+            if (parseVersion(entry.name)) |_| {
                 stats.failed += 1;
+            } else |_| {
+                stats.skipped += 1;
             }
         }
     }
@@ -418,9 +418,15 @@ pub fn runAllGoldenTests(
 
 test "parse version from filename" {
     const testing = std.testing;
-    try testing.expectEqual(Version.init(3, 11), parseVersion("test.3.11.pyc").?);
-    try testing.expectEqual(Version.init(2, 7), parseVersion("foo.2.7.pyc").?);
-    try testing.expect(parseVersion("nope.pyc") == null);
+    const v311 = try parseVersion("test.3.11.pyc");
+    try testing.expectEqual(@as(u8, 3), v311.major);
+    try testing.expectEqual(@as(u8, 11), v311.minor);
+
+    const v27 = try parseVersion("foo.2.7.pyc");
+    try testing.expectEqual(@as(u8, 2), v27.major);
+    try testing.expectEqual(@as(u8, 7), v27.minor);
+
+    try testing.expectError(error.InvalidFilename, parseVersion("nope.pyc"));
 }
 
 test "get base name from pyc filename" {

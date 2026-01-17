@@ -90,7 +90,7 @@ pub fn main() !void {
         std.process.exit(1);
     };
 
-    const version = decoder.Version.init(@intCast(module.major_ver), @intCast(module.minor_ver));
+    const py_ver = decoder.Version.init(@intCast(module.major_ver), @intCast(module.minor_ver));
 
     switch (mode) {
         .disasm => {
@@ -101,14 +101,14 @@ pub fn main() !void {
         .cfgdump => {
             try stdout.print("# CFG Analysis for Python {d}.{d}\n\n", .{ module.major_ver, module.minor_ver });
             if (module.code) |code| {
-                try dumpCodeCFG(allocator, code, version, stdout, 0);
+                try dumpCodeCFG(allocator, code, py_ver, stdout, 0);
             }
         },
         .decompile => {
             try stdout.print("# Python {d}.{d}\n", .{ module.major_ver, module.minor_ver });
             try stdout.print("# Decompiled by pez {s}\n\n", .{version.full});
             if (module.code) |code| {
-                try decompile.decompileToSourceWithContext(allocator, code, version, stdout, std.fs.File.stderr());
+                try decompile.decompileToSourceWithContext(allocator, code, py_ver, stdout, std.fs.File.stderr());
             }
         },
         .test_suite, .golden => unreachable, // Handled earlier
@@ -116,7 +116,7 @@ pub fn main() !void {
     try stdout.flush();
 }
 
-fn dumpCodeCFG(allocator: std.mem.Allocator, code: *const pyc.Code, version: decoder.Version, writer: anytype, indent: u32) !void {
+fn dumpCodeCFG(allocator: std.mem.Allocator, code: *const pyc.Code, py_ver: decoder.Version, writer: anytype, indent: u32) !void {
     // Print indent
     var i: u32 = 0;
     while (i < indent) : (i += 1) {
@@ -127,7 +127,7 @@ fn dumpCodeCFG(allocator: std.mem.Allocator, code: *const pyc.Code, version: dec
 
     // Build CFG
     if (code.code.len > 0) {
-        var cfg = try cfg_mod.buildCFGWithExceptions(allocator, code.code, code.exceptiontable, version);
+        var cfg = try cfg_mod.buildCFGWithExceptions(allocator, code.code, code.exceptiontable, py_ver);
         defer cfg.deinit();
 
         // Print CFG summary
@@ -209,7 +209,7 @@ fn dumpCodeCFG(allocator: std.mem.Allocator, code: *const pyc.Code, version: dec
     for (code.consts) |c| {
         if (c == .code) {
             const nested = c.code;
-            try dumpCodeCFG(allocator, nested, version, writer, indent + 1);
+            try dumpCodeCFG(allocator, nested, py_ver, writer, indent + 1);
         }
     }
 }

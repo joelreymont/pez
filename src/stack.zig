@@ -185,6 +185,10 @@ pub const Stack = struct {
         self.items.deinit(self.allocator);
     }
 
+    pub fn deinitShallow(self: *Stack) void {
+        self.items.deinit(self.allocator);
+    }
+
     pub fn push(self: *Stack, value: StackValue) !void {
         try self.items.append(self.allocator, value);
     }
@@ -299,6 +303,8 @@ pub const SimContext = struct {
     pending_await: bool = false,
     /// Relaxed stack simulation (used by stack-flow analysis).
     lenient: bool = false,
+    /// Avoid deep deinit in stack-flow analysis.
+    flow_mode: bool = false,
 
     pub fn init(allocator: Allocator, code: *const pyc.Code, version: Version) SimContext {
         return .{
@@ -309,10 +315,15 @@ pub const SimContext = struct {
             .iter_override = null,
             .comp_builder = null,
             .lenient = false,
+            .flow_mode = false,
         };
     }
 
     pub fn deinit(self: *SimContext) void {
+        if (self.flow_mode) {
+            self.stack.deinitShallow();
+            return;
+        }
         self.stack.deinit();
         if (self.iter_override) |ov| {
             if (ov.expr) |expr| {
@@ -924,6 +935,21 @@ pub const SimContext = struct {
         };
     }
 
+    pub fn cloneStackValueFlow(self: *SimContext, value: StackValue) !StackValue {
+        return switch (value) {
+            .expr => |e| .{ .expr = e },
+            .function_obj => |func| .{ .function_obj = try self.cloneFunctionValue(func) },
+            .class_obj => |cls| .{ .class_obj = try self.cloneClassValue(cls) },
+            .comp_builder => |builder| .{ .comp_builder = try self.cloneCompBuilder(builder) },
+            .comp_obj => |comp| .{ .comp_obj = comp },
+            .code_obj => |code| .{ .code_obj = code },
+            .import_module => |imp| .{ .import_module = imp },
+            .null_marker => .null_marker,
+            .saved_local => |name| .{ .saved_local = name },
+            .unknown => .unknown,
+        };
+    }
+
     fn cloneFunctionValue(self: *SimContext, func: *const FunctionValue) !*FunctionValue {
         const copy = try self.allocator.create(FunctionValue);
         errdefer self.allocator.destroy(copy);
@@ -1024,11 +1050,66 @@ pub const SimContext = struct {
     }
 
     /// Parse keyword defaults dict from MAKE_FUNCTION.
-    fn parseKwDefaults(self: *SimContext, val: StackValue) SimError![]const ?*Expr {
-        // For now, just discard - full implementation needs dict handling
-        var v = val;
-        v.deinit(self.allocator);
-        return &.{};
+    fn parseKwDefaults(self: *SimContext, val: StackValue, code_opt: ?*const pyc.Code) SimError![]const ?*Expr {
+        const code = code_opt orelse {
+            var v = val;
+            v.deinit(self.allocator);
+            return &.{};
+        };
+        if (code.kwonlyargcount == 0) {
+            var v = val;
+            v.deinit(self.allocator);
+            return &.{};
+        }
+
+        const kw_count: usize = @intCast(code.kwonlyargcount);
+        const out = try self.allocator.alloc(?*Expr, kw_count);
+        @memset(out, null);
+
+        var expr_opt: ?*Expr = null;
+        switch (val) {
+            .expr => |expr| expr_opt = expr,
+            else => {
+                var v = val;
+                v.deinit(self.allocator);
+                return out;
+            },
+        }
+
+        const dict_expr = expr_opt.?;
+        defer {
+            dict_expr.deinit(self.allocator);
+            self.allocator.destroy(dict_expr);
+        }
+
+        if (dict_expr.* != .dict) {
+            return out;
+        }
+
+        const keys = dict_expr.dict.keys;
+        const values = dict_expr.dict.values;
+
+        const base_args: usize = @intCast(code.posonlyargcount + code.argcount);
+        const has_vararg = (code.flags & pyc.Code.CO_VARARGS) != 0;
+        const kw_start = base_args + @as(usize, @intFromBool(has_vararg));
+
+        for (keys, values) |maybe_key, value| {
+            const key = maybe_key orelse continue;
+            if (key.* != .constant) continue;
+            if (key.constant != .string) continue;
+            const name = key.constant.string;
+            var i: usize = 0;
+            while (i < kw_count) : (i += 1) {
+                const idx = kw_start + i;
+                if (idx >= code.varnames.len) break;
+                if (std.mem.eql(u8, code.varnames[idx], name)) {
+                    out[i] = try ast.cloneExpr(self.allocator, value);
+                    break;
+                }
+            }
+        }
+
+        return out;
     }
 
     /// Parse defaults tuple from MAKE_FUNCTION.
@@ -2737,6 +2818,10 @@ pub const SimContext = struct {
 
                 // Python 3.3+: pop code object
                 const code_val = self.stack.pop() orelse return error.StackUnderflow;
+                const code_ptr: ?*const pyc.Code = switch (code_val) {
+                    .code_obj => |code| code,
+                    else => null,
+                };
 
                 if ((inst.arg & 0x08) != 0) {
                     if (self.stack.pop()) |closure| {
@@ -2755,7 +2840,7 @@ pub const SimContext = struct {
                 }
                 if ((inst.arg & 0x02) != 0) {
                     if (self.stack.pop()) |kwdefaults| {
-                        kw_defaults = try self.parseKwDefaults(kwdefaults);
+                        kw_defaults = try self.parseKwDefaults(kwdefaults, code_ptr);
                     } else {
                         return error.StackUnderflow;
                     }
@@ -2919,12 +3004,12 @@ pub const SimContext = struct {
                         }
                     },
                     2 => { // kwdefaults
-                        // kwdefaults is a dict - need to extract to []?*Expr
-                        attr_val.deinit(self.allocator);
+                        const func = func_val.function_obj;
+                        func.kw_defaults = try self.parseKwDefaults(attr_val, func.code);
                     },
                     4 => { // annotations
                         const func = func_val.function_obj;
-                        func.annotations = self.parseAnnotations(attr_val) catch &.{};
+                        func.annotations = try self.parseAnnotations(attr_val);
                     },
                     8 => { // closure - ignore
                         attr_val.deinit(self.allocator);

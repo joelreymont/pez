@@ -8,9 +8,9 @@ const opcodes = @import("opcodes.zig");
 
 const Version = opcodes.Version;
 
-fn parsePycVersion(filename: []const u8) ?Version {
-    var idx = std.mem.lastIndexOf(u8, filename, ".") orelse return null;
-    if (idx == 0) return null;
+fn parsePycVersion(filename: []const u8) !Version {
+    var idx = std.mem.lastIndexOf(u8, filename, ".") orelse return error.InvalidFilename;
+    if (idx == 0) return error.InvalidFilename;
     idx -= 1;
 
     var end = idx;
@@ -19,24 +19,33 @@ fn parsePycVersion(filename: []const u8) ?Version {
 
     const ver_str = filename[end .. idx + 1];
     var it = std.mem.splitScalar(u8, ver_str, '.');
-    const major_str = it.next() orelse return null;
-    const minor_str = it.next() orelse return null;
+    const major_str = it.next() orelse return error.InvalidFilename;
+    const minor_str = it.next() orelse return error.InvalidFilename;
 
-    const major = std.fmt.parseInt(u8, major_str, 10) catch return null;
-    const minor = std.fmt.parseInt(u8, minor_str, 10) catch return null;
+    const major = if (std.fmt.parseInt(u8, major_str, 10)) |value| value else |_| return error.InvalidFilename;
+    const minor = if (std.fmt.parseInt(u8, minor_str, 10)) |value| value else |_| return error.InvalidFilename;
 
     return Version.init(major, minor);
 }
 
 test "parse pyc version from filename" {
-    try testing.expectEqual(Version.init(3, 11), parsePycVersion("test.3.11.pyc").?);
-    try testing.expectEqual(Version.init(2, 7), parsePycVersion("foo.2.7.pyc").?);
-    try testing.expectEqual(Version.init(3, 14), parsePycVersion("swap.3.14.pyc").?);
-    try testing.expect(parsePycVersion("nope.pyc") == null);
+    const v311 = try parsePycVersion("test.3.11.pyc");
+    try testing.expectEqual(@as(u8, 3), v311.major);
+    try testing.expectEqual(@as(u8, 11), v311.minor);
+
+    const v27 = try parsePycVersion("foo.2.7.pyc");
+    try testing.expectEqual(@as(u8, 2), v27.major);
+    try testing.expectEqual(@as(u8, 7), v27.minor);
+
+    const v314 = try parsePycVersion("swap.3.14.pyc");
+    try testing.expectEqual(@as(u8, 3), v314.major);
+    try testing.expectEqual(@as(u8, 14), v314.minor);
+
+    try testing.expectError(error.InvalidFilename, parsePycVersion("nope.pyc"));
 }
 
 fn decompilePycFile(allocator: std.mem.Allocator, path: []const u8) ![]const u8 {
-    const version = parsePycVersion(path) orelse return error.InvalidFilename;
+    const version = try parsePycVersion(path);
 
     const file = try std.fs.cwd().openFile(path, .{});
     defer file.close();

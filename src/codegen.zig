@@ -749,6 +749,12 @@ pub const Writer = struct {
             }
         }
 
+        if (args.kwonlyargs.len > 0 and args.vararg == null) {
+            if (!first) try self.write(allocator, ", ");
+            first = false;
+            try self.write(allocator, "*");
+        }
+
         // Write keyword-only args with defaults
         for (args.kwonlyargs, 0..) |arg, i| {
             if (!first) try self.write(allocator, ", ");
@@ -1990,7 +1996,6 @@ pub const DebugPrinter = struct {
         }
     }
 };
-
 
 /// Extract function name from code object.
 pub fn extractFunctionName(code: *const pyc.Code) []const u8 {

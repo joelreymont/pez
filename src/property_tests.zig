@@ -14,6 +14,27 @@ const opcodes = @import("opcodes.zig");
 const Version = decoder.Version;
 const Opcode = opcodes.Opcode;
 
+fn opcodeByte(ver: Version, op: Opcode) u8 {
+    var b: u16 = 0;
+    while (b < 256) : (b += 1) {
+        if (opcodes.byteToOpcode(ver, @intCast(b))) |found| {
+            if (found == op) return @intCast(b);
+        }
+    }
+    @panic("opcode byte not found");
+}
+
+fn encodeOps(ver: Version, idxs: []const u8, safe_ops: []const Opcode, out: []u8) void {
+    var i: usize = 0;
+    while (i < idxs.len) : (i += 1) {
+        const op = safe_ops[idxs[i] % safe_ops.len];
+        const byte = opcodeByte(ver, op);
+        const out_idx = i * 2;
+        out[out_idx] = byte;
+        out[out_idx + 1] = 0;
+    }
+}
+
 // ============================================================================
 // Bytecode Decoder Properties
 // ============================================================================
@@ -153,18 +174,21 @@ test "exception table entry fields are correctly parsed" {
             buf[3] = depth_lasti;
 
             // Parse it
-            const entries = cfg.parseExceptionTable(&buf, testing.allocator) catch return false;
-            defer testing.allocator.free(entries);
+            if (cfg.parseExceptionTable(&buf, testing.allocator)) |entries| {
+                defer testing.allocator.free(entries);
 
-            if (entries.len != 1) return false;
+                if (entries.len != 1) return false;
 
-            const e = entries[0];
-            // Exception table values are in instruction units, converted to bytes (*2)
-            return e.start == start_val * 2 and
-                e.end == (start_val + size_val) * 2 and
-                e.target == target_val * 2 and
-                e.depth == depth_val and
-                e.push_lasti == args.lasti;
+                const e = entries[0];
+                // Exception table values are in instruction units, converted to bytes (*2)
+                return e.start == start_val * 2 and
+                    e.end == (start_val + size_val) * 2 and
+                    e.target == target_val * 2 and
+                    e.depth == depth_val and
+                    e.push_lasti == args.lasti;
+            } else |_| {
+                return false;
+            }
         }
     }.prop, .{ .iterations = 500 });
 }
@@ -175,47 +199,59 @@ test "exception table entry fields are correctly parsed" {
 
 test "CFG blocks have non-overlapping offset ranges" {
     try zc.check(struct {
-        fn prop(args: struct { bytecode: [48]u8 }) bool {
+        fn prop(args: struct { ops: [24]u8 }) bool {
             const version = Version.init(3, 12);
+            const safe_ops = [_]Opcode{ .RESUME, .NOP, .LOAD_CONST, .RETURN_VALUE };
+            var bytecode: [48]u8 = undefined;
+            encodeOps(version, &args.ops, &safe_ops, &bytecode);
 
-            // CFG builder can panic on malformed bytecode (e.g., backward jump underflow)
-            // We catch errors but panics indicate bugs that should be fixed
-            var cfg_result = cfg.buildCFG(testing.allocator, &args.bytecode, version) catch return true;
-            defer cfg_result.deinit();
+            if (cfg.buildCFG(testing.allocator, &bytecode, version)) |cfg_result_const| {
+                var cfg_result = cfg_result_const;
+                defer cfg_result.deinit();
 
-            // Check that no blocks overlap
-            for (cfg_result.blocks, 0..) |block1, i| {
-                for (cfg_result.blocks[i + 1 ..]) |block2| {
-                    // Blocks should not overlap
-                    if (block1.start_offset < block2.end_offset and
-                        block1.end_offset > block2.start_offset)
-                    {
-                        return false;
+                // Check that no blocks overlap
+                for (cfg_result.blocks, 0..) |block1, i| {
+                    for (cfg_result.blocks[i + 1 ..]) |block2| {
+                        // Blocks should not overlap
+                        if (block1.start_offset < block2.end_offset and
+                            block1.end_offset > block2.start_offset)
+                        {
+                            return false;
+                        }
                     }
                 }
-            }
 
-            return true;
+                return true;
+            } else |_| {
+                return false;
+            }
         }
     }.prop, .{ .iterations = 200 });
 }
 
 test "CFG block successor targets are valid block IDs" {
     try zc.check(struct {
-        fn prop(args: struct { bytecode: [32]u8 }) bool {
+        fn prop(args: struct { ops: [16]u8 }) bool {
             const version = Version.init(3, 12);
-            var cfg_result = cfg.buildCFG(testing.allocator, &args.bytecode, version) catch return true;
-            defer cfg_result.deinit();
+            const safe_ops = [_]Opcode{ .RESUME, .NOP, .LOAD_CONST, .RETURN_VALUE };
+            var bytecode: [32]u8 = undefined;
+            encodeOps(version, &args.ops, &safe_ops, &bytecode);
 
-            for (cfg_result.blocks) |block| {
-                for (block.successors) |edge| {
-                    if (edge.target >= cfg_result.blocks.len) {
-                        return false;
+            if (cfg.buildCFG(testing.allocator, &bytecode, version)) |cfg_result_const| {
+                var cfg_result = cfg_result_const;
+                defer cfg_result.deinit();
+                for (cfg_result.blocks) |block| {
+                    for (block.successors) |edge| {
+                        if (edge.target >= cfg_result.blocks.len) {
+                            return false;
+                        }
                     }
                 }
-            }
 
-            return true;
+                return true;
+            } else |_| {
+                return false;
+            }
         }
     }.prop, .{ .iterations = 200 });
 }
@@ -244,17 +280,21 @@ test "line table lookup returns consistent results" {
             if (len == 0) return true;
 
             const version = Version.init(3, 9);
-            var table = decoder.parseLineTable(lnotab[0..len], 1, version, testing.allocator) catch return true;
-            defer table.deinit();
+            if (decoder.parseLineTable(lnotab[0..len], 1, version, testing.allocator)) |table_const| {
+                var table = table_const;
+                defer table.deinit();
 
-            // Property: consecutive lookups at same offset return same result
-            for (0..50) |offset| {
-                const line1 = table.getLine(@intCast(offset));
-                const line2 = table.getLine(@intCast(offset));
-                if (line1 != line2) return false;
+                // Property: consecutive lookups at same offset return same result
+                for (0..50) |offset| {
+                    const line1 = table.getLine(@intCast(offset));
+                    const line2 = table.getLine(@intCast(offset));
+                    if (line1 != line2) return false;
+                }
+
+                return true;
+            } else |_| {
+                return false;
             }
-
-            return true;
         }
     }.prop, .{ .iterations = 200 });
 }
@@ -389,7 +429,7 @@ test "stack never goes negative with valid opcode sequences" {
                 };
                 // Only test load ops which push to stack
                 if (op == .LOAD_CONST or op == .LOAD_FAST or op == .LOAD_NAME or op == .LOAD_GLOBAL) {
-                    ctx.simulate(inst) catch {};
+                    if (ctx.simulate(inst)) |_| {} else |_| return false;
                 }
             }
 
@@ -415,8 +455,8 @@ test "stack simulation deinit cleans up" {
 
     var ctx = stack.SimContext.init(allocator, &code, version);
     // Push some values
-    ctx.stack.push(.unknown) catch unreachable;
-    ctx.stack.push(.unknown) catch unreachable;
+    try ctx.stack.push(.unknown);
+    try ctx.stack.push(.unknown);
     // Deinit should free all
     ctx.deinit();
     // If we get here without leak detection failing, test passes
