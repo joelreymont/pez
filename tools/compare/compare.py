@@ -56,7 +56,7 @@ def parse_args() -> argparse.Namespace:
         default="",
         help="Python interpreter with xdis installed (default: autodetect)",
     )
-    p.add_argument("--timeout", type=int, default=30, help="Timeout seconds per step")
+    p.add_argument("--timeout", type=int, default=120, help="Timeout seconds per step")
     p.add_argument("--out", default="", help="Write JSON report to this path")
     p.add_argument("--keep-temp", action="store_true", help="Keep temp files")
     p.add_argument("--min-unit-ratio", type=float, default=0.90, help="Min per-unit seq ratio")
@@ -86,9 +86,16 @@ def check_xdis(python: str, timeout: int) -> bool:
 def pick_xdis_python(arg: str, timeout: int) -> str:
     if arg:
         return arg
+    candidate = "/private/tmp/xdis-venv39/bin/python"
+    if Path(candidate).exists() and check_xdis(candidate, timeout):
+        return candidate
     candidate = "/private/tmp/uncompyle6-venv312/bin/python"
     if Path(candidate).exists() and check_xdis(candidate, timeout):
         return candidate
+    for name in ("python3.9", "python3.10", "python3.11", "python3.12"):
+        path = shutil.which(name)
+        if path and check_xdis(path, timeout):
+            return path
     if check_xdis(sys.executable, timeout):
         return sys.executable
     return ""
