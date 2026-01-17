@@ -8,6 +8,7 @@ const decoder = @import("decoder.zig");
 const codegen = @import("codegen.zig");
 const decompile = @import("decompile.zig");
 const test_harness = @import("test_harness.zig");
+const version = @import("util/version.zig");
 
 pub fn main() !void {
     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
@@ -38,6 +39,10 @@ pub fn main() !void {
             mode = .test_suite;
         } else if (std.mem.eql(u8, arg, "--golden")) {
             mode = .golden;
+        } else if (std.mem.eql(u8, arg, "-V") or std.mem.eql(u8, arg, "--version")) {
+            try stdout.print("pez {s}\n", .{version.full});
+            try stdout.flush();
+            return;
         } else if (arg[0] != '-') {
             filename = arg;
         }
@@ -71,6 +76,7 @@ pub fn main() !void {
         try stderr.print("  --cfg         Dump CFG analysis\n", .{});
         try stderr.print("  --test        Run test suite (decompile check)\n", .{});
         try stderr.print("  --golden      Compare with golden .py files\n", .{});
+        try stderr.print("  -V, --version Show version\n", .{});
         try stderr.flush();
         std.process.exit(1);
     }
@@ -89,7 +95,7 @@ pub fn main() !void {
     switch (mode) {
         .disasm => {
             try stdout.print("# Python {d}.{d}\n", .{ module.major_ver, module.minor_ver });
-            try stdout.print("# Disassembled by pez\n\n", .{});
+            try stdout.print("# Disassembled by pez {s}\n\n", .{version.full});
             try module.disassemble(stdout);
         },
         .cfgdump => {
@@ -100,7 +106,7 @@ pub fn main() !void {
         },
         .decompile => {
             try stdout.print("# Python {d}.{d}\n", .{ module.major_ver, module.minor_ver });
-            try stdout.print("# Decompiled by pez\n\n", .{});
+            try stdout.print("# Decompiled by pez {s}\n\n", .{version.full});
             if (module.code) |code| {
                 try decompile.decompileToSourceWithContext(allocator, code, version, stdout, std.fs.File.stderr());
             }

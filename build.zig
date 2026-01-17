@@ -5,6 +5,11 @@ pub fn build(b: *std.Build) void {
     const optimize = b.standardOptimizeOption(.{});
     const strip = b.option(bool, "strip", "Strip symbols (default: false)") orelse false;
     const test_filter = b.option([]const u8, "test-filter", "Run only tests containing this substring");
+    const git_hash = b.run(&.{ "git", "rev-parse", "--short", "HEAD" });
+    const version = b.option([]const u8, "version", "Semantic version (default: 0.1.0)") orelse "0.1.0";
+    const options = b.addOptions();
+    options.addOption([]const u8, "git_hash", std.mem.trim(u8, git_hash, "\n\r "));
+    options.addOption([]const u8, "version", version);
 
     // Main executable
     const exe_mod = b.createModule(.{
@@ -13,6 +18,7 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
     exe_mod.strip = strip;
+    exe_mod.addOptions("build_options", options);
 
     const exe = b.addExecutable(.{
         .name = "pez",
@@ -39,6 +45,7 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
     test_mod.strip = strip;
+    test_mod.addOptions("build_options", options);
 
     const unit_tests = b.addTest(.{
         .root_module = test_mod,
