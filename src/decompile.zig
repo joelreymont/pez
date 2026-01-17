@@ -142,6 +142,10 @@ pub const Decompiler = struct {
     loop_depth: u32 = 0,
     /// Scratch buffers for try/except analysis.
     try_scratch: ?TryScratch = null,
+    /// Scratch reachability set for conditional analysis.
+    cond_seen: GenSet,
+    /// Scratch DFS stack for conditional reachability.
+    cond_stack: std.ArrayListUnmanaged(u32),
 
     pub fn init(allocator: Allocator, code: *const pyc.Code, version: Version) DecompileError!Decompiler {
         var arena = std.heap.ArenaAllocator.init(allocator);
@@ -166,6 +170,14 @@ pub const Decompiler = struct {
         var analyzer = try Analyzer.init(allocator, cfg, dom);
         errdefer analyzer.deinit();
 
+        var cond_seen = try GenSet.init(allocator, cfg.blocks.len);
+        errdefer cond_seen.deinit(allocator);
+        var cond_stack: std.ArrayListUnmanaged(u32) = .{};
+        errdefer cond_stack.deinit(allocator);
+        if (cfg.blocks.len > 0) {
+            try cond_stack.ensureTotalCapacity(allocator, cfg.blocks.len);
+        }
+
         var decomp = Decompiler{
             .allocator = allocator,
             .arena = arena,
@@ -180,6 +192,8 @@ pub const Decompiler = struct {
             .pending_chain_targets = .{},
             .stack_in = &.{},
             .range_in_progress = std.AutoHashMap(u64, void).init(allocator),
+            .cond_seen = cond_seen,
+            .cond_stack = cond_stack,
         };
 
         try decomp.initStackFlow();
@@ -211,6 +225,8 @@ pub const Decompiler = struct {
         if (self.try_scratch) |*scratch| {
             scratch.deinit(self.allocator);
         }
+        self.cond_seen.deinit(self.allocator);
+        self.cond_stack.deinit(self.allocator);
         self.arena.deinit();
         self.statements.deinit(self.allocator);
     }
@@ -2048,19 +2064,17 @@ pub const Decompiler = struct {
         false_block: u32,
     ) DecompileError!bool {
         if (start == target) return true;
-        var seen = try std.DynamicBitSet.initEmpty(self.allocator, self.cfg.blocks.len);
-        defer seen.deinit();
+        try self.cond_seen.ensureSize(self.allocator, self.cfg.blocks.len);
+        self.cond_seen.reset();
+        self.cond_stack.clearRetainingCapacity();
 
-        var stack: std.ArrayListUnmanaged(u32) = .{};
-        defer stack.deinit(self.allocator);
-
-        try stack.append(self.allocator, start);
-        while (stack.items.len > 0) {
-            const cur = stack.items[stack.items.len - 1];
-            stack.items.len -= 1;
+        try self.cond_stack.append(self.allocator, start);
+        while (self.cond_stack.items.len > 0) {
+            const cur = self.cond_stack.items[self.cond_stack.items.len - 1];
+            self.cond_stack.items.len -= 1;
             if (cur >= self.cfg.blocks.len) continue;
-            if (seen.isSet(cur)) continue;
-            seen.set(cur);
+            if (self.cond_seen.isSet(cur)) continue;
+            try self.cond_seen.set(self.allocator, cur);
 
             const blk = &self.cfg.blocks[cur];
             for (blk.successors) |edge| {
@@ -2068,7 +2082,7 @@ pub const Decompiler = struct {
                 const next = edge.target;
                 if (next == target) return true;
                 if (next == true_block or next == false_block) continue;
-                try stack.append(self.allocator, next);
+                try self.cond_stack.append(self.allocator, next);
             }
         }
         return false;
@@ -10354,6 +10368,44 @@ test "simulate condition expr propagates errors" {
     try testing.expectError(error.StackUnderflow, decompiler.simulateConditionExpr(0, &.{}));
 }
 
+test "condReach uses scratch and finds path" {
+    const testing = std.testing;
+    const allocator = testing.allocator;
+    const version = Version.init(3, 9);
+
+    const ops = [_]test_utils.OpArg{
+        .{ .op = .LOAD_CONST, .arg = 0 },
+        .{ .op = .POP_JUMP_IF_FALSE, .arg = 8 },
+        .{ .op = .LOAD_CONST, .arg = 1 },
+        .{ .op = .JUMP_FORWARD, .arg = 2 },
+        .{ .op = .LOAD_CONST, .arg = 2 },
+        .{ .op = .RETURN_VALUE, .arg = 0 },
+    };
+
+    const bytecode = try test_utils.emitOpsOwned(allocator, version, &ops);
+    const consts = [_]pyc.Object{ .{ .none = {} }, .{ .none = {} }, .{ .none = {} } };
+    const code = try test_utils.allocCode(
+        allocator,
+        "cond_reach",
+        &[_][]const u8{},
+        &consts,
+        bytecode,
+        0,
+    );
+    defer {
+        code.deinit();
+        allocator.destroy(code);
+    }
+
+    var decompiler = try Decompiler.init(allocator, code, version);
+    defer decompiler.deinit();
+
+    const start = decompiler.cfg.entry;
+    try testing.expect(decompiler.cfg.blocks[start].successors.len > 0);
+    const target = decompiler.cfg.blocks[start].successors[0].target;
+    const skip = std.math.maxInt(u32);
+    try testing.expect(try decompiler.condReach(start, target, skip, skip));
+}
 
 test "exception seed handles JUMP_IF_NOT_EXC_MATCH" {
     const testing = std.testing;
