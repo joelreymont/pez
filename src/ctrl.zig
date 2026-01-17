@@ -336,6 +336,17 @@ pub const Analyzer = struct {
             if (self.detectWhilePattern(block_id)) |pattern| {
                 return .{ .while_loop = pattern };
             }
+            // Loop headers that don't form a well-structured while shouldn't be treated as if.
+            if (term.opcode != .FOR_ITER and term.opcode != .FOR_LOOP) {
+                return .unknown;
+            }
+        }
+
+        // Check for with statement (BEFORE_WITH opcode)
+        if (self.hasWithSetup(block)) {
+            if (self.detectWithPattern(block_id)) |pattern| {
+                return .{ .with_stmt = pattern };
+            }
         }
 
         // Check for conditional jump (if statement pattern)
@@ -350,13 +361,6 @@ pub const Analyzer = struct {
         if (term.opcode == .FOR_ITER or term.opcode == .FOR_LOOP) {
             if (self.detectForPattern(block_id)) |pattern| {
                 return .{ .for_loop = pattern };
-            }
-        }
-
-        // Check for with statement (BEFORE_WITH opcode)
-        if (self.hasWithSetup(block)) {
-            if (self.detectWithPattern(block_id)) |pattern| {
-                return .{ .with_stmt = pattern };
             }
         }
 
@@ -384,6 +388,7 @@ pub const Analyzer = struct {
         _ = self;
         for (block.instructions) |inst| {
             if (inst.opcode == .BEFORE_WITH or inst.opcode == .BEFORE_ASYNC_WITH or inst.opcode == .LOAD_SPECIAL) return true;
+            if (inst.opcode == .SETUP_WITH or inst.opcode == .SETUP_ASYNC_WITH) return true;
         }
         return false;
     }
@@ -853,6 +858,9 @@ pub const Analyzer = struct {
 
         const body_id = body_block orelse return null;
         const exit_id = exit_block orelse return null;
+
+        if (!self.dom.isInLoop(body_id, block_id)) return null;
+        if (self.dom.isInLoop(exit_id, block_id)) return null;
 
         return WhilePattern{
             .header_block = block_id,
@@ -1391,16 +1399,21 @@ pub const Analyzer = struct {
     fn detectWithPattern(self: *Analyzer, block_id: u32) ?WithPattern {
         const block = &self.cfg.blocks[block_id];
 
-        // Find BEFORE_WITH/BEFORE_ASYNC_WITH/LOAD_SPECIAL instruction
+        // Find BEFORE_WITH/BEFORE_ASYNC_WITH/LOAD_SPECIAL or legacy SETUP_WITH
         var has_before_with = false;
+        var legacy_setup: ?cfg_mod.Instruction = null;
         for (block.instructions) |inst| {
             if (inst.opcode == .BEFORE_WITH or inst.opcode == .BEFORE_ASYNC_WITH or inst.opcode == .LOAD_SPECIAL) {
                 has_before_with = true;
                 break;
             }
+            if (inst.opcode == .SETUP_WITH or inst.opcode == .SETUP_ASYNC_WITH) {
+                legacy_setup = inst;
+                break;
+            }
         }
 
-        if (!has_before_with) return null;
+        if (!has_before_with and legacy_setup == null) return null;
 
         // The body is the normal successor
         var body_block: ?u32 = null;
@@ -1435,6 +1448,17 @@ pub const Analyzer = struct {
                         }
                     }
                     break;
+                }
+            }
+        }
+
+        // Legacy SETUP_WITH uses jump target for cleanup handler
+        if (cleanup_block == null) {
+            if (legacy_setup) |inst| {
+                if (inst.jumpTarget(self.cfg.version)) |target| {
+                    if (self.cfg.blockAtOffset(target)) |cleanup_id| {
+                        cleanup_block = cleanup_id;
+                    }
                 }
             }
         }
@@ -1867,8 +1891,8 @@ test "analyzer loop membership uses dom" {
 
     var preds_0 = [_]u32{};
     var preds_1 = [_]u32{ 0, 2 };
-    var preds_2 = [_]u32{ 1 };
-    var preds_3 = [_]u32{ 1 };
+    var preds_2 = [_]u32{1};
+    var preds_3 = [_]u32{1};
 
     var blocks: [4]cfg_mod.BasicBlock = undefined;
     blocks[0] = .{
@@ -1930,6 +1954,82 @@ test "analyzer loop membership uses dom" {
     const loops = analyzer.findEnclosingLoops(2);
     try testing.expectEqual(@as(usize, 1), loops.len);
     try testing.expectEqual(@as(u32, 1), loops[0]);
+}
+
+test "detectWhilePattern rejects internal exit" {
+    const testing = std.testing;
+    const allocator = testing.allocator;
+
+    const version = cfg_mod.Version.init(3, 12);
+    const block_offsets = &[_]u32{ 0, 2, 4 };
+
+    const inst_0 = [_]cfg_mod.Instruction{.{
+        .opcode = .POP_JUMP_IF_FALSE,
+        .arg = 0,
+        .offset = 0,
+        .size = 2,
+        .cache_entries = 0,
+    }};
+
+    var succ_0 = [_]cfg_mod.Edge{
+        .{ .target = 1, .edge_type = .conditional_true },
+        .{ .target = 2, .edge_type = .conditional_false },
+    };
+    var succ_1 = [_]cfg_mod.Edge{.{ .target = 2, .edge_type = .normal }};
+    var succ_2 = [_]cfg_mod.Edge{.{ .target = 0, .edge_type = .loop_back }};
+
+    var preds_0 = [_]u32{2};
+    var preds_1 = [_]u32{0};
+    var preds_2 = [_]u32{ 0, 1 };
+
+    var blocks: [3]cfg_mod.BasicBlock = undefined;
+    blocks[0] = .{
+        .id = 0,
+        .start_offset = 0,
+        .end_offset = 2,
+        .instructions = inst_0[0..],
+        .successors = succ_0[0..],
+        .predecessors = preds_0[0..],
+        .is_exception_handler = false,
+        .is_loop_header = true,
+    };
+    blocks[1] = .{
+        .id = 1,
+        .start_offset = 2,
+        .end_offset = 2,
+        .instructions = &.{},
+        .successors = succ_1[0..],
+        .predecessors = preds_1[0..],
+        .is_exception_handler = false,
+        .is_loop_header = false,
+    };
+    blocks[2] = .{
+        .id = 2,
+        .start_offset = 4,
+        .end_offset = 4,
+        .instructions = &.{},
+        .successors = succ_2[0..],
+        .predecessors = preds_2[0..],
+        .is_exception_handler = false,
+        .is_loop_header = false,
+    };
+
+    var cfg = cfg_mod.CFG{
+        .allocator = allocator,
+        .blocks = blocks[0..],
+        .block_offsets = @constCast(block_offsets),
+        .entry = 0,
+        .instructions = &.{},
+        .version = version,
+    };
+
+    var dom = try dom_mod.DomTree.init(allocator, &cfg);
+    defer dom.deinit();
+
+    var analyzer = try Analyzer.init(allocator, &cfg, &dom);
+    defer analyzer.deinit();
+
+    try testing.expect(analyzer.detectWhilePattern(0) == null);
 }
 
 test "isConditionalJump" {

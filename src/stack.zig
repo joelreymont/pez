@@ -3748,8 +3748,33 @@ pub const SimContext = struct {
                 // Pops nothing new, exception info already on stack
             },
 
+            .SETUP_WITH, .SETUP_ASYNC_WITH => {
+                // SETUP_WITH - pop context manager, push (__exit__, __enter__ result)
+                const ctx = try self.stack.popExpr();
+                ctx.deinit(self.allocator);
+                self.allocator.destroy(ctx);
+                // Push exit func placeholder and __enter__ result placeholder
+                const exit_expr = try ast.makeName(self.allocator, "__with_exit__", .load);
+                try self.stack.push(.{ .expr = exit_expr });
+                try self.stack.push(.unknown);
+            },
+
+            .WITH_EXCEPT_START => {
+                // WITH_EXCEPT_START - call __exit__ with exception details
+                // Stack: exit, exc_type, exc, tb -> result
+                var i: usize = 0;
+                while (i < 4) : (i += 1) {
+                    if (self.stack.pop()) |v| {
+                        var val = v;
+                        val.deinit(self.allocator);
+                    } else {
+                        return error.StackUnderflow;
+                    }
+                }
+                try self.stack.push(.unknown);
+            },
+
             .SETUP_FINALLY,
-            .SETUP_ASYNC_WITH,
             .BEGIN_FINALLY,
             .CALL_FINALLY,
             .POP_FINALLY,

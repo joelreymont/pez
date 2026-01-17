@@ -232,7 +232,7 @@ fn buildCFGWithLeaders(
         }
 
         // If this is a branch or terminator, next instruction (if any) is a leader
-        if (inst.isJump() or inst.isBlockTerminator()) {
+        if (inst.isJump() or inst.isBlockTerminator() or inst.opcode == .SETUP_WITH or inst.opcode == .SETUP_ASYNC_WITH) {
             if (i + 1 < instructions.len) {
                 try leaders.put(instructions[i + 1].offset, {});
             }
@@ -452,7 +452,7 @@ fn collectLegacyExceptionEntries(
     var entries: std.ArrayList(ExceptionEntry) = .{};
     errdefer entries.deinit(allocator);
 
-    const SetupKind = enum { loop, except, finally };
+    const SetupKind = enum { loop, except, finally, with };
     const SetupEntry = struct {
         kind: SetupKind,
         start: u32,
@@ -491,11 +491,20 @@ fn collectLegacyExceptionEntries(
                     .target = target,
                 });
             },
+            .SETUP_WITH, .SETUP_ASYNC_WITH => {
+                const target = inst.offset + inst.size + inst.arg * multiplier;
+                try stack.append(allocator, .{
+                    .kind = .with,
+                    // Include SETUP_WITH in protected range to keep with header in same block
+                    .start = inst.offset,
+                    .target = target,
+                });
+            },
             .POP_BLOCK => {
                 if (stack.items.len == 0) continue;
                 const entry = stack.pop() orelse continue;
                 switch (entry.kind) {
-                    .except, .finally => {
+                    .except, .finally, .with => {
                         try entries.append(allocator, .{
                             .start = entry.start,
                             .end = inst.offset + inst.size,

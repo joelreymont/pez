@@ -43,6 +43,65 @@ pub const ErrorContext = struct {
     opcode: []const u8,
 };
 
+const GenSet = struct {
+    marks: []u32,
+    gen: u32,
+    list: std.ArrayListUnmanaged(u32),
+
+    fn init(allocator: Allocator, bit_len: usize) !GenSet {
+        const marks = try allocator.alloc(u32, bit_len);
+        @memset(marks, 0);
+        var list: std.ArrayListUnmanaged(u32) = .{};
+        if (bit_len > 0) {
+            try list.ensureTotalCapacity(allocator, bit_len);
+        }
+        return .{ .marks = marks, .gen = 1, .list = list };
+    }
+
+    fn ensureSize(self: *GenSet, allocator: Allocator, bit_len: usize) !void {
+        if (self.marks.len != bit_len) {
+            const old_len = self.marks.len;
+            self.marks = try allocator.realloc(self.marks, bit_len);
+            if (bit_len > old_len) {
+                @memset(self.marks[old_len..], 0);
+            }
+        }
+        if (bit_len > self.list.capacity) {
+            try self.list.ensureTotalCapacity(allocator, bit_len);
+        }
+        self.reset();
+    }
+
+    fn reset(self: *GenSet) void {
+        self.gen +%= 1;
+        if (self.gen == 0) {
+            @memset(self.marks, 0);
+            self.gen = 1;
+        }
+        self.list.clearRetainingCapacity();
+    }
+
+    fn set(self: *GenSet, allocator: Allocator, idx: u32) !void {
+        const i: usize = @intCast(idx);
+        if (i >= self.marks.len) return;
+        if (self.marks[i] != self.gen) {
+            self.marks[i] = self.gen;
+            try self.list.append(allocator, idx);
+        }
+    }
+
+    fn isSet(self: *const GenSet, idx: u32) bool {
+        const i: usize = @intCast(idx);
+        if (i >= self.marks.len) return false;
+        return self.marks[i] == self.gen;
+    }
+
+    fn deinit(self: *GenSet, allocator: Allocator) void {
+        if (self.marks.len > 0) allocator.free(self.marks);
+        self.list.deinit(allocator);
+    }
+};
+
 /// Decompiler state for a single code object.
 pub const Decompiler = struct {
     allocator: Allocator,
@@ -71,6 +130,8 @@ pub const Decompiler = struct {
     pending_chain_targets: std.ArrayList(*Expr),
     /// Entry stack state per block (computed by dataflow).
     stack_in: []?[]StackValue,
+    /// Scratch buffers for try/except analysis.
+    try_scratch: ?TryScratch = null,
 
     pub fn init(allocator: Allocator, code: *const pyc.Code, version: Version) DecompileError!Decompiler {
         var arena = std.heap.ArenaAllocator.init(allocator);
@@ -131,8 +192,59 @@ pub const Decompiler = struct {
         self.analyzer.deinit();
         self.dom.deinit();
         self.allocator.destroy(self.dom);
+        if (self.try_scratch) |*scratch| {
+            scratch.deinit(self.allocator);
+        }
         self.arena.deinit();
         self.statements.deinit(self.allocator);
+    }
+
+    const TryScratch = struct {
+        handler_set: GenSet,
+        protected_set: GenSet,
+        handler_reach: GenSet,
+        normal_reach: GenSet,
+        queue: std.ArrayListUnmanaged(u32),
+
+        fn init(allocator: Allocator, bit_len: usize) !TryScratch {
+            return .{
+                .handler_set = try GenSet.init(allocator, bit_len),
+                .protected_set = try GenSet.init(allocator, bit_len),
+                .handler_reach = try GenSet.init(allocator, bit_len),
+                .normal_reach = try GenSet.init(allocator, bit_len),
+                .queue = .{},
+            };
+        }
+
+        fn ensureSize(self: *TryScratch, allocator: Allocator, bit_len: usize) !void {
+            try self.handler_set.ensureSize(allocator, bit_len);
+            try self.protected_set.ensureSize(allocator, bit_len);
+            try self.handler_reach.ensureSize(allocator, bit_len);
+            try self.normal_reach.ensureSize(allocator, bit_len);
+            if (bit_len > self.queue.capacity) {
+                try self.queue.ensureTotalCapacity(allocator, bit_len);
+            }
+            self.queue.clearRetainingCapacity();
+        }
+
+        fn deinit(self: *TryScratch, allocator: Allocator) void {
+            self.handler_set.deinit(allocator);
+            self.protected_set.deinit(allocator);
+            self.handler_reach.deinit(allocator);
+            self.normal_reach.deinit(allocator);
+            self.queue.deinit(allocator);
+        }
+    };
+
+    fn getTryScratch(self: *Decompiler, bit_len: usize) DecompileError!*TryScratch {
+        if (self.try_scratch) |*scratch| {
+            try scratch.ensureSize(self.allocator, bit_len);
+            return scratch;
+        }
+        var scratch = try TryScratch.init(self.allocator, bit_len);
+        try scratch.ensureSize(self.allocator, bit_len);
+        self.try_scratch = scratch;
+        return &self.try_scratch.?;
     }
 
     fn isStatementOpcode(op: Opcode) bool {
@@ -474,9 +586,17 @@ pub const Decompiler = struct {
             }
 
             const block = &self.cfg.blocks[bid];
+            var simulate_failed = false;
             for (block.instructions) |inst| {
-                try sim.simulate(inst);
+                sim.simulate(inst) catch |err| {
+                    if (sim.lenient and (err == error.NotAnExpression or err == error.StackUnderflow or err == error.InvalidStackDepth)) {
+                        simulate_failed = true;
+                        break;
+                    }
+                    return err;
+                };
             }
+            if (simulate_failed) continue;
 
             const exit = try self.cloneStackValuesArena(&clone_sim, sim.stack.items.items);
             defer if (exit.len > 0) self.allocator.free(exit);
@@ -993,28 +1113,16 @@ pub const Decompiler = struct {
                         .STORE_DEREF => sim.getDeref(inst.arg) orelse "<unknown>",
                         else => "<unknown>",
                     };
-                    const value = sim.stack.pop() orelse return error.StackUnderflow;
-                    errdefer value.deinit(self.allocator);
-
-                    // Check for augmented assignment: x = x + 5 -> x += 5
-                    if (value == .expr and value.expr.* == .bin_op) {
-                        const binop = &value.expr.bin_op;
-                        if (binop.left.* == .name and std.mem.eql(u8, binop.left.name.id, name)) {
-                            const arena = self.arena.allocator();
-                            binop.left.deinit(arena);
-                            arena.destroy(binop.left);
-                            const stmt = try arena.create(Stmt);
-                            const target = try ast.makeName(arena, name, .store);
-                            stmt.* = .{ .aug_assign = .{
-                                .target = target,
-                                .op = binop.op,
-                                .value = binop.right,
-                            } };
-                            arena.destroy(value.expr);
+                    const value_opt = sim.stack.pop();
+                    if (value_opt == null) {
+                        if (try self.tryRecoverFunctionDefFromMakeFunction(sim, instructions, i, name)) |stmt| {
                             try stmts.append(stmts_allocator, stmt);
                             continue;
                         }
+                        return error.StackUnderflow;
                     }
+                    const value = value_opt.?;
+                    errdefer value.deinit(self.allocator);
 
                     // Check for augmented assignment: x = x + 5 -> x += 5
                     if (value == .expr and value.expr.* == .bin_op) {
@@ -2698,6 +2806,7 @@ pub const Decompiler = struct {
         // Process blocks in order, using control flow patterns
         var block_idx: u32 = 0;
         while (block_idx < self.cfg.blocks.len) {
+            const prev_idx = block_idx;
             // Try BoolOp pattern first (x and y, x or y)
             if (try self.tryDecompileBoolOpInto(
                 block_idx,
@@ -2706,6 +2815,17 @@ pub const Decompiler = struct {
                 self.allocator,
             )) |next_block| {
                 block_idx = next_block;
+                if (block_idx <= prev_idx) {
+                    if (self.last_error_ctx == null) {
+                        self.last_error_ctx = .{
+                            .code_name = self.code.name,
+                            .block_id = prev_idx,
+                            .offset = self.cfg.blocks[prev_idx].start_offset,
+                            .opcode = "boolop_no_progress",
+                        };
+                    }
+                    return error.InvalidBlock;
+                }
                 continue;
             }
             if (try self.tryDecompileTernaryInto(
@@ -2715,6 +2835,17 @@ pub const Decompiler = struct {
                 self.allocator,
             )) |next_block| {
                 block_idx = next_block;
+                if (block_idx <= prev_idx) {
+                    if (self.last_error_ctx == null) {
+                        self.last_error_ctx = .{
+                            .code_name = self.code.name,
+                            .block_id = prev_idx,
+                            .offset = self.cfg.blocks[prev_idx].start_offset,
+                            .opcode = "ternary_no_progress",
+                        };
+                    }
+                    return error.InvalidBlock;
+                }
                 continue;
             }
             const pattern = try self.analyzer.detectPattern(block_idx);
@@ -2804,6 +2935,15 @@ pub const Decompiler = struct {
                 },
                 else => {
                     const block = &self.cfg.blocks[block_idx];
+                    if (block.is_loop_header) {
+                        if (try self.decompileLoopHeader(block_idx)) |result| {
+                            if (result.stmt) |s| {
+                                try self.statements.append(self.allocator, s);
+                            }
+                            block_idx = result.next_block;
+                            break;
+                        }
+                    }
                     // Skip exception handler blocks - they're decompiled as part of try/except
                     if (block.is_exception_handler or self.hasExceptionHandlerOpcodes(block)) {
                         block_idx += 1;
@@ -2819,6 +2959,17 @@ pub const Decompiler = struct {
                     try self.decompileBlock(block_idx);
                     block_idx += 1;
                 },
+            }
+            if (block_idx <= prev_idx) {
+                if (self.last_error_ctx == null) {
+                    self.last_error_ctx = .{
+                        .code_name = self.code.name,
+                        .block_id = prev_idx,
+                        .offset = self.cfg.blocks[prev_idx].start_offset,
+                        .opcode = "decompile_no_progress",
+                    };
+                }
+                return error.InvalidBlock;
             }
         }
 
@@ -3374,6 +3525,63 @@ pub const Decompiler = struct {
         return stmt;
     }
 
+    fn decompileLoopHeader(self: *Decompiler, header: u32) DecompileError!?PatternResult {
+        const body_set = self.dom.getLoopBody(header) orelse return null;
+        if (!body_set.isSet(@intCast(header))) return null;
+
+        var visited = try std.DynamicBitSet.initEmpty(self.allocator, self.cfg.blocks.len);
+        defer visited.deinit();
+
+        var skip_first = false;
+        var seed_pop = false;
+        const body = try self.decompileLoopBody(
+            header,
+            header,
+            &skip_first,
+            &seed_pop,
+            &visited,
+            null,
+        );
+
+        const a = self.arena.allocator();
+        const cond = try ast.makeConstant(a, .true_);
+        const stmt = try a.create(Stmt);
+        stmt.* = .{
+            .while_stmt = .{
+                .condition = cond,
+                .body = body,
+                .else_body = &.{},
+            },
+        };
+
+        var exit_block: ?u32 = null;
+        var max_block: u32 = header;
+        var it = body_set.iterator(.{});
+        while (it.next()) |bit| {
+            const bid: u32 = @intCast(bit);
+            if (bid > max_block) max_block = bid;
+            const blk = &self.cfg.blocks[bid];
+            for (blk.successors) |edge| {
+                if (edge.edge_type == .exception) continue;
+                if (edge.target >= self.cfg.blocks.len) continue;
+                if (!body_set.isSet(@intCast(edge.target))) {
+                    exit_block = if (exit_block) |prev|
+                        @min(prev, edge.target)
+                    else
+                        edge.target;
+                }
+            }
+        }
+
+        const limit: u32 = @intCast(self.cfg.blocks.len);
+        const next_block = exit_block orelse blk: {
+            const candidate = max_block + 1;
+            break :blk if (candidate < limit) candidate else limit;
+        };
+
+        return .{ .stmt = stmt, .next_block = next_block };
+    }
+
     const PatternResult = struct {
         stmt: ?*Stmt,
         next_block: u32,
@@ -3674,8 +3882,11 @@ pub const Decompiler = struct {
             defer self.allocator.free(pattern.handlers);
         }
 
-        var handler_blocks: std.ArrayList(u32) = .{};
+        var handler_blocks: std.ArrayListUnmanaged(u32) = .{};
         defer handler_blocks.deinit(self.allocator);
+        if (pattern.handlers.len > 0) {
+            try handler_blocks.ensureTotalCapacity(self.allocator, pattern.handlers.len);
+        }
 
         for (pattern.handlers) |handler| {
             if (handler.handler_block >= self.cfg.blocks.len) continue;
@@ -3691,26 +3902,33 @@ pub const Decompiler = struct {
             return try self.decompileTry311(pattern, handler_blocks.items);
         }
 
-        var handler_set = try std.DynamicBitSet.initEmpty(self.allocator, self.cfg.blocks.len);
-        defer handler_set.deinit();
+        const scratch = try self.getTryScratch(self.cfg.blocks.len);
+        var handler_set = &scratch.handler_set;
+        handler_set.reset();
         for (handler_blocks.items) |hid| {
-            handler_set.set(hid);
+            try handler_set.set(self.allocator, hid);
         }
 
-        var protected_set = try std.DynamicBitSet.initEmpty(self.allocator, self.cfg.blocks.len);
-        defer protected_set.deinit();
-        for (self.cfg.blocks, 0..) |block, i| {
-            for (block.successors) |edge| {
-                if (edge.edge_type == .exception and handler_set.isSet(edge.target)) {
-                    protected_set.set(i);
-                    break;
+        var protected_set = &scratch.protected_set;
+        protected_set.reset();
+        for (handler_blocks.items) |hid| {
+            if (hid >= self.cfg.blocks.len) continue;
+            const handler = &self.cfg.blocks[hid];
+            for (handler.predecessors) |pred_id| {
+                if (pred_id >= self.cfg.blocks.len) continue;
+                const pred = &self.cfg.blocks[pred_id];
+                for (pred.successors) |edge| {
+                    if (edge.edge_type == .exception and edge.target == hid) {
+                        try protected_set.set(self.allocator, pred_id);
+                        break;
+                    }
                 }
             }
         }
 
         var post_try_entry: ?u32 = null;
-        for (self.cfg.blocks, 0..) |block, i| {
-            if (!protected_set.isSet(i)) continue;
+        for (protected_set.list.items) |bid| {
+            const block = &self.cfg.blocks[bid];
             for (block.successors) |edge| {
                 if (edge.edge_type == .exception) continue;
                 if (edge.target >= self.cfg.blocks.len) continue;
@@ -3723,22 +3941,26 @@ pub const Decompiler = struct {
             }
         }
 
-        var handler_reach = try std.DynamicBitSet.initEmpty(self.allocator, self.cfg.blocks.len);
-        defer handler_reach.deinit();
-        for (handler_blocks.items) |hid| {
-            var reach = try self.collectReachableNoException(hid, &handler_set);
-            defer reach.deinit();
-            handler_reach.setUnion(reach);
-        }
+        var handler_reach = &scratch.handler_reach;
+        try self.collectReachableNoExceptionFromStarts(
+            handler_blocks.items,
+            handler_set,
+            handler_reach,
+            &scratch.queue,
+        );
 
         var join_block: ?u32 = null;
         if (post_try_entry) |entry| {
-            var normal_reach = try self.collectReachableNoException(entry, &handler_set);
-            defer normal_reach.deinit();
-            var it = normal_reach.iterator(.{});
-            while (it.next()) |bit| {
-                if (handler_reach.isSet(bit)) {
-                    join_block = @intCast(bit);
+            try self.collectReachableNoExceptionInto(
+                entry,
+                handler_set,
+                &scratch.normal_reach,
+                &scratch.queue,
+                false,
+            );
+            for (scratch.normal_reach.list.items) |bid| {
+                if (handler_reach.isSet(bid)) {
+                    join_block = bid;
                     break;
                 }
             }
@@ -3891,17 +4113,17 @@ pub const Decompiler = struct {
         var optional_vars: ?*Expr = null;
         var context_expr: ?*Expr = null;
 
-        // Python 3.14+ uses LOAD_SPECIAL for with statement setup
-        // Pattern: CALL (context manager) -> COPY -> LOAD_SPECIAL...
-        // We need to capture the context expression before COPY or LOAD_SPECIAL
+        // Python 3.14+ uses LOAD_SPECIAL; legacy uses SETUP_WITH
+        // Capture the context expression before COPY/LOAD_SPECIAL/SETUP_WITH
         for (setup.instructions) |inst| {
             switch (inst.opcode) {
                 .BEFORE_ASYNC_WITH => is_async = true,
+                .SETUP_ASYNC_WITH => is_async = true,
                 else => {},
             }
 
-            // Capture context expression right before COPY or LOAD_SPECIAL (clone, don't pop)
-            if ((inst.opcode == .COPY or inst.opcode == .LOAD_SPECIAL) and context_expr == null) {
+            // Capture context expression right before COPY/LOAD_SPECIAL/SETUP_WITH (clone, don't pop)
+            if ((inst.opcode == .COPY or inst.opcode == .LOAD_SPECIAL or inst.opcode == .SETUP_WITH or inst.opcode == .SETUP_ASYNC_WITH) and context_expr == null) {
                 if (sim.stack.items.items.len > 0) {
                     const top = sim.stack.items.items[sim.stack.items.items.len - 1];
                     if (top == .expr) {
@@ -3910,12 +4132,16 @@ pub const Decompiler = struct {
                 }
             }
 
-            // Stop at LOAD_SPECIAL - rest is just method binding
-            if (inst.opcode == .LOAD_SPECIAL or inst.opcode == .BEFORE_WITH or inst.opcode == .BEFORE_ASYNC_WITH) {
+            // Stop at LOAD_SPECIAL/SETUP_WITH - rest is just method binding or with body
+            if (inst.opcode == .LOAD_SPECIAL or inst.opcode == .SETUP_WITH or inst.opcode == .SETUP_ASYNC_WITH or inst.opcode == .BEFORE_WITH or inst.opcode == .BEFORE_ASYNC_WITH) {
                 break;
             }
 
             try sim.simulate(inst);
+        }
+
+        if (context_expr == null) {
+            context_expr = try self.tryExtractWithContextFromPred(pattern.setup_block);
         }
 
         // In Python 3.14+, the variable binding (STORE_NAME) is in the body block
@@ -4003,6 +4229,45 @@ pub const Decompiler = struct {
         return .{ .stmt = stmt, .next_block = exit };
     }
 
+    fn tryExtractWithContextFromPred(self: *Decompiler, setup_block: u32) DecompileError!?*Expr {
+        const a = self.arena.allocator();
+        if (setup_block >= self.cfg.blocks.len) return null;
+        const setup = &self.cfg.blocks[setup_block];
+
+        for (setup.predecessors) |pred_id| {
+            const pred = &self.cfg.blocks[pred_id];
+            var has_normal = false;
+            for (pred.successors) |edge| {
+                if (edge.edge_type == .normal and edge.target == setup_block) {
+                    has_normal = true;
+                    break;
+                }
+            }
+            if (!has_normal) continue;
+
+            var pred_sim = SimContext.init(a, self.code, self.version);
+            defer pred_sim.deinit();
+
+            for (pred.instructions) |inst| {
+                if (inst.opcode == .NOT_TAKEN) continue;
+                // If the block ends in a jump, don't simulate past it.
+                if (inst.isUnconditionalJump()) {
+                    break;
+                }
+                try pred_sim.simulate(inst);
+                if (inst.isConditionalJump()) break;
+            }
+
+            if (pred_sim.stack.len() == 0) continue;
+            const top = pred_sim.stack.items.items[pred_sim.stack.items.items.len - 1];
+            if (top == .expr) {
+                return try ast.cloneExpr(a, top.expr);
+            }
+        }
+
+        return null;
+    }
+
     fn decompileMatch(self: *Decompiler, pattern: ctrl.MatchPattern) DecompileError!PatternResult {
         defer pattern.deinit(self.allocator);
         // Get subject from subject block - simulate only until MATCH_* or COPY
@@ -4080,7 +4345,7 @@ pub const Decompiler = struct {
                                 const pop_need = self.maxLeadPop(resolved, fb_end);
                                 if (pop_need > 0) {
                                     if (pop_need == 1) {
-                                        var init_stack = [_]StackValue{ .unknown };
+                                        var init_stack = [_]StackValue{.unknown};
                                         fb_body_opt = try self.decompileStructuredRangeWithStack(resolved, fb_end, init_stack[0..]);
                                     } else {
                                         const init_stack = try self.allocator.alloc(StackValue, pop_need);
@@ -4362,9 +4627,7 @@ pub const Decompiler = struct {
         for (block.instructions) |inst| {
             switch (inst.opcode) {
                 .GET_LEN => has_get_len = true,
-                .MATCH_SEQUENCE, .MATCH_MAPPING, .MATCH_CLASS, .MATCH_KEYS,
-                .UNPACK_SEQUENCE, .STORE_FAST_STORE_FAST, .STORE_FAST_LOAD_FAST,
-                .STORE_FAST, .STORE_NAME => has_pat_op = true,
+                .MATCH_SEQUENCE, .MATCH_MAPPING, .MATCH_CLASS, .MATCH_KEYS, .UNPACK_SEQUENCE, .STORE_FAST_STORE_FAST, .STORE_FAST_LOAD_FAST, .STORE_FAST, .STORE_NAME => has_pat_op = true,
                 else => {},
             }
         }
@@ -4382,7 +4645,7 @@ pub const Decompiler = struct {
         const a = self.arena.allocator();
         var sim = SimContext.init(a, self.code, self.version);
         defer sim.deinit();
-        for (block.instructions[start_idx.? ..]) |g_inst| {
+        for (block.instructions[start_idx.?..]) |g_inst| {
             if (g_inst.opcode == .POP_JUMP_IF_FALSE or g_inst.opcode == .POP_JUMP_FORWARD_IF_FALSE) break;
             sim.simulate(g_inst) catch break;
         }
@@ -4398,9 +4661,7 @@ pub const Decompiler = struct {
         var seen_match = false;
         for (block.instructions, 0..) |inst, i| {
             switch (inst.opcode) {
-                .MATCH_SEQUENCE, .MATCH_MAPPING, .MATCH_CLASS, .MATCH_KEYS,
-                .UNPACK_SEQUENCE, .COPY, .GET_LEN,
-                .STORE_FAST_LOAD_FAST, .STORE_FAST_STORE_FAST => seen_match = true,
+                .MATCH_SEQUENCE, .MATCH_MAPPING, .MATCH_CLASS, .MATCH_KEYS, .UNPACK_SEQUENCE, .COPY, .GET_LEN, .STORE_FAST_LOAD_FAST, .STORE_FAST_STORE_FAST => seen_match = true,
                 .COMPARE_OP => seen_match = true,
                 else => {},
             }
@@ -4468,15 +4729,12 @@ pub const Decompiler = struct {
                     prev_get_len = true;
                 },
                 .COPY => has_copy = true,
-                .LOAD_FAST, .LOAD_FAST_BORROW,
-                .LOAD_FAST_LOAD_FAST, .LOAD_FAST_BORROW_LOAD_FAST_BORROW,
-                .LOAD_NAME, .LOAD_GLOBAL, .LOAD_DEREF => has_subject_load = true,
+                .LOAD_FAST, .LOAD_FAST_BORROW, .LOAD_FAST_LOAD_FAST, .LOAD_FAST_BORROW_LOAD_FAST_BORROW, .LOAD_NAME, .LOAD_GLOBAL, .LOAD_DEREF => has_subject_load = true,
                 .MATCH_SEQUENCE, .MATCH_MAPPING, .MATCH_CLASS, .MATCH_KEYS => {
                     has_match_op = true;
                     has_pat_op = true;
                 },
-                .UNPACK_SEQUENCE, .STORE_FAST_STORE_FAST, .STORE_FAST_LOAD_FAST,
-                .STORE_FAST, .STORE_NAME => has_pat_op = true,
+                .UNPACK_SEQUENCE, .STORE_FAST_STORE_FAST, .STORE_FAST_LOAD_FAST, .STORE_FAST, .STORE_NAME => has_pat_op = true,
                 .LOAD_CONST, .LOAD_SMALL_INT => {
                     if (!prev_get_len) {
                         var j = idx + 1;
@@ -4587,8 +4845,7 @@ pub const Decompiler = struct {
                         }
                         continue;
                     },
-                    .STORE_FAST_STORE_FAST, .MATCH_SEQUENCE, .MATCH_MAPPING, .MATCH_CLASS, .MATCH_KEYS,
-                    .UNPACK_SEQUENCE, .GET_LEN, .STORE_FAST, .STORE_NAME => continue,
+                    .STORE_FAST_STORE_FAST, .MATCH_SEQUENCE, .MATCH_MAPPING, .MATCH_CLASS, .MATCH_KEYS, .UNPACK_SEQUENCE, .GET_LEN, .STORE_FAST, .STORE_NAME => continue,
                     .POP_TOP => {
                         if (sim.stack.len() > 0) {
                             _ = sim.stack.pop();
@@ -4633,8 +4890,7 @@ pub const Decompiler = struct {
         for (blk.instructions) |inst| {
             if (ctrl.Analyzer.isConditionalJump(undefined, inst.opcode)) return false;
             switch (inst.opcode) {
-                .MATCH_SEQUENCE, .MATCH_MAPPING, .MATCH_CLASS, .MATCH_KEYS, .COPY,
-                .STORE_FAST_LOAD_FAST, .STORE_FAST_STORE_FAST => return false,
+                .MATCH_SEQUENCE, .MATCH_MAPPING, .MATCH_CLASS, .MATCH_KEYS, .COPY, .STORE_FAST_LOAD_FAST, .STORE_FAST_STORE_FAST => return false,
                 .RETURN_VALUE, .RETURN_CONST => has_return = true,
                 else => {},
             }
@@ -4803,12 +5059,19 @@ pub const Decompiler = struct {
             const op = insts[i].opcode;
             if (op == .NOT_TAKEN or op == .CACHE) continue;
             switch (op) {
-                .POP_JUMP_IF_FALSE, .POP_JUMP_FORWARD_IF_FALSE,
-                .POP_JUMP_IF_TRUE, .POP_JUMP_FORWARD_IF_TRUE,
-                .POP_JUMP_IF_NONE, .POP_JUMP_FORWARD_IF_NONE,
+                .POP_JUMP_IF_FALSE,
+                .POP_JUMP_FORWARD_IF_FALSE,
+                .POP_JUMP_IF_TRUE,
+                .POP_JUMP_FORWARD_IF_TRUE,
+                .POP_JUMP_IF_NONE,
+                .POP_JUMP_FORWARD_IF_NONE,
                 => break,
-                .LOAD_FAST_BORROW, .LOAD_FAST_BORROW_LOAD_FAST_BORROW,
-                .LOAD_FAST_LOAD_FAST, .LOAD_FAST, .LOAD_GLOBAL, .LOAD_NAME,
+                .LOAD_FAST_BORROW,
+                .LOAD_FAST_BORROW_LOAD_FAST_BORROW,
+                .LOAD_FAST_LOAD_FAST,
+                .LOAD_FAST,
+                .LOAD_GLOBAL,
+                .LOAD_NAME,
                 => break,
                 .STORE_FAST => return self.code.varnames[insts[i].arg],
                 .STORE_NAME => return self.code.names[insts[i].arg],
@@ -5597,7 +5860,7 @@ pub const Decompiler = struct {
                         const pop_need = self.maxLeadPop(bid, end);
                         if (pop_need > 0) {
                             if (pop_need == 1) {
-                                var init_stack = [_]StackValue{ .unknown };
+                                var init_stack = [_]StackValue{.unknown};
                                 body = try self.decompileStructuredRangeWithStack(bid, end, init_stack[0..]);
                             } else {
                                 const init_stack = try self.allocator.alloc(StackValue, pop_need);
@@ -5783,7 +6046,7 @@ pub const Decompiler = struct {
                             const pop_need = self.maxLeadPop(fb, fb_end);
                             if (pop_need > 0) {
                                 if (pop_need == 1) {
-                                    var init_stack = [_]StackValue{ .unknown };
+                                    var init_stack = [_]StackValue{.unknown};
                                     fallback_body = try self.decompileStructuredRangeWithStack(fb, fb_end, init_stack[0..]);
                                 } else {
                                     const init_stack = try self.allocator.alloc(StackValue, pop_need);
@@ -5855,7 +6118,7 @@ pub const Decompiler = struct {
                     const pop_need = self.maxLeadPop(bid, body_end);
                     if (pop_need > 0) {
                         if (pop_need == 1) {
-                            var init_stack = [_]StackValue{ .unknown };
+                            var init_stack = [_]StackValue{.unknown};
                             body = try self.decompileStructuredRangeWithStack(bid, body_end, init_stack[0..]);
                         } else {
                             const init_stack = try self.allocator.alloc(StackValue, pop_need);
@@ -6004,7 +6267,7 @@ pub const Decompiler = struct {
                             const pop_need = self.maxLeadPop(fb, fb_end);
                             if (pop_need > 0) {
                                 if (pop_need == 1) {
-                                    var init_stack = [_]StackValue{ .unknown };
+                                    var init_stack = [_]StackValue{.unknown};
                                     fallback_body = try self.decompileStructuredRangeWithStack(fb, fb_end, init_stack[0..]);
                                 } else {
                                     const init_stack = try self.allocator.alloc(StackValue, pop_need);
@@ -6570,6 +6833,7 @@ pub const Decompiler = struct {
         const limit = @min(end, @as(u32, @intCast(self.cfg.blocks.len)));
 
         while (block_idx < limit) {
+            const prev_idx = block_idx;
             if (self.cfg.blocks[block_idx].is_exception_handler) {
                 block_idx += 1;
                 continue;
@@ -6633,9 +6897,30 @@ pub const Decompiler = struct {
                     block_idx = result.next_block;
                 },
                 else => {
+                    const block = &self.cfg.blocks[block_idx];
+                    if (block.is_loop_header) {
+                        if (try self.decompileLoopHeader(block_idx)) |result| {
+                            if (result.stmt) |s| {
+                                try stmts.append(a, s);
+                            }
+                            block_idx = result.next_block;
+                            break;
+                        }
+                    }
                     try self.decompileBlockIntoWithStack(block_idx, &stmts, a, init_stack);
                     block_idx += 1;
                 },
+            }
+            if (block_idx <= prev_idx) {
+                if (self.last_error_ctx == null) {
+                    self.last_error_ctx = .{
+                        .code_name = self.code.name,
+                        .block_id = prev_idx,
+                        .offset = self.cfg.blocks[prev_idx].start_offset,
+                        .opcode = "structured_no_progress",
+                    };
+                }
+                return error.InvalidBlock;
             }
         }
 
@@ -7290,36 +7575,70 @@ pub const Decompiler = struct {
         return stmts.toOwnedSlice(a);
     }
 
-    fn collectReachableNoException(
+    fn collectReachableNoExceptionInto(
         self: *Decompiler,
         start: u32,
-        handler_set: *const std.DynamicBitSet,
-    ) DecompileError!std.DynamicBitSet {
-        var visited = try std.DynamicBitSet.initEmpty(self.allocator, self.cfg.blocks.len);
-        var queue: std.ArrayList(u32) = .{};
-        defer queue.deinit(self.allocator);
+        handler_set: *const GenSet,
+        visited: *GenSet,
+        queue: *std.ArrayListUnmanaged(u32),
+        allow_start_in_handler: bool,
+    ) DecompileError!void {
+        visited.reset();
+        queue.clearRetainingCapacity();
 
-        if (start >= self.cfg.blocks.len) return visited;
-        if (handler_set.isSet(start)) return visited;
+        if (start >= self.cfg.blocks.len) return;
+        if (handler_set.isSet(start) and !allow_start_in_handler) return;
 
-        visited.set(start);
+        try visited.set(self.allocator, start);
         try queue.append(self.allocator, start);
 
         while (queue.items.len > 0) {
-            const node = queue.pop().?;
+            const node = queue.items[queue.items.len - 1];
+            queue.items.len -= 1;
             const block = &self.cfg.blocks[node];
             for (block.successors) |edge| {
                 if (edge.edge_type == .exception) continue;
                 if (edge.target >= self.cfg.blocks.len) continue;
                 if (handler_set.isSet(edge.target)) continue;
                 if (!visited.isSet(edge.target)) {
-                    visited.set(edge.target);
+                    try visited.set(self.allocator, edge.target);
                     try queue.append(self.allocator, edge.target);
                 }
             }
         }
+    }
 
-        return visited;
+    fn collectReachableNoExceptionFromStarts(
+        self: *Decompiler,
+        starts: []const u32,
+        handler_set: *const GenSet,
+        visited: *GenSet,
+        queue: *std.ArrayListUnmanaged(u32),
+    ) DecompileError!void {
+        visited.reset();
+        queue.clearRetainingCapacity();
+
+        for (starts) |start| {
+            if (start >= self.cfg.blocks.len) continue;
+            if (visited.isSet(start)) continue;
+            try visited.set(self.allocator, start);
+            try queue.append(self.allocator, start);
+        }
+
+        while (queue.items.len > 0) {
+            const node = queue.items[queue.items.len - 1];
+            queue.items.len -= 1;
+            const block = &self.cfg.blocks[node];
+            for (block.successors) |edge| {
+                if (edge.edge_type == .exception) continue;
+                if (edge.target >= self.cfg.blocks.len) continue;
+                if (handler_set.isSet(edge.target)) continue;
+                if (!visited.isSet(edge.target)) {
+                    try visited.set(self.allocator, edge.target);
+                    try queue.append(self.allocator, edge.target);
+                }
+            }
+        }
     }
 
     fn isFinallyHandler(self: *Decompiler, handler_block: u32) bool {
@@ -8356,6 +8675,57 @@ pub const Decompiler = struct {
         };
     }
 
+    fn tryRecoverFunctionDefFromMakeFunction(
+        self: *Decompiler,
+        sim: *SimContext,
+        instructions: []const decoder.Instruction,
+        inst_idx: usize,
+        name: []const u8,
+    ) DecompileError!?*Stmt {
+        if (inst_idx == 0 or inst_idx > instructions.len) return null;
+        const make_inst = instructions[inst_idx - 1];
+        if (make_inst.opcode != .MAKE_FUNCTION) return null;
+
+        const flags: u32 = make_inst.arg;
+        if ((flags & ~@as(u32, 0x01)) != 0) return null;
+        if (inst_idx < 3) return null;
+        const qual_inst = instructions[inst_idx - 2];
+        const code_inst = instructions[inst_idx - 3];
+        if (qual_inst.opcode != .LOAD_CONST or code_inst.opcode != .LOAD_CONST) return null;
+        const code_obj = sim.getConst(code_inst.arg) orelse return null;
+        const code = switch (code_obj) {
+            .code, .code_ref => |c| c,
+            else => return null,
+        };
+
+        var defaults: []const *Expr = &.{};
+        if ((flags & 0x01) != 0) {
+            if (inst_idx < 4) return null;
+            const def_inst = instructions[inst_idx - 4];
+            if (def_inst.opcode != .LOAD_CONST) return null;
+            if (sim.getConst(def_inst.arg)) |def_obj| {
+                const def_expr = sim.objToExpr(def_obj) catch return null;
+                if (def_expr.* == .tuple) {
+                    defaults = def_expr.tuple.elts;
+                } else {
+                    def_expr.deinit(sim.allocator);
+                    sim.allocator.destroy(def_expr);
+                }
+            }
+        }
+
+        const func = try self.allocator.create(stack_mod.FunctionValue);
+        func.* = .{
+            .code = code,
+            .decorators = .{},
+            .defaults = defaults,
+            .kw_defaults = &.{},
+            .annotations = &.{},
+        };
+
+        return try self.makeFunctionDef(name, func);
+    }
+
     fn makeImport(self: *Decompiler, alias_name: []const u8, imp: stack_mod.ImportModule) DecompileError!*Stmt {
         const a = self.arena.allocator();
         const stmt = try a.create(ast.Stmt);
@@ -8949,12 +9319,12 @@ test "exception seed handles JUMP_IF_NOT_EXC_MATCH" {
     };
 
     const bytecode = try test_utils.emitOpsOwned(allocator, version, &ops);
-    const consts = [_]pyc.Object{ .{ .none = {} } };
+    const consts = [_]pyc.Object{.{ .none = {} }};
     const code = try test_utils.allocCodeWithNames(
         allocator,
         "exc_seed",
-        &[_][]const u8{ "e" },
-        &[_][]const u8{ "Exception" },
+        &[_][]const u8{"e"},
+        &[_][]const u8{"Exception"},
         &consts,
         bytecode,
         0,
@@ -8968,4 +9338,22 @@ test "exception seed handles JUMP_IF_NOT_EXC_MATCH" {
     defer out.deinit(allocator);
     try decompileToSource(allocator, code, version, out.writer(allocator));
     try testing.expect(out.items.len > 0);
+}
+
+test "genset reuse" {
+    const allocator = std.testing.allocator;
+    var set = try GenSet.init(allocator, 4);
+    defer set.deinit(allocator);
+
+    try set.set(allocator, 1);
+    try std.testing.expect(set.isSet(1));
+    try std.testing.expect(set.list.items.len == 1);
+
+    set.reset();
+    try std.testing.expect(!set.isSet(1));
+    try std.testing.expect(set.list.items.len == 0);
+
+    try set.set(allocator, 1);
+    try std.testing.expect(set.isSet(1));
+    try std.testing.expect(set.list.items.len == 1);
 }
