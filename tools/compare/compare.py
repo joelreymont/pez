@@ -10,41 +10,6 @@ from difflib import SequenceMatcher
 from pathlib import Path
 
 
-IGNORE_OPS = {
-    "CACHE",
-    "EXTENDED_ARG",
-    "NOP",
-    "RESUME",
-    "COPY_FREE_VARS",
-}
-
-CONST_OPS = {
-    "LOAD_CONST",
-    "LOAD_SMALL_INT",
-    "LOAD_BIG_INT",
-}
-
-NAME_OPS = {
-    "LOAD_NAME",
-    "STORE_NAME",
-    "LOAD_GLOBAL",
-    "STORE_GLOBAL",
-    "LOAD_FAST",
-    "STORE_FAST",
-    "LOAD_FAST_CHECK",
-    "LOAD_FAST_BORROW",
-    "STORE_FAST_MAYBE_NULL",
-    "LOAD_DEREF",
-    "STORE_DEREF",
-}
-
-JUMP_OPS_PREFIX = (
-    "JUMP",
-    "POP_JUMP",
-    "JUMP_IF",
-    "FOR_ITER",
-)
-
 
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser()
@@ -62,6 +27,9 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--min-unit-ratio", type=float, default=0.90, help="Min per-unit seq ratio")
     p.add_argument("--avg-ratio", type=float, default=0.97, help="Min average seq ratio")
     p.add_argument("--min-count-jaccard", type=float, default=0.95, help="Min avg opcode-count Jaccard")
+    p.add_argument("--min-block-jaccard", type=float, default=0.95, help="Min avg block-signature Jaccard")
+    p.add_argument("--min-edge-jaccard", type=float, default=0.95, help="Min avg edge-signature Jaccard")
+    p.add_argument("--min-semantic-score", type=float, default=0.95, help="Min avg semantic score")
     return p.parse_args()
 
 
@@ -119,85 +87,10 @@ def disassemble_with_xdis(
     pyc_path: Path,
     timeout: int,
 ) -> dict:
-    helper = r"""
-import json
-import sys
-from xdis import load
-from xdis import op_imports
-from xdis.bytecode import Bytecode
-
-IGNORE = set(""" + json.dumps(sorted(IGNORE_OPS)) + r""")
-CONST_OPS = set(""" + json.dumps(sorted(CONST_OPS)) + r""")
-NAME_OPS = set(""" + json.dumps(sorted(NAME_OPS)) + r""")
-JUMP_PREFIX = """ + json.dumps(list(JUMP_OPS_PREFIX)) + r"""
-
-def norm_arg(opname, argval, argrepr):
-    if opname in CONST_OPS:
-        if argval is None:
-            return "const:none"
-        t = type(argval).__name__
-        if t == "code" or t.startswith("Code"):
-            return "const:code"
-        if t in ("int", "float", "complex", "str", "bytes", "bool"):
-            return "const:" + t
-        return "const:other"
-    if opname in NAME_OPS:
-        return "name"
-    for p in JUMP_PREFIX:
-        if opname.startswith(p):
-            return "jump"
-    if opname == "COMPARE_OP":
-        return "cmp:" + str(argrepr)
-    if argrepr is None:
-        return ""
-    return "arg"
-
-def walk(code, opc, path, out):
-    ops = []
-    norm_ops = []
-    counts = {}
-    for ins in Bytecode(code, opc):
-        opname = ins.opname
-        if opname in IGNORE:
-            continue
-        ops.append(opname)
-        narg = norm_arg(opname, getattr(ins, "argval", None), getattr(ins, "argrepr", None))
-        norm_ops.append(opname + (":" + narg if narg else ""))
-        counts[opname] = counts.get(opname, 0) + 1
-    out.append({"path": path, "ops": ops, "norm_ops": norm_ops, "counts": counts})
-    for c in code.co_consts:
-        if hasattr(c, "co_code"):
-            walk(c, opc, path + "." + c.co_name, out)
-
-def main():
-    pyc = sys.argv[1]
-    res = load.load_module(pyc)
-    ver = res[0]
-    code = res[3]
-    try:
-        from xdis.op_imports import PythonImplementation
-    except Exception:
-        PythonImplementation = None
-
-    if PythonImplementation is None:
-        opc = op_imports.get_opcode_module(ver)
-    else:
-        impl = None
-        for item in res:
-            if isinstance(item, PythonImplementation):
-                impl = item
-                break
-        if impl is None:
-            impl = PythonImplementation.CPython
-        opc = op_imports.get_opcode_module(ver, impl)
-    out = []
-    walk(code, opc, code.co_name, out)
-    print(json.dumps({"version": list(ver), "units": out}))
-
-if __name__ == "__main__":
-    main()
-"""
-    proc = run_cmd([xdis_py, "-c", helper, str(pyc_path)], timeout)
+    script = Path(__file__).with_name("analyze_xdis.py")
+    if not script.exists():
+        raise SystemExit(f"missing: {script}")
+    proc = run_cmd([xdis_py, str(script), str(pyc_path)], timeout)
     if proc.returncode != 0:
         sys.stderr.write(proc.stderr)
         raise SystemExit(proc.returncode)
@@ -224,6 +117,39 @@ def count_jaccard(a: dict, b: dict) -> float:
         inter += min(av, bv)
         union += max(av, bv)
     return inter / union if union else 1.0
+
+
+def multiset_jaccard(a: dict, b: dict) -> float:
+    return count_jaccard(a, b)
+
+
+def semantic_score(block_j: float, edge_j: float) -> float:
+    return (0.4 * block_j) + (0.6 * edge_j)
+
+
+def meta_diff(a: dict, b: dict) -> list:
+    diffs = []
+    keys = set(a) | set(b)
+    for k in sorted(keys):
+        if a.get(k) != b.get(k):
+            diffs.append(k)
+    return diffs
+
+
+def counter_diff(a: dict, b: dict, limit: int = 5) -> dict:
+    missing = []
+    extra = []
+    for k, v in a.items():
+        diff = v - b.get(k, 0)
+        if diff > 0:
+            missing.append((k, diff))
+    for k, v in b.items():
+        diff = v - a.get(k, 0)
+        if diff > 0:
+            extra.append((k, diff))
+    missing.sort(key=lambda x: -x[1])
+    extra.sort(key=lambda x: -x[1])
+    return {"missing": missing[:limit], "extra": extra[:limit]}
 
 
 def main() -> None:
@@ -257,14 +183,23 @@ def main() -> None:
                 "units_missing": [],
                 "avg_seq_ratio": 0.0,
                 "avg_count_jaccard": 0.0,
+                "avg_block_jaccard": 0.0,
+                "avg_edge_jaccard": 0.0,
+                "avg_semantic_score": 0.0,
                 "min_seq_ratio": 0.0,
                 "min_count_jaccard": 0.0,
+                "min_block_jaccard": 0.0,
+                "min_edge_jaccard": 0.0,
+                "min_semantic_score": 0.0,
                 "exact_units": 0,
                 "verdict": "mismatch",
                 "thresholds": {
                     "avg_ratio": args.avg_ratio,
                     "min_unit_ratio": args.min_unit_ratio,
                     "min_count_jaccard": args.min_count_jaccard,
+                    "min_block_jaccard": args.min_block_jaccard,
+                    "min_edge_jaccard": args.min_edge_jaccard,
+                    "min_semantic_score": args.min_semantic_score,
                 },
             }
             report = {"verdict": "mismatch", "summary": summary, "rows": []}
@@ -282,10 +217,16 @@ def main() -> None:
         rows = []
         total_ratio = 0.0
         total_jaccard = 0.0
+        total_block_j = 0.0
+        total_edge_j = 0.0
+        total_semantic = 0.0
         total_count = 0
         missing = []
         min_ratio = 1.0
         min_jaccard = 1.0
+        min_block_j = 1.0
+        min_edge_j = 1.0
+        min_semantic = 1.0
         exact_units = 0
         for unit in orig_data["units"]:
             path = unit["path"]
@@ -297,17 +238,41 @@ def main() -> None:
                 continue
             other = candidates[idx]
             ratio = seq_ratio(unit["norm_ops"], other["norm_ops"])
-            jac = count_jaccard(unit["counts"], other["counts"])
+            jac = count_jaccard(unit.get("op_counts", {}), other.get("op_counts", {}))
+            block_counts = unit.get("block_sig_counts", {})
+            edge_counts = unit.get("edge_sig_counts", {})
+            other_block_counts = other.get("block_sig_counts", {})
+            other_edge_counts = other.get("edge_sig_counts", {})
+            block_j = multiset_jaccard(block_counts, other_block_counts)
+            edge_j = multiset_jaccard(edge_counts, other_edge_counts)
+            semantic = semantic_score(block_j, edge_j)
             exact = unit["norm_ops"] == other["norm_ops"]
+            meta_mismatch = meta_diff(unit.get("meta", {}), other.get("meta", {}))
+            block_sig_diff = counter_diff(block_counts, other_block_counts)
+            edge_sig_diff = counter_diff(edge_counts, other_edge_counts)
             total_ratio += ratio
             total_jaccard += jac
+            total_block_j += block_j
+            total_edge_j += edge_j
+            total_semantic += semantic
             total_count += 1
             if ratio < min_ratio:
                 min_ratio = ratio
             if jac < min_jaccard:
                 min_jaccard = jac
+            if block_j < min_block_j:
+                min_block_j = block_j
+            if edge_j < min_edge_j:
+                min_edge_j = edge_j
+            if semantic < min_semantic:
+                min_semantic = semantic
             if exact:
                 exact_units += 1
+            tier = "mismatch"
+            if exact:
+                tier = "exact"
+            elif not meta_mismatch and block_j >= args.min_block_jaccard and edge_j >= args.min_edge_jaccard:
+                tier = "semantic_equiv"
             rows.append(
                 {
                     "path": path,
@@ -315,12 +280,24 @@ def main() -> None:
                     "len_comp": len(other["norm_ops"]),
                     "seq_ratio": ratio,
                     "count_jaccard": jac,
+                    "block_jaccard": block_j,
+                    "edge_jaccard": edge_j,
+                    "semantic_score": semantic,
                     "exact": exact,
+                    "tier": tier,
+                    "meta_mismatch": meta_mismatch,
+                    "cfg_sig_orig": unit.get("cfg_sig", {}),
+                    "cfg_sig_comp": other.get("cfg_sig", {}),
+                    "block_sig_diff": block_sig_diff,
+                    "edge_sig_diff": edge_sig_diff,
                 }
             )
 
         avg_ratio = (total_ratio / total_count) if total_count else 0.0
         avg_jaccard = (total_jaccard / total_count) if total_count else 0.0
+        avg_block_j = (total_block_j / total_count) if total_count else 0.0
+        avg_edge_j = (total_edge_j / total_count) if total_count else 0.0
+        avg_semantic = (total_semantic / total_count) if total_count else 0.0
         verdict = "mismatch"
         if total_count == 0:
             verdict = "mismatch"
@@ -332,6 +309,9 @@ def main() -> None:
             avg_ratio >= args.avg_ratio
             and min_ratio >= args.min_unit_ratio
             and avg_jaccard >= args.min_count_jaccard
+            and avg_block_j >= args.min_block_jaccard
+            and avg_edge_j >= args.min_edge_jaccard
+            and avg_semantic >= args.min_semantic_score
         ):
             verdict = "close"
 
@@ -342,14 +322,23 @@ def main() -> None:
             "units_missing": missing,
             "avg_seq_ratio": avg_ratio,
             "avg_count_jaccard": avg_jaccard,
+            "avg_block_jaccard": avg_block_j,
+            "avg_edge_jaccard": avg_edge_j,
+            "avg_semantic_score": avg_semantic,
             "min_seq_ratio": min_ratio if total_count else 0.0,
             "min_count_jaccard": min_jaccard if total_count else 0.0,
+            "min_block_jaccard": min_block_j if total_count else 0.0,
+            "min_edge_jaccard": min_edge_j if total_count else 0.0,
+            "min_semantic_score": min_semantic if total_count else 0.0,
             "exact_units": exact_units,
             "verdict": verdict,
             "thresholds": {
                 "avg_ratio": args.avg_ratio,
                 "min_unit_ratio": args.min_unit_ratio,
                 "min_count_jaccard": args.min_count_jaccard,
+                "min_block_jaccard": args.min_block_jaccard,
+                "min_edge_jaccard": args.min_edge_jaccard,
+                "min_semantic_score": args.min_semantic_score,
             },
         }
 

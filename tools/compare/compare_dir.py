@@ -89,6 +89,7 @@ def main() -> None:
     results = []
     counts = {"exact": 0, "close": 0, "mismatch": 0, "error": 0, "missing_src": 0}
     worst_seq = []
+    worst_semantic = []
 
     processed = 0
     for pyc in orig_root.rglob("*.pyc"):
@@ -120,6 +121,15 @@ def main() -> None:
                     "min_count_jaccard": summary.get("min_count_jaccard", 0.0),
                 }
             )
+            worst_semantic.append(
+                {
+                    "file": str(rel),
+                    "min_semantic_score": summary.get("min_semantic_score", 0.0),
+                    "avg_semantic_score": summary.get("avg_semantic_score", 0.0),
+                    "min_block_jaccard": summary.get("min_block_jaccard", 0.0),
+                    "min_edge_jaccard": summary.get("min_edge_jaccard", 0.0),
+                }
+            )
 
         results.append({"file": str(rel), "verdict": verdict, "summary": summary})
 
@@ -132,11 +142,13 @@ def main() -> None:
             break
 
     worst_seq.sort(key=lambda r: (r["min_seq_ratio"], r["min_count_jaccard"]))
+    worst_semantic.sort(key=lambda r: (r["min_semantic_score"], r["min_block_jaccard"], r["min_edge_jaccard"]))
 
     summary = {
         "total": len(results),
         "counts": counts,
         "worst_seq": worst_seq[:25],
+        "worst_semantic": worst_semantic[:25],
     }
 
     out = json.dumps({"summary": summary, "results": results}, indent=2)
