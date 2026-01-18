@@ -4437,6 +4437,7 @@ pub const Decompiler = struct {
         }
 
         std.mem.sort(u32, handler_blocks.items, {}, std.sort.asc(u32));
+        const handler_start = handler_blocks.items[0];
 
         if (self.version.gte(3, 11)) {
             return try self.decompileTry311(pattern, handler_blocks.items);
@@ -4514,6 +4515,12 @@ pub const Decompiler = struct {
             self.resolveJumpOnlyBlock(entry)
         else
             null;
+        var exit_block = effective_exit;
+        if (exit_block) |exit| {
+            if (exit <= handler_start) {
+                exit_block = null;
+            }
+        }
 
         var has_finally = false;
         for (handler_blocks.items) |hid| {
@@ -4552,7 +4559,6 @@ pub const Decompiler = struct {
             break :blk null;
         };
 
-        const handler_start = handler_blocks.items[0];
         var try_end: u32 = handler_start;
         if (else_start) |start| {
             if (start < try_end) try_end = start;
@@ -4568,7 +4574,7 @@ pub const Decompiler = struct {
 
         const a = self.arena.allocator();
 
-        var else_end: u32 = effective_exit orelse @as(u32, @intCast(self.cfg.blocks.len));
+        var else_end: u32 = exit_block orelse @as(u32, @intCast(self.cfg.blocks.len));
         if (else_start) |start| {
             if (handler_start > start and handler_start < else_end) else_end = handler_start;
             if (finally_start) |final_start| {
@@ -4584,7 +4590,7 @@ pub const Decompiler = struct {
             break :blk try self.decompileStructuredRange(start, else_end);
         } else &[_]*Stmt{};
 
-        var final_end: u32 = effective_exit orelse @as(u32, @intCast(self.cfg.blocks.len));
+        var final_end: u32 = exit_block orelse @as(u32, @intCast(self.cfg.blocks.len));
         if (finally_start) |final_start| {
             if (handler_start > final_start and handler_start < final_end) {
                 final_end = handler_start;
@@ -4622,7 +4628,7 @@ pub const Decompiler = struct {
                 const next_handler = if (idx + 1 < handler_blocks.items.len)
                     handler_blocks.items[idx + 1]
                 else
-                    (effective_exit orelse @as(u32, @intCast(self.cfg.blocks.len)));
+                    (exit_block orelse @as(u32, @intCast(self.cfg.blocks.len)));
                 if (finally_start) |start| {
                     if (start > hid and start < next_handler) break :blk start;
                 }
@@ -4710,7 +4716,7 @@ pub const Decompiler = struct {
         if (else_start) |start| {
             if (start > next_block) next_block = start;
         }
-        if (effective_exit) |exit| {
+        if (exit_block) |exit| {
             if (exit > next_block) next_block = exit;
         }
 
@@ -9393,7 +9399,12 @@ pub const Decompiler = struct {
 
             const block = &self.cfg.blocks[block_idx];
             const has_back_edge = self.hasLoopBackEdge(block, loop_header);
-            const pattern = try self.analyzer.detectPattern(block_idx);
+            var pattern = try self.analyzer.detectPattern(block_idx);
+            if (pattern == .unknown and !block.is_exception_handler and self.analyzer.hasExceptionEdge(block)) {
+                if (try self.analyzer.detectTryPatternAt(block_idx)) |tp| {
+                    pattern = .{ .try_stmt = tp };
+                }
+            }
 
             switch (pattern) {
                 .if_stmt => |p| {
@@ -9422,6 +9433,21 @@ pub const Decompiler = struct {
                     if (!self.dom.isInLoop(next_id, loop_header)) break;
                     if (next_id <= block_idx) break;
                     block_idx = next_id;
+                    continue;
+                },
+                .try_stmt => |p| {
+                    if (try self.tryDecompileAsyncFor(p)) |result| {
+                        if (result.stmt) |s| {
+                            try stmts.append(a, s);
+                        }
+                        block_idx = result.next_block;
+                        continue;
+                    }
+                    const result = try self.decompileTry(p);
+                    if (result.stmt) |s| {
+                        try stmts.append(a, s);
+                    }
+                    block_idx = result.next_block;
                     continue;
                 },
                 else => {

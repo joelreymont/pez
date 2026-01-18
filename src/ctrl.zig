@@ -433,8 +433,12 @@ pub const Analyzer = struct {
         return .unknown;
     }
 
+    pub fn detectTryPatternAt(self: *Analyzer, block_id: u32) !?TryPattern {
+        return self.detectTryPattern(block_id);
+    }
+
     /// Check if block has any exception edges.
-    fn hasExceptionEdge(self: *const Analyzer, block: *const BasicBlock) bool {
+    pub fn hasExceptionEdge(self: *const Analyzer, block: *const BasicBlock) bool {
         if (block.id >= self.block_flags.len) return false;
         return self.block_flags[block.id].has_exception_edge;
     }

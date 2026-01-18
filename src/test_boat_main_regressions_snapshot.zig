@@ -171,3 +171,18 @@ test "snapshot class private names 3.9" {
         \\"
     );
 }
+
+test "snapshot loop try 3.9" {
+    try runSnapshot(@src(), "test/corpus/loop_try.3.9.pyc",
+        \\[]u8
+        \\  "import time
+        \\def run_bot(bot):
+        \\    while True:
+        \\        try:
+        \\            bot.infinity_polling()
+        \\        except Exception:
+        \\            print('Bot polling error')
+        \\            time.sleep(5)
+        \\"
+    );
+}
