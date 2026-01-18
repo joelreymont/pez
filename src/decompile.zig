@@ -502,7 +502,7 @@ pub const Decompiler = struct {
             self.allocator.free(out);
         }
         _ = sim;
-        var clone_sim = SimContext.init(self.allocator, self.code, self.version);
+        var clone_sim = SimContext.init(self.allocator, self.allocator, self.code, self.version);
         defer clone_sim.deinit();
 
         for (values, 0..) |val, idx| {
@@ -525,7 +525,7 @@ pub const Decompiler = struct {
             self.allocator.free(out);
         }
 
-        var clone_sim = SimContext.init(self.allocator, self.code, self.version);
+        var clone_sim = SimContext.init(self.allocator, self.allocator, self.code, self.version);
         defer clone_sim.deinit();
 
         for (values, 0..) |val, idx| {
@@ -676,7 +676,7 @@ pub const Decompiler = struct {
         self.stack_in[0] = &.{};
         try worklist.append(self.allocator, 0);
 
-        var clone_sim = SimContext.init(self.arena.allocator(), self.code, self.version);
+        var clone_sim = SimContext.init(self.arena.allocator(), self.arena.allocator(), self.code, self.version);
         clone_sim.flow_mode = true;
         clone_sim.stack.allow_underflow = true;
         defer clone_sim.deinit();
@@ -690,7 +690,7 @@ pub const Decompiler = struct {
             var sim_arena = std.heap.ArenaAllocator.init(self.allocator);
             defer sim_arena.deinit();
 
-            var sim = SimContext.init(sim_arena.allocator(), self.code, self.version);
+            var sim = SimContext.init(sim_arena.allocator(), sim_arena.allocator(), self.code, self.version);
             defer sim.deinit();
             sim.lenient = true;
             sim.flow_mode = true;
@@ -1866,7 +1866,7 @@ pub const Decompiler = struct {
         if (block_id >= self.cfg.blocks.len) return null;
         const block = &self.cfg.blocks[block_id];
 
-        var sim = SimContext.init(self.arena.allocator(), self.code, self.version);
+        var sim = SimContext.init(self.arena.allocator(), self.arena.allocator(), self.code, self.version);
         defer sim.deinit();
 
         for (base_vals) |val| {
@@ -1893,7 +1893,7 @@ pub const Decompiler = struct {
         if (block_id >= self.cfg.blocks.len) return null;
         const block = &self.cfg.blocks[block_id];
 
-        var sim = SimContext.init(self.arena.allocator(), self.code, self.version);
+        var sim = SimContext.init(self.arena.allocator(), self.arena.allocator(), self.code, self.version);
         defer sim.deinit();
 
         for (base_vals) |val| {
@@ -1921,7 +1921,7 @@ pub const Decompiler = struct {
         const block = &self.cfg.blocks[block_id];
         if (skip > block.instructions.len) return null;
 
-        var sim = SimContext.init(self.arena.allocator(), self.code, self.version);
+        var sim = SimContext.init(self.arena.allocator(), self.arena.allocator(), self.code, self.version);
         defer sim.deinit();
 
         for (base_vals) |val| {
@@ -1951,7 +1951,7 @@ pub const Decompiler = struct {
         const block = &self.cfg.blocks[block_id];
         if (skip > block.instructions.len) return null;
 
-        var sim = SimContext.init(self.arena.allocator(), self.code, self.version);
+        var sim = SimContext.init(self.arena.allocator(), self.arena.allocator(), self.code, self.version);
         defer sim.deinit();
 
         for (base_vals) |val| {
@@ -2012,7 +2012,7 @@ pub const Decompiler = struct {
         if (block_id >= self.cfg.blocks.len) return null;
         const cond_block = &self.cfg.blocks[block_id];
 
-        var cond_sim = SimContext.init(self.arena.allocator(), self.code, self.version);
+        var cond_sim = SimContext.init(self.arena.allocator(), self.arena.allocator(), self.code, self.version);
         defer cond_sim.deinit();
         cond_sim.lenient = true;
 
@@ -2634,7 +2634,7 @@ pub const Decompiler = struct {
             }
         }
 
-        var sim = SimContext.init(self.arena.allocator(), self.code, self.version);
+        var sim = SimContext.init(self.arena.allocator(), self.arena.allocator(), self.code, self.version);
         defer sim.deinit();
 
         // Determine simulation start point based on pattern type
@@ -2650,7 +2650,7 @@ pub const Decompiler = struct {
             } else {
                 // Python 3.12+: BUILD_LIST after GET_ITER
                 // Simulate setup code to get iterator expression, then start from GET_ITER
-                var setup_sim = SimContext.init(self.arena.allocator(), self.code, self.version);
+                var setup_sim = SimContext.init(self.arena.allocator(), self.arena.allocator(), self.code, self.version);
                 defer setup_sim.deinit();
 
                 var setup_iter = decoder.InstructionIterator.init(self.code.code, self.version);
@@ -2811,7 +2811,7 @@ pub const Decompiler = struct {
         }
 
         const cond_block = &self.cfg.blocks[pattern.condition_block];
-        var cond_sim = SimContext.init(self.arena.allocator(), self.code, self.version);
+        var cond_sim = SimContext.init(self.arena.allocator(), self.arena.allocator(), self.code, self.version);
         defer cond_sim.deinit();
         if (pattern.condition_block < self.stack_in.len) {
             if (self.stack_in[pattern.condition_block]) |entry| {
@@ -2869,7 +2869,7 @@ pub const Decompiler = struct {
         const final_merge = bool_result.merge_block;
 
         // Process merge block with the bool expression on stack
-        var merge_sim = SimContext.init(self.arena.allocator(), self.code, self.version);
+        var merge_sim = SimContext.init(self.arena.allocator(), self.arena.allocator(), self.code, self.version);
         defer merge_sim.deinit();
         const merge_entry = if (final_merge < self.stack_in.len) self.stack_in[final_merge] else null;
         const merge_seed = merge_entry orelse base_vals;
@@ -3292,7 +3292,7 @@ pub const Decompiler = struct {
         if (block_id >= self.cfg.blocks.len) return;
         const block = &self.cfg.blocks[block_id];
 
-        var sim = SimContext.init(self.arena.allocator(), self.code, self.version);
+        var sim = SimContext.init(self.arena.allocator(), self.arena.allocator(), self.code, self.version);
         defer sim.deinit();
         if (self.hasExceptionSuccessor(block) or self.hasWithExitCleanup(block)) {
             sim.lenient = true;
@@ -3404,7 +3404,7 @@ pub const Decompiler = struct {
         if (block_id >= self.cfg.blocks.len) return;
         const block = &self.cfg.blocks[block_id];
 
-        var sim = SimContext.init(self.arena.allocator(), self.code, self.version);
+        var sim = SimContext.init(self.arena.allocator(), self.arena.allocator(), self.code, self.version);
         defer sim.deinit();
         if (self.hasExceptionSuccessor(block) or self.hasWithExitCleanup(block)) {
             sim.lenient = true;
@@ -3515,7 +3515,7 @@ pub const Decompiler = struct {
             const sim_start = idx + 1;
 
             // Simulate to get the comparison
-            var then_sim = SimContext.init(self.arena.allocator(), self.code, self.version);
+            var then_sim = SimContext.init(self.arena.allocator(), self.arena.allocator(), self.code, self.version);
             defer then_sim.deinit();
             try then_sim.stack.push(.{ .expr = current_mid });
 
@@ -3633,7 +3633,7 @@ pub const Decompiler = struct {
         var msg: ?*Expr = null;
         if (block.instructions[i].opcode == .LOAD_CONST) {
             const const_idx = block.instructions[i].arg;
-            var sim = SimContext.init(self.arena.allocator(), self.code, self.version);
+            var sim = SimContext.init(self.arena.allocator(), self.arena.allocator(), self.code, self.version);
             defer sim.deinit();
             if (sim.getConst(const_idx)) |obj| {
                 msg = try sim.objToExpr(obj);
@@ -3679,7 +3679,7 @@ pub const Decompiler = struct {
         const cond_block = &self.cfg.blocks[pattern.condition_block];
 
         // Get the condition expression from the last instruction before the jump
-        var sim = SimContext.init(self.arena.allocator(), self.code, self.version);
+        var sim = SimContext.init(self.arena.allocator(), self.arena.allocator(), self.code, self.version);
         defer sim.deinit();
 
         if (pattern.condition_block < self.stack_in.len) {
@@ -3836,7 +3836,7 @@ pub const Decompiler = struct {
         const header = &self.cfg.blocks[pattern.header_block];
 
         // Get the condition expression
-        var sim = SimContext.init(self.arena.allocator(), self.code, self.version);
+        var sim = SimContext.init(self.arena.allocator(), self.arena.allocator(), self.code, self.version);
         defer sim.deinit();
 
         var cond_idx: usize = header.instructions.len;
@@ -3860,7 +3860,7 @@ pub const Decompiler = struct {
                     const else_is_exit = else_id == pattern.exit_block;
                     const then_in_loop = self.dom.isInLoop(guard.then_block, pattern.header_block);
                     if (merge_is_then and else_is_exit and then_in_loop) {
-                        var guard_sim = SimContext.init(self.arena.allocator(), self.code, self.version);
+                        var guard_sim = SimContext.init(self.arena.allocator(), self.arena.allocator(), self.code, self.version);
                         defer guard_sim.deinit();
                         const guard_block = &self.cfg.blocks[guard.condition_block];
                         for (guard_block.instructions) |inst| {
@@ -4111,7 +4111,7 @@ pub const Decompiler = struct {
         const aiter_block_id = aiter_id orelse setup_block_id;
         const aiter_block = &self.cfg.blocks[aiter_block_id];
 
-        var sim = SimContext.init(self.arena.allocator(), self.code, self.version);
+        var sim = SimContext.init(self.arena.allocator(), self.arena.allocator(), self.code, self.version);
         defer sim.deinit();
         for (aiter_block.instructions) |inst| {
             if (inst.opcode == .GET_AITER) break;
@@ -4615,7 +4615,7 @@ pub const Decompiler = struct {
     fn decompileWith(self: *Decompiler, pattern: ctrl.WithPattern) DecompileError!PatternResult {
         const a = self.arena.allocator();
         const setup = &self.cfg.blocks[pattern.setup_block];
-        var sim = SimContext.init(a, self.code, self.version);
+        var sim = SimContext.init(a, a, self.code, self.version);
         defer sim.deinit();
 
         var is_async = false;
@@ -4764,7 +4764,7 @@ pub const Decompiler = struct {
             }
             if (!has_normal) continue;
 
-            var pred_sim = SimContext.init(a, self.code, self.version);
+            var pred_sim = SimContext.init(a, a, self.code, self.version);
             defer pred_sim.deinit();
             pred_sim.lenient = true;
             pred_sim.stack.allow_underflow = true;
@@ -4799,7 +4799,7 @@ pub const Decompiler = struct {
         // Get subject from subject block - simulate only until MATCH_* or COPY
         const subj_block = &self.cfg.blocks[pattern.subject_block];
         const a = self.arena.allocator();
-        var sim = SimContext.init(a, self.code, self.version);
+        var sim = SimContext.init(a, a, self.code, self.version);
         defer sim.deinit();
         var prev_was_load = false;
         for (subj_block.instructions) |inst| {
@@ -5054,7 +5054,7 @@ pub const Decompiler = struct {
         if (end_idx == 0 or end_idx <= first_idx.?) return;
         var tmp = block.*;
         tmp.instructions = block.instructions[0..end_idx];
-        var sim = SimContext.init(self.arena.allocator(), self.code, self.version);
+        var sim = SimContext.init(self.arena.allocator(), self.arena.allocator(), self.code, self.version);
         defer sim.deinit();
         try self.processBlockWithSimAndSkip(&tmp, &sim, stmts, stmts_allocator, 0);
     }
@@ -5078,7 +5078,7 @@ pub const Decompiler = struct {
                 break;
             } else if (inst.opcode == .STORE_FAST_LOAD_FAST) {
                 const a = self.arena.allocator();
-                var sim = SimContext.init(a, self.code, self.version);
+                var sim = SimContext.init(a, a, self.code, self.version);
                 defer sim.deinit();
 
                 const load_idx = inst.arg & 0xF;
@@ -5110,7 +5110,7 @@ pub const Decompiler = struct {
 
                         if (same_var) {
                             const a = self.arena.allocator();
-                            var sim = SimContext.init(a, self.code, self.version);
+                            var sim = SimContext.init(a, a, self.code, self.version);
                             defer sim.deinit();
                             for (block.instructions[j..]) |g_inst| {
                                 if (g_inst.opcode == .POP_JUMP_IF_FALSE or g_inst.opcode == .POP_JUMP_FORWARD_IF_FALSE) break;
@@ -5128,7 +5128,7 @@ pub const Decompiler = struct {
 
         if (guard_start) |start| {
             const a = self.arena.allocator();
-            var sim = SimContext.init(a, self.code, self.version);
+            var sim = SimContext.init(a, a, self.code, self.version);
             defer sim.deinit();
             for (block.instructions[start..]) |g_inst| {
                 if (g_inst.opcode == .POP_JUMP_IF_FALSE or g_inst.opcode == .POP_JUMP_FORWARD_IF_FALSE) break;
@@ -5164,7 +5164,7 @@ pub const Decompiler = struct {
         if (start_idx == null) return null;
 
         const a = self.arena.allocator();
-        var sim = SimContext.init(a, self.code, self.version);
+        var sim = SimContext.init(a, a, self.code, self.version);
         defer sim.deinit();
         for (block.instructions[start_idx.?..]) |g_inst| {
             if (g_inst.opcode == .POP_JUMP_IF_FALSE or g_inst.opcode == .POP_JUMP_FORWARD_IF_FALSE) break;
@@ -5340,7 +5340,7 @@ pub const Decompiler = struct {
         var guard_exprs: std.ArrayList(*Expr) = .{};
         errdefer guard_exprs.deinit(self.allocator);
 
-        var sim = SimContext.init(self.arena.allocator(), self.code, self.version);
+        var sim = SimContext.init(self.arena.allocator(), self.arena.allocator(), self.code, self.version);
         defer sim.deinit();
 
         for (blocks) |bid| {
@@ -6493,7 +6493,7 @@ pub const Decompiler = struct {
                     var stmts: std.ArrayList(*Stmt) = .{};
                     defer stmts.deinit(a);
 
-                    var sim = SimContext.init(a, self.code, self.version);
+                    var sim = SimContext.init(a, a, self.code, self.version);
                     defer sim.deinit();
 
                     for (body_insts.items) |inst| {
@@ -6528,7 +6528,7 @@ pub const Decompiler = struct {
                         var stmts: std.ArrayList(*Stmt) = .{};
                         defer stmts.deinit(a);
 
-                        var sim = SimContext.init(a, self.code, self.version);
+                        var sim = SimContext.init(a, a, self.code, self.version);
                         defer sim.deinit();
 
                         for (fb_insts.items) |inst| {
@@ -6715,7 +6715,7 @@ pub const Decompiler = struct {
                     const aa = self.arena.allocator();
                     var stmts: std.ArrayList(*Stmt) = .{};
                     defer stmts.deinit(aa);
-                    var sim = SimContext.init(aa, self.code, self.version);
+                    var sim = SimContext.init(aa, aa, self.code, self.version);
                     defer sim.deinit();
 
                     for (final_block.instructions[start..]) |inst| {
@@ -6748,7 +6748,7 @@ pub const Decompiler = struct {
                         const aa = self.arena.allocator();
                         var stmts: std.ArrayList(*Stmt) = .{};
                         defer stmts.deinit(aa);
-                        var sim = SimContext.init(aa, self.code, self.version);
+                        var sim = SimContext.init(aa, aa, self.code, self.version);
                         defer sim.deinit();
 
                         for (fb_insts.items) |inst| {
@@ -6830,7 +6830,7 @@ pub const Decompiler = struct {
 
     pub fn extractMatchPatternFromInsts(self: *Decompiler, insts: []const cfg_mod.Instruction, subject_on_stack: bool) DecompileError!*ast.Pattern {
         const a = self.arena.allocator();
-        var sim = SimContext.init(a, self.code, self.version);
+        var sim = SimContext.init(a, a, self.code, self.version);
         defer sim.deinit();
 
         var subject_expr: ?*Expr = null;
@@ -7624,7 +7624,7 @@ pub const Decompiler = struct {
             var exc_name: ?[]const u8 = null;
             var body_skip: usize = 0;
 
-            var sim = SimContext.init(a, self.code, self.version);
+            var sim = SimContext.init(a, a, self.code, self.version);
             defer sim.deinit();
 
             var seen_push_exc = false;
@@ -7927,7 +7927,7 @@ pub const Decompiler = struct {
         if (handler_block >= self.cfg.blocks.len) return error.InvalidBlock;
         const block = &self.cfg.blocks[handler_block];
         const a = self.arena.allocator();
-        var sim = SimContext.init(a, self.code, self.version);
+        var sim = SimContext.init(a, a, self.code, self.version);
         defer sim.deinit();
         sim.lenient = true;
         sim.stack.allow_underflow = true;
@@ -8157,7 +8157,7 @@ pub const Decompiler = struct {
             head.instructions = head.instructions[skip..];
         }
 
-        var sim = SimContext.init(a, self.code, self.version);
+        var sim = SimContext.init(a, a, self.code, self.version);
         defer sim.deinit();
         sim.lenient = true;
         sim.stack.allow_underflow = true;
@@ -8409,7 +8409,7 @@ pub const Decompiler = struct {
         const setup = &self.cfg.blocks[pattern.setup_block];
         const header = &self.cfg.blocks[pattern.header_block];
 
-        var iter_sim = SimContext.init(self.arena.allocator(), self.code, self.version);
+        var iter_sim = SimContext.init(self.arena.allocator(), self.arena.allocator(), self.code, self.version);
         defer iter_sim.deinit();
 
         if (pattern.setup_block < self.stack_in.len) {
@@ -8676,7 +8676,7 @@ pub const Decompiler = struct {
         loop_header: ?u32,
     ) DecompileError!void {
         const a = self.arena.allocator();
-        var sim = SimContext.init(a, self.code, self.version);
+        var sim = SimContext.init(a, a, self.code, self.version);
         defer sim.deinit();
         if (self.hasExceptionSuccessor(block) or self.hasWithExitCleanup(block)) {
             sim.lenient = true;
@@ -9022,7 +9022,7 @@ pub const Decompiler = struct {
         skip_first_store: *bool,
         stop_idx: ?usize,
     ) DecompileError!void {
-        var sim = SimContext.init(self.arena.allocator(), self.code, self.version);
+        var sim = SimContext.init(self.arena.allocator(), self.arena.allocator(), self.code, self.version);
         sim.lenient = true;
         defer sim.deinit();
 
@@ -9137,7 +9137,7 @@ pub const Decompiler = struct {
         const legacy_cond = if (term) |t| t.opcode == .JUMP_IF_FALSE or t.opcode == .JUMP_IF_TRUE else false;
 
         // Get the condition expression
-        var sim = SimContext.init(self.arena.allocator(), self.code, self.version);
+        var sim = SimContext.init(self.arena.allocator(), self.arena.allocator(), self.code, self.version);
         defer sim.deinit();
         sim.lenient = true;
         sim.stack.allow_underflow = true;

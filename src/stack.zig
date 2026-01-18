@@ -303,30 +303,32 @@ fn optExprEqual(a: ?*Expr, b: ?*Expr) bool {
 /// Simulated Python evaluation stack.
 pub const Stack = struct {
     items: std.ArrayList(StackValue),
-    allocator: Allocator,
+    stack_alloc: Allocator,
+    ast_alloc: Allocator,
     allow_underflow: bool = false,
 
-    pub fn init(allocator: Allocator) Stack {
+    pub fn init(stack_alloc: Allocator, ast_alloc: Allocator) Stack {
         return .{
             .items = .{},
-            .allocator = allocator,
+            .stack_alloc = stack_alloc,
+            .ast_alloc = ast_alloc,
             .allow_underflow = false,
         };
     }
 
     pub fn deinit(self: *Stack) void {
         for (self.items.items) |*item| {
-            item.deinit(self.allocator);
+            item.deinit(self.ast_alloc);
         }
-        self.items.deinit(self.allocator);
+        self.items.deinit(self.stack_alloc);
     }
 
     pub fn deinitShallow(self: *Stack) void {
-        self.items.deinit(self.allocator);
+        self.items.deinit(self.stack_alloc);
     }
 
     pub fn push(self: *Stack, value: StackValue) !void {
-        try self.items.append(self.allocator, value);
+        try self.items.append(self.stack_alloc, value);
     }
 
     pub fn pop(self: *Stack) ?StackValue {
@@ -342,20 +344,20 @@ pub const Stack = struct {
         return switch (val) {
             .expr => |e| e,
             .unknown => {
-                const expr = try self.allocator.create(Expr);
+                const expr = try self.ast_alloc.create(Expr);
                 expr.* = .{ .name = .{ .id = "__unknown__", .ctx = .load } };
                 return expr;
             },
             else => {
                 if (self.allow_underflow) {
                     var tmp = val;
-                    tmp.deinit(self.allocator);
-                    const expr = try self.allocator.create(Expr);
+                    tmp.deinit(self.ast_alloc);
+                    const expr = try self.ast_alloc.create(Expr);
                     expr.* = .{ .name = .{ .id = "__unknown__", .ctx = .load } };
                     return expr;
                 }
                 var tmp = val;
-                tmp.deinit(self.allocator);
+                tmp.deinit(self.ast_alloc);
                 return error.NotAnExpression;
             },
         };
@@ -378,7 +380,7 @@ pub const Stack = struct {
     /// Pop n items and return them in reverse order (bottom to top becomes first to last).
     pub fn popN(self: *Stack, n: usize) ![]StackValue {
         if (!self.allow_underflow and n > self.items.items.len) return error.StackUnderflow;
-        const result = try self.allocator.alloc(StackValue, n);
+        const result = try self.stack_alloc.alloc(StackValue, n);
         var i: usize = 0;
         while (i < n) : (i += 1) {
             if (self.items.items.len == 0) {
@@ -397,37 +399,37 @@ pub const Stack = struct {
     }
 
     pub fn valuesToExprs(self: *Stack, values: []StackValue) ![]const *Expr {
-        const exprs = try self.allocator.alloc(*Expr, values.len);
+        const exprs = try self.ast_alloc.alloc(*Expr, values.len);
         var created: std.ArrayListUnmanaged(*Expr) = .{};
         errdefer {
             for (created.items) |e| {
-                e.deinit(self.allocator);
-                self.allocator.destroy(e);
+                e.deinit(self.ast_alloc);
+                self.ast_alloc.destroy(e);
             }
-            created.deinit(self.allocator);
+            created.deinit(self.stack_alloc);
             for (values) |*val| {
-                val.deinit(self.allocator);
+                val.deinit(self.ast_alloc);
             }
-            if (values.len > 0) self.allocator.free(values);
-            self.allocator.free(exprs);
+            if (values.len > 0) self.stack_alloc.free(values);
+            self.ast_alloc.free(exprs);
         }
 
         for (values, 0..) |v, i| {
             exprs[i] = switch (v) {
                 .expr => |e| e,
                 .unknown => blk: {
-                    const expr = try self.allocator.create(Expr);
+                    const expr = try self.ast_alloc.create(Expr);
                     expr.* = .{ .name = .{ .id = "__unknown__", .ctx = .load } };
-                    try created.append(self.allocator, expr);
+                    try created.append(self.stack_alloc, expr);
                     break :blk expr;
                 },
                 else => blk: {
                     if (self.allow_underflow) {
                         var tmp = v;
-                        tmp.deinit(self.allocator);
-                        const expr = try self.allocator.create(Expr);
+                        tmp.deinit(self.ast_alloc);
+                        const expr = try self.ast_alloc.create(Expr);
                         expr.* = .{ .name = .{ .id = "__unknown__", .ctx = .load } };
-                        try created.append(self.allocator, expr);
+                        try created.append(self.stack_alloc, expr);
                         break :blk expr;
                     }
                     return error.NotAnExpression;
@@ -435,8 +437,8 @@ pub const Stack = struct {
             };
         }
 
-        if (values.len > 0) self.allocator.free(values);
-        created.deinit(self.allocator);
+        if (values.len > 0) self.stack_alloc.free(values);
+        created.deinit(self.stack_alloc);
         return exprs;
     }
 };
@@ -449,6 +451,7 @@ pub const SimContext = struct {
     };
 
     allocator: Allocator,
+    stack_alloc: Allocator,
     version: Version,
     /// Code object being simulated.
     code: *const pyc.Code,
@@ -467,12 +470,13 @@ pub const SimContext = struct {
     /// Avoid deep deinit in stack-flow analysis.
     flow_mode: bool = false,
 
-    pub fn init(allocator: Allocator, code: *const pyc.Code, version: Version) SimContext {
+    pub fn init(allocator: Allocator, stack_alloc: Allocator, code: *const pyc.Code, version: Version) SimContext {
         return .{
             .allocator = allocator,
+            .stack_alloc = stack_alloc,
             .version = version,
             .code = code,
-            .stack = Stack.init(allocator),
+            .stack = Stack.init(stack_alloc, allocator),
             .iter_override = null,
             .comp_builder = null,
             .lenient = false,
@@ -1580,7 +1584,7 @@ pub const SimContext = struct {
     }
 
     fn buildComprehensionFromCode(self: *SimContext, comp: CompObject, iter_expr: *Expr) SimError!*Expr {
-        var nested = SimContext.init(self.allocator, comp.code, self.version);
+        var nested = SimContext.init(self.allocator, self.allocator, comp.code, self.version);
         defer nested.deinit();
 
         const builder = try self.allocator.create(CompBuilder);
@@ -4974,7 +4978,7 @@ fn compKindFromName(name: []const u8) ?CompKind {
 }
 
 pub fn buildLambdaExpr(allocator: Allocator, code: *const pyc.Code, version: Version) SimError!*Expr {
-    var ctx = SimContext.init(allocator, code, version);
+    var ctx = SimContext.init(allocator, allocator, code, version);
     defer ctx.deinit();
 
     var body_expr: ?*Expr = null;
@@ -5092,7 +5096,7 @@ test "stack simulation load const" {
     };
     const version = Version.init(3, 12);
 
-    var ctx = SimContext.init(allocator, &code, version);
+    var ctx = SimContext.init(allocator, allocator, &code, version);
     defer ctx.deinit();
 
     // Simulate LOAD_CONST 0
@@ -5132,7 +5136,7 @@ test "stack simulation dup top clones expr" {
     };
     const version = Version.init(3, 12);
 
-    var ctx = SimContext.init(allocator, &code, version);
+    var ctx = SimContext.init(allocator, allocator, &code, version);
     defer ctx.deinit();
 
     const load_inst = Instruction{
@@ -5198,7 +5202,7 @@ test "stack simulation composite load const" {
     };
     const version = Version.init(3, 12);
 
-    var ctx = SimContext.init(allocator, &code, version);
+    var ctx = SimContext.init(allocator, allocator, &code, version);
     defer ctx.deinit();
 
     const tuple_inst = Instruction{
@@ -5253,7 +5257,7 @@ test "stack simulation CALL_FUNCTION_KW error clears moved args" {
     };
     const version = Version.init(3, 9);
 
-    var ctx = SimContext.init(allocator, &code, version);
+    var ctx = SimContext.init(allocator, allocator, &code, version);
     defer {
         // Clean up remaining stack items
         while (ctx.stack.pop()) |val| {

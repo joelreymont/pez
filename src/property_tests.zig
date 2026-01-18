@@ -414,7 +414,7 @@ test "stack never goes negative with valid opcode sequences" {
                 .firstlineno = 1,
             };
 
-            var ctx = stack.SimContext.init(allocator, &code, version);
+            var ctx = stack.SimContext.init(allocator, allocator, &code, version);
             defer ctx.deinit();
 
             // Push some values, then check stack is never negative
@@ -453,7 +453,7 @@ test "stack simulation deinit cleans up" {
         .firstlineno = 1,
     };
 
-    var ctx = stack.SimContext.init(allocator, &code, version);
+    var ctx = stack.SimContext.init(allocator, allocator, &code, version);
     // Push some values
     try ctx.stack.push(.unknown);
     try ctx.stack.push(.unknown);

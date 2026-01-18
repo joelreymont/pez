@@ -60,7 +60,7 @@ pub fn dupeStrings(allocator: Allocator, items: []const []const u8) ![][]const u
 }
 
 pub fn simulateExpr(allocator: Allocator, code: *pyc.Code, version: Version, insts: []const Instruction) !*stack.Expr {
-    var sim = stack.SimContext.init(allocator, code, version);
+    var sim = stack.SimContext.init(allocator, allocator, code, version);
     defer sim.deinit();
 
     for (insts) |item| {
