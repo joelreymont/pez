@@ -2139,6 +2139,44 @@ pub const Decompiler = struct {
         return false;
     }
 
+    fn branchEnd(self: *Decompiler, start: u32, stop: ?u32) DecompileError!u32 {
+        const limit: u32 = stop orelse @intCast(self.cfg.blocks.len);
+        if (start >= limit) return start;
+
+        try self.cond_seen.ensureSize(self.allocator, self.cfg.blocks.len);
+        self.cond_seen.reset();
+        self.cond_stack.clearRetainingCapacity();
+        try self.cond_stack.append(self.allocator, start);
+
+        var max_block = start;
+        while (self.cond_stack.items.len > 0) {
+            const cur = self.cond_stack.items[self.cond_stack.items.len - 1];
+            self.cond_stack.items.len -= 1;
+            if (cur >= self.cfg.blocks.len) continue;
+            if (cur >= limit) continue;
+            if (cur < start) continue;
+            if (self.cond_seen.isSet(cur)) continue;
+            try self.cond_seen.set(self.allocator, cur);
+            if (cur > max_block) max_block = cur;
+
+            const blk = &self.cfg.blocks[cur];
+            for (blk.successors) |edge| {
+                const next = edge.target;
+                if (next < start) continue;
+                if (next >= limit) continue;
+                if (stop) |stop_id| {
+                    if (next == stop_id) continue;
+                }
+                if (!self.cond_seen.isSet(next)) {
+                    try self.cond_stack.append(self.allocator, next);
+                }
+            }
+        }
+
+        const end = max_block + 1;
+        return if (end > limit) limit else end;
+    }
+
     fn buildCondTree(
         self: *Decompiler,
         block_id: u32,
@@ -3826,7 +3864,11 @@ pub const Decompiler = struct {
         defer if (else_owned) deinitStackValuesSlice(self.allocator, self.allocator, else_vals);
 
         // Decompile the then body with inherited stack
-        const then_end = pattern.else_block orelse pattern.merge_block;
+        const then_end = blk: {
+            if (pattern.else_block) |else_id| break :blk else_id;
+            if (pattern.merge_block) |merge_id| break :blk merge_id;
+            break :blk try self.branchEnd(pattern.then_block, null);
+        };
         const then_body = try self.decompileBranchRange(pattern.then_block, then_end, then_vals, skip);
         const a = self.arena.allocator();
 
@@ -3868,7 +3910,11 @@ pub const Decompiler = struct {
                 deinitStackValuesSlice(self.allocator, self.allocator, base_vals);
                 base_owned = false;
             }
-            break :blk try self.decompileBranchRange(else_id, pattern.merge_block, else_vals, skip);
+            const else_end = if (pattern.merge_block) |merge_id|
+                merge_id
+            else
+                try self.branchEnd(else_id, null);
+            break :blk try self.decompileBranchRange(else_id, else_end, else_vals, skip);
         } else blk: {
             // No else block - clean up base_vals
             deinitStackValuesSlice(self.allocator, self.allocator, base_vals);

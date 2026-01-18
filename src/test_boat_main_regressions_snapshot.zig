@@ -114,6 +114,19 @@ test "snapshot if return fallthrough 3.9" {
     );
 }
 
+test "snapshot if return else fallthrough 3.9" {
+    try runSnapshot(@src(), "test/corpus/if_else_return_fallthrough.3.9.pyc",
+        \\[]u8
+        \\  "def f(x):
+        \\    if x:
+        \\        y = 1
+        \\    else:
+        \\        return 2
+        \\    return y
+        \\"
+    );
+}
+
 test "snapshot try import 3.9" {
     try runSnapshot(@src(), "test/corpus/try_import.3.9.pyc",
         \\[]u8
