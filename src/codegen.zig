@@ -458,7 +458,7 @@ pub const Writer = struct {
                 else
                     pickQuote(s);
                 try self.writeByte(allocator, quote);
-                try self.writeStringContents(allocator, s, quote);
+                try self.writeStringContents(allocator, s, quote, false);
                 try self.writeByte(allocator, quote);
             },
             .bytes => |b| {
@@ -469,7 +469,7 @@ pub const Writer = struct {
                     pickQuote(b);
                 try self.writeByte(allocator, 'b');
                 try self.writeByte(allocator, quote);
-                try self.writeStringContents(allocator, b, quote);
+                try self.writeStringContents(allocator, b, quote, true);
                 try self.writeByte(allocator, quote);
             },
             .tuple => |items| {
@@ -485,11 +485,72 @@ pub const Writer = struct {
         }
     }
 
-    fn writeStringContents(self: *Writer, allocator: std.mem.Allocator, s: []const u8, quote: u8) !void {
-        try self.writeStringContentsEx(allocator, s, quote, false);
+    fn writeStringContents(self: *Writer, allocator: std.mem.Allocator, s: []const u8, quote: u8, is_bytes: bool) !void {
+        try self.writeStringContentsEx(allocator, s, quote, false, is_bytes);
     }
 
-    fn writeStringContentsEx(self: *Writer, allocator: std.mem.Allocator, s: []const u8, quote: u8, in_fstring: bool) !void {
+    fn writeStringContentsEx(
+        self: *Writer,
+        allocator: std.mem.Allocator,
+        s: []const u8,
+        quote: u8,
+        in_fstring: bool,
+        is_bytes: bool,
+    ) !void {
+        if (!is_bytes) {
+            if (std.unicode.Utf8View.init(s)) |view| {
+                var it = std.unicode.Utf8View.iterator(view);
+                while (it.nextCodepoint()) |cp| {
+                    if (cp <= 0x7F) {
+                        const c: u8 = @intCast(cp);
+                        switch (c) {
+                            '\n' => try self.write(allocator, "\\n"),
+                            '\r' => try self.write(allocator, "\\r"),
+                            '\t' => try self.write(allocator, "\\t"),
+                            '\\' => try self.write(allocator, "\\\\"),
+                            '\'' => if (quote == '\'') {
+                                try self.write(allocator, "\\'");
+                            } else {
+                                try self.writeByte(allocator, '\'');
+                            },
+                            '"' => if (quote == '"') {
+                                try self.write(allocator, "\\\"");
+                            } else {
+                                try self.writeByte(allocator, '"');
+                            },
+                            '{' => if (in_fstring) {
+                                try self.write(allocator, "{{");
+                            } else {
+                                try self.writeByte(allocator, '{');
+                            },
+                            '}' => if (in_fstring) {
+                                try self.write(allocator, "}}");
+                            } else {
+                                try self.writeByte(allocator, '}');
+                            },
+                            else => {
+                                if (c >= 0x20 and c < 0x7F) {
+                                    try self.writeByte(allocator, c);
+                                } else {
+                                    try self.writeFmt(allocator, "\\x{x:0>2}", .{c});
+                                }
+                            },
+                        }
+                        continue;
+                    }
+                    if (cp <= 0xFF) {
+                        try self.writeFmt(allocator, "\\x{x:0>2}", .{cp});
+                    } else if (cp <= 0xFFFF) {
+                        try self.writeFmt(allocator, "\\u{x:0>4}", .{cp});
+                    } else {
+                        try self.writeFmt(allocator, "\\U{x:0>8}", .{cp});
+                    }
+                }
+                return;
+            } else |_| {}
+        }
+
+        // Byte fallback (bytes literals or invalid UTF-8)
         for (s) |c| {
             switch (c) {
                 '\n' => try self.write(allocator, "\\n"),
@@ -660,7 +721,7 @@ pub const Writer = struct {
             switch (v.*) {
                 .constant => |c| {
                     if (c == .string) {
-                        try self.writeStringContentsEx(allocator, c.string, quote, true);
+                        try self.writeStringContentsEx(allocator, c.string, quote, true, false);
                     }
                 },
                 .formatted_value => |f| {
@@ -1004,7 +1065,7 @@ pub const Writer = struct {
                             if (expr.* == .constant and expr.constant == .string) {
                                 try self.writeIndent(allocator);
                                 try self.write(allocator, "\"\"\"");
-                                try self.writeStringContents(allocator, expr.constant.string, '"');
+                                try self.writeStringContents(allocator, expr.constant.string, '"', false);
                                 try self.write(allocator, "\"\"\"\n");
                                 continue;
                             }
@@ -1052,7 +1113,7 @@ pub const Writer = struct {
                             if (expr.* == .constant and expr.constant == .string) {
                                 try self.writeIndent(allocator);
                                 try self.write(allocator, "\"\"\"");
-                                try self.writeStringContents(allocator, expr.constant.string, '"');
+                                try self.writeStringContents(allocator, expr.constant.string, '"', false);
                                 try self.write(allocator, "\"\"\"\n");
                                 continue;
                             }

@@ -16,6 +16,7 @@ const dom_mod = @import("dom.zig");
 
 pub const CFG = cfg_mod.CFG;
 pub const BasicBlock = cfg_mod.BasicBlock;
+const Edge = cfg_mod.Edge;
 pub const EdgeType = cfg_mod.EdgeType;
 pub const Instruction = decoder.Instruction;
 pub const Opcode = opcodes.Opcode;
@@ -367,11 +368,29 @@ pub const Analyzer = struct {
 
     /// Detect the control flow pattern starting at a block.
     pub fn detectPattern(self: *Analyzer, block_id: u32) !ControlFlowPattern {
+        return self.detectPatternInner(block_id, false, false);
+    }
+
+    pub fn detectPatternNoTry(self: *Analyzer, block_id: u32) !ControlFlowPattern {
+        return self.detectPatternInner(block_id, true, false);
+    }
+
+    pub fn detectPatternInLoop(self: *Analyzer, block_id: u32) !ControlFlowPattern {
+        return self.detectPatternInner(block_id, false, true);
+    }
+
+    fn detectPatternInner(
+        self: *Analyzer,
+        block_id: u32,
+        skip_try: bool,
+        allow_loop_if: bool,
+    ) !ControlFlowPattern {
         if (block_id >= self.cfg.blocks.len) return .unknown;
         if (self.processed.isSet(block_id)) return .unknown;
 
         const block = &self.cfg.blocks[block_id];
         const term = block.terminator() orelse return .unknown;
+        const has_try_setup = self.hasTrySetup(block);
 
         // Check for exception handler with CHECK_EXC_MATCH - not a regular if
         if (block.is_exception_handler or self.hasCheckExcMatch(block)) {
@@ -396,7 +415,7 @@ pub const Analyzer = struct {
                 return .{ .while_loop = pattern };
             }
             // Loop headers that don't form a well-structured while shouldn't be treated as if.
-            if (term.opcode != .FOR_ITER and term.opcode != .FOR_LOOP) {
+            if (!allow_loop_if and term.opcode != .FOR_ITER and term.opcode != .FOR_LOOP) {
                 return .unknown;
             }
         }
@@ -410,7 +429,8 @@ pub const Analyzer = struct {
 
         // Check for conditional jump (if statement pattern)
         // Skip POP_JUMP_FORWARD_IF_NOT_NONE - exception table infrastructure
-        if (self.isConditionalJump(term.opcode) and term.opcode != .POP_JUMP_FORWARD_IF_NOT_NONE) {
+        const allow_if = if (skip_try) true else !has_try_setup;
+        if (allow_if and self.isConditionalJump(term.opcode) and term.opcode != .POP_JUMP_FORWARD_IF_NOT_NONE) {
             if (try self.detectIfPattern(block_id)) |pattern| {
                 return .{ .if_stmt = pattern };
             }
@@ -424,7 +444,7 @@ pub const Analyzer = struct {
         }
 
         // Check for try/except pattern (block with exception edge)
-        if (self.hasExceptionEdge(block)) {
+        if (!skip_try and self.hasExceptionEdge(block)) {
             if (try self.detectTryPattern(block_id)) |pattern| {
                 return .{ .try_stmt = pattern };
             }
@@ -447,6 +467,18 @@ pub const Analyzer = struct {
     fn hasWithSetup(self: *const Analyzer, block: *const BasicBlock) bool {
         if (block.id >= self.block_flags.len) return false;
         return self.block_flags[block.id].has_with_setup;
+    }
+
+    /// Check if block has SETUP_EXCEPT/SETUP_FINALLY (try header).
+    fn hasTrySetup(self: *const Analyzer, block: *const BasicBlock) bool {
+        if (self.cfg.version.gte(3, 11)) return false;
+        for (block.instructions) |inst| {
+            switch (inst.opcode) {
+                .SETUP_EXCEPT, .SETUP_FINALLY => return true,
+                else => {},
+            }
+        }
+        return false;
     }
 
     /// Check if block has CHECK_EXC_MATCH (exception handler).
@@ -835,14 +867,23 @@ pub const Analyzer = struct {
     fn detectIfPattern(self: *Analyzer, block_id: u32) !?IfPattern {
         const block = &self.cfg.blocks[block_id];
 
-        // Need exactly two successors for a conditional
-        if (block.successors.len != 2) return null;
+        // Need exactly two non-exception successors for a conditional
+        var non_exc_edges: [2]Edge = undefined;
+        var non_exc_len: usize = 0;
+        for (block.successors) |edge| {
+            if (edge.edge_type == .exception) continue;
+            if (non_exc_len < non_exc_edges.len) {
+                non_exc_edges[non_exc_len] = edge;
+            }
+            non_exc_len += 1;
+        }
+        if (non_exc_len != 2) return null;
 
         var then_block: ?u32 = null;
         var else_block: ?u32 = null;
 
         // Identify then and else blocks based on edge types
-        for (block.successors) |edge| {
+        for (non_exc_edges[0..2]) |edge| {
             switch (edge.edge_type) {
                 .conditional_false => else_block = edge.target,
                 .conditional_true, .normal => {
@@ -863,7 +904,7 @@ pub const Analyzer = struct {
             term.opcode == .JUMP_IF_FALSE) // Python 3.0
         {
             // Jump target is else, fallthrough is then
-            for (block.successors) |edge| {
+            for (non_exc_edges[0..2]) |edge| {
                 if (edge.edge_type == .conditional_true or edge.edge_type == .normal) {
                     then_block = edge.target;
                 } else if (edge.edge_type == .conditional_false) {
@@ -875,7 +916,7 @@ pub const Analyzer = struct {
         const then_id = then_block orelse return null;
 
         // Find merge point - where both branches converge
-        const merge = try self.findMergePoint(block_id, then_id, else_block);
+        var merge = try self.findMergePoint(block_id, then_id, else_block);
 
         // Check if else block is actually an elif
         var is_elif = false;
@@ -889,6 +930,9 @@ pub const Analyzer = struct {
                     }
                 }
             }
+        }
+        if (is_elif and merge != null and merge.? == then_id) {
+            merge = null;
         }
 
         return IfPattern{
@@ -920,8 +964,16 @@ pub const Analyzer = struct {
             }
         }
 
-        const body_id = body_block orelse return null;
-        const exit_id = exit_block orelse return null;
+        var body_id = body_block orelse return null;
+        var exit_id = exit_block orelse return null;
+
+        const body_in_loop = self.dom.isInLoop(body_id, block_id);
+        const exit_in_loop = self.dom.isInLoop(exit_id, block_id);
+        if (!body_in_loop and exit_in_loop) {
+            const tmp = body_id;
+            body_id = exit_id;
+            exit_id = tmp;
+        }
 
         if (!self.dom.isInLoop(body_id, block_id)) return null;
         if (self.dom.isInLoop(exit_id, block_id)) return null;
@@ -1009,6 +1061,40 @@ pub const Analyzer = struct {
 
         try self.collectExceptionTargets(block_id, &handler_targets);
         if (handler_targets.items.len == 0) return null;
+        if (!self.cfg.version.gte(3, 11) and handler_targets.items.len > 1) {
+            const first_handler = handler_targets.items[0];
+            var reachable = try std.DynamicBitSet.initEmpty(self.allocator, self.cfg.blocks.len);
+            defer reachable.deinit();
+            var queue: std.ArrayList(u32) = .{};
+            defer queue.deinit(self.allocator);
+            try queue.append(self.allocator, first_handler);
+            while (queue.items.len > 0) {
+                const bid = queue.items[queue.items.len - 1];
+                queue.items.len -= 1;
+                if (bid >= self.cfg.blocks.len) continue;
+                if (reachable.isSet(bid)) continue;
+                reachable.set(bid);
+                const blk = &self.cfg.blocks[bid];
+                for (blk.successors) |edge| {
+                    if (edge.edge_type != .normal) continue;
+                    if (edge.target >= self.cfg.blocks.len) continue;
+                    if (!reachable.isSet(edge.target)) {
+                        try queue.append(self.allocator, edge.target);
+                    }
+                }
+            }
+            var filtered: std.ArrayList(u32) = .{};
+            defer filtered.deinit(self.allocator);
+            for (handler_targets.items) |hid| {
+                if (hid < self.cfg.blocks.len and reachable.isSet(hid)) {
+                    try filtered.append(self.allocator, hid);
+                }
+            }
+            if (filtered.items.len > 0) {
+                handler_targets.clearRetainingCapacity();
+                try handler_targets.appendSlice(self.allocator, filtered.items);
+            }
+        }
 
         // Collect all exception handlers reachable from this block
         var handler_list: std.ArrayList(HandlerInfo) = .{};
@@ -1078,6 +1164,55 @@ pub const Analyzer = struct {
         return false;
     }
 
+    fn jumpOnlyTarget(self: *const Analyzer, block_id: u32) ?u32 {
+        if (block_id >= self.cfg.blocks.len) return null;
+        const blk = &self.cfg.blocks[block_id];
+        if (blk.instructions.len != 1) return null;
+        const inst = blk.instructions[0];
+        if (inst.opcode != .JUMP_FORWARD and inst.opcode != .JUMP_ABSOLUTE) return null;
+        if (inst.jumpTarget(self.cfg.version)) |target_offset| {
+            if (self.cfg.blockAtOffset(target_offset)) |target_id| {
+                return target_id;
+            }
+        }
+        return null;
+    }
+
+    fn handlerReaches(self: *Analyzer, handlers: []const HandlerInfo, target: u32) !bool {
+        if (handlers.len == 0) return false;
+        if (target >= self.cfg.blocks.len) return false;
+
+        var seen = try std.DynamicBitSet.initEmpty(self.allocator, self.cfg.blocks.len);
+        defer seen.deinit();
+        var queue: std.ArrayList(u32) = .{};
+        defer queue.deinit(self.allocator);
+
+        for (handlers) |h| {
+            if (h.handler_block < self.cfg.blocks.len) {
+                try queue.append(self.allocator, h.handler_block);
+            }
+        }
+
+        while (queue.items.len > 0) {
+            const bid = queue.items[queue.items.len - 1];
+            queue.items.len -= 1;
+            if (bid >= self.cfg.blocks.len) continue;
+            if (seen.isSet(bid)) continue;
+            seen.set(bid);
+            if (bid == target) return true;
+            const blk = &self.cfg.blocks[bid];
+            for (blk.successors) |edge| {
+                if (edge.edge_type == .exception) continue;
+                if (edge.target >= self.cfg.blocks.len) continue;
+                if (!seen.isSet(edge.target)) {
+                    try queue.append(self.allocator, edge.target);
+                }
+            }
+        }
+
+        return false;
+    }
+
     fn detectElseBlock311(
         self: *Analyzer,
         try_block: u32,
@@ -1127,17 +1262,15 @@ pub const Analyzer = struct {
 
         if (candidate == null) return null;
         const cand = candidate.?;
+        if (self.jumpOnlyTarget(cand) != null) return null;
+        const loops = self.findEnclosingLoops(try_block);
+        if (loops.len > 0) {
+            const header = loops[loops.len - 1];
+            if (!self.dom.isInLoop(cand, header)) return null;
+        }
 
         // Verify candidate is not reachable from any handler without going through exit
-        for (handlers) |h| {
-            const h_block = &self.cfg.blocks[h.handler_block];
-            for (h_block.successors) |edge| {
-                if (edge.target == cand and edge.edge_type == .normal) {
-                    // Handler directly reaches candidate - not an else block
-                    return null;
-                }
-            }
-        }
+        if (try self.handlerReaches(handlers, cand)) return null;
 
         // Verify candidate comes before exit_block
         if (exit_block) |exit| {
@@ -1208,23 +1341,20 @@ pub const Analyzer = struct {
         }
         if (candidate == null) return null;
         const cand = candidate.?;
+        if (self.jumpOnlyTarget(cand) != null) return null;
+        const loops = self.findEnclosingLoops(try_block);
+        if (loops.len > 0) {
+            const header = loops[loops.len - 1];
+            if (!self.dom.isInLoop(cand, header)) return null;
+        }
 
         // Verify not a handler
         for (handlers) |h| {
             if (cand == h.handler_block) return null;
         }
 
-        // Verify not reachable from handlers via exception path
-        for (handlers) |h| {
-            if (h.handler_block >= self.cfg.blocks.len) continue;
-            const h_blk = &self.cfg.blocks[h.handler_block];
-            for (h_blk.successors) |edge| {
-                if (edge.target == cand) {
-                    // Handler reaches candidate - could be exit, check if it's exception edge
-                    if (edge.edge_type == .exception) return null;
-                }
-            }
-        }
+        // Verify candidate is not reachable from handlers
+        if (try self.handlerReaches(handlers, cand)) return null;
 
         // Verify candidate comes before exit
         if (exit_block) |exit| {
@@ -1543,8 +1673,16 @@ pub const Analyzer = struct {
         for (block.successors) |edge| {
             if (edge.edge_type == .normal) {
                 body_block = edge.target;
-            } else if (edge.edge_type == .exception) {
-                cleanup_block = edge.target;
+                continue;
+            }
+            if (edge.edge_type != .exception) continue;
+            if (edge.target >= self.cfg.blocks.len) continue;
+            const handler = &self.cfg.blocks[edge.target];
+            for (handler.instructions) |inst| {
+                if (inst.opcode == .WITH_EXCEPT_START) {
+                    cleanup_block = edge.target;
+                    break;
+                }
             }
         }
 
@@ -1820,6 +1958,10 @@ pub const Analyzer = struct {
     /// Find the merge point where two branches converge.
     fn findMergePoint(self: *Analyzer, cond_block: u32, then_block: u32, else_block: ?u32) !?u32 {
         const else_id = else_block orelse return null;
+        const cond_off = if (cond_block < self.cfg.blocks.len)
+            self.cfg.blocks[cond_block].start_offset
+        else
+            0;
 
         // If else block returns (no successors), merge is after the then branch (if any).
         const else_blk = &self.cfg.blocks[else_id];
@@ -1866,7 +2008,11 @@ pub const Analyzer = struct {
             }
             const then_blk = &self.cfg.blocks[then_block];
             if (then_blk.successors.len == 1) {
-                return then_blk.successors[0].target;
+                const candidate = then_blk.successors[0].target;
+                if (candidate < self.cfg.blocks.len and self.cfg.blocks[candidate].is_loop_header) {
+                    return null;
+                }
+                return candidate;
             }
             return null;
         }
@@ -1888,6 +2034,9 @@ pub const Analyzer = struct {
 
             const blk = &self.cfg.blocks[bid];
             for (blk.successors) |edge| {
+                if (edge.edge_type == .exception or edge.edge_type == .loop_back) continue;
+                if (edge.target >= self.cfg.blocks.len) continue;
+                if (self.cfg.blocks[edge.target].start_offset <= cond_off) continue;
                 if (edge.target < self.merge_then_seen.len and self.merge_then_seen[edge.target] != gen) {
                     try queue.append(self.allocator, edge.target);
                 }
@@ -1911,6 +2060,9 @@ pub const Analyzer = struct {
 
             const blk = &self.cfg.blocks[bid];
             for (blk.successors) |edge| {
+                if (edge.edge_type == .exception or edge.edge_type == .loop_back) continue;
+                if (edge.target >= self.cfg.blocks.len) continue;
+                if (self.cfg.blocks[edge.target].start_offset <= cond_off) continue;
                 if (edge.target < self.merge_else_seen.len and self.merge_else_seen[edge.target] != gen) {
                     try queue.append(self.allocator, edge.target);
                 }

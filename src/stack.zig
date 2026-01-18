@@ -50,6 +50,7 @@ pub const ClassValue = struct {
     code: *const pyc.Code,
     name: []const u8,
     bases: []const *Expr,
+    keywords: []const ast.Keyword,
     decorators: std.ArrayList(*Expr),
 
     pub fn deinit(self: *ClassValue, allocator: Allocator) void {
@@ -91,6 +92,20 @@ const PendingComp = struct {
             ast_alloc.destroy(cond);
         }
         self.ifs.deinit(stack_alloc);
+    }
+};
+
+const PendingUnpack = struct {
+    builder: *CompBuilder,
+    remain: u32,
+    names: std.ArrayList(*Expr),
+
+    fn deinit(self: *PendingUnpack, ast_alloc: Allocator, stack_alloc: Allocator) void {
+        for (self.names.items) |expr| {
+            expr.deinit(ast_alloc);
+            ast_alloc.destroy(expr);
+        }
+        self.names.deinit(stack_alloc);
     }
 };
 
@@ -264,10 +279,25 @@ fn functionValueEqual(a: *const FunctionValue, b: *const FunctionValue) bool {
     return true;
 }
 
+fn keywordsEqual(a: []const ast.Keyword, b: []const ast.Keyword) bool {
+    if (a.len != b.len) return false;
+    for (a, 0..) |kw, idx| {
+        const other = b[idx];
+        if (kw.arg == null and other.arg != null) return false;
+        if (kw.arg != null and other.arg == null) return false;
+        if (kw.arg) |arg| {
+            if (!std.mem.eql(u8, arg, other.arg.?)) return false;
+        }
+        if (!ast.exprEqual(kw.value, other.value)) return false;
+    }
+    return true;
+}
+
 fn classValueEqual(a: *const ClassValue, b: *const ClassValue) bool {
     if (a.code != b.code) return false;
     if (!std.mem.eql(u8, a.name, b.name)) return false;
     if (!exprSliceEqual(a.bases, b.bases)) return false;
+    if (!keywordsEqual(a.keywords, b.keywords)) return false;
     if (!exprSliceEqual(a.decorators.items, b.decorators.items)) return false;
     return true;
 }
@@ -501,6 +531,8 @@ pub const SimContext = struct {
     iter_override: ?IterOverride = null,
     /// Optional comprehension builder not stored on the stack.
     comp_builder: ?*CompBuilder = null,
+    /// Pending unpack for comprehension target.
+    comp_unpack: ?PendingUnpack = null,
     /// Pending keyword argument names from KW_NAMES (3.11+).
     pending_kwnames: ?[]const []const u8 = null,
     /// GET_AWAITABLE was seen, next YIELD_FROM should be await.
@@ -519,6 +551,7 @@ pub const SimContext = struct {
             .stack = Stack.init(stack_alloc, allocator),
             .iter_override = null,
             .comp_builder = null,
+            .comp_unpack = null,
             .lenient = false,
             .flow_mode = false,
             .class_name = null,
@@ -529,6 +562,10 @@ pub const SimContext = struct {
         self.stack.reset();
         self.iter_override = null;
         self.comp_builder = null;
+        if (self.comp_unpack) |*pending| {
+            pending.deinit(self.allocator, self.stack_alloc);
+        }
+        self.comp_unpack = null;
         self.pending_kwnames = null;
         self.pending_await = false;
         self.lenient = false;
@@ -546,6 +583,9 @@ pub const SimContext = struct {
                 expr.deinit(self.allocator);
                 self.allocator.destroy(expr);
             }
+        }
+        if (self.comp_unpack) |*pending| {
+            pending.deinit(self.allocator, self.stack_alloc);
         }
     }
 
@@ -768,7 +808,12 @@ pub const SimContext = struct {
         };
     }
 
-    fn buildClassValue(self: *SimContext, callee_expr: *Expr, args_vals: []StackValue) !bool {
+    fn buildClassValue(
+        self: *SimContext,
+        callee_expr: *Expr,
+        args_vals: []StackValue,
+        keywords: []ast.Keyword,
+    ) !bool {
         if (args_vals.len < 2) return false;
 
         const func = switch (args_vals[0]) {
@@ -809,6 +854,7 @@ pub const SimContext = struct {
             .code = func.code,
             .name = name_copy,
             .bases = bases,
+            .keywords = keywords,
             .decorators = .{},
         };
 
@@ -821,6 +867,47 @@ pub const SimContext = struct {
 
         try self.stack.push(.{ .class_obj = cls });
         return true;
+    }
+
+    fn tryBuildClassValueKw(
+        self: *SimContext,
+        callee_expr: *Expr,
+        args_vals: []StackValue,
+        kw_names: []const []const u8,
+    ) !bool {
+        if (kw_names.len > args_vals.len) return false;
+        const pos_count = args_vals.len - kw_names.len;
+        if (pos_count < 2) return false;
+
+        if (args_vals[0] != .function_obj) return false;
+        const name_expr = switch (args_vals[1]) {
+            .expr => |e| e,
+            else => return false,
+        };
+        if (name_expr.* != .constant or name_expr.constant != .string) return false;
+        for (args_vals[2..pos_count]) |val| {
+            if (val != .expr) return false;
+        }
+        for (args_vals[pos_count..]) |val| {
+            if (val != .expr) return false;
+        }
+
+        var keywords: []ast.Keyword = &.{};
+        if (kw_names.len > 0) {
+            keywords = try self.allocator.alloc(ast.Keyword, kw_names.len);
+        }
+        errdefer if (kw_names.len > 0) self.allocator.free(keywords);
+
+        for (kw_names, 0..) |name, idx| {
+            const value = args_vals[pos_count + idx].expr;
+            keywords[idx] = .{ .arg = name, .value = value };
+        }
+
+        const pos_vals = args_vals[0..pos_count];
+        if (try self.buildClassValue(callee_expr, pos_vals, keywords)) return true;
+
+        if (kw_names.len > 0) self.allocator.free(keywords);
+        return false;
     }
 
     fn takeClassName(self: *SimContext, value: StackValue) SimError![]const u8 {
@@ -1108,10 +1195,11 @@ pub const SimContext = struct {
             }
         }
 
-        if (keywords.len == 0 and self.isBuildClass(callee_expr)) {
-            if (try self.buildClassValue(callee_expr, args_vals)) {
+        if (self.isBuildClass(callee_expr)) {
+            if (try self.buildClassValue(callee_expr, args_vals, keywords)) {
                 cleanup_callee = false;
                 cleanup_args = false;
+                cleanup_keywords = false;
                 return;
             }
         }
@@ -1146,6 +1234,7 @@ pub const SimContext = struct {
                 .code = func.code,
                 .name = &.{},
                 .bases = &.{},
+                .keywords = &.{},
                 .decorators = .{},
             };
             func.deinit(self.allocator);
@@ -1265,6 +1354,29 @@ pub const SimContext = struct {
         return copy;
     }
 
+    fn cloneKeywords(self: *SimContext, keywords: []const ast.Keyword) ![]const ast.Keyword {
+        if (keywords.len == 0) return &.{};
+        const out = try self.allocator.alloc(ast.Keyword, keywords.len);
+        var count: usize = 0;
+        errdefer {
+            var i: usize = 0;
+            while (i < count) : (i += 1) {
+                if (out[i].arg) |arg| self.allocator.free(arg);
+                out[i].value.deinit(self.allocator);
+                self.allocator.destroy(out[i].value);
+            }
+            self.allocator.free(out);
+        }
+        for (keywords, 0..) |kw, idx| {
+            out[idx] = .{
+                .arg = if (kw.arg) |arg| try self.allocator.dupe(u8, arg) else null,
+                .value = try ast.cloneExpr(self.allocator, kw.value),
+            };
+            count += 1;
+        }
+        return out;
+    }
+
     fn cloneClassValue(self: *SimContext, cls: *const ClassValue) !*ClassValue {
         const copy = try self.allocator.create(ClassValue);
         errdefer self.allocator.destroy(copy);
@@ -1289,10 +1401,13 @@ pub const SimContext = struct {
             bases = bases_mut;
         }
 
+        const kw = try self.cloneKeywords(cls.keywords);
+
         copy.* = .{
             .code = cls.code,
             .name = if (cls.name.len > 0) try self.allocator.dupe(u8, cls.name) else &.{},
             .bases = bases,
+            .keywords = kw,
             .decorators = .{},
         };
 
@@ -1306,8 +1421,8 @@ pub const SimContext = struct {
         return copy;
     }
 
-    /// Parse annotations tuple from MAKE_FUNCTION.
-    /// Annotations are a tuple of (name, annotation, ...) pairs.
+    /// Parse annotations from MAKE_FUNCTION.
+    /// Annotations are a tuple of (name, annotation, ...) pairs or a dict.
     fn parseAnnotations(self: *SimContext, val: StackValue) SimError![]const signature.Annotation {
         switch (val) {
             .expr => |expr| {
@@ -1329,6 +1444,31 @@ pub const SimContext = struct {
                         else
                             "<unknown>";
                         result[i] = .{ .name = name, .value = ann_expr };
+                    }
+                    return result;
+                }
+                if (expr.* == .dict) {
+                    const keys = expr.dict.keys;
+                    const values = expr.dict.values;
+                    var count: usize = 0;
+                    for (keys) |maybe_key| {
+                        const key = maybe_key orelse continue;
+                        if (key.* != .constant) continue;
+                        if (key.constant != .string) continue;
+                        count += 1;
+                    }
+                    if (count == 0) return &.{};
+
+                    const result = try self.allocator.alloc(signature.Annotation, count);
+                    errdefer self.allocator.free(result);
+
+                    var i: usize = 0;
+                    for (keys, values) |maybe_key, value| {
+                        const key = maybe_key orelse continue;
+                        if (key.* != .constant) continue;
+                        if (key.constant != .string) continue;
+                        result[i] = .{ .name = key.constant.string, .value = value };
+                        i += 1;
                     }
                     return result;
                 }
@@ -1599,6 +1739,38 @@ pub const SimContext = struct {
         try self.addCompTarget(builder, target);
     }
 
+    fn startCompUnpack(self: *SimContext, count: u32) !void {
+        if (self.comp_unpack != null) return;
+        const builder = self.findActiveCompBuilder() orelse return;
+        if (builder.loop_stack.items.len == 0) return;
+        var pending = PendingUnpack{
+            .builder = builder,
+            .remain = count,
+            .names = .{},
+        };
+        try pending.names.ensureTotalCapacity(self.stack_alloc, count);
+        self.comp_unpack = pending;
+    }
+
+    fn consumeCompUnpackName(self: *SimContext, name: []const u8) !bool {
+        if (self.comp_unpack) |*pending| {
+            const target = try self.makeName(name, .store);
+            try pending.names.append(self.stack_alloc, target);
+            if (pending.remain > 0) pending.remain -= 1;
+            if (pending.remain == 0) {
+                const a = self.allocator;
+                const elts = try a.alloc(*Expr, pending.names.items.len);
+                std.mem.copyForwards(*Expr, elts, pending.names.items);
+                const tuple = try ast.makeTuple(a, elts, .store);
+                try self.addCompTarget(pending.builder, tuple);
+                pending.names.deinit(self.stack_alloc);
+                self.comp_unpack = null;
+            }
+            return true;
+        }
+        return false;
+    }
+
     fn makeIsNoneCompare(self: *SimContext, value: *Expr, is_not: bool) !*Expr {
         const none_expr = try ast.makeConstant(self.allocator, .none);
         errdefer {
@@ -1863,7 +2035,9 @@ pub const SimContext = struct {
                 // For now, just pop the value
                 if (self.stack.pop()) |v| {
                     const name = self.getName(inst.arg) orelse "<unknown>";
-                    try self.addCompTargetName(name);
+                    if (!try self.consumeCompUnpackName(name)) {
+                        try self.addCompTargetName(name);
+                    }
                     var val = v;
                     val.deinit(self.allocator, self.stack_alloc);
                 }
@@ -1881,7 +2055,9 @@ pub const SimContext = struct {
                 // Pop the value
                 if (self.stack.pop()) |v| {
                     const name = self.getLocal(inst.arg) orelse "<unknown>";
-                    try self.addCompTargetName(name);
+                    if (!try self.consumeCompUnpackName(name)) {
+                        try self.addCompTargetName(name);
+                    }
                     var val = v;
                     val.deinit(self.allocator, self.stack_alloc);
                 }
@@ -2828,6 +3004,21 @@ pub const SimContext = struct {
                         val.deinit(self.allocator, self.stack_alloc);
                     };
 
+                    switch (callable) {
+                        .expr => |callee_expr| {
+                            if (self.isBuildClass(callee_expr)) {
+                                if (try self.tryBuildClassValueKw(callee_expr, args_vals, kw_names)) {
+                                    callable_owned = false;
+                                    args_owned = false;
+                                    self.allocator.free(kw_names);
+                                    kw_names_owned = false;
+                                    return;
+                                }
+                            }
+                        },
+                        else => {},
+                    }
+
                     if (kw_names.len > args_vals.len) return error.InvalidKeywordNames;
 
                     const pos_count = args_vals.len - kw_names.len;
@@ -3412,7 +3603,9 @@ pub const SimContext = struct {
                 // STORE_DEREF i - stores value to a cell
                 if (self.stack.pop()) |v| {
                     const name = self.getDeref(inst.arg) orelse "<unknown>";
-                    try self.addCompTargetName(name);
+                    if (!try self.consumeCompUnpackName(name)) {
+                        try self.addCompTargetName(name);
+                    }
                     var val = v;
                     val.deinit(self.allocator, self.stack_alloc);
                 }
@@ -3665,7 +3858,7 @@ pub const SimContext = struct {
                     fromlist_val = self.stack.pop() orelse return error.StackUnderflow;
                     if (self.version.gte(2, 5)) {
                         const level_val = self.stack.pop() orelse return error.StackUnderflow;
-                        defer level_val.deinit(self.allocator, self.stack_alloc);
+                        defer if (!self.flow_mode) level_val.deinit(self.allocator, self.stack_alloc);
                         if (level_val == .expr and level_val.expr.* == .constant) {
                             switch (level_val.expr.constant) {
                                 .int => |v| {
@@ -3676,7 +3869,7 @@ pub const SimContext = struct {
                         }
                     }
                 }
-                defer if (fromlist_val) |fv| fv.deinit(self.allocator, self.stack_alloc);
+                defer if (fromlist_val) |fv| if (!self.flow_mode) fv.deinit(self.allocator, self.stack_alloc);
 
                 // Extract fromlist tuple if available
                 var fromlist: []const []const u8 = &.{};
@@ -3712,6 +3905,18 @@ pub const SimContext = struct {
                 if (top == .import_module) {
                     if (self.getName(inst.arg)) |attr_name| {
                         const imp = top.import_module;
+                        if (imp.fromlist.len == 0) {
+                            if (std.mem.lastIndexOfScalar(u8, imp.module, '.')) |dot| {
+                                if (std.mem.eql(u8, imp.module[dot + 1 ..], attr_name)) {
+                                    try self.stack.push(.{ .import_module = .{
+                                        .module = imp.module,
+                                        .fromlist = &.{},
+                                        .level = imp.level,
+                                    } });
+                                    return;
+                                }
+                            }
+                        }
                         var new_fromlist: std.ArrayList([]const u8) = .{};
                         try new_fromlist.appendSlice(self.allocator, imp.fromlist);
                         try new_fromlist.append(self.allocator, attr_name);
@@ -5018,6 +5223,7 @@ pub const SimContext = struct {
                 // Pop sequence, push N elements as unpack markers
                 // Handled at decompile level to detect unpacking pattern
                 const count = inst.arg;
+                try self.startCompUnpack(count);
                 const seq = self.stack.pop() orelse blk: {
                     if (self.lenient or self.flow_mode) break :blk .unknown;
                     return error.StackUnderflow;

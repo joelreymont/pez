@@ -59,8 +59,6 @@ test "snapshot match guards 3.14" {
         \\        case _:
         \\            return 'unknown'
         \\class Point:
-        \\    __module__ = __name__
-        \\    __qualname__ = 'Point'
         \\    __firstlineno__ = 36
         \\    <unknown> = locals()
         \\    def __init__(self, x, y):
