@@ -27,6 +27,39 @@ const StackValue = stack_mod.StackValue;
 const Opcode = decoder.Opcode;
 pub const DecompileError = stack_mod.SimError || error{ UnexpectedEmptyWorklist, InvalidBlock, SkipStatement };
 
+fn isSoftSimErr(err: anyerror) bool {
+    return switch (err) {
+        error.StackUnderflow,
+        error.NotAnExpression,
+        error.InvalidSwapArg,
+        error.InvalidDupArg,
+        error.InvalidComprehension,
+        error.InvalidConstant,
+        error.InvalidLambdaBody,
+        error.InvalidKeywordNames,
+        error.InvalidStackDepth,
+        error.UnsupportedConstant,
+        error.InvalidConstKeyMap,
+        => true,
+        else => false,
+    };
+}
+
+fn simOpt(sim: *SimContext, inst: decoder.Instruction) DecompileError!bool {
+    sim.simulate(inst) catch |err| {
+        if (isSoftSimErr(err)) return false;
+        return err;
+    };
+    return true;
+}
+
+fn popExprOpt(sim: *SimContext) DecompileError!?*Expr {
+    return sim.stack.popExpr() catch |err| {
+        if (isSoftSimErr(err)) return null;
+        return err;
+    };
+}
+
 /// Check if an opcode is a LOAD instruction.
 fn isLoadInstr(op: Opcode) bool {
     return switch (op) {
@@ -1897,12 +1930,11 @@ pub const Decompiler = struct {
             if (inst.isConditionalJump()) return null;
             if (inst.isUnconditionalJump()) break;
             if (isStatementOpcode(inst.opcode)) return null;
-            try sim.simulate(inst);
+            if (!try simOpt(&sim, inst)) return null;
         }
 
         if (sim.stack.len() != base_vals.len + 1) return null;
-        const expr = try sim.stack.popExpr();
-        return expr;
+        return (try popExprOpt(&sim)) orelse null;
     }
 
     fn simulateConditionExpr(
@@ -1923,10 +1955,10 @@ pub const Decompiler = struct {
         for (block.instructions) |inst| {
             if (ctrl.Analyzer.isConditionalJump(undefined, inst.opcode)) break;
             if (isStatementOpcode(inst.opcode)) return null;
-            try sim.simulate(inst);
+            if (!try simOpt(&sim, inst)) return null;
         }
 
-        const expr = try sim.stack.popExpr();
+        const expr = (try popExprOpt(&sim)) orelse return null;
         if (sim.stack.len() != base_vals.len) return null;
         return expr;
     }
@@ -1952,12 +1984,11 @@ pub const Decompiler = struct {
             if (ctrl.Analyzer.isConditionalJump(undefined, inst.opcode)) break;
             if (inst.isUnconditionalJump()) break;
             if (isStatementOpcode(inst.opcode)) break;
-            try sim.simulate(inst);
+            if (!try simOpt(&sim, inst)) return null;
         }
 
         if (sim.stack.len() != base_vals.len + 1) return null;
-        const expr = try sim.stack.popExpr();
-        return expr;
+        return (try popExprOpt(&sim)) orelse null;
     }
 
     fn simulateBoolOpCondExpr(
@@ -1991,10 +2022,10 @@ pub const Decompiler = struct {
             }
             if (ctrl.Analyzer.isConditionalJump(undefined, inst.opcode)) break;
             if (isStatementOpcode(inst.opcode)) return null;
-            try sim.simulate(inst);
+            if (!try simOpt(&sim, inst)) return null;
         }
 
-        const expr = try sim.stack.popExpr();
+        const expr = (try popExprOpt(&sim)) orelse return null;
         if (sim.stack.len() != base_vals.len) return null;
         return expr;
     }
@@ -2049,11 +2080,11 @@ pub const Decompiler = struct {
                     try stmts.append(stmts_allocator, stmt);
                 }
             } else {
-                try cond_sim.simulate(inst);
+                if (!try simOpt(&cond_sim, inst)) return null;
             }
         }
 
-        const expr = try cond_sim.stack.popExpr();
+        const expr = (try popExprOpt(&cond_sim)) orelse return null;
         const base_vals = try self.cloneStackValues(cond_sim.stack.items.items);
         return .{ .expr = expr, .base_vals = base_vals };
     }
@@ -2566,6 +2597,38 @@ pub const Decompiler = struct {
         return pattern.merge_block;
     }
 
+    fn loopHasCompAdd(self: *Decompiler, pattern: ctrl.ForPattern) DecompileError!bool {
+        try self.cond_seen.ensureSize(self.allocator, self.cfg.blocks.len);
+        self.cond_seen.reset();
+        self.cond_stack.clearRetainingCapacity();
+        try self.cond_stack.append(self.allocator, pattern.body_block);
+
+        while (self.cond_stack.items.len > 0) {
+            const cur = self.cond_stack.items[self.cond_stack.items.len - 1];
+            self.cond_stack.items.len -= 1;
+            if (cur >= self.cfg.blocks.len) continue;
+            if (cur == pattern.exit_block or cur == pattern.header_block) continue;
+            if (self.cond_seen.isSet(cur)) continue;
+            try self.cond_seen.set(self.allocator, cur);
+
+            const blk = &self.cfg.blocks[cur];
+            for (blk.instructions) |inst| {
+                if (inst.opcode == .LIST_APPEND or inst.opcode == .SET_ADD or inst.opcode == .MAP_ADD) {
+                    return true;
+                }
+            }
+            for (blk.successors) |edge| {
+                if (edge.edge_type == .exception) continue;
+                const next = edge.target;
+                if (next == pattern.exit_block or next == pattern.header_block) continue;
+                if (self.cond_seen.isSet(next)) continue;
+                try self.cond_stack.append(self.allocator, next);
+            }
+        }
+
+        return false;
+    }
+
     const InlineCompResult = struct {
         exit_block: u32,
         stack: []const StackValue,
@@ -2644,6 +2707,7 @@ pub const Decompiler = struct {
         if (term.opcode != .FOR_ITER) return null;
         const exit_offset = term.jumpTarget(self.version) orelse return null;
         if (exit_offset <= start) return null;
+        if (!try self.loopHasCompAdd(pattern)) return null;
 
         // Find GET_ITER position
         var get_iter_offset: ?u32 = null;
@@ -2677,7 +2741,7 @@ pub const Decompiler = struct {
                 while (setup_iter.next()) |inst| {
                     if (inst.offset >= gio) break;
                     if (inst.opcode == .RESUME) continue;
-                    setup_sim.simulate(inst) catch continue;
+                    if (!try simOpt(&setup_sim, inst)) return null;
                 }
 
                 // Get the iterator expression from TOS
@@ -2701,11 +2765,11 @@ pub const Decompiler = struct {
         while (iter.next()) |inst| {
             if (inst.offset < sim_start) continue;
             if (inst.offset >= exit_offset) break;
-            try sim.simulate(inst);
+            if (!try simOpt(&sim, inst)) return null;
         }
 
         const expr = sim.buildInlineCompExpr() catch |err| {
-            if (err == error.InvalidComprehension) return null;
+            if (isSoftSimErr(err)) return null;
             return err;
         } orelse return null;
 
@@ -10358,7 +10422,7 @@ test "decompiler init" {
     try testing.expectEqual(@as(usize, 0), decompiler.cfg.blocks.len);
 }
 
-test "simulate condition expr propagates errors" {
+test "simulate condition expr returns null on sim error" {
     const testing = std.testing;
     const allocator = testing.allocator;
     const version = Version.init(3, 9);
@@ -10385,7 +10449,10 @@ test "simulate condition expr propagates errors" {
     var decompiler = try Decompiler.init(allocator, code, version);
     defer decompiler.deinit();
 
-    try testing.expectError(error.StackUnderflow, decompiler.simulateConditionExpr(0, &.{}));
+    var stmts: std.ArrayList(*Stmt) = .{};
+    defer stmts.deinit(allocator);
+    try testing.expect((try decompiler.initCondSim(0, &stmts, allocator)) == null);
+    try testing.expect((try decompiler.simulateConditionExpr(0, &.{})) == null);
 }
 
 test "condReach uses scratch and finds path" {
