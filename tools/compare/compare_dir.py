@@ -153,7 +153,9 @@ def main() -> None:
 
     out = json.dumps({"summary": summary, "results": results}, indent=2)
     if args.out:
-        Path(args.out).write_text(out)
+        out_path = Path(args.out)
+        out_path.parent.mkdir(parents=True, exist_ok=True)
+        out_path.write_text(out)
     else:
         print(out)
 

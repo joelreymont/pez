@@ -1,6 +1,9 @@
 #!/usr/bin/env python3
 import hashlib
+import importlib.util
 import json
+import marshal
+import os
 import sys
 from collections import Counter, defaultdict
 
@@ -462,11 +465,33 @@ def walk(code, opc, path, out):
             walk(c, opc, path + "." + c.co_name, out)
 
 
+def load_code(pyc: str):
+    force_marshal = os.environ.get("PEZ_COMPARE_FORCE_MARSHAL") == "1"
+    err = None
+    if not force_marshal:
+        try:
+            res = load.load_module(pyc)
+            return res[0], res[3]
+        except Exception as exc:
+            err = exc
+    try:
+        with open(pyc, "rb") as f:
+            magic = f.read(4)
+            if magic != importlib.util.MAGIC_NUMBER:
+                raise RuntimeError("magic mismatch for marshal fallback")
+            f.read(12)
+            code = marshal.load(f)
+        ver = (sys.version_info.major, sys.version_info.minor, 0)
+        return ver, code
+    except Exception:
+        if err:
+            raise err
+        raise
+
+
 def main():
     pyc = sys.argv[1]
-    res = load.load_module(pyc)
-    ver = res[0]
-    code = res[3]
+    ver, code = load_code(pyc)
     opc = op_imports.get_opcode_module(ver)
     out = []
     walk(code, opc, code.co_name, out)

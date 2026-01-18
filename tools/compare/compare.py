@@ -6,6 +6,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+from typing import Optional, Tuple
 from difflib import SequenceMatcher
 from pathlib import Path
 
@@ -49,6 +50,51 @@ def check_xdis(python: str, timeout: int) -> bool:
         return proc.returncode == 0
     except Exception:
         return False
+
+
+def python_version(py: str, timeout: int) -> Optional[Tuple[int, int]]:
+    proc = run_cmd(
+        [py, "-c", "import sys;print(f\"{sys.version_info.major}.{sys.version_info.minor}\")"],
+        timeout,
+    )
+    if proc.returncode != 0:
+        return None
+    text = proc.stdout.strip()
+    if not text:
+        return None
+    parts = text.split(".")
+    if len(parts) < 2:
+        return None
+    try:
+        return int(parts[0]), int(parts[1])
+    except ValueError:
+        return None
+
+
+def find_uv_python(ver: Tuple[int, int]) -> str:
+    major, minor = ver
+    root = Path.home() / ".local" / "share" / "uv" / "python"
+    if not root.exists():
+        return ""
+    prefix = f"cpython-{major}.{minor}."
+    candidates = sorted([p for p in root.iterdir() if p.name.startswith(prefix)], reverse=True)
+    for cand in candidates:
+        exe = cand / "bin" / f"python{major}.{minor}"
+        if exe.exists():
+            return str(exe)
+    return ""
+
+
+def find_python_for_version(ver: Tuple[int, int], timeout: int) -> str:
+    major, minor = ver
+    for name in (f"python{major}.{minor}",):
+        path = shutil.which(name)
+        if path:
+            return path
+    uv = find_uv_python(ver)
+    if uv and python_version(uv, timeout) == ver:
+        return uv
+    return ""
 
 
 def pick_xdis_python(arg: str, timeout: int) -> str:
@@ -167,10 +213,19 @@ def main() -> None:
 
     tmpdir = Path(tempfile.mkdtemp(prefix="pez-compare-"))
     try:
-        compiled_pyc = tmpdir / "compiled.pyc"
-        compile_source(args.py, src, compiled_pyc, args.timeout)
-
         orig_data = disassemble_with_xdis(xdis_py, orig, args.timeout)
+        orig_ver = tuple(orig_data.get("version", [])[:2])
+
+        py = args.py
+        if py == sys.executable and orig_ver:
+            py_ver = python_version(py, args.timeout)
+            if py_ver and py_ver != orig_ver:
+                alt = find_python_for_version(orig_ver, args.timeout)
+                if alt:
+                    py = alt
+
+        compiled_pyc = tmpdir / "compiled.pyc"
+        compile_source(py, src, compiled_pyc, args.timeout)
         comp_data = disassemble_with_xdis(xdis_py, compiled_pyc, args.timeout)
 
         version_mismatch = orig_data["version"] != comp_data["version"]
