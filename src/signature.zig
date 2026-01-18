@@ -2,6 +2,7 @@
 
 const std = @import("std");
 const ast = @import("ast.zig");
+const name_mangle = @import("name_mangle.zig");
 const pyc = @import("pyc.zig");
 
 /// Annotation for a function parameter or return type.
@@ -15,6 +16,7 @@ pub const Annotation = struct {
 pub fn extractFunctionSignature(
     allocator: std.mem.Allocator,
     code: *const pyc.Code,
+    class_name: ?[]const u8,
     defaults: []const *ast.Expr,
     kw_defaults: []const ?*ast.Expr,
     annotations: []const Annotation,
@@ -24,9 +26,15 @@ pub fn extractFunctionSignature(
 
     // Helper to find annotation for a parameter name
     const findAnnotation = struct {
-        fn find(anns: []const Annotation, name: []const u8) ?*ast.Expr {
+        fn find(
+            alloc: std.mem.Allocator,
+            cls_name: ?[]const u8,
+            anns: []const Annotation,
+            name: []const u8,
+        ) !?*ast.Expr {
             for (anns) |ann| {
-                if (std.mem.eql(u8, ann.name, name)) {
+                const ann_name = try name_mangle.unmangleClassName(alloc, cls_name, ann.name);
+                if (std.mem.eql(u8, ann_name, name)) {
                     return ann.value;
                 }
             }
@@ -44,7 +52,12 @@ pub fn extractFunctionSignature(
     if (posonlyargcount > 0 and code.varnames.len >= posonlyargcount) {
         posonly_args = try allocator.alloc(ast.Arg, posonlyargcount);
         for (code.varnames[0..posonlyargcount], 0..) |name, i| {
-            posonly_args[i] = .{ .arg = name, .annotation = findAnnotation(annotations, name), .type_comment = null };
+            const unmangled = try name_mangle.unmangleClassName(allocator, class_name, name);
+            posonly_args[i] = .{
+                .arg = unmangled,
+                .annotation = try findAnnotation(allocator, class_name, annotations, unmangled),
+                .type_comment = null,
+            };
         }
     }
 
@@ -55,7 +68,12 @@ pub fn extractFunctionSignature(
     if (regular_end > regular_start and code.varnames.len >= regular_end) {
         regular_args = try allocator.alloc(ast.Arg, regular_end - regular_start);
         for (code.varnames[regular_start..regular_end], 0..) |name, i| {
-            regular_args[i] = .{ .arg = name, .annotation = findAnnotation(annotations, name), .type_comment = null };
+            const unmangled = try name_mangle.unmangleClassName(allocator, class_name, name);
+            regular_args[i] = .{
+                .arg = unmangled,
+                .annotation = try findAnnotation(allocator, class_name, annotations, unmangled),
+                .type_comment = null,
+            };
         }
     }
 
@@ -66,7 +84,12 @@ pub fn extractFunctionSignature(
     if (kwonlyargcount > 0 and code.varnames.len >= kwonly_end) {
         kwonly_args = try allocator.alloc(ast.Arg, kwonlyargcount);
         for (code.varnames[kwonly_start..kwonly_end], 0..) |name, i| {
-            kwonly_args[i] = .{ .arg = name, .annotation = findAnnotation(annotations, name), .type_comment = null };
+            const unmangled = try name_mangle.unmangleClassName(allocator, class_name, name);
+            kwonly_args[i] = .{
+                .arg = unmangled,
+                .annotation = try findAnnotation(allocator, class_name, annotations, unmangled),
+                .type_comment = null,
+            };
         }
     }
 
@@ -76,9 +99,10 @@ pub fn extractFunctionSignature(
     if ((code.flags & pyc.Code.CO_VARARGS) != 0) {
         if (next_arg_idx < code.varnames.len) {
             const name = code.varnames[next_arg_idx];
+            const unmangled = try name_mangle.unmangleClassName(allocator, class_name, name);
             vararg = .{
-                .arg = name,
-                .annotation = findAnnotation(annotations, name),
+                .arg = unmangled,
+                .annotation = try findAnnotation(allocator, class_name, annotations, unmangled),
                 .type_comment = null,
             };
             next_arg_idx += 1;
@@ -89,9 +113,10 @@ pub fn extractFunctionSignature(
     if ((code.flags & pyc.Code.CO_VARKEYWORDS) != 0) {
         if (next_arg_idx < code.varnames.len) {
             const name = code.varnames[next_arg_idx];
+            const unmangled = try name_mangle.unmangleClassName(allocator, class_name, name);
             kwarg = .{
-                .arg = name,
-                .annotation = findAnnotation(annotations, name),
+                .arg = unmangled,
+                .annotation = try findAnnotation(allocator, class_name, annotations, unmangled),
                 .type_comment = null,
             };
         }

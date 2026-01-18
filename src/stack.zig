@@ -8,6 +8,7 @@ const Allocator = std.mem.Allocator;
 const ast = @import("ast.zig");
 const codegen = @import("codegen.zig");
 const decoder = @import("decoder.zig");
+const name_mangle = @import("name_mangle.zig");
 const opcodes = @import("opcodes.zig");
 const pyc = @import("pyc.zig");
 const signature = @import("signature.zig");
@@ -492,6 +493,8 @@ pub const SimContext = struct {
     version: Version,
     /// Code object being simulated.
     code: *const pyc.Code,
+    /// Class name for name-unmangling (null outside class scope).
+    class_name: ?[]const u8 = null,
     /// Current stack state.
     stack: Stack,
     /// Override for iterator locals (used for genexpr/listcomp code objects).
@@ -518,6 +521,7 @@ pub const SimContext = struct {
             .comp_builder = null,
             .lenient = false,
             .flow_mode = false,
+            .class_name = null,
         };
     }
 
@@ -543,6 +547,16 @@ pub const SimContext = struct {
                 self.allocator.destroy(expr);
             }
         }
+    }
+
+    fn makeName(self: *SimContext, name: []const u8, ctx: ast.ExprContext) !*Expr {
+        const unmangled = try name_mangle.unmangleClassName(self.allocator, self.class_name, name);
+        return ast.makeName(self.allocator, unmangled, ctx);
+    }
+
+    fn makeAttribute(self: *SimContext, value: *Expr, attr: []const u8, ctx: ast.ExprContext) !*Expr {
+        const unmangled = try name_mangle.unmangleClassName(self.allocator, self.class_name, attr);
+        return ast.makeAttribute(self.allocator, value, unmangled, ctx);
     }
 
     /// Get a name from the code object's names tuple.
@@ -665,7 +679,7 @@ pub const SimContext = struct {
                     list_expr.deinit(self.allocator);
                     self.allocator.destroy(list_expr);
                 }
-                const func = try ast.makeName(self.allocator, "frozenset", .load);
+                const func = try self.makeName("frozenset", .load);
                 errdefer {
                     func.deinit(self.allocator);
                     self.allocator.destroy(func);
@@ -1181,7 +1195,7 @@ pub const SimContext = struct {
                 try self.stack.push(.{ .expr = comp_expr });
             },
             .unknown => {
-                const unknown_expr = try ast.makeName(self.allocator, "__unknown__", .load);
+                const unknown_expr = try self.makeName("__unknown__", .load);
                 try self.handleCallExpr(unknown_expr, args_vals, keywords);
             },
             .expr => |callee_expr| {
@@ -1581,7 +1595,7 @@ pub const SimContext = struct {
     fn addCompTargetName(self: *SimContext, name: []const u8) !void {
         const builder = self.findActiveCompBuilder() orelse return;
         if (builder.loop_stack.items.len == 0) return;
-        const target = try ast.makeName(self.allocator, name, .store);
+        const target = try self.makeName(name, .store);
         try self.addCompTarget(builder, target);
     }
 
@@ -1786,7 +1800,7 @@ pub const SimContext = struct {
                 // Stack order: [NULL/self, callable, args...] from bottom to top
                 if (push_null) try self.stack.push(.null_marker);
                 if (self.getName(name_idx)) |name| {
-                    const expr = try ast.makeName(self.allocator, name, .load);
+                    const expr = try self.makeName(name, .load);
                     try self.stack.push(.{ .expr = expr });
                 } else {
                     try self.stack.push(.unknown);
@@ -1805,7 +1819,7 @@ pub const SimContext = struct {
                 }
 
                 if (self.getLocal(inst.arg)) |name| {
-                    const expr = try ast.makeName(self.allocator, name, .load);
+                    const expr = try self.makeName(name, .load);
                     try self.stack.push(.{ .expr = expr });
                 } else {
                     try self.stack.push(.unknown);
@@ -1829,7 +1843,7 @@ pub const SimContext = struct {
 
                 // Push first variable
                 if (self.getLocal(first_idx)) |name| {
-                    const expr = try ast.makeName(self.allocator, name, .load);
+                    const expr = try self.makeName(name, .load);
                     try self.stack.push(.{ .expr = expr });
                 } else {
                     try self.stack.push(.unknown);
@@ -1837,7 +1851,7 @@ pub const SimContext = struct {
 
                 // Push second variable
                 if (self.getLocal(second_idx)) |name| {
-                    const expr = try ast.makeName(self.allocator, name, .load);
+                    const expr = try self.makeName(name, .load);
                     try self.stack.push(.{ .expr = expr });
                 } else {
                     try self.stack.push(.unknown);
@@ -1883,7 +1897,7 @@ pub const SimContext = struct {
                 // Store the popped value into store_idx local
                 if (self.getLocal(store_idx)) |store_name| {
                     if (self.findActiveCompBuilder()) |builder| {
-                        const target = try ast.makeName(self.allocator, store_name, .store);
+                        const target = try self.makeName(store_name, .store);
                         try self.addCompTarget(builder, target);
                     }
                 }
@@ -1893,7 +1907,7 @@ pub const SimContext = struct {
 
                 // Load from load_idx and push to stack
                 if (self.getLocal(load_idx)) |name| {
-                    const expr = try ast.makeName(self.allocator, name, .load);
+                    const expr = try self.makeName(name, .load);
                     try self.stack.push(.{ .expr = expr });
                 } else {
                     try self.stack.push(.unknown);
@@ -2144,7 +2158,7 @@ pub const SimContext = struct {
                         value.deinit(self.allocator);
                         self.allocator.destroy(value);
                     }
-                    const func = try ast.makeName(self.allocator, "tuple", .load);
+                    const func = try self.makeName("tuple", .load);
                     errdefer {
                         func.deinit(self.allocator);
                         self.allocator.destroy(func);
@@ -2836,7 +2850,7 @@ pub const SimContext = struct {
                             else => {
                                 var tmp = val;
                                 tmp.deinit(self.allocator, self.stack_alloc);
-                                const expr = try ast.makeName(self.allocator, "__unknown__", .load);
+                                const expr = try self.makeName("__unknown__", .load);
                                 args[idx] = expr;
                                 args_filled += 1;
                                 args_vals[idx] = .unknown;
@@ -2869,7 +2883,7 @@ pub const SimContext = struct {
                             else => {
                                 var tmp = val;
                                 tmp.deinit(self.allocator, self.stack_alloc);
-                                const expr = try ast.makeName(self.allocator, "__unknown__", .load);
+                                const expr = try self.makeName("__unknown__", .load);
                                 const arg_name = try self.allocator.dupe(u8, name);
                                 var arg_owned = true;
                                 errdefer if (arg_owned) self.allocator.free(arg_name);
@@ -2899,13 +2913,13 @@ pub const SimContext = struct {
                         },
                         .unknown => {
                             callable_owned = false;
-                            callee_expr = try ast.makeName(self.allocator, "__unknown__", .load);
+                            callee_expr = try self.makeName("__unknown__", .load);
                         },
                         else => {
                             var val = callable;
                             val.deinit(self.allocator, self.stack_alloc);
                             callable_owned = false;
-                            callee_expr = try ast.makeName(self.allocator, "__unknown__", .load);
+                            callee_expr = try self.makeName("__unknown__", .load);
                         },
                     }
                     errdefer if (cleanup_callee) {
@@ -2938,13 +2952,13 @@ pub const SimContext = struct {
                     switch (kw_val) {
                         .expr => |expr| kwargs_expr = expr,
                         .unknown => {
-                            kwargs_expr = try ast.makeName(self.allocator, "__unknown__", .load);
+                            kwargs_expr = try self.makeName("__unknown__", .load);
                         },
                         else => {
                             var val = kw_val;
                             val.deinit(self.allocator, self.stack_alloc);
                             if (self.flow_mode or self.lenient) {
-                                kwargs_expr = try ast.makeName(self.allocator, "__unknown__", .load);
+                                kwargs_expr = try self.makeName("__unknown__", .load);
                             } else {
                                 return error.NotAnExpression;
                             }
@@ -2959,12 +2973,12 @@ pub const SimContext = struct {
                 const args_val = self.stack.pop() orelse return error.StackUnderflow;
                 const args_expr = switch (args_val) {
                     .expr => |expr| expr,
-                    .unknown => try ast.makeName(self.allocator, "__unknown__", .load),
+                    .unknown => try self.makeName("__unknown__", .load),
                     else => blk: {
                         var val = args_val;
                         val.deinit(self.allocator, self.stack_alloc);
                         if (self.flow_mode or self.lenient) {
-                            break :blk try ast.makeName(self.allocator, "__unknown__", .load);
+                            break :blk try self.makeName("__unknown__", .load);
                         }
                         return error.NotAnExpression;
                     },
@@ -3006,12 +3020,12 @@ pub const SimContext = struct {
 
                 const callee_expr = switch (callable) {
                     .expr => |expr| expr,
-                    .unknown => try ast.makeName(self.allocator, "__unknown__", .load),
+                    .unknown => try self.makeName("__unknown__", .load),
                     else => blk: {
                         var val = callable;
                         val.deinit(self.allocator, self.stack_alloc);
                         if (self.flow_mode or self.lenient) {
-                            break :blk try ast.makeName(self.allocator, "__unknown__", .load);
+                            break :blk try self.makeName("__unknown__", .load);
                         }
                         return error.NotAnExpression;
                     },
@@ -3115,7 +3129,7 @@ pub const SimContext = struct {
                                     else => {
                                         var v = val;
                                         v.deinit(self.allocator, self.stack_alloc);
-                                        def_exprs[idx] = try ast.makeName(self.allocator, "<default>", .load);
+                                        def_exprs[idx] = try self.makeName("<default>", .load);
                                     },
                                 }
                             } else {
@@ -3150,7 +3164,7 @@ pub const SimContext = struct {
                         else => {
                             var v = code_val;
                             v.deinit(self.allocator, self.stack_alloc);
-                            const expr = try ast.makeName(self.allocator, "<function>", .load);
+                            const expr = try self.makeName("<function>", .load);
                             try self.stack.push(.{ .expr = expr });
                         },
                     }
@@ -3227,7 +3241,7 @@ pub const SimContext = struct {
                             else => "<function>",
                         };
 
-                        const expr = try ast.makeName(self.allocator, func_name, .load);
+                        const expr = try self.makeName(func_name, .load);
                         try self.stack.push(.{ .expr = expr });
                     },
                 }
@@ -3312,7 +3326,7 @@ pub const SimContext = struct {
                         try self.stack.push(.{ .function_obj = func });
                     },
                     else => {
-                        const expr = try ast.makeName(self.allocator, "<closure>", .load);
+                        const expr = try self.makeName("<closure>", .load);
                         try self.stack.push(.{ .expr = expr });
                     },
                 }
@@ -3387,7 +3401,7 @@ pub const SimContext = struct {
             .LOAD_DEREF => {
                 // LOAD_DEREF i - loads value from a cell
                 if (self.getDeref(inst.arg)) |name| {
-                    const expr = try ast.makeName(self.allocator, name, .load);
+                    const expr = try self.makeName(name, .load);
                     try self.stack.push(.{ .expr = expr });
                 } else {
                     try self.stack.push(.unknown);
@@ -3735,7 +3749,7 @@ pub const SimContext = struct {
                         }
                         const name_idx = if (self.version.gte(3, 12)) inst.arg >> 1 else inst.arg;
                         if (self.getName(name_idx)) |attr_name| {
-                            const attr = try ast.makeAttribute(self.allocator, obj, attr_name, .load);
+                            const attr = try self.makeAttribute(obj, attr_name, .load);
                             // In 3.12+: push NULL/self BEFORE callable for method call preparation
                             // Stack order: [NULL/self, callable, args...] from bottom to top
                             if (push_null) try self.stack.push(.null_marker);
@@ -3772,7 +3786,7 @@ pub const SimContext = struct {
                 }
                 const name_idx = inst.arg;
                 if (self.getName(name_idx)) |attr_name| {
-                    const attr = try ast.makeAttribute(self.allocator, obj, attr_name, .load);
+                    const attr = try self.makeAttribute(obj, attr_name, .load);
                     // NULL on bottom, method on top
                     try self.stack.push(.null_marker);
                     try self.stack.push(.{ .expr = attr });
@@ -3798,7 +3812,7 @@ pub const SimContext = struct {
                     obj_copy.deinit(self.allocator);
                     self.allocator.destroy(obj_copy);
                 }
-                const attr = try ast.makeAttribute(self.allocator, obj, attr_name, .load);
+                const attr = try self.makeAttribute(obj, attr_name, .load);
                 // For context managers, these are methods - push [method, self]
                 try self.stack.push(.{ .expr = attr });
                 try self.stack.push(.{ .expr = obj_copy });
@@ -4137,14 +4151,14 @@ pub const SimContext = struct {
             .LOAD_BUILD_CLASS => {
                 // LOAD_BUILD_CLASS - push __build_class__ builtin onto stack
                 // Used to construct classes: __build_class__(func, name, *bases, **keywords)
-                const expr = try ast.makeName(self.allocator, "__build_class__", .load);
+                const expr = try self.makeName("__build_class__", .load);
                 try self.stack.push(.{ .expr = expr });
             },
 
             .LOAD_LOCALS => {
                 // LOAD_LOCALS - Python 2.x: push locals() dict onto stack
                 // Used at end of class body to return the class namespace
-                const func_expr = try ast.makeName(self.allocator, "locals", .load);
+                const func_expr = try self.makeName("locals", .load);
                 const expr = try ast.makeCall(self.allocator, func_expr, &.{});
                 try self.stack.push(.{ .expr = expr });
             },
@@ -4160,7 +4174,7 @@ pub const SimContext = struct {
             .LOAD_CLASSDEREF => {
                 // LOAD_CLASSDEREF i - load value from cell or free variable for class scoping
                 if (self.getDeref(inst.arg)) |name| {
-                    const expr = try ast.makeName(self.allocator, name, .load);
+                    const expr = try self.makeName(name, .load);
                     try self.stack.push(.{ .expr = expr });
                 } else {
                     try self.stack.push(.unknown);
@@ -4223,7 +4237,7 @@ pub const SimContext = struct {
                 ctx.deinit(self.allocator);
                 self.allocator.destroy(ctx);
                 // Push exit func placeholder and __enter__ result placeholder
-                const exit_expr = try ast.makeName(self.allocator, "__with_exit__", .load);
+                const exit_expr = try self.makeName("__with_exit__", .load);
                 try self.stack.push(.{ .expr = exit_expr });
                 try self.stack.push(.unknown);
             },
@@ -5078,7 +5092,7 @@ pub fn buildLambdaExpr(allocator: Allocator, code: *const pyc.Code, version: Ver
         allocator.destroy(body);
     }
 
-    const args = try signature.extractFunctionSignature(allocator, code, &.{}, &.{}, &.{});
+    const args = try signature.extractFunctionSignature(allocator, code, null, &.{}, &.{}, &.{});
     errdefer {
         args.deinit(allocator);
         allocator.destroy(args);

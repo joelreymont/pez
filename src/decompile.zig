@@ -13,6 +13,7 @@ const dom_mod = @import("dom.zig");
 const stack_mod = @import("stack.zig");
 const pyc = @import("pyc.zig");
 const codegen = @import("codegen.zig");
+const name_mangle = @import("name_mangle.zig");
 const signature = @import("signature.zig");
 const test_utils = @import("test_utils.zig");
 
@@ -23,6 +24,7 @@ pub const SimContext = stack_mod.SimContext;
 pub const Version = decoder.Version;
 pub const Expr = ast.Expr;
 pub const Stmt = ast.Stmt;
+const ExprContext = ast.ExprContext;
 const StackValue = stack_mod.StackValue;
 const Opcode = decoder.Opcode;
 pub const DecompileError = stack_mod.SimError || error{ UnexpectedEmptyWorklist, InvalidBlock, SkipStatement };
@@ -163,6 +165,8 @@ pub const Decompiler = struct {
     pending_chain_targets: std.ArrayList(*Expr),
     /// Saw __classcell__ store in class body; suppress return emission.
     saw_classcell: bool = false,
+    /// Class name for name-unmangling in class scope (null outside classes).
+    class_name: ?[]const u8 = null,
     /// Entry stack state per block (computed by dataflow).
     stack_in: []?[]StackValue,
     /// Guard against recursive if/elif cycles.
@@ -230,6 +234,7 @@ pub const Decompiler = struct {
             .cond_seen = cond_seen,
             .cond_stack = cond_stack,
             .clone_sim = SimContext.init(allocator, allocator, code, version),
+            .class_name = null,
         };
 
         try decomp.initStackFlow();
@@ -395,7 +400,7 @@ pub const Decompiler = struct {
                     else => "<unknown>",
                 };
                 const a = self.arena.allocator();
-                const target = try ast.makeName(a, name, .del);
+                const target = try self.makeName(name, .del);
                 const targets = try a.alloc(*Expr, 1);
                 targets[0] = target;
                 const stmt = try a.create(Stmt);
@@ -406,7 +411,7 @@ pub const Decompiler = struct {
                 const obj = try sim.stack.popExpr();
                 const attr = sim.getName(inst.arg) orelse "<unknown>";
                 const a = self.arena.allocator();
-                const target = try ast.makeAttribute(a, obj, attr, .del);
+                const target = try self.makeAttribute(obj, attr, .del);
                 const targets = try a.alloc(*Expr, 1);
                 targets[0] = target;
                 const stmt = try a.create(Stmt);
@@ -729,7 +734,7 @@ pub const Decompiler = struct {
         self.stack_in[0] = &.{};
         try worklist.append(self.allocator, 0);
 
-        var clone_sim = SimContext.init(self.arena.allocator(), self.arena.allocator(), self.code, self.version);
+        var clone_sim = self.initSim(self.arena.allocator(), self.arena.allocator(), self.code, self.version);
         clone_sim.flow_mode = true;
         clone_sim.stack.allow_underflow = true;
         defer clone_sim.deinit();
@@ -743,7 +748,7 @@ pub const Decompiler = struct {
             var sim_arena = std.heap.ArenaAllocator.init(self.allocator);
             defer sim_arena.deinit();
 
-            var sim = SimContext.init(sim_arena.allocator(), sim_arena.allocator(), self.code, self.version);
+            var sim = self.initSim(sim_arena.allocator(), sim_arena.allocator(), self.code, self.version);
             defer sim.deinit();
             sim.lenient = true;
             sim.flow_mode = true;
@@ -914,11 +919,11 @@ pub const Decompiler = struct {
                             const idx1 = (store_inst.arg >> 4) & 0xF;
                             const idx2 = store_inst.arg & 0xF;
                             if (sim.getLocal(idx1)) |n1| {
-                                const t1 = try ast.makeName(arena, n1, .store);
+                                const t1 = try self.makeName(n1, .store);
                                 try targets.append(arena, t1);
                             }
                             if (sim.getLocal(idx2)) |n2| {
-                                const t2 = try ast.makeName(arena, n2, .store);
+                                const t2 = try self.makeName(n2, .store);
                                 try targets.append(arena, t2);
                             }
                             j += 1; // Count as 2 targets
@@ -937,11 +942,11 @@ pub const Decompiler = struct {
                             const target = if (star_pos != null and j == star_pos.?) blk: {
                                 const starred = try arena.create(Expr);
                                 starred.* = .{ .starred = .{
-                                    .value = try ast.makeName(arena, n, .store),
+                                    .value = try self.makeName(n, .store),
                                     .ctx = .store,
                                 } };
                                 break :blk starred;
-                            } else try ast.makeName(arena, n, .store);
+                            } else try self.makeName(n, .store);
                             try targets.append(arena, target);
                             skip_count += 1;
                             instr_idx += 1;
@@ -959,7 +964,7 @@ pub const Decompiler = struct {
                                     break;
                                 }
                                 const attr_name = sim.getName(next.arg) orelse break;
-                                const target = try ast.makeAttribute(arena, container.expr, attr_name, .store);
+                                const target = try self.makeAttribute(container.expr, attr_name, .store);
                                 try targets.append(arena, target);
                                 skip_count += 2;
                                 instr_idx += 2;
@@ -1068,7 +1073,7 @@ pub const Decompiler = struct {
                         var targets: std.ArrayList(*Expr) = .{};
 
                         // Add current target
-                        const first_target = try ast.makeName(arena, name, .store);
+                        const first_target = try self.makeName(name, .store);
                         try targets.append(arena, first_target);
 
                         // Pop one value (the dup'd copy) - don't deinit, arena-allocated
@@ -1095,7 +1100,7 @@ pub const Decompiler = struct {
                                             else => null,
                                         };
                                         if (store_name) |sn| {
-                                            const target = try ast.makeName(arena, sn, .store);
+                                            const target = try self.makeName(sn, .store);
                                             try targets.append(arena, target);
                                             // Pop dup'd value (from the simulated DUP)
                                             _ = sim.stack.pop() orelse return error.StackUnderflow;
@@ -1107,11 +1112,11 @@ pub const Decompiler = struct {
                                         const idx1 = (following.arg >> 4) & 0xF;
                                         const idx2 = following.arg & 0xF;
                                         if (sim.getLocal(idx1)) |n1| {
-                                            const t1 = try ast.makeName(arena, n1, .store);
+                                            const t1 = try self.makeName(n1, .store);
                                             try targets.append(arena, t1);
                                         }
                                         if (sim.getLocal(idx2)) |n2| {
-                                            const t2 = try ast.makeName(arena, n2, .store);
+                                            const t2 = try self.makeName(n2, .store);
                                             try targets.append(arena, t2);
                                         }
                                         // Pop dup'd value
@@ -1133,12 +1138,12 @@ pub const Decompiler = struct {
                                                 const idx1 = (us2.arg >> 4) & 0xF;
                                                 const idx2 = us2.arg & 0xF;
                                                 if (sim.getLocal(idx1)) |n1| {
-                                                    const t1 = try ast.makeName(arena, n1, .store);
+                                                    const t1 = try self.makeName(n1, .store);
                                                     try tup_targets.append(arena, t1);
                                                     found += 1;
                                                 }
                                                 if (sim.getLocal(idx2)) |n2| {
-                                                    const t2 = try ast.makeName(arena, n2, .store);
+                                                    const t2 = try self.makeName(n2, .store);
                                                     try tup_targets.append(arena, t2);
                                                     found += 1;
                                                 }
@@ -1152,7 +1157,7 @@ pub const Decompiler = struct {
                                                 else => null,
                                             };
                                             if (un2) |nm| {
-                                                const tgt = try ast.makeName(arena, nm, .store);
+                                                const tgt = try self.makeName(nm, .store);
                                                 try tup_targets.append(arena, tgt);
                                                 found += 1;
                                                 kk += 1;
@@ -1211,7 +1216,7 @@ pub const Decompiler = struct {
                                     else => null,
                                 };
                                 if (store_name) |sn| {
-                                    const target = try ast.makeName(arena, sn, .store);
+                                    const target = try self.makeName(sn, .store);
                                     try targets.append(arena, target);
                                     j += 1;
                                 }
@@ -1243,12 +1248,12 @@ pub const Decompiler = struct {
                                         const idx1 = (us.arg >> 4) & 0xF;
                                         const idx2 = us.arg & 0xF;
                                         if (sim.getLocal(idx1)) |n1| {
-                                            const t1 = try ast.makeName(arena, n1, .store);
+                                            const t1 = try self.makeName(n1, .store);
                                             try tuple_targets.append(arena, t1);
                                             targets_found += 1;
                                         }
                                         if (sim.getLocal(idx2)) |n2| {
-                                            const t2 = try ast.makeName(arena, n2, .store);
+                                            const t2 = try self.makeName(n2, .store);
                                             try tuple_targets.append(arena, t2);
                                             targets_found += 1;
                                         }
@@ -1263,7 +1268,7 @@ pub const Decompiler = struct {
                                         else => null,
                                     };
                                     if (un) |tgt_name| {
-                                        const t = try ast.makeName(arena, tgt_name, .store);
+                                        const t = try self.makeName(tgt_name, .store);
                                         try tuple_targets.append(arena, t);
                                         targets_found += 1;
                                         k += 1;
@@ -1346,7 +1351,7 @@ pub const Decompiler = struct {
                             binop.left.deinit(arena);
                             arena.destroy(binop.left);
                             const stmt = try arena.create(Stmt);
-                            const target = try ast.makeName(arena, name, .store);
+                            const target = try self.makeName(name, .store);
                             stmt.* = .{ .aug_assign = .{
                                 .target = target,
                                 .op = binop.op,
@@ -1432,7 +1437,7 @@ pub const Decompiler = struct {
                                             else => null,
                                         };
                                         if (store_name) |sn| {
-                                            const target = try ast.makeName(arena, sn, .store);
+                                            const target = try self.makeName(sn, .store);
                                             try targets.append(arena, target);
                                             _ = sim.stack.pop() orelse return error.StackUnderflow;
                                             j += 2;
@@ -1456,7 +1461,7 @@ pub const Decompiler = struct {
                                                 else => null,
                                             };
                                             if (un) |name| {
-                                                const t = try ast.makeName(arena, name, .store);
+                                                const t = try self.makeName(name, .store);
                                                 try tuple_targets.append(arena, t);
                                                 targets_found += 1;
                                                 k += 1;
@@ -1511,7 +1516,7 @@ pub const Decompiler = struct {
                                         else => null,
                                     };
                                     if (un) |name| {
-                                        const t = try ast.makeName(arena, name, .store);
+                                        const t = try self.makeName(name, .store);
                                         try tuple_targets.append(arena, t);
                                         targets_found += 1;
                                         k += 1;
@@ -1562,7 +1567,7 @@ pub const Decompiler = struct {
                                     else => null,
                                 };
                                 if (store_name) |sn| {
-                                    const target = try ast.makeName(arena, sn, .store);
+                                    const target = try self.makeName(sn, .store);
                                     try targets.append(arena, target);
                                     j += 1;
                                 }
@@ -1613,7 +1618,7 @@ pub const Decompiler = struct {
                         key.* == .constant and key.constant == .string)
                     {
                         const var_name = key.constant.string;
-                        const target = try ast.makeName(a, var_name, .store);
+                        const target = try self.makeName(var_name, .store);
 
                         // Check if previous statement was an assignment to the same variable
                         // Pattern: x = value; __annotations__['x'] = type => x: type = value
@@ -1709,12 +1714,11 @@ pub const Decompiler = struct {
 
                     // If part of a chain followed by UNPACK_SEQUENCE, defer to UNPACK handler
                     if (has_dup_before and next_is_unpack) {
-                        const arena = self.arena.allocator();
                         const container_val = sim.stack.pop() orelse return error.StackUnderflow;
                         _ = sim.stack.pop() orelse return error.StackUnderflow; // pop dup'd value
                         if (container_val == .expr) {
                             const attr_name = sim.getName(inst.arg) orelse "<unknown>";
-                            const target = try ast.makeAttribute(arena, container_val.expr, attr_name, .store);
+                            const target = try self.makeAttribute(container_val.expr, attr_name, .store);
                             try self.pending_chain_targets.append(self.allocator, target);
                         }
                         continue;
@@ -1733,12 +1737,7 @@ pub const Decompiler = struct {
 
                         if (container_val == .expr) {
                             const attr_name = sim.getName(inst.arg) orelse "<unknown>";
-                            const first_target = try arena.create(Expr);
-                            first_target.* = .{ .attribute = .{
-                                .value = container_val.expr,
-                                .attr = attr_name,
-                                .ctx = .store,
-                            } };
+                            const first_target = try self.makeAttribute(container_val.expr, attr_name, .store);
                             try targets.append(arena, first_target);
                         }
 
@@ -1758,12 +1757,7 @@ pub const Decompiler = struct {
                                         _ = sim.stack.pop() orelse return error.StackUnderflow;
                                         if (cont_val == .expr) {
                                             const attr = sim.getName(store_inst.arg) orelse "<unknown>";
-                                            const target = try arena.create(Expr);
-                                            target.* = .{ .attribute = .{
-                                                .value = cont_val.expr,
-                                                .attr = attr,
-                                                .ctx = .store,
-                                            } };
+                                            const target = try self.makeAttribute(cont_val.expr, attr, .store);
                                             try targets.append(arena, target);
                                         }
                                         j += 3;
@@ -1782,12 +1776,7 @@ pub const Decompiler = struct {
                                     const cont_val = sim.stack.pop() orelse return error.StackUnderflow;
                                     if (cont_val == .expr) {
                                         const attr = sim.getName(instructions[j + 1].arg) orelse "<unknown>";
-                                        const target = try arena.create(Expr);
-                                        target.* = .{ .attribute = .{
-                                            .value = cont_val.expr,
-                                            .attr = attr,
-                                            .ctx = .store,
-                                        } };
+                                        const target = try self.makeAttribute(cont_val.expr, attr, .store);
                                         try targets.append(arena, target);
                                     }
                                     j += 2;
@@ -1826,14 +1815,8 @@ pub const Decompiler = struct {
                     const container = if (container_val == .expr) container_val.expr else continue;
                     const value = if (value_val == .expr) value_val.expr else continue;
 
-                    const a = self.arena.allocator();
                     const attr_name = sim.getName(inst.arg) orelse "<unknown>";
-                    const attr_expr = try a.create(Expr);
-                    attr_expr.* = .{ .attribute = .{
-                        .value = container,
-                        .attr = attr_name,
-                        .ctx = .store,
-                    } };
+                    const attr_expr = try self.makeAttribute(container, attr_name, .store);
                     const stmt = try self.makeAssign(attr_expr, value);
                     try stmts.append(stmts_allocator, stmt);
                 },
@@ -1919,7 +1902,7 @@ pub const Decompiler = struct {
         if (block_id >= self.cfg.blocks.len) return null;
         const block = &self.cfg.blocks[block_id];
 
-        var sim = SimContext.init(self.arena.allocator(), self.arena.allocator(), self.code, self.version);
+        var sim = self.initSim(self.arena.allocator(), self.arena.allocator(), self.code, self.version);
         defer sim.deinit();
 
         for (base_vals) |val| {
@@ -1945,7 +1928,7 @@ pub const Decompiler = struct {
         if (block_id >= self.cfg.blocks.len) return null;
         const block = &self.cfg.blocks[block_id];
 
-        var sim = SimContext.init(self.arena.allocator(), self.arena.allocator(), self.code, self.version);
+        var sim = self.initSim(self.arena.allocator(), self.arena.allocator(), self.code, self.version);
         defer sim.deinit();
 
         for (base_vals) |val| {
@@ -1973,7 +1956,7 @@ pub const Decompiler = struct {
         const block = &self.cfg.blocks[block_id];
         if (skip > block.instructions.len) return null;
 
-        var sim = SimContext.init(self.arena.allocator(), self.arena.allocator(), self.code, self.version);
+        var sim = self.initSim(self.arena.allocator(), self.arena.allocator(), self.code, self.version);
         defer sim.deinit();
 
         for (base_vals) |val| {
@@ -2002,7 +1985,7 @@ pub const Decompiler = struct {
         const block = &self.cfg.blocks[block_id];
         if (skip > block.instructions.len) return null;
 
-        var sim = SimContext.init(self.arena.allocator(), self.arena.allocator(), self.code, self.version);
+        var sim = self.initSim(self.arena.allocator(), self.arena.allocator(), self.code, self.version);
         defer sim.deinit();
 
         for (base_vals) |val| {
@@ -2063,7 +2046,7 @@ pub const Decompiler = struct {
         if (block_id >= self.cfg.blocks.len) return null;
         const cond_block = &self.cfg.blocks[block_id];
 
-        var cond_sim = SimContext.init(self.arena.allocator(), self.arena.allocator(), self.code, self.version);
+        var cond_sim = self.initSim(self.arena.allocator(), self.arena.allocator(), self.code, self.version);
         defer cond_sim.deinit();
         cond_sim.lenient = true;
 
@@ -2756,7 +2739,7 @@ pub const Decompiler = struct {
             }
         }
 
-        var sim = SimContext.init(self.arena.allocator(), self.arena.allocator(), self.code, self.version);
+        var sim = self.initSim(self.arena.allocator(), self.arena.allocator(), self.code, self.version);
         defer sim.deinit();
 
         // Determine simulation start point based on pattern type
@@ -2772,7 +2755,7 @@ pub const Decompiler = struct {
             } else {
                 // Python 3.12+: BUILD_LIST after GET_ITER
                 // Simulate setup code to get iterator expression, then start from GET_ITER
-                var setup_sim = SimContext.init(self.arena.allocator(), self.arena.allocator(), self.code, self.version);
+                var setup_sim = self.initSim(self.arena.allocator(), self.arena.allocator(), self.code, self.version);
                 defer setup_sim.deinit();
 
                 var setup_iter = decoder.InstructionIterator.init(self.code.code, self.version);
@@ -2787,12 +2770,12 @@ pub const Decompiler = struct {
                     switch (val) {
                         .expr => |e| try sim.stack.push(.{ .expr = e }),
                         else => {
-                            const iter_placeholder = try ast.makeName(self.arena.allocator(), ".iter", .load);
+                            const iter_placeholder = try self.makeName(".iter", .load);
                             try sim.stack.push(.{ .expr = iter_placeholder });
                         },
                     }
                 } else {
-                    const iter_placeholder = try ast.makeName(self.arena.allocator(), ".iter", .load);
+                    const iter_placeholder = try self.makeName(".iter", .load);
                     try sim.stack.push(.{ .expr = iter_placeholder });
                 }
                 sim_start = gio;
@@ -2933,7 +2916,7 @@ pub const Decompiler = struct {
         }
 
         const cond_block = &self.cfg.blocks[pattern.condition_block];
-        var cond_sim = SimContext.init(self.arena.allocator(), self.arena.allocator(), self.code, self.version);
+        var cond_sim = self.initSim(self.arena.allocator(), self.arena.allocator(), self.code, self.version);
         defer cond_sim.deinit();
         if (pattern.condition_block < self.stack_in.len) {
             if (self.stack_in[pattern.condition_block]) |entry| {
@@ -2991,7 +2974,7 @@ pub const Decompiler = struct {
         const final_merge = bool_result.merge_block;
 
         // Process merge block with the bool expression on stack
-        var merge_sim = SimContext.init(self.arena.allocator(), self.arena.allocator(), self.code, self.version);
+        var merge_sim = self.initSim(self.arena.allocator(), self.arena.allocator(), self.code, self.version);
         defer merge_sim.deinit();
         const merge_entry = if (final_merge < self.stack_in.len) self.stack_in[final_merge] else null;
         const merge_seed = merge_entry orelse base_vals;
@@ -3413,7 +3396,7 @@ pub const Decompiler = struct {
         if (block_id >= self.cfg.blocks.len) return;
         const block = &self.cfg.blocks[block_id];
 
-        var sim = SimContext.init(self.arena.allocator(), self.arena.allocator(), self.code, self.version);
+        var sim = self.initSim(self.arena.allocator(), self.arena.allocator(), self.code, self.version);
         defer sim.deinit();
         if (self.hasExceptionSuccessor(block) or self.hasWithExitCleanup(block)) {
             sim.lenient = true;
@@ -3525,7 +3508,7 @@ pub const Decompiler = struct {
         if (block_id >= self.cfg.blocks.len) return;
         const block = &self.cfg.blocks[block_id];
 
-        var sim = SimContext.init(self.arena.allocator(), self.arena.allocator(), self.code, self.version);
+        var sim = self.initSim(self.arena.allocator(), self.arena.allocator(), self.code, self.version);
         defer sim.deinit();
         if (self.hasExceptionSuccessor(block) or self.hasWithExitCleanup(block)) {
             sim.lenient = true;
@@ -3636,7 +3619,7 @@ pub const Decompiler = struct {
             const sim_start = idx + 1;
 
             // Simulate to get the comparison
-            var then_sim = SimContext.init(self.arena.allocator(), self.arena.allocator(), self.code, self.version);
+            var then_sim = self.initSim(self.arena.allocator(), self.arena.allocator(), self.code, self.version);
             defer then_sim.deinit();
             try then_sim.stack.push(.{ .expr = current_mid });
 
@@ -3754,7 +3737,7 @@ pub const Decompiler = struct {
         var msg: ?*Expr = null;
         if (block.instructions[i].opcode == .LOAD_CONST) {
             const const_idx = block.instructions[i].arg;
-            var sim = SimContext.init(self.arena.allocator(), self.arena.allocator(), self.code, self.version);
+            var sim = self.initSim(self.arena.allocator(), self.arena.allocator(), self.code, self.version);
             defer sim.deinit();
             if (sim.getConst(const_idx)) |obj| {
                 msg = try sim.objToExpr(obj);
@@ -3800,7 +3783,7 @@ pub const Decompiler = struct {
         const cond_block = &self.cfg.blocks[pattern.condition_block];
 
         // Get the condition expression from the last instruction before the jump
-        var sim = SimContext.init(self.arena.allocator(), self.arena.allocator(), self.code, self.version);
+        var sim = self.initSim(self.arena.allocator(), self.arena.allocator(), self.code, self.version);
         defer sim.deinit();
 
         if (pattern.condition_block < self.stack_in.len) {
@@ -3965,7 +3948,7 @@ pub const Decompiler = struct {
         const header = &self.cfg.blocks[pattern.header_block];
 
         // Get the condition expression
-        var sim = SimContext.init(self.arena.allocator(), self.arena.allocator(), self.code, self.version);
+        var sim = self.initSim(self.arena.allocator(), self.arena.allocator(), self.code, self.version);
         defer sim.deinit();
 
         var cond_idx: usize = header.instructions.len;
@@ -3989,7 +3972,7 @@ pub const Decompiler = struct {
                     const else_is_exit = else_id == pattern.exit_block;
                     const then_in_loop = self.dom.isInLoop(guard.then_block, pattern.header_block);
                     if (merge_is_then and else_is_exit and then_in_loop) {
-                        var guard_sim = SimContext.init(self.arena.allocator(), self.arena.allocator(), self.code, self.version);
+                        var guard_sim = self.initSim(self.arena.allocator(), self.arena.allocator(), self.code, self.version);
                         defer guard_sim.deinit();
                         const guard_block = &self.cfg.blocks[guard.condition_block];
                         for (guard_block.instructions) |inst| {
@@ -4240,7 +4223,7 @@ pub const Decompiler = struct {
         const aiter_block_id = aiter_id orelse setup_block_id;
         const aiter_block = &self.cfg.blocks[aiter_block_id];
 
-        var sim = SimContext.init(self.arena.allocator(), self.arena.allocator(), self.code, self.version);
+        var sim = self.initSim(self.arena.allocator(), self.arena.allocator(), self.code, self.version);
         defer sim.deinit();
         for (aiter_block.instructions) |inst| {
             if (inst.opcode == .GET_AITER) break;
@@ -4280,9 +4263,7 @@ pub const Decompiler = struct {
                             .STORE_NAME, .STORE_GLOBAL => sim.getName(store_inst.arg) orelse "_",
                             else => return null,
                         };
-                        const name_expr = try a.create(Expr);
-                        name_expr.* = .{ .name = .{ .id = name, .ctx = .store } };
-                        elts[j] = name_expr;
+                        elts[j] = try self.makeName(name, .store);
                     }
                     target = try a.create(Expr);
                     target.* = .{ .tuple = .{ .elts = elts, .ctx = .store } };
@@ -4291,19 +4272,19 @@ pub const Decompiler = struct {
                 },
                 .STORE_FAST => {
                     const name = sim.getLocal(inst.arg) orelse "_";
-                    target = try ast.makeName(a, name, .store);
+                    target = try self.makeName(name, .store);
                     found_target = true;
                     break;
                 },
                 .STORE_DEREF => {
                     const name = sim.getDeref(inst.arg) orelse "_";
-                    target = try ast.makeName(a, name, .store);
+                    target = try self.makeName(name, .store);
                     found_target = true;
                     break;
                 },
                 .STORE_NAME, .STORE_GLOBAL => {
                     const name = sim.getName(inst.arg) orelse "_";
-                    target = try ast.makeName(a, name, .store);
+                    target = try self.makeName(name, .store);
                     found_target = true;
                     break;
                 },
@@ -4744,7 +4725,7 @@ pub const Decompiler = struct {
     fn decompileWith(self: *Decompiler, pattern: ctrl.WithPattern) DecompileError!PatternResult {
         const a = self.arena.allocator();
         const setup = &self.cfg.blocks[pattern.setup_block];
-        var sim = SimContext.init(a, a, self.code, self.version);
+        var sim = self.initSim(a, a, self.code, self.version);
         defer sim.deinit();
 
         var is_async = false;
@@ -4788,12 +4769,12 @@ pub const Decompiler = struct {
                 switch (first.opcode) {
                     .STORE_FAST => {
                         if (sim.getLocal(first.arg)) |name| {
-                            optional_vars = try ast.makeName(a, name, .store);
+                            optional_vars = try self.makeName(name, .store);
                         }
                     },
                     .STORE_NAME, .STORE_GLOBAL => {
                         if (sim.getName(first.arg)) |name| {
-                            optional_vars = try ast.makeName(a, name, .store);
+                            optional_vars = try self.makeName(name, .store);
                         }
                     },
                     else => {},
@@ -4838,7 +4819,7 @@ pub const Decompiler = struct {
                 }
             }
             if (init_stack.len == 0) {
-                const exit_expr = try ast.makeName(a, "__with_exit__", .load);
+                const exit_expr = try self.makeName("__with_exit__", .load);
                 const seed = try a.alloc(StackValue, 2);
                 seed[0] = .{ .expr = exit_expr };
                 seed[1] = .unknown;
@@ -4893,7 +4874,7 @@ pub const Decompiler = struct {
             }
             if (!has_normal) continue;
 
-            var pred_sim = SimContext.init(a, a, self.code, self.version);
+            var pred_sim = self.initSim(a, a, self.code, self.version);
             defer pred_sim.deinit();
             pred_sim.lenient = true;
             pred_sim.stack.allow_underflow = true;
@@ -4928,7 +4909,7 @@ pub const Decompiler = struct {
         // Get subject from subject block - simulate only until MATCH_* or COPY
         const subj_block = &self.cfg.blocks[pattern.subject_block];
         const a = self.arena.allocator();
-        var sim = SimContext.init(a, a, self.code, self.version);
+        var sim = self.initSim(a, a, self.code, self.version);
         defer sim.deinit();
         var prev_was_load = false;
         for (subj_block.instructions) |inst| {
@@ -5183,7 +5164,7 @@ pub const Decompiler = struct {
         if (end_idx == 0 or end_idx <= first_idx.?) return;
         var tmp = block.*;
         tmp.instructions = block.instructions[0..end_idx];
-        var sim = SimContext.init(self.arena.allocator(), self.arena.allocator(), self.code, self.version);
+        var sim = self.initSim(self.arena.allocator(), self.arena.allocator(), self.code, self.version);
         defer sim.deinit();
         try self.processBlockWithSimAndSkip(&tmp, &sim, stmts, stmts_allocator, 0);
     }
@@ -5207,13 +5188,13 @@ pub const Decompiler = struct {
                 break;
             } else if (inst.opcode == .STORE_FAST_LOAD_FAST) {
                 const a = self.arena.allocator();
-                var sim = SimContext.init(a, a, self.code, self.version);
+                var sim = self.initSim(a, a, self.code, self.version);
                 defer sim.deinit();
 
                 const load_idx = inst.arg & 0xF;
                 if (load_idx < self.code.varnames.len) {
                     const name = self.code.varnames[load_idx];
-                    const expr = try ast.makeName(a, name, .load);
+                    const expr = try self.makeName(name, .load);
                     try sim.stack.push(.{ .expr = expr });
 
                     for (block.instructions[i + 1 ..]) |g_inst| {
@@ -5239,7 +5220,7 @@ pub const Decompiler = struct {
 
                         if (same_var) {
                             const a = self.arena.allocator();
-                            var sim = SimContext.init(a, a, self.code, self.version);
+                            var sim = self.initSim(a, a, self.code, self.version);
                             defer sim.deinit();
                             for (block.instructions[j..]) |g_inst| {
                                 if (g_inst.opcode == .POP_JUMP_IF_FALSE or g_inst.opcode == .POP_JUMP_FORWARD_IF_FALSE) break;
@@ -5257,7 +5238,7 @@ pub const Decompiler = struct {
 
         if (guard_start) |start| {
             const a = self.arena.allocator();
-            var sim = SimContext.init(a, a, self.code, self.version);
+            var sim = self.initSim(a, a, self.code, self.version);
             defer sim.deinit();
             for (block.instructions[start..]) |g_inst| {
                 if (g_inst.opcode == .POP_JUMP_IF_FALSE or g_inst.opcode == .POP_JUMP_FORWARD_IF_FALSE) break;
@@ -5293,7 +5274,7 @@ pub const Decompiler = struct {
         if (start_idx == null) return null;
 
         const a = self.arena.allocator();
-        var sim = SimContext.init(a, a, self.code, self.version);
+        var sim = self.initSim(a, a, self.code, self.version);
         defer sim.deinit();
         for (block.instructions[start_idx.?..]) |g_inst| {
             if (g_inst.opcode == .POP_JUMP_IF_FALSE or g_inst.opcode == .POP_JUMP_FORWARD_IF_FALSE) break;
@@ -5320,7 +5301,7 @@ pub const Decompiler = struct {
                 const load_idx = inst.arg & 0xF;
                 if (load_idx >= self.code.varnames.len) return null;
                 const name = self.code.varnames[load_idx];
-                const expr = try ast.makeName(self.arena.allocator(), name, .load);
+                const expr = try self.makeName(name, .load);
                 return .{ .idx = i + 1, .preload = expr };
             }
             if (inst.opcode == .STORE_FAST_STORE_FAST) {
@@ -5333,7 +5314,7 @@ pub const Decompiler = struct {
                         const load_idx = block.instructions[j].arg & 0xF;
                         if (load_idx < self.code.varnames.len) {
                             const name = self.code.varnames[load_idx];
-                            preload = try ast.makeName(self.arena.allocator(), name, .load);
+                            preload = try self.makeName(name, .load);
                         }
                         continue;
                     }
@@ -5469,7 +5450,7 @@ pub const Decompiler = struct {
         var guard_exprs: std.ArrayList(*Expr) = .{};
         errdefer guard_exprs.deinit(self.allocator);
 
-        var sim = SimContext.init(self.arena.allocator(), self.arena.allocator(), self.code, self.version);
+        var sim = self.initSim(self.arena.allocator(), self.arena.allocator(), self.code, self.version);
         defer sim.deinit();
 
         for (blocks) |bid| {
@@ -5488,7 +5469,7 @@ pub const Decompiler = struct {
                         const load_idx = inst.arg & 0xF;
                         if (load_idx < self.code.varnames.len) {
                             const name = self.code.varnames[load_idx];
-                            const expr = try ast.makeName(self.arena.allocator(), name, .load);
+                            const expr = try self.makeName(name, .load);
                             try sim.stack.push(.{ .expr = expr });
                         } else {
                             try sim.stack.push(.unknown);
@@ -5687,7 +5668,7 @@ pub const Decompiler = struct {
                 const names = try a.alloc([]const u8, items.len);
                 for (items, 0..) |item, i| {
                     switch (item) {
-                        .string => |s| names[i] = s,
+                        .string => |s| names[i] = try self.unmangleClassName(s),
                         else => return null,
                     }
                 }
@@ -5976,8 +5957,9 @@ pub const Decompiler = struct {
                     self.code.names[vblk.instructions[i].arg]
                 else
                     self.code.varnames[vblk.instructions[i].arg];
+                const unmangled = try self.unmangleClassName(name);
                 const p = try a.create(ast.Pattern);
-                p.* = .{ .match_as = .{ .pattern = null, .name = name } };
+                p.* = .{ .match_as = .{ .pattern = null, .name = unmangled } };
                 pats[filled] = p;
                 filled += 1;
                 continue;
@@ -5987,15 +5969,17 @@ pub const Decompiler = struct {
                 const idx2 = vblk.instructions[i].arg & 0xF;
                 if (filled < k.len) {
                     const name1 = self.code.varnames[idx1];
+                    const unmangled1 = try self.unmangleClassName(name1);
                     const p1 = try a.create(ast.Pattern);
-                    p1.* = .{ .match_as = .{ .pattern = null, .name = name1 } };
+                    p1.* = .{ .match_as = .{ .pattern = null, .name = unmangled1 } };
                     pats[filled] = p1;
                     filled += 1;
                 }
                 if (filled < k.len) {
                     const name2 = self.code.varnames[idx2];
+                    const unmangled2 = try self.unmangleClassName(name2);
                     const p2 = try a.create(ast.Pattern);
-                    p2.* = .{ .match_as = .{ .pattern = null, .name = name2 } };
+                    p2.* = .{ .match_as = .{ .pattern = null, .name = unmangled2 } };
                     pats[filled] = p2;
                     filled += 1;
                 }
@@ -6039,19 +6023,19 @@ pub const Decompiler = struct {
                     .LOAD_GLOBAL => {
                         if (inst.arg < self.code.names.len) {
                             const name = self.code.names[inst.arg];
-                            last_cls = try ast.makeName(a, name, .load);
+                            last_cls = try self.makeName(name, .load);
                         }
                     },
                     .LOAD_NAME => {
                         if (inst.arg < self.code.names.len) {
                             const name = self.code.names[inst.arg];
-                            last_cls = try ast.makeName(a, name, .load);
+                            last_cls = try self.makeName(name, .load);
                         }
                     },
                     .LOAD_FAST, .LOAD_FAST_BORROW => {
                         if (inst.arg < self.code.varnames.len) {
                             const name = self.code.varnames[inst.arg];
-                            last_cls = try ast.makeName(a, name, .load);
+                            last_cls = try self.makeName(name, .load);
                         }
                     },
                     .LOAD_CONST => {
@@ -6108,8 +6092,9 @@ pub const Decompiler = struct {
                     self.code.names[vblk.instructions[i].arg]
                 else
                     self.code.varnames[vblk.instructions[i].arg];
+                const unmangled = try self.unmangleClassName(name);
                 const p = try a.create(ast.Pattern);
-                p.* = .{ .match_as = .{ .pattern = null, .name = name } };
+                p.* = .{ .match_as = .{ .pattern = null, .name = unmangled } };
                 pats[filled] = p;
                 filled += 1;
                 continue;
@@ -6119,10 +6104,12 @@ pub const Decompiler = struct {
                 const idx2 = vblk.instructions[i].arg & 0xF;
                 const name1 = self.code.varnames[idx1];
                 const name2 = self.code.varnames[idx2];
+                const unmangled1 = try self.unmangleClassName(name1);
+                const unmangled2 = try self.unmangleClassName(name2);
                 const p1 = try a.create(ast.Pattern);
-                p1.* = .{ .match_as = .{ .pattern = null, .name = name1 } };
+                p1.* = .{ .match_as = .{ .pattern = null, .name = unmangled1 } };
                 const p2 = try a.create(ast.Pattern);
-                p2.* = .{ .match_as = .{ .pattern = null, .name = name2 } };
+                p2.* = .{ .match_as = .{ .pattern = null, .name = unmangled2 } };
                 pats[filled] = p1;
                 pats[filled + 1] = p2;
                 filled += 2;
@@ -6176,8 +6163,9 @@ pub const Decompiler = struct {
                         self.code.names[all_insts.items[k].arg]
                     else
                         self.code.varnames[all_insts.items[k].arg];
+                    const unmangled = try self.unmangleClassName(name);
                     const p = try a.create(ast.Pattern);
-                    p.* = .{ .match_as = .{ .pattern = null, .name = name } };
+                    p.* = .{ .match_as = .{ .pattern = null, .name = unmangled } };
                     pats2[filled2] = p;
                     filled2 += 1;
                     continue;
@@ -6187,10 +6175,12 @@ pub const Decompiler = struct {
                     const idx2 = all_insts.items[k].arg & 0xF;
                     const name1 = self.code.varnames[idx1];
                     const name2 = self.code.varnames[idx2];
+                    const unmangled1 = try self.unmangleClassName(name1);
+                    const unmangled2 = try self.unmangleClassName(name2);
                     const p1 = try a.create(ast.Pattern);
-                    p1.* = .{ .match_as = .{ .pattern = null, .name = name1 } };
+                    p1.* = .{ .match_as = .{ .pattern = null, .name = unmangled1 } };
                     const p2 = try a.create(ast.Pattern);
-                    p2.* = .{ .match_as = .{ .pattern = null, .name = name2 } };
+                    p2.* = .{ .match_as = .{ .pattern = null, .name = unmangled2 } };
                     if (filled2 < attr_list.len) {
                         pats2[filled2] = p1;
                         filled2 += 1;
@@ -6622,7 +6612,7 @@ pub const Decompiler = struct {
                     var stmts: std.ArrayList(*Stmt) = .{};
                     defer stmts.deinit(a);
 
-                    var sim = SimContext.init(a, a, self.code, self.version);
+                    var sim = self.initSim(a, a, self.code, self.version);
                     defer sim.deinit();
 
                     for (body_insts.items) |inst| {
@@ -6657,7 +6647,7 @@ pub const Decompiler = struct {
                         var stmts: std.ArrayList(*Stmt) = .{};
                         defer stmts.deinit(a);
 
-                        var sim = SimContext.init(a, a, self.code, self.version);
+                        var sim = self.initSim(a, a, self.code, self.version);
                         defer sim.deinit();
 
                         for (fb_insts.items) |inst| {
@@ -6844,7 +6834,7 @@ pub const Decompiler = struct {
                     const aa = self.arena.allocator();
                     var stmts: std.ArrayList(*Stmt) = .{};
                     defer stmts.deinit(aa);
-                    var sim = SimContext.init(aa, aa, self.code, self.version);
+                    var sim = self.initSim(aa, aa, self.code, self.version);
                     defer sim.deinit();
 
                     for (final_block.instructions[start..]) |inst| {
@@ -6877,7 +6867,7 @@ pub const Decompiler = struct {
                         const aa = self.arena.allocator();
                         var stmts: std.ArrayList(*Stmt) = .{};
                         defer stmts.deinit(aa);
-                        var sim = SimContext.init(aa, aa, self.code, self.version);
+                        var sim = self.initSim(aa, aa, self.code, self.version);
                         defer sim.deinit();
 
                         for (fb_insts.items) |inst| {
@@ -6959,7 +6949,7 @@ pub const Decompiler = struct {
 
     pub fn extractMatchPatternFromInsts(self: *Decompiler, insts: []const cfg_mod.Instruction, subject_on_stack: bool) DecompileError!*ast.Pattern {
         const a = self.arena.allocator();
-        var sim = SimContext.init(a, a, self.code, self.version);
+        var sim = self.initSim(a, a, self.code, self.version);
         defer sim.deinit();
 
         var subject_expr: ?*Expr = null;
@@ -7062,7 +7052,7 @@ pub const Decompiler = struct {
                     prev_was_load = true;
                     prev_was_get_len = false;
                     const name = self.code.names[inst.arg];
-                    last_cls = try ast.makeName(a, name, .load);
+                    last_cls = try self.makeName(name, .load);
                     try sim.simulate(inst);
                     if (subject_expr == null) {
                         const items = sim.stack.items.items;
@@ -7092,7 +7082,7 @@ pub const Decompiler = struct {
                     prev_was_load = false;
                     prev_was_get_len = false;
                     const name = self.code.names[inst.arg];
-                    last_cls = try ast.makeName(a, name, .load);
+                    last_cls = try self.makeName(name, .load);
                     try sim.simulate(inst);
                     if (subject_expr == null) {
                         const items = sim.stack.items.items;
@@ -7182,8 +7172,9 @@ pub const Decompiler = struct {
                                         self.code.names[insts[j].arg]
                                     else
                                         self.code.varnames[insts[j].arg];
+                                    const unmangled = try self.unmangleClassName(name);
                                     const p = try a.create(ast.Pattern);
-                                    p.* = .{ .match_as = .{ .pattern = null, .name = name } };
+                                    p.* = .{ .match_as = .{ .pattern = null, .name = unmangled } };
                                     pats[filled] = p;
                                     filled += 1;
                                     continue;
@@ -7245,18 +7236,20 @@ pub const Decompiler = struct {
                         const idx2 = inst.arg & 0xF;
                         const name1 = self.code.varnames[idx1];
                         const name2 = self.code.varnames[idx2];
+                        const unmangled1 = try self.unmangleClassName(name1);
+                        const unmangled2 = try self.unmangleClassName(name2);
                         const pat1 = try a.create(ast.Pattern);
                         const pat2 = try a.create(ast.Pattern);
                         if (unpack_ex_active and unpack_ex_seen == unpack_ex_before) {
-                            pat1.* = .{ .match_star = name1 };
+                            pat1.* = .{ .match_star = unmangled1 };
                         } else {
-                            pat1.* = .{ .match_as = .{ .pattern = null, .name = name1 } };
+                            pat1.* = .{ .match_as = .{ .pattern = null, .name = unmangled1 } };
                         }
                         unpack_ex_seen += 1;
                         if (unpack_ex_active and unpack_ex_seen == unpack_ex_before) {
-                            pat2.* = .{ .match_star = name2 };
+                            pat2.* = .{ .match_star = unmangled2 };
                         } else {
-                            pat2.* = .{ .match_as = .{ .pattern = null, .name = name2 } };
+                            pat2.* = .{ .match_as = .{ .pattern = null, .name = unmangled2 } };
                         }
                         unpack_ex_seen += 1;
                         if (unpack_ex_active and unpack_ex_seen >= unpack_ex_before + unpack_ex_after + 1) {
@@ -7268,7 +7261,8 @@ pub const Decompiler = struct {
                         if (try self.finishSeq(&seq_stack)) |seq_pat| {
                             if (self.findAsName(insts, idx)) |as_name| {
                                 const as_pat = try a.create(ast.Pattern);
-                                as_pat.* = .{ .match_as = .{ .pattern = seq_pat, .name = as_name } };
+                                const unmangled_as = try self.unmangleClassName(as_name);
+                                as_pat.* = .{ .match_as = .{ .pattern = seq_pat, .name = unmangled_as } };
                                 return as_pat;
                             }
                             return seq_pat;
@@ -7282,11 +7276,13 @@ pub const Decompiler = struct {
                             const idx2 = inst.arg & 0xF;
                             const name1 = self.code.varnames[idx1];
                             const name2 = self.code.varnames[idx2];
+                            const unmangled1 = try self.unmangleClassName(name1);
+                            const unmangled2 = try self.unmangleClassName(name2);
 
                             const pat1 = try a.create(ast.Pattern);
-                            pat1.* = .{ .match_as = .{ .pattern = null, .name = name1 } };
+                            pat1.* = .{ .match_as = .{ .pattern = null, .name = unmangled1 } };
                             const pat2 = try a.create(ast.Pattern);
-                            pat2.* = .{ .match_as = .{ .pattern = null, .name = name2 } };
+                            pat2.* = .{ .match_as = .{ .pattern = null, .name = unmangled2 } };
 
                             if (class_info) |ci| {
                                 const pats = try a.alloc(*ast.Pattern, 2);
@@ -7309,7 +7305,8 @@ pub const Decompiler = struct {
                                 if (try self.finishSeq(&seq_stack)) |seq_pat| {
                                     if (self.findAsName(insts, idx)) |as_name| {
                                         const as_pat = try a.create(ast.Pattern);
-                                        as_pat.* = .{ .match_as = .{ .pattern = seq_pat, .name = as_name } };
+                                        const unmangled_as = try self.unmangleClassName(as_name);
+                                        as_pat.* = .{ .match_as = .{ .pattern = seq_pat, .name = unmangled_as } };
                                         return as_pat;
                                     }
                                     return seq_pat;
@@ -7322,7 +7319,8 @@ pub const Decompiler = struct {
                                 pat.* = .{ .match_sequence = pats };
                                 if (self.findAsName(insts, idx)) |as_name| {
                                     const as_pat = try a.create(ast.Pattern);
-                                    as_pat.* = .{ .match_as = .{ .pattern = pat, .name = as_name } };
+                                    const unmangled_as = try self.unmangleClassName(as_name);
+                                    as_pat.* = .{ .match_as = .{ .pattern = pat, .name = unmangled_as } };
                                     return as_pat;
                                 }
                                 return pat;
@@ -7336,8 +7334,9 @@ pub const Decompiler = struct {
                     if (seq_stack.items.len > 0) {
                         const load_idx = inst.arg & 0xF;
                         const name = self.code.varnames[load_idx];
+                        const unmangled = try self.unmangleClassName(name);
                         const pat = try a.create(ast.Pattern);
-                        pat.* = .{ .match_as = .{ .pattern = null, .name = name } };
+                        pat.* = .{ .match_as = .{ .pattern = null, .name = unmangled } };
                         var top = &seq_stack.items[seq_stack.items.len - 1];
                         try top.items.append(self.allocator, pat);
                         if (try self.finishSeq(&seq_stack)) |seq_pat| return seq_pat;
@@ -7347,8 +7346,9 @@ pub const Decompiler = struct {
                         if (count == 1) {
                             const load_idx = inst.arg & 0xF;
                             const name = self.code.varnames[load_idx];
+                            const unmangled = try self.unmangleClassName(name);
                             const pat1 = try a.create(ast.Pattern);
-                            pat1.* = .{ .match_as = .{ .pattern = null, .name = name } };
+                            pat1.* = .{ .match_as = .{ .pattern = null, .name = unmangled } };
 
                             const pats = try a.alloc(*ast.Pattern, 1);
                             pats[0] = pat1;
@@ -7360,8 +7360,9 @@ pub const Decompiler = struct {
                     } else {
                         const load_idx = inst.arg & 0xF;
                         const name = self.code.varnames[load_idx];
+                        const unmangled = try self.unmangleClassName(name);
                         const pat = try a.create(ast.Pattern);
-                        pat.* = .{ .match_as = .{ .pattern = null, .name = name } };
+                        pat.* = .{ .match_as = .{ .pattern = null, .name = unmangled } };
                         return pat;
                     }
                 },
@@ -7371,11 +7372,12 @@ pub const Decompiler = struct {
                             self.code.names[inst.arg]
                         else
                             self.code.varnames[inst.arg];
+                        const unmangled = try self.unmangleClassName(name);
                         const pat = try a.create(ast.Pattern);
                         if (unpack_ex_active and unpack_ex_seen == unpack_ex_before) {
-                            pat.* = .{ .match_star = name };
+                            pat.* = .{ .match_star = unmangled };
                         } else {
-                            pat.* = .{ .match_as = .{ .pattern = null, .name = name } };
+                            pat.* = .{ .match_as = .{ .pattern = null, .name = unmangled } };
                         }
                         var top = &seq_stack.items[seq_stack.items.len - 1];
                         try top.items.append(self.allocator, pat);
@@ -7392,9 +7394,10 @@ pub const Decompiler = struct {
                             self.code.names[inst.arg]
                         else
                             self.code.varnames[inst.arg];
+                        const unmangled = try self.unmangleClassName(name);
 
                         const pat = try self.arena.allocator().create(ast.Pattern);
-                        pat.* = .{ .match_as = .{ .pattern = null, .name = name } };
+                        pat.* = .{ .match_as = .{ .pattern = null, .name = unmangled } };
                         return pat;
                     }
                     prev_was_load = false;
@@ -7432,8 +7435,9 @@ pub const Decompiler = struct {
                                 self.code.names[insts[j].arg]
                             else
                                 self.code.varnames[insts[j].arg];
+                            const unmangled = try self.unmangleClassName(name);
                             const p = try a.create(ast.Pattern);
-                            p.* = .{ .match_as = .{ .pattern = null, .name = name } };
+                            p.* = .{ .match_as = .{ .pattern = null, .name = unmangled } };
                             pats[filled] = p;
                             filled += 1;
                             continue;
@@ -7753,7 +7757,7 @@ pub const Decompiler = struct {
             var exc_name: ?[]const u8 = null;
             var body_skip: usize = 0;
 
-            var sim = SimContext.init(a, a, self.code, self.version);
+            var sim = self.initSim(a, a, self.code, self.version);
             defer sim.deinit();
 
             var seen_push_exc = false;
@@ -8056,7 +8060,7 @@ pub const Decompiler = struct {
         if (handler_block >= self.cfg.blocks.len) return error.InvalidBlock;
         const block = &self.cfg.blocks[handler_block];
         const a = self.arena.allocator();
-        var sim = SimContext.init(a, a, self.code, self.version);
+        var sim = self.initSim(a, a, self.code, self.version);
         defer sim.deinit();
         sim.lenient = true;
         sim.stack.allow_underflow = true;
@@ -8104,7 +8108,7 @@ pub const Decompiler = struct {
                         else => null,
                     };
                     if (exc_name) |n| {
-                        exc_type = try ast.makeName(a, n, .load);
+                        exc_type = try self.makeName(n, .load);
                         break;
                     }
                 }
@@ -8286,7 +8290,7 @@ pub const Decompiler = struct {
             head.instructions = head.instructions[skip..];
         }
 
-        var sim = SimContext.init(a, a, self.code, self.version);
+        var sim = self.initSim(a, a, self.code, self.version);
         defer sim.deinit();
         sim.lenient = true;
         sim.stack.allow_underflow = true;
@@ -8538,7 +8542,7 @@ pub const Decompiler = struct {
         const setup = &self.cfg.blocks[pattern.setup_block];
         const header = &self.cfg.blocks[pattern.header_block];
 
-        var iter_sim = SimContext.init(self.arena.allocator(), self.arena.allocator(), self.code, self.version);
+        var iter_sim = self.initSim(self.arena.allocator(), self.arena.allocator(), self.code, self.version);
         defer iter_sim.deinit();
 
         if (pattern.setup_block < self.stack_in.len) {
@@ -8588,7 +8592,7 @@ pub const Decompiler = struct {
                         self.code.varnames[inst.arg]
                     else
                         "_";
-                    target = try ast.makeName(a, name, .store);
+                    target = try self.makeName(name, .store);
                     found_target = true;
                     break;
                 },
@@ -8597,7 +8601,7 @@ pub const Decompiler = struct {
                         self.code.names[inst.arg]
                     else
                         "_";
-                    target = try ast.makeName(a, name, .store);
+                    target = try self.makeName(name, .store);
                     found_target = true;
                     break;
                 },
@@ -8613,9 +8617,7 @@ pub const Decompiler = struct {
                         // For now, create placeholder names
                         var elts = try a.alloc(*Expr, count);
                         for (0..count) |idx| {
-                            const placeholder = try a.create(Expr);
-                            placeholder.* = .{ .name = .{ .id = "_", .ctx = .store } };
-                            elts[idx] = placeholder;
+                            elts[idx] = try self.makeName("_", .store);
                         }
                         target = try a.create(Expr);
                         target.* = .{ .tuple = .{ .elts = elts, .ctx = .store } };
@@ -8628,7 +8630,7 @@ pub const Decompiler = struct {
         }
 
         if (!found_target) {
-            target = try ast.makeName(a, "_", .store);
+            target = try self.makeName("_", .store);
         }
 
         // Decompile the body (skip the first STORE_FAST which is the target)
@@ -8805,7 +8807,7 @@ pub const Decompiler = struct {
         loop_header: ?u32,
     ) DecompileError!void {
         const a = self.arena.allocator();
-        var sim = SimContext.init(a, a, self.code, self.version);
+        var sim = self.initSim(a, a, self.code, self.version);
         defer sim.deinit();
         if (self.hasExceptionSuccessor(block) or self.hasWithExitCleanup(block)) {
             sim.lenient = true;
@@ -8997,7 +8999,7 @@ pub const Decompiler = struct {
                         key.* == .constant and key.constant == .string)
                     {
                         const var_name = key.constant.string;
-                        const target = try ast.makeName(a, var_name, .store);
+                        const target = try self.makeName(var_name, .store);
 
                         // Check if previous statement was an assignment to the same variable
                         // Pattern: x = value; __annotations__['x'] = type => x: type = value
@@ -9151,7 +9153,7 @@ pub const Decompiler = struct {
         skip_first_store: *bool,
         stop_idx: ?usize,
     ) DecompileError!void {
-        var sim = SimContext.init(self.arena.allocator(), self.arena.allocator(), self.code, self.version);
+        var sim = self.initSim(self.arena.allocator(), self.arena.allocator(), self.code, self.version);
         sim.lenient = true;
         defer sim.deinit();
 
@@ -9266,7 +9268,7 @@ pub const Decompiler = struct {
         const legacy_cond = if (term) |t| t.opcode == .JUMP_IF_FALSE or t.opcode == .JUMP_IF_TRUE else false;
 
         // Get the condition expression
-        var sim = SimContext.init(self.arena.allocator(), self.arena.allocator(), self.code, self.version);
+        var sim = self.initSim(self.arena.allocator(), self.arena.allocator(), self.code, self.version);
         defer sim.deinit();
         sim.lenient = true;
         sim.stack.allow_underflow = true;
@@ -9502,12 +9504,38 @@ pub const Decompiler = struct {
         return out;
     }
 
+    fn unmangleClassName(self: *Decompiler, name: []const u8) DecompileError![]const u8 {
+        return name_mangle.unmangleClassName(self.arena.allocator(), self.class_name, name);
+    }
+
+    fn makeName(self: *Decompiler, name: []const u8, ctx: ExprContext) DecompileError!*Expr {
+        const unmangled = try self.unmangleClassName(name);
+        return ast.makeName(self.arena.allocator(), unmangled, ctx);
+    }
+
+    fn makeAttribute(self: *Decompiler, value: *Expr, attr: []const u8, ctx: ExprContext) DecompileError!*Expr {
+        const unmangled = try self.unmangleClassName(attr);
+        return ast.makeAttribute(self.arena.allocator(), value, unmangled, ctx);
+    }
+
+    fn initSim(self: *Decompiler, allocator: Allocator, stack_alloc: Allocator, code: *const pyc.Code, version: Version) SimContext {
+        var sim = SimContext.init(allocator, stack_alloc, code, version);
+        sim.class_name = self.class_name;
+        return sim;
+    }
+
     fn decompileNestedBody(self: *Decompiler, code: *const pyc.Code) DecompileError![]const *Stmt {
+        return self.decompileNestedBodyWithClass(code, self.class_name);
+    }
+
+    fn decompileNestedBodyWithClass(self: *Decompiler, code: *const pyc.Code, class_name: ?[]const u8) DecompileError![]const *Stmt {
         const nested_ptr = try self.allocator.create(Decompiler);
         errdefer self.allocator.destroy(nested_ptr);
 
         nested_ptr.* = try Decompiler.init(self.allocator, code, self.version);
         errdefer nested_ptr.deinit();
+        nested_ptr.class_name = class_name;
+        nested_ptr.clone_sim.class_name = class_name;
 
         _ = nested_ptr.decompile() catch |err| {
             if (nested_ptr.last_error_ctx) |ctx| {
@@ -9556,7 +9584,7 @@ pub const Decompiler = struct {
             var it = nonlocals.keyIterator();
             var i: usize = 0;
             while (it.next()) |key| : (i += 1) {
-                names[i] = try a.dupe(u8, key.*);
+                names[i] = try self.unmangleClassName(key.*);
             }
             const nl_stmt = try a.create(Stmt);
             nl_stmt.* = .{ .nonlocal_stmt = .{ .names = names } };
@@ -9579,7 +9607,7 @@ pub const Decompiler = struct {
             var it = globals.keyIterator();
             var i: usize = 0;
             while (it.next()) |key| : (i += 1) {
-                names[i] = try a.dupe(u8, key.*);
+                names[i] = try self.unmangleClassName(key.*);
             }
             const g_stmt = try a.create(Stmt);
             g_stmt.* = .{ .global_stmt = .{ .names = names } };
@@ -9612,7 +9640,7 @@ pub const Decompiler = struct {
             }
         }
 
-        const args = try signature.extractFunctionSignature(a, func.code, func.defaults, func.kw_defaults, func.annotations);
+        const args = try signature.extractFunctionSignature(a, func.code, self.class_name, func.defaults, func.kw_defaults, func.annotations);
 
         // Find return annotation
         var returns: ?*Expr = null;
@@ -9650,7 +9678,8 @@ pub const Decompiler = struct {
 
         const a = self.arena.allocator();
 
-        var body = try self.decompileNestedBody(cls.code);
+        const class_name_for_body = if (cls.name.len > 0) cls.name else name;
+        var body = try self.decompileNestedBodyWithClass(cls.code, class_name_for_body);
         body = try self.trimTrailingReturnNone(body);
 
         // Python 2.x classes: trim trailing "return locals()"
@@ -9710,19 +9739,20 @@ pub const Decompiler = struct {
                 return try self.makeExprStmt(value.expr);
             }
         }
+        const out_name = try self.unmangleClassName(name);
         return switch (value) {
             .expr => |expr| blk: {
-                const target = try ast.makeName(a, name, .store);
+                const target = try self.makeName(out_name, .store);
                 break :blk try self.makeAssign(target, expr);
             },
-            .function_obj => |func| try self.makeFunctionDef(name, func),
-            .class_obj => |cls| try self.makeClassDef(name, cls),
-            .import_module => |imp| try self.makeImport(name, imp),
+            .function_obj => |func| try self.makeFunctionDef(out_name, func),
+            .class_obj => |cls| try self.makeClassDef(out_name, cls),
+            .import_module => |imp| try self.makeImport(out_name, imp),
             .saved_local => null,
             .code_obj, .comp_obj, .comp_builder, .null_marker, .unknown => blk: {
                 // Fallback for unhandled stack values - emit a valid placeholder
                 const placeholder = try ast.makeConstant(a, .ellipsis);
-                const target = try ast.makeName(a, name, .store);
+                const target = try self.makeName(out_name, .store);
                 break :blk try self.makeAssign(target, placeholder);
             },
         };
@@ -9917,7 +9947,6 @@ pub const Decompiler = struct {
         start_idx: usize,
         arena: Allocator,
     ) DecompileError!?SubscriptTargetResult {
-        _ = self;
         if (start_idx >= instructions.len) return null;
 
         // Simulate loads to build container expression
@@ -9933,7 +9962,7 @@ pub const Decompiler = struct {
         };
         if (container_name == null) return null;
 
-        const container = try ast.makeName(arena, container_name.?, .load);
+        const container = try self.makeName(container_name.?, .load);
         idx += 1;
 
         if (idx >= instructions.len) return null;
@@ -9942,18 +9971,13 @@ pub const Decompiler = struct {
         // Check for STORE_ATTR (container.attr)
         if (next.opcode == .STORE_ATTR) {
             const attr_name = sim.getName(next.arg) orelse return null;
-            const target = try arena.create(Expr);
-            target.* = .{ .attribute = .{
-                .value = container,
-                .attr = attr_name,
-                .ctx = .store,
-            } };
+            const target = try self.makeAttribute(container, attr_name, .store);
             return .{ .target = target, .next_idx = idx + 1 };
         }
 
         // Check for BUILD_SLICE pattern: LOAD start, LOAD stop, [LOAD step], BUILD_SLICE, STORE_SUBSCR
         // Or simple key: LOAD key, STORE_SUBSCR
-        const key_or_start: ?*Expr = try parseLoadExpr(sim, arena, next);
+        const key_or_start: ?*Expr = try parseLoadExpr(self, sim, arena, next);
         if (key_or_start == null) return null;
         idx += 1;
 
@@ -9973,7 +9997,7 @@ pub const Decompiler = struct {
         // Check for slice pattern: start is loaded, now check for stop [and step]
         // Pattern: LOAD stop, [LOAD step], BUILD_SLICE n, STORE_SUBSCR
         const stop_inst = instructions[idx];
-        const stop: ?*Expr = try parseLoadExpr(sim, arena, stop_inst);
+        const stop: ?*Expr = try parseLoadExpr(self, sim, arena, stop_inst);
         if (stop == null) return null;
         idx += 1;
 
@@ -9989,7 +10013,7 @@ pub const Decompiler = struct {
             idx += 1;
         } else {
             // Try to parse step
-            step = try parseLoadExpr(sim, arena, maybe_step_or_build);
+            step = try parseLoadExpr(self, sim, arena, maybe_step_or_build);
             if (step != null) {
                 idx += 1;
                 if (idx >= instructions.len) return null;
@@ -10021,15 +10045,15 @@ pub const Decompiler = struct {
     }
 
     /// Helper to parse a LOAD instruction into an expression
-    fn parseLoadExpr(sim: *SimContext, arena: Allocator, inst: decoder.Instruction) DecompileError!?*Expr {
+    fn parseLoadExpr(self: *Decompiler, sim: *SimContext, arena: Allocator, inst: decoder.Instruction) DecompileError!?*Expr {
         return switch (inst.opcode) {
             .LOAD_NAME, .LOAD_GLOBAL => blk: {
                 const name = sim.getName(inst.arg) orelse break :blk null;
-                break :blk try ast.makeName(arena, name, .load);
+                break :blk try self.makeName(name, .load);
             },
             .LOAD_FAST => blk: {
                 const name = sim.getLocal(inst.arg) orelse break :blk null;
-                break :blk try ast.makeName(arena, name, .load);
+                break :blk try self.makeName(name, .load);
             },
             .LOAD_CONST => blk: {
                 const c = sim.getConst(inst.arg) orelse break :blk null;

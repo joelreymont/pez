@@ -156,3 +156,18 @@ test "snapshot try import 3.9" {
         \\"
     );
 }
+
+test "snapshot class private names 3.9" {
+    try runSnapshot(@src(), "test/corpus/class_private_names.3.9.pyc",
+        \\[]u8
+        \\  "class C:
+        \\    __module__ = __name__
+        \\    __qualname__ = 'C'
+        \\    def __setstate(self):
+        \\        pass
+        \\    def f(self, __x):
+        \\        __y = __x
+        \\        return self.__y
+        \\"
+    );
+}
