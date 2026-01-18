@@ -76,20 +76,20 @@ const PendingComp = struct {
     ifs: std.ArrayList(*Expr),
     is_async: bool,
 
-    fn deinit(self: *PendingComp, allocator: Allocator) void {
+    fn deinit(self: *PendingComp, ast_alloc: Allocator, stack_alloc: Allocator) void {
         if (self.target) |target| {
-            target.deinit(allocator);
-            allocator.destroy(target);
+            target.deinit(ast_alloc);
+            ast_alloc.destroy(target);
         }
         if (self.iter) |iter_expr| {
-            iter_expr.deinit(allocator);
-            allocator.destroy(iter_expr);
+            iter_expr.deinit(ast_alloc);
+            ast_alloc.destroy(iter_expr);
         }
         for (self.ifs.items) |cond| {
-            cond.deinit(allocator);
-            allocator.destroy(cond);
+            cond.deinit(ast_alloc);
+            ast_alloc.destroy(cond);
         }
-        self.ifs.deinit(allocator);
+        self.ifs.deinit(stack_alloc);
     }
 };
 
@@ -114,10 +114,13 @@ const CompBuilder = struct {
         };
     }
 
-    fn deinit(self: *CompBuilder, allocator: Allocator) void {
-        self.generators.deinit(allocator);
-        self.loop_stack.deinit(allocator);
-        allocator.destroy(self);
+    fn deinit(self: *CompBuilder, ast_alloc: Allocator, stack_alloc: Allocator) void {
+        for (self.generators.items) |*gen| {
+            gen.deinit(ast_alloc, stack_alloc);
+        }
+        self.generators.deinit(stack_alloc);
+        self.loop_stack.deinit(stack_alloc);
+        stack_alloc.destroy(self);
     }
 };
 
@@ -151,14 +154,14 @@ pub const StackValue = union(enum) {
     /// Unknown/untracked value.
     unknown,
 
-    pub fn deinit(self: StackValue, allocator: Allocator) void {
+    pub fn deinit(self: StackValue, ast_alloc: Allocator, stack_alloc: Allocator) void {
         switch (self) {
             .expr => |e| {
-                e.deinit(allocator);
-                allocator.destroy(e);
+                e.deinit(ast_alloc);
+                ast_alloc.destroy(e);
             },
             .comp_builder => |b| {
-                b.deinit(allocator);
+                b.deinit(ast_alloc, stack_alloc);
             },
             // function_obj and class_obj are consumed by decompiler and ownership transfers
             // to arena or they're cleaned up explicitly by the code that creates them
@@ -306,6 +309,8 @@ pub const Stack = struct {
     stack_alloc: Allocator,
     ast_alloc: Allocator,
     allow_underflow: bool = false,
+    pop_scratch: std.ArrayListUnmanaged(StackValue) = .{},
+    pop_in_use: bool = false,
 
     pub fn init(stack_alloc: Allocator, ast_alloc: Allocator) Stack {
         return .{
@@ -313,18 +318,31 @@ pub const Stack = struct {
             .stack_alloc = stack_alloc,
             .ast_alloc = ast_alloc,
             .allow_underflow = false,
+            .pop_scratch = .{},
+            .pop_in_use = false,
         };
     }
 
     pub fn deinit(self: *Stack) void {
         for (self.items.items) |*item| {
-            item.deinit(self.ast_alloc);
+            item.deinit(self.ast_alloc, self.stack_alloc);
         }
         self.items.deinit(self.stack_alloc);
+        self.pop_scratch.deinit(self.stack_alloc);
     }
 
     pub fn deinitShallow(self: *Stack) void {
         self.items.deinit(self.stack_alloc);
+        self.pop_scratch.deinit(self.stack_alloc);
+    }
+
+    pub fn reset(self: *Stack) void {
+        for (self.items.items) |*item| {
+            item.deinit(self.ast_alloc, self.stack_alloc);
+        }
+        self.items.clearRetainingCapacity();
+        self.pop_in_use = false;
+        self.pop_scratch.items.len = 0;
     }
 
     pub fn push(self: *Stack, value: StackValue) !void {
@@ -351,13 +369,13 @@ pub const Stack = struct {
             else => {
                 if (self.allow_underflow) {
                     var tmp = val;
-                    tmp.deinit(self.ast_alloc);
+                    tmp.deinit(self.ast_alloc, self.stack_alloc);
                     const expr = try self.ast_alloc.create(Expr);
                     expr.* = .{ .name = .{ .id = "__unknown__", .ctx = .load } };
                     return expr;
                 }
                 var tmp = val;
-                tmp.deinit(self.ast_alloc);
+                tmp.deinit(self.ast_alloc, self.stack_alloc);
                 return error.NotAnExpression;
             },
         };
@@ -380,7 +398,16 @@ pub const Stack = struct {
     /// Pop n items and return them in reverse order (bottom to top becomes first to last).
     pub fn popN(self: *Stack, n: usize) ![]StackValue {
         if (!self.allow_underflow and n > self.items.items.len) return error.StackUnderflow;
-        const result = try self.stack_alloc.alloc(StackValue, n);
+        if (n == 0) return &.{};
+        var result: []StackValue = undefined;
+        if (!self.pop_in_use) {
+            try self.pop_scratch.ensureTotalCapacity(self.stack_alloc, n);
+            self.pop_scratch.items.len = n;
+            self.pop_in_use = true;
+            result = self.pop_scratch.items[0..n];
+        } else {
+            result = try self.stack_alloc.alloc(StackValue, n);
+        }
         var i: usize = 0;
         while (i < n) : (i += 1) {
             if (self.items.items.len == 0) {
@@ -390,6 +417,16 @@ pub const Stack = struct {
             }
         }
         return result;
+    }
+
+    pub fn releasePop(self: *Stack, values: []StackValue) void {
+        if (values.len == 0) return;
+        if (self.pop_in_use and values.ptr == self.pop_scratch.items.ptr) {
+            self.pop_in_use = false;
+            self.pop_scratch.items.len = 0;
+            return;
+        }
+        self.stack_alloc.free(values);
     }
 
     /// Pop n expressions in reverse order.
@@ -408,9 +445,9 @@ pub const Stack = struct {
             }
             created.deinit(self.stack_alloc);
             for (values) |*val| {
-                val.deinit(self.ast_alloc);
+                val.deinit(self.ast_alloc, self.stack_alloc);
             }
-            if (values.len > 0) self.stack_alloc.free(values);
+            self.releasePop(values);
             self.ast_alloc.free(exprs);
         }
 
@@ -426,7 +463,7 @@ pub const Stack = struct {
                 else => blk: {
                     if (self.allow_underflow) {
                         var tmp = v;
-                        tmp.deinit(self.ast_alloc);
+                        tmp.deinit(self.ast_alloc, self.stack_alloc);
                         const expr = try self.ast_alloc.create(Expr);
                         expr.* = .{ .name = .{ .id = "__unknown__", .ctx = .load } };
                         try created.append(self.stack_alloc, expr);
@@ -437,7 +474,7 @@ pub const Stack = struct {
             };
         }
 
-        if (values.len > 0) self.stack_alloc.free(values);
+        self.releasePop(values);
         created.deinit(self.stack_alloc);
         return exprs;
     }
@@ -482,6 +519,16 @@ pub const SimContext = struct {
             .lenient = false,
             .flow_mode = false,
         };
+    }
+
+    pub fn resetForClone(self: *SimContext) void {
+        self.stack.reset();
+        self.iter_override = null;
+        self.comp_builder = null;
+        self.pending_kwnames = null;
+        self.pending_await = false;
+        self.lenient = false;
+        self.flow_mode = false;
     }
 
     pub fn deinit(self: *SimContext) void {
@@ -756,7 +803,7 @@ pub const SimContext = struct {
         self.allocator.destroy(name_expr);
         callee_expr.deinit(self.allocator);
         self.allocator.destroy(callee_expr);
-        self.allocator.free(args_vals);
+        self.stack.releasePop(args_vals);
 
         try self.stack.push(.{ .class_obj = cls });
         return true;
@@ -764,7 +811,7 @@ pub const SimContext = struct {
 
     fn takeClassName(self: *SimContext, value: StackValue) SimError![]const u8 {
         var owned = value;
-        errdefer owned.deinit(self.allocator);
+        errdefer owned.deinit(self.allocator, self.stack_alloc);
 
         const expr = switch (owned) {
             .expr => |e| e,
@@ -783,7 +830,7 @@ pub const SimContext = struct {
         const expr = switch (owned) {
             .expr => |e| e,
             else => {
-                owned.deinit(self.allocator);
+                owned.deinit(self.allocator, self.stack_alloc);
                 return error.NotAnExpression;
             },
         };
@@ -803,9 +850,9 @@ pub const SimContext = struct {
 
     fn deinitStackValues(self: *SimContext, values: []StackValue) void {
         for (values) |val| {
-            val.deinit(self.allocator);
+            val.deinit(self.allocator, self.stack_alloc);
         }
-        if (values.len > 0) self.allocator.free(values);
+        self.stack.releasePop(values);
     }
 
     fn deinitExprSlice(allocator: Allocator, items: []const *Expr) void {
@@ -825,9 +872,71 @@ pub const SimContext = struct {
         if (keywords.len > 0) allocator.free(keywords);
     }
 
+    fn buildPosArgsAndKeywords(
+        self: *SimContext,
+        args_vals: []StackValue,
+        kwnames: []const []const u8,
+    ) SimError!struct { posargs: []StackValue, keywords: []ast.Keyword } {
+        const num_kwargs = kwnames.len;
+        if (args_vals.len < num_kwargs) return error.StackUnderflow;
+        const num_posargs = args_vals.len - num_kwargs;
+
+        var posargs: []StackValue = &.{};
+        if (num_posargs > 0) {
+            posargs = try self.stack_alloc.alloc(StackValue, num_posargs);
+        }
+        var pos_filled: usize = 0;
+
+        var keywords: []ast.Keyword = &.{};
+        if (num_kwargs > 0) {
+            keywords = try self.allocator.alloc(ast.Keyword, num_kwargs);
+        }
+        var kw_filled: usize = 0;
+
+        errdefer {
+            // Deinit values not moved to keywords.
+            var idx = num_posargs + kw_filled;
+            while (idx < args_vals.len) : (idx += 1) {
+                args_vals[idx].deinit(self.allocator, self.stack_alloc);
+            }
+
+            for (posargs[0..pos_filled]) |val| {
+                val.deinit(self.allocator, self.stack_alloc);
+            }
+            if (posargs.len > 0) self.stack_alloc.free(posargs);
+
+            for (keywords[0..kw_filled]) |kw| {
+                if (kw.arg) |arg| self.allocator.free(arg);
+                kw.value.deinit(self.allocator);
+                self.allocator.destroy(kw.value);
+            }
+            if (keywords.len > 0) self.allocator.free(keywords);
+            self.stack.releasePop(args_vals);
+        }
+
+        for (args_vals[0..num_posargs], 0..) |val, i| {
+            posargs[i] = val;
+            pos_filled += 1;
+        }
+
+        for (kwnames, 0..) |name, i| {
+            const val = args_vals[num_posargs + i];
+            const value = switch (val) {
+                .expr => |e| e,
+                else => return error.NotAnExpression,
+            };
+            const arg = if (std.mem.eql(u8, name, "<unknown>")) null else try self.allocator.dupe(u8, name);
+            keywords[i] = .{ .arg = arg, .value = value };
+            kw_filled += 1;
+        }
+
+        self.stack.releasePop(args_vals);
+        return .{ .posargs = posargs, .keywords = keywords };
+    }
+
     fn keywordNamesFromValue(self: *SimContext, value: StackValue) SimError![]const []const u8 {
         var owned = value;
-        defer owned.deinit(self.allocator);
+        defer owned.deinit(self.allocator, self.stack_alloc);
 
         const expr = switch (owned) {
             .expr => |e| e,
@@ -857,7 +966,7 @@ pub const SimContext = struct {
 
     fn keywordNameFromValue(self: *SimContext, value: StackValue) SimError![]const u8 {
         var owned = value;
-        errdefer owned.deinit(self.allocator);
+        errdefer owned.deinit(self.allocator, self.stack_alloc);
 
         const expr = switch (owned) {
             .expr => |e| e,
@@ -969,7 +1078,7 @@ pub const SimContext = struct {
                     try func.decorators.append(self.allocator, callee_expr);
                     cleanup_callee = false;
                     cleanup_args = false;
-                    self.allocator.free(args_vals);
+                    self.stack.releasePop(args_vals);
                     try self.stack.push(.{ .function_obj = func });
                     return;
                 },
@@ -977,7 +1086,7 @@ pub const SimContext = struct {
                     try cls.decorators.append(self.allocator, callee_expr);
                     cleanup_callee = false;
                     cleanup_args = false;
-                    self.allocator.free(args_vals);
+                    self.stack.releasePop(args_vals);
                     try self.stack.push(.{ .class_obj = cls });
                     return;
                 },
@@ -1026,7 +1135,7 @@ pub const SimContext = struct {
                 .decorators = .{},
             };
             func.deinit(self.allocator);
-            if (args_vals.len > 0) self.allocator.free(args_vals);
+            self.stack.releasePop(args_vals);
             try self.stack.push(.{ .class_obj = cls });
             return;
         }
@@ -1068,7 +1177,7 @@ pub const SimContext = struct {
 
                 const comp_expr = try self.buildComprehensionFromCode(comp, iter_expr.?);
                 iter_expr = null;
-                self.allocator.free(args_vals);
+                self.stack.releasePop(args_vals);
                 try self.stack.push(.{ .expr = comp_expr });
             },
             .unknown => {
@@ -1082,7 +1191,7 @@ pub const SimContext = struct {
                 deinitKeywordsOwned(self.allocator, keywords);
                 self.deinitStackValues(args_vals);
                 var val = callable;
-                val.deinit(self.allocator);
+                val.deinit(self.allocator, self.stack_alloc);
                 if (self.flow_mode or self.lenient) {
                     try self.stack.push(.unknown);
                     return;
@@ -1216,7 +1325,7 @@ pub const SimContext = struct {
             },
             else => {
                 var v = val;
-                v.deinit(self.allocator);
+                v.deinit(self.allocator, self.stack_alloc);
                 return &.{};
             },
         }
@@ -1226,12 +1335,12 @@ pub const SimContext = struct {
     fn parseKwDefaults(self: *SimContext, val: StackValue, code_opt: ?*const pyc.Code) SimError![]const ?*Expr {
         const code = code_opt orelse {
             var v = val;
-            v.deinit(self.allocator);
+            v.deinit(self.allocator, self.stack_alloc);
             return &.{};
         };
         if (code.kwonlyargcount == 0) {
             var v = val;
-            v.deinit(self.allocator);
+            v.deinit(self.allocator, self.stack_alloc);
             return &.{};
         }
 
@@ -1244,7 +1353,7 @@ pub const SimContext = struct {
             .expr => |expr| expr_opt = expr,
             else => {
                 var v = val;
-                v.deinit(self.allocator);
+                v.deinit(self.allocator, self.stack_alloc);
                 return out;
             },
         }
@@ -1298,15 +1407,15 @@ pub const SimContext = struct {
             },
             else => {
                 var v = val;
-                v.deinit(self.allocator);
+                v.deinit(self.allocator, self.stack_alloc);
                 return &.{};
             },
         }
     }
 
     fn cloneCompBuilder(self: *SimContext, builder: *const CompBuilder) !*CompBuilder {
-        const copy = try self.allocator.create(CompBuilder);
-        errdefer copy.deinit(self.allocator);
+        const copy = try self.stack_alloc.create(CompBuilder);
+        errdefer copy.deinit(self.allocator, self.stack_alloc);
 
         copy.* = CompBuilder.init(builder.kind);
         copy.seen_append = builder.seen_append;
@@ -1322,7 +1431,7 @@ pub const SimContext = struct {
         }
 
         if (builder.generators.items.len > 0) {
-            try copy.generators.ensureTotalCapacity(self.allocator, builder.generators.items.len);
+            try copy.generators.ensureTotalCapacity(self.stack_alloc, builder.generators.items.len);
             for (builder.generators.items) |gen| {
                 const iter_expr = gen.iter orelse return error.InvalidComprehension;
                 var gen_copy = PendingComp{
@@ -1332,24 +1441,24 @@ pub const SimContext = struct {
                     .is_async = gen.is_async,
                 };
                 var appended = false;
-                errdefer if (!appended) gen_copy.deinit(self.allocator);
+                errdefer if (!appended) gen_copy.deinit(self.allocator, self.stack_alloc);
 
                 if (gen.ifs.items.len > 0) {
-                    try gen_copy.ifs.ensureTotalCapacity(self.allocator, gen.ifs.items.len);
+                    try gen_copy.ifs.ensureTotalCapacity(self.stack_alloc, gen.ifs.items.len);
                     for (gen.ifs.items) |cond| {
-                        try gen_copy.ifs.append(self.allocator, try ast.cloneExpr(self.allocator, cond));
+                        try gen_copy.ifs.append(self.stack_alloc, try ast.cloneExpr(self.allocator, cond));
                     }
                 }
 
-                try copy.generators.append(self.allocator, gen_copy);
+                try copy.generators.append(self.stack_alloc, gen_copy);
                 appended = true;
             }
         }
 
         if (builder.loop_stack.items.len > 0) {
-            try copy.loop_stack.ensureTotalCapacity(self.allocator, builder.loop_stack.items.len);
+            try copy.loop_stack.ensureTotalCapacity(self.stack_alloc, builder.loop_stack.items.len);
             for (builder.loop_stack.items) |idx| {
-                try copy.loop_stack.append(self.allocator, idx);
+                try copy.loop_stack.append(self.stack_alloc, idx);
             }
         }
 
@@ -1409,7 +1518,7 @@ pub const SimContext = struct {
                 };
                 if (!matches) return error.InvalidComprehension;
 
-                const builder = try self.allocator.create(CompBuilder);
+                const builder = try self.stack_alloc.create(CompBuilder);
                 builder.* = CompBuilder.init(kind);
                 expr.deinit(self.allocator);
                 self.allocator.destroy(expr);
@@ -1424,12 +1533,12 @@ pub const SimContext = struct {
         const idx = self.stackIndexFromDepth(depth) catch |err| {
             if (err != error.StackUnderflow) return err;
             const missing = depth - @as(u32, @intCast(self.stack.items.items.len));
-            const builder = try self.allocator.create(CompBuilder);
+            const builder = try self.stack_alloc.create(CompBuilder);
             builder.* = CompBuilder.init(kind);
-            try self.stack.items.insert(self.allocator, 0, .{ .comp_builder = builder });
+            try self.stack.items.insert(self.stack_alloc, 0, .{ .comp_builder = builder });
             var i: u32 = 1;
             while (i < missing) : (i += 1) {
-                try self.stack.items.insert(self.allocator, @intCast(i), .unknown);
+                try self.stack.items.insert(self.stack_alloc, @intCast(i), .unknown);
             }
             return builder;
         };
@@ -1443,13 +1552,13 @@ pub const SimContext = struct {
             .ifs = .{},
             .is_async = false,
         };
-        errdefer pending.deinit(self.allocator);
+        errdefer pending.deinit(self.allocator, self.stack_alloc);
 
         const gen_idx = builder.generators.items.len;
-        try builder.loop_stack.append(self.allocator, gen_idx);
+        try builder.loop_stack.append(self.stack_alloc, gen_idx);
         errdefer builder.loop_stack.items.len -= 1;
 
-        try builder.generators.append(self.allocator, pending);
+        try builder.generators.append(self.stack_alloc, pending);
     }
 
     fn addCompTarget(self: *SimContext, builder: *CompBuilder, target: *Expr) !void {
@@ -1466,7 +1575,7 @@ pub const SimContext = struct {
     fn addCompIf(self: *SimContext, builder: *CompBuilder, cond: *Expr) !void {
         if (builder.loop_stack.items.len == 0) return error.InvalidComprehension;
         const idx = builder.loop_stack.items[builder.loop_stack.items.len - 1];
-        try builder.generators.items[idx].ifs.append(self.allocator, cond);
+        try builder.generators.items[idx].ifs.append(self.stack_alloc, cond);
     }
 
     fn addCompTargetName(self: *SimContext, name: []const u8) !void {
@@ -1589,7 +1698,7 @@ pub const SimContext = struct {
 
         const builder = try self.allocator.create(CompBuilder);
         builder.* = CompBuilder.init(comp.kind);
-        errdefer builder.deinit(self.allocator);
+        errdefer builder.deinit(self.allocator, self.stack_alloc);
 
         nested.comp_builder = builder;
         nested.iter_override = .{ .index = 0, .expr = iter_expr };
@@ -1604,7 +1713,7 @@ pub const SimContext = struct {
 
         if (!builder.seen_append) return error.InvalidComprehension;
         const expr = try nested.buildCompExpr(builder);
-        builder.deinit(self.allocator);
+        builder.deinit(self.allocator, self.stack_alloc);
         return expr;
     }
 
@@ -1637,7 +1746,7 @@ pub const SimContext = struct {
             .POP_TOP => {
                 if (self.stack.pop()) |v| {
                     var val = v;
-                    val.deinit(self.allocator);
+                    val.deinit(self.allocator, self.stack_alloc);
                 }
             },
 
@@ -1742,7 +1851,7 @@ pub const SimContext = struct {
                     const name = self.getName(inst.arg) orelse "<unknown>";
                     try self.addCompTargetName(name);
                     var val = v;
-                    val.deinit(self.allocator);
+                    val.deinit(self.allocator, self.stack_alloc);
                 }
             },
 
@@ -1750,7 +1859,7 @@ pub const SimContext = struct {
                 // STORE_ANNOTATION namei - stores annotation, value is on stack
                 if (self.stack.pop()) |v| {
                     var val = v;
-                    val.deinit(self.allocator);
+                    val.deinit(self.allocator, self.stack_alloc);
                 }
             },
 
@@ -1760,7 +1869,7 @@ pub const SimContext = struct {
                     const name = self.getLocal(inst.arg) orelse "<unknown>";
                     try self.addCompTargetName(name);
                     var val = v;
-                    val.deinit(self.allocator);
+                    val.deinit(self.allocator, self.stack_alloc);
                 }
             },
 
@@ -1780,7 +1889,7 @@ pub const SimContext = struct {
                 }
 
                 // Deinit the value after storing
-                val.deinit(self.allocator);
+                val.deinit(self.allocator, self.stack_alloc);
 
                 // Load from load_idx and push to stack
                 if (self.getLocal(load_idx)) |name| {
@@ -1797,11 +1906,11 @@ pub const SimContext = struct {
                 // Pops two values from stack
                 if (self.stack.pop()) |v| {
                     var val = v;
-                    val.deinit(self.allocator);
+                    val.deinit(self.allocator, self.stack_alloc);
                 }
                 if (self.stack.pop()) |v| {
                     var val = v;
-                    val.deinit(self.allocator);
+                    val.deinit(self.allocator, self.stack_alloc);
                 }
             },
 
@@ -2087,7 +2196,7 @@ pub const SimContext = struct {
                 };
 
                 const tos1 = self.stack.pop() orelse {
-                    tos.deinit(self.allocator);
+                    tos.deinit(self.allocator, self.stack_alloc);
                     self.deinitStackValues(args_vals);
                     return error.StackUnderflow;
                 };
@@ -2117,7 +2226,7 @@ pub const SimContext = struct {
                     // Attach decorator to the function object and push it back
                     const decorator = tos1.expr;
                     try tos.function_obj.decorators.insert(self.allocator, 0, decorator);
-                    self.allocator.free(args_vals);
+                    self.stack.releasePop(args_vals);
                     try self.stack.push(tos);
                 } else {
                     // Two stack orders for function calls with NULL:
@@ -2134,11 +2243,11 @@ pub const SimContext = struct {
                     } else if (tos == .expr and tos1 != .null_marker) {
                         // Method call - tos is callable, tos1 is self
                         callable = tos;
-                        tos1.deinit(self.allocator);
+                        tos1.deinit(self.allocator, self.stack_alloc);
                     } else {
                         // Fallback: try tos as callable
                         callable = tos;
-                        tos1.deinit(self.allocator);
+                        tos1.deinit(self.allocator, self.stack_alloc);
                     }
 
                     // Check if KW_NAMES set up keyword argument names
@@ -2147,28 +2256,8 @@ pub const SimContext = struct {
                             self.allocator.free(kwnames);
                             self.pending_kwnames = null;
                         }
-                        const num_kwargs = kwnames.len;
-                        const num_posargs = argc - num_kwargs;
-
-                        // Split args into positional and keyword
-                        const posargs = args_vals[0..num_posargs];
-                        const kwvalues = args_vals[num_posargs..];
-
-                        // Build keyword arguments
-                        const keywords = try self.allocator.alloc(ast.Keyword, num_kwargs);
-                        errdefer self.allocator.free(keywords);
-                        for (kwnames, kwvalues, 0..) |name, kwval, i| {
-                            const value = switch (kwval) {
-                                .expr => |e| e,
-                                else => return error.NotAnExpression,
-                            };
-                            keywords[i] = .{
-                                .arg = if (std.mem.eql(u8, name, "<unknown>")) null else name,
-                                .value = value,
-                            };
-                        }
-
-                        try self.handleCall(callable, posargs, keywords, iter_expr_from_stack);
+                        const split = try self.buildPosArgsAndKeywords(args_vals, kwnames);
+                        try self.handleCall(callable, split.posargs, split.keywords, iter_expr_from_stack);
                     } else {
                         try self.handleCall(callable, args_vals, &[_]ast.Keyword{}, iter_expr_from_stack);
                     }
@@ -2182,7 +2271,7 @@ pub const SimContext = struct {
 
                 // Pop kwnames tuple
                 const kwnames_val = self.stack.pop() orelse return error.StackUnderflow;
-                defer kwnames_val.deinit(self.allocator);
+                defer kwnames_val.deinit(self.allocator, self.stack_alloc);
 
                 var kwnames: []const []const u8 = &.{};
                 if (kwnames_val == .expr and kwnames_val.expr.* == .tuple) {
@@ -2199,15 +2288,8 @@ pub const SimContext = struct {
                 }
                 defer if (kwnames.len > 0) self.allocator.free(kwnames);
 
-                const num_kwargs = kwnames.len;
-                const num_posargs = argc - num_kwargs;
-
                 // Pop all args (positional + keyword values)
                 const all_vals = try self.stack.popN(argc);
-                defer self.deinitStackValues(all_vals);
-
-                const posargs = all_vals[0..num_posargs];
-                const kwvalues = all_vals[num_posargs..];
 
                 // Pop callable (with optional NULL marker)
                 const maybe_null = self.stack.pop() orelse return error.StackUnderflow;
@@ -2216,20 +2298,8 @@ pub const SimContext = struct {
                     callable = self.stack.pop() orelse return error.StackUnderflow;
                 }
 
-                // Build kwargs
-                const keywords = try self.allocator.alloc(ast.Keyword, num_kwargs);
-                for (kwnames, kwvalues, 0..) |name, kwval, i| {
-                    const value = switch (kwval) {
-                        .expr => |e| e,
-                        else => return error.NotAnExpression,
-                    };
-                    keywords[i] = .{
-                        .arg = if (std.mem.eql(u8, name, "<unknown>")) null else name,
-                        .value = value,
-                    };
-                }
-
-                try self.handleCall(callable, posargs, keywords, null);
+                const split = try self.buildPosArgsAndKeywords(all_vals, kwnames);
+                try self.handleCall(callable, split.posargs, split.keywords, null);
             },
 
             .CALL_METHOD => {
@@ -2245,28 +2315,28 @@ pub const SimContext = struct {
                 // Pop NULL/self marker
                 const marker = self.stack.pop() orelse {
                     var val = callable;
-                    val.deinit(self.allocator);
+                    val.deinit(self.allocator, self.stack_alloc);
                     self.deinitStackValues(args_vals);
                     return error.StackUnderflow;
                 };
                 // If marker is self (an expr), prepend it to args
                 if (marker == .expr) {
                     const expr = marker.expr;
-                    const args_with_self = self.allocator.alloc(StackValue, args_vals.len + 1) catch |err| {
+                    const args_with_self = self.stack_alloc.alloc(StackValue, args_vals.len + 1) catch |err| {
                         expr.deinit(self.allocator);
                         self.allocator.destroy(expr);
                         var val = callable;
-                        val.deinit(self.allocator);
+                        val.deinit(self.allocator, self.stack_alloc);
                         self.deinitStackValues(args_vals);
                         return err;
                     };
                     args_with_self[0] = .{ .expr = expr };
                     @memcpy(args_with_self[1..], args_vals);
-                    self.allocator.free(args_vals);
+                    self.stack.releasePop(args_vals);
                     args_vals = args_with_self;
                 } else if (marker != .null_marker) {
                     var val = marker;
-                    val.deinit(self.allocator);
+                    val.deinit(self.allocator, self.stack_alloc);
                 }
                 try self.handleCall(callable, args_vals, &[_]ast.Keyword{}, null);
             },
@@ -2280,12 +2350,12 @@ pub const SimContext = struct {
                     while (argc_flow > 0) : (argc_flow -= 1) {
                         if (self.stack.pop()) |v| {
                             var val = v;
-                            val.deinit(self.allocator);
+                            val.deinit(self.allocator, self.stack_alloc);
                         } else return error.StackUnderflow;
                     }
                     if (self.stack.pop()) |v| {
                         var val = v;
-                        val.deinit(self.allocator);
+                        val.deinit(self.allocator, self.stack_alloc);
                     } else return error.StackUnderflow;
                     try self.stack.push(.unknown);
                     return;
@@ -2354,7 +2424,7 @@ pub const SimContext = struct {
                     .expr => |expr| expr,
                     else => {
                         var val = star_val;
-                        val.deinit(self.allocator);
+                        val.deinit(self.allocator, self.stack_alloc);
                         return error.NotAnExpression;
                     },
                 };
@@ -2450,7 +2520,7 @@ pub const SimContext = struct {
                     },
                     else => {
                         var val = callable;
-                        val.deinit(self.allocator);
+                        val.deinit(self.allocator, self.stack_alloc);
                         return error.NotAnExpression;
                     },
                 }
@@ -2465,7 +2535,7 @@ pub const SimContext = struct {
                     .expr => |expr| expr,
                     else => {
                         var val = kwargs_val;
-                        val.deinit(self.allocator);
+                        val.deinit(self.allocator, self.stack_alloc);
                         return error.NotAnExpression;
                     },
                 };
@@ -2480,7 +2550,7 @@ pub const SimContext = struct {
                     .expr => |expr| expr,
                     else => {
                         var val = star_val;
-                        val.deinit(self.allocator);
+                        val.deinit(self.allocator, self.stack_alloc);
                         return error.NotAnExpression;
                     },
                 };
@@ -2577,7 +2647,7 @@ pub const SimContext = struct {
                     },
                     else => {
                         var val = callable;
-                        val.deinit(self.allocator);
+                        val.deinit(self.allocator, self.stack_alloc);
                         return error.NotAnExpression;
                     },
                 }
@@ -2591,14 +2661,14 @@ pub const SimContext = struct {
                         // kwargs dict
                         if (self.stack.pop()) |v| {
                             var val = v;
-                            val.deinit(self.allocator);
+                            val.deinit(self.allocator, self.stack_alloc);
                         } else return error.StackUnderflow;
                         // keyword pairs
                         var kw_idx = num_kw * 2;
                         while (kw_idx > 0) : (kw_idx -= 1) {
                             if (self.stack.pop()) |v| {
                                 var val = v;
-                                val.deinit(self.allocator);
+                                val.deinit(self.allocator, self.stack_alloc);
                             } else return error.StackUnderflow;
                         }
                         // positional args
@@ -2606,28 +2676,28 @@ pub const SimContext = struct {
                         while (pos_idx > 0) : (pos_idx -= 1) {
                             if (self.stack.pop()) |v| {
                                 var val = v;
-                                val.deinit(self.allocator);
+                                val.deinit(self.allocator, self.stack_alloc);
                             } else return error.StackUnderflow;
                         }
                     } else {
                         // kw names tuple
                         if (self.stack.pop()) |v| {
                             var val = v;
-                            val.deinit(self.allocator);
+                            val.deinit(self.allocator, self.stack_alloc);
                         } else return error.StackUnderflow;
                         // args
                         var argc: usize = @intCast(inst.arg);
                         while (argc > 0) : (argc -= 1) {
                             if (self.stack.pop()) |v| {
                                 var val = v;
-                                val.deinit(self.allocator);
+                                val.deinit(self.allocator, self.stack_alloc);
                             } else return error.StackUnderflow;
                         }
                     }
                     // callable
                     if (self.stack.pop()) |v| {
                         var val = v;
-                        val.deinit(self.allocator);
+                        val.deinit(self.allocator, self.stack_alloc);
                     } else return error.StackUnderflow;
                     try self.stack.push(.unknown);
                     return;
@@ -2641,7 +2711,7 @@ pub const SimContext = struct {
                         .expr => |expr| expr,
                         else => {
                             var val = kwargs_val;
-                            val.deinit(self.allocator);
+                            val.deinit(self.allocator, self.stack_alloc);
                             return error.NotAnExpression;
                         },
                     };
@@ -2717,7 +2787,7 @@ pub const SimContext = struct {
                         },
                         else => {
                             var val = callable;
-                            val.deinit(self.allocator);
+                            val.deinit(self.allocator, self.stack_alloc);
                             return error.NotAnExpression;
                         },
                     }
@@ -2741,7 +2811,7 @@ pub const SimContext = struct {
                     var callable_owned = true;
                     errdefer if (callable_owned) {
                         var val = callable;
-                        val.deinit(self.allocator);
+                        val.deinit(self.allocator, self.stack_alloc);
                     };
 
                     if (kw_names.len > args_vals.len) return error.InvalidKeywordNames;
@@ -2765,7 +2835,7 @@ pub const SimContext = struct {
                             },
                             else => {
                                 var tmp = val;
-                                tmp.deinit(self.allocator);
+                                tmp.deinit(self.allocator, self.stack_alloc);
                                 const expr = try ast.makeName(self.allocator, "__unknown__", .load);
                                 args[idx] = expr;
                                 args_filled += 1;
@@ -2798,7 +2868,7 @@ pub const SimContext = struct {
                             },
                             else => {
                                 var tmp = val;
-                                tmp.deinit(self.allocator);
+                                tmp.deinit(self.allocator, self.stack_alloc);
                                 const expr = try ast.makeName(self.allocator, "__unknown__", .load);
                                 const arg_name = try self.allocator.dupe(u8, name);
                                 var arg_owned = true;
@@ -2812,7 +2882,7 @@ pub const SimContext = struct {
                     }
 
                     for (args_vals) |*val| val.* = .unknown;
-                    self.allocator.free(args_vals);
+                    self.stack.releasePop(args_vals);
                     args_owned = false;
                     for (kw_names) |name| {
                         if (name.len > 0) self.allocator.free(name);
@@ -2833,7 +2903,7 @@ pub const SimContext = struct {
                         },
                         else => {
                             var val = callable;
-                            val.deinit(self.allocator);
+                            val.deinit(self.allocator, self.stack_alloc);
                             callable_owned = false;
                             callee_expr = try ast.makeName(self.allocator, "__unknown__", .load);
                         },
@@ -2872,7 +2942,7 @@ pub const SimContext = struct {
                         },
                         else => {
                             var val = kw_val;
-                            val.deinit(self.allocator);
+                            val.deinit(self.allocator, self.stack_alloc);
                             if (self.flow_mode or self.lenient) {
                                 kwargs_expr = try ast.makeName(self.allocator, "__unknown__", .load);
                             } else {
@@ -2892,7 +2962,7 @@ pub const SimContext = struct {
                     .unknown => try ast.makeName(self.allocator, "__unknown__", .load),
                     else => blk: {
                         var val = args_val;
-                        val.deinit(self.allocator);
+                        val.deinit(self.allocator, self.stack_alloc);
                         if (self.flow_mode or self.lenient) {
                             break :blk try ast.makeName(self.allocator, "__unknown__", .load);
                         }
@@ -2939,7 +3009,7 @@ pub const SimContext = struct {
                     .unknown => try ast.makeName(self.allocator, "__unknown__", .load),
                     else => blk: {
                         var val = callable;
-                        val.deinit(self.allocator);
+                        val.deinit(self.allocator, self.stack_alloc);
                         if (self.flow_mode or self.lenient) {
                             break :blk try ast.makeName(self.allocator, "__unknown__", .load);
                         }
@@ -2966,7 +3036,7 @@ pub const SimContext = struct {
                 // Pop return value - typically ends simulation
                 if (self.stack.pop()) |v| {
                     var val = v;
-                    val.deinit(self.allocator);
+                    val.deinit(self.allocator, self.stack_alloc);
                 } else {
                     if (self.lenient or self.flow_mode) return;
                     return error.StackUnderflow;
@@ -2996,7 +3066,7 @@ pub const SimContext = struct {
                 if (self.version.gte(3, 3) and self.version.lt(3, 11)) {
                     if (self.stack.pop()) |qualname| {
                         var val = qualname;
-                        val.deinit(self.allocator);
+                        val.deinit(self.allocator, self.stack_alloc);
                     } else {
                         return error.StackUnderflow;
                     }
@@ -3026,7 +3096,7 @@ pub const SimContext = struct {
                         while (i < num_kw_defaults * 2) : (i += 1) {
                             if (self.stack.pop()) |val| {
                                 var v = val;
-                                v.deinit(self.allocator);
+                                v.deinit(self.allocator, self.stack_alloc);
                             } else {
                                 return error.StackUnderflow;
                             }
@@ -3044,7 +3114,7 @@ pub const SimContext = struct {
                                     .expr => |e| def_exprs[idx] = e,
                                     else => {
                                         var v = val;
-                                        v.deinit(self.allocator);
+                                        v.deinit(self.allocator, self.stack_alloc);
                                         def_exprs[idx] = try ast.makeName(self.allocator, "<default>", .load);
                                     },
                                 }
@@ -3079,7 +3149,7 @@ pub const SimContext = struct {
                         },
                         else => {
                             var v = code_val;
-                            v.deinit(self.allocator);
+                            v.deinit(self.allocator, self.stack_alloc);
                             const expr = try ast.makeName(self.allocator, "<function>", .load);
                             try self.stack.push(.{ .expr = expr });
                         },
@@ -3097,7 +3167,7 @@ pub const SimContext = struct {
                 if ((inst.arg & 0x08) != 0) {
                     if (self.stack.pop()) |closure| {
                         var val = closure;
-                        val.deinit(self.allocator);
+                        val.deinit(self.allocator, self.stack_alloc);
                     } else {
                         return error.StackUnderflow;
                     }
@@ -3172,7 +3242,7 @@ pub const SimContext = struct {
                 if (self.version.gte(3, 3)) {
                     if (self.stack.pop()) |qualname| {
                         var val = qualname;
-                        val.deinit(self.allocator);
+                        val.deinit(self.allocator, self.stack_alloc);
                     } else {
                         return error.StackUnderflow;
                     }
@@ -3184,7 +3254,7 @@ pub const SimContext = struct {
                 // Pop closure tuple (already consumed by BUILD_TUPLE which pushed unknown)
                 if (self.stack.pop()) |closure| {
                     var val = closure;
-                    val.deinit(self.allocator);
+                    val.deinit(self.allocator, self.stack_alloc);
                 } else {
                     return error.StackUnderflow;
                 }
@@ -3212,7 +3282,7 @@ pub const SimContext = struct {
                                 };
                             } else {
                                 var val = def_val;
-                                val.deinit(self.allocator);
+                                val.deinit(self.allocator, self.stack_alloc);
                             }
                         }
                     }
@@ -3260,8 +3330,8 @@ pub const SimContext = struct {
                 const attr_val = self.stack.pop() orelse return error.StackUnderflow;
 
                 if (func_val != .function_obj) {
-                    attr_val.deinit(self.allocator);
-                    func_val.deinit(self.allocator);
+                    attr_val.deinit(self.allocator, self.stack_alloc);
+                    func_val.deinit(self.allocator, self.stack_alloc);
                     return error.NotAnExpression;
                 }
 
@@ -3271,7 +3341,7 @@ pub const SimContext = struct {
                         if (attr_val == .expr and attr_val.expr.* == .tuple) {
                             func_val.function_obj.defaults = attr_val.expr.tuple.elts;
                         } else {
-                            attr_val.deinit(self.allocator);
+                            attr_val.deinit(self.allocator, self.stack_alloc);
                         }
                     },
                     2 => { // kwdefaults
@@ -3283,15 +3353,15 @@ pub const SimContext = struct {
                         func.annotations = try self.parseAnnotations(attr_val);
                     },
                     8 => { // closure - ignore
-                        attr_val.deinit(self.allocator);
+                        attr_val.deinit(self.allocator, self.stack_alloc);
                     },
                     16 => { // annotate (Python 3.14+ - PEP 649 deferred annotations)
                         // This sets __annotate__ which is a function, not a dict
                         // For now, ignore as we'd need to run/analyze the code object
-                        attr_val.deinit(self.allocator);
+                        attr_val.deinit(self.allocator, self.stack_alloc);
                     },
                     else => {
-                        attr_val.deinit(self.allocator);
+                        attr_val.deinit(self.allocator, self.stack_alloc);
                     },
                 }
 
@@ -3330,7 +3400,7 @@ pub const SimContext = struct {
                     const name = self.getDeref(inst.arg) orelse "<unknown>";
                     try self.addCompTargetName(name);
                     var val = v;
-                    val.deinit(self.allocator);
+                    val.deinit(self.allocator, self.stack_alloc);
                 }
             },
 
@@ -3377,11 +3447,11 @@ pub const SimContext = struct {
                 const start = self.stack.items.items.len - count;
                 const items = self.stack.items.items;
 
-                var clones = try self.allocator.alloc(StackValue, count);
-                defer self.allocator.free(clones);
+                var clones = try self.stack_alloc.alloc(StackValue, count);
+                defer self.stack_alloc.free(clones);
                 var cloned_count: usize = 0;
                 errdefer {
-                    for (clones[0..cloned_count]) |*val| val.deinit(self.allocator);
+                    for (clones[0..cloned_count]) |*val| val.deinit(self.allocator, self.stack_alloc);
                 }
 
                 var i: usize = 0;
@@ -3581,7 +3651,7 @@ pub const SimContext = struct {
                     fromlist_val = self.stack.pop() orelse return error.StackUnderflow;
                     if (self.version.gte(2, 5)) {
                         const level_val = self.stack.pop() orelse return error.StackUnderflow;
-                        defer level_val.deinit(self.allocator);
+                        defer level_val.deinit(self.allocator, self.stack_alloc);
                         if (level_val == .expr and level_val.expr.* == .constant) {
                             switch (level_val.expr.constant) {
                                 .int => |v| {
@@ -3592,7 +3662,7 @@ pub const SimContext = struct {
                         }
                     }
                 }
-                defer if (fromlist_val) |fv| fv.deinit(self.allocator);
+                defer if (fromlist_val) |fv| fv.deinit(self.allocator, self.stack_alloc);
 
                 // Extract fromlist tuple if available
                 var fromlist: []const []const u8 = &.{};
@@ -3684,7 +3754,7 @@ pub const SimContext = struct {
                     },
                     else => {
                         var val = obj_val;
-                        val.deinit(self.allocator);
+                        val.deinit(self.allocator, self.stack_alloc);
                         return error.NotAnExpression;
                     },
                 }
@@ -3739,11 +3809,11 @@ pub const SimContext = struct {
                 // Stack: obj, value -> (empty)
                 if (self.stack.pop()) |v| {
                     var val = v;
-                    val.deinit(self.allocator);
+                    val.deinit(self.allocator, self.stack_alloc);
                 }
                 if (self.stack.pop()) |v| {
                     var val = v;
-                    val.deinit(self.allocator);
+                    val.deinit(self.allocator, self.stack_alloc);
                 }
             },
 
@@ -3794,15 +3864,15 @@ pub const SimContext = struct {
                 // Stack: key, container, value -> (empty)
                 if (self.stack.pop()) |v| {
                     var val = v;
-                    val.deinit(self.allocator);
+                    val.deinit(self.allocator, self.stack_alloc);
                 }
                 if (self.stack.pop()) |v| {
                     var val = v;
-                    val.deinit(self.allocator);
+                    val.deinit(self.allocator, self.stack_alloc);
                 }
                 if (self.stack.pop()) |v| {
                     var val = v;
-                    val.deinit(self.allocator);
+                    val.deinit(self.allocator, self.stack_alloc);
                 }
             },
 
@@ -3892,7 +3962,7 @@ pub const SimContext = struct {
                     try self.stack.push(dict_val);
                 } else {
                     // Not a dict on stack, just discard
-                    dict_val.deinit(self.allocator);
+                    dict_val.deinit(self.allocator, self.stack_alloc);
                     key.deinit(self.allocator);
                     self.allocator.destroy(key);
                     value.deinit(self.allocator);
@@ -3907,7 +3977,7 @@ pub const SimContext = struct {
 
                 // Pop values first (TOS down to TOS-count+1)
                 const keys_val = self.stack.pop() orelse return error.StackUnderflow;
-                defer keys_val.deinit(self.allocator);
+                defer keys_val.deinit(self.allocator, self.stack_alloc);
 
                 // Pop values in reverse order
                 const values = try self.allocator.alloc(*Expr, count);
@@ -4027,23 +4097,23 @@ pub const SimContext = struct {
             .BUILD_CLASS => {
                 var methods_val = self.stack.pop() orelse return error.StackUnderflow;
                 const bases_val = self.stack.pop() orelse {
-                    methods_val.deinit(self.allocator);
+                    methods_val.deinit(self.allocator, self.stack_alloc);
                     return error.StackUnderflow;
                 };
                 const name_val = self.stack.pop() orelse {
-                    bases_val.deinit(self.allocator);
-                    methods_val.deinit(self.allocator);
+                    bases_val.deinit(self.allocator, self.stack_alloc);
+                    methods_val.deinit(self.allocator, self.stack_alloc);
                     return error.StackUnderflow;
                 };
 
                 const class_name = self.takeClassName(name_val) catch |err| {
-                    bases_val.deinit(self.allocator);
-                    methods_val.deinit(self.allocator);
+                    bases_val.deinit(self.allocator, self.stack_alloc);
+                    methods_val.deinit(self.allocator, self.stack_alloc);
                     return err;
                 };
                 const bases = self.takeClassBases(bases_val) catch |err| {
                     self.allocator.free(class_name);
-                    methods_val.deinit(self.allocator);
+                    methods_val.deinit(self.allocator, self.stack_alloc);
                     return err;
                 };
 
@@ -4060,7 +4130,7 @@ pub const SimContext = struct {
                 } else {
                     self.allocator.free(class_name);
                     deinitExprSlice(self.allocator, bases);
-                    methods_val.deinit(self.allocator);
+                    methods_val.deinit(self.allocator, self.stack_alloc);
                     return error.NotAnExpression;
                 }
             },
@@ -4083,7 +4153,7 @@ pub const SimContext = struct {
                 // STORE_LOCALS - Python 3.0-3.3: store TOS to locals (used in class bodies)
                 if (self.stack.pop()) |v| {
                     var val = v;
-                    val.deinit(self.allocator);
+                    val.deinit(self.allocator, self.stack_alloc);
                 }
             },
 
@@ -4109,7 +4179,7 @@ pub const SimContext = struct {
                 // Pops the exception type, leaves bool result on stack
                 if (self.stack.pop()) |v| {
                     var val = v;
-                    val.deinit(self.allocator);
+                    val.deinit(self.allocator, self.stack_alloc);
                 } else {
                     return error.StackUnderflow;
                 }
@@ -4130,13 +4200,13 @@ pub const SimContext = struct {
                 // JUMP_IF_NOT_EXC_MATCH - pop two exception values
                 if (self.stack.pop()) |v| {
                     var val = v;
-                    val.deinit(self.allocator);
+                    val.deinit(self.allocator, self.stack_alloc);
                 } else {
                     return error.StackUnderflow;
                 }
                 if (self.stack.pop()) |v| {
                     var val = v;
-                    val.deinit(self.allocator);
+                    val.deinit(self.allocator, self.stack_alloc);
                 } else {
                     return error.StackUnderflow;
                 }
@@ -4165,7 +4235,7 @@ pub const SimContext = struct {
                 while (i < 4) : (i += 1) {
                     if (self.stack.pop()) |v| {
                         var val = v;
-                        val.deinit(self.allocator);
+                        val.deinit(self.allocator, self.stack_alloc);
                     } else {
                         if (self.lenient or self.flow_mode) break;
                         return error.StackUnderflow;
@@ -4201,19 +4271,19 @@ pub const SimContext = struct {
                 const key = self.stack.pop() orelse return error.StackUnderflow;
                 const container = self.stack.pop() orelse {
                     var v = key;
-                    v.deinit(self.allocator);
+                    v.deinit(self.allocator, self.stack_alloc);
                     return error.StackUnderflow;
                 };
                 var key_val = key;
                 var container_val = container;
-                key_val.deinit(self.allocator);
-                container_val.deinit(self.allocator);
+                key_val.deinit(self.allocator, self.stack_alloc);
+                container_val.deinit(self.allocator, self.stack_alloc);
             },
             .DELETE_ATTR => {
                 // DELETE_ATTR namei - delete attribute from TOS
                 if (self.stack.pop()) |v| {
                     var val = v;
-                    val.deinit(self.allocator);
+                    val.deinit(self.allocator, self.stack_alloc);
                 } else {
                     return error.StackUnderflow;
                 }
@@ -4404,7 +4474,7 @@ pub const SimContext = struct {
                 // In decompilation, we start with empty stack, so just ignore
                 if (self.stack.pop()) |v| {
                     var val = v;
-                    val.deinit(self.allocator);
+                    val.deinit(self.allocator, self.stack_alloc);
                 }
             },
 
@@ -4414,7 +4484,7 @@ pub const SimContext = struct {
                 if (self.pending_await) {
                     if (self.stack.pop()) |v| {
                         var val = v;
-                        val.deinit(self.allocator);
+                        val.deinit(self.allocator, self.stack_alloc);
                     }
                     try self.stack.push(.unknown);
                     return;
@@ -4481,7 +4551,7 @@ pub const SimContext = struct {
                 // Pop value, push result; generator stays at TOS1
                 if (self.stack.pop()) |v| {
                     var val = v;
-                    val.deinit(self.allocator);
+                    val.deinit(self.allocator, self.stack_alloc);
                 }
                 // Generator stays, received value pushed
                 try self.stack.push(.unknown);
@@ -4505,7 +4575,7 @@ pub const SimContext = struct {
                             // Discard the value
                             if (value) |v| {
                                 var val = v;
-                                val.deinit(self.allocator);
+                                val.deinit(self.allocator, self.stack_alloc);
                             }
                             return;
                         }
@@ -4520,7 +4590,7 @@ pub const SimContext = struct {
                 // Clean up awaitable if not used
                 if (awaitable) |aw| {
                     var awv = aw;
-                    awv.deinit(self.allocator);
+                    awv.deinit(self.allocator, self.stack_alloc);
                 }
             },
 
@@ -4533,7 +4603,7 @@ pub const SimContext = struct {
                 if (self.lenient) {
                     if (self.stack.pop()) |v| {
                         var val = v;
-                        val.deinit(self.allocator);
+                        val.deinit(self.allocator, self.stack_alloc);
                     }
                     return;
                 }
@@ -4590,7 +4660,7 @@ pub const SimContext = struct {
                 if (self.lenient) {
                     if (self.stack.pop()) |v| {
                         var val = v;
-                        val.deinit(self.allocator);
+                        val.deinit(self.allocator, self.stack_alloc);
                     }
                     return;
                 }
@@ -4615,11 +4685,11 @@ pub const SimContext = struct {
                 if (self.lenient) {
                     if (self.stack.pop()) |v| {
                         var val = v;
-                        val.deinit(self.allocator);
+                        val.deinit(self.allocator, self.stack_alloc);
                     }
                     if (self.stack.pop()) |v| {
                         var val = v;
-                        val.deinit(self.allocator);
+                        val.deinit(self.allocator, self.stack_alloc);
                     }
                     return;
                 }
@@ -4704,14 +4774,14 @@ pub const SimContext = struct {
                 // SET_UPDATE i - update set at stack[i] with TOS
                 if (self.stack.pop()) |v| {
                     var val = v;
-                    val.deinit(self.allocator);
+                    val.deinit(self.allocator, self.stack_alloc);
                 }
             },
 
             .DICT_UPDATE => {
                 // DICT_UPDATE i - update dict at stack[i] with TOS
                 const update_val = self.stack.pop() orelse return error.StackUnderflow;
-                errdefer update_val.deinit(self.allocator);
+                errdefer update_val.deinit(self.allocator, self.stack_alloc);
 
                 const idx: usize = @intCast(inst.arg);
                 if (idx > self.stack.items.items.len) return error.StackUnderflow;
@@ -4742,7 +4812,7 @@ pub const SimContext = struct {
                     dict.keys = new_keys;
                     dict.values = new_values;
                 } else {
-                    update_val.deinit(self.allocator);
+                    update_val.deinit(self.allocator, self.stack_alloc);
                 }
             },
 
@@ -4750,13 +4820,13 @@ pub const SimContext = struct {
                 // COPY_DICT_WITHOUT_KEYS - remove keys tuple from a dict copy
                 if (self.stack.pop()) |v| {
                     var val = v;
-                    val.deinit(self.allocator);
+                    val.deinit(self.allocator, self.stack_alloc);
                 } else {
                     return error.StackUnderflow;
                 }
                 if (self.stack.pop()) |v| {
                     var val = v;
-                    val.deinit(self.allocator);
+                    val.deinit(self.allocator, self.stack_alloc);
                 } else {
                     return error.StackUnderflow;
                 }
@@ -4767,7 +4837,7 @@ pub const SimContext = struct {
                 // DICT_MERGE i - merge TOS into dict at stack[i]
                 if (self.stack.pop()) |v| {
                     var val = v;
-                    val.deinit(self.allocator);
+                    val.deinit(self.allocator, self.stack_alloc);
                 }
             },
 
@@ -4812,7 +4882,7 @@ pub const SimContext = struct {
                                     break;
                                 }
                             }
-                            builder.deinit(self.allocator);
+                            builder.deinit(self.allocator, self.stack_alloc);
                         }
                     }
                 }
@@ -4821,7 +4891,7 @@ pub const SimContext = struct {
             .POP_ITER => {
                 if (self.stack.pop()) |v| {
                     var val = v;
-                    val.deinit(self.allocator);
+                    val.deinit(self.allocator, self.stack_alloc);
                 } else {
                     return error.StackUnderflow;
                 }
@@ -4834,7 +4904,7 @@ pub const SimContext = struct {
                 const after = (inst.arg >> 8) & 0xFF;
                 if (self.stack.pop()) |v| {
                     var val = v;
-                    val.deinit(self.allocator);
+                    val.deinit(self.allocator, self.stack_alloc);
                 } else {
                     return error.StackUnderflow;
                 }
@@ -4859,7 +4929,7 @@ pub const SimContext = struct {
                 // Stack effect 0: pop keys tuple, push values tuple or None (subject stays)
                 if (self.stack.pop()) |v| {
                     var val = v;
-                    val.deinit(self.allocator);
+                    val.deinit(self.allocator, self.stack_alloc);
                 } else {
                     return error.StackUnderflow;
                 }
@@ -4870,19 +4940,19 @@ pub const SimContext = struct {
                 // Stack effect -2: pop attr_names, class, subject (3); push result (1)
                 if (self.stack.pop()) |v| {
                     var val = v;
-                    val.deinit(self.allocator);
+                    val.deinit(self.allocator, self.stack_alloc);
                 } else {
                     return error.StackUnderflow;
                 }
                 if (self.stack.pop()) |v| {
                     var val = v;
-                    val.deinit(self.allocator);
+                    val.deinit(self.allocator, self.stack_alloc);
                 } else {
                     return error.StackUnderflow;
                 }
                 if (self.stack.pop()) |v| {
                     var val = v;
-                    val.deinit(self.allocator);
+                    val.deinit(self.allocator, self.stack_alloc);
                 } else {
                     return error.StackUnderflow;
                 }
@@ -4899,7 +4969,7 @@ pub const SimContext = struct {
                 // Pop and print value - handled at decompile level
                 if (self.stack.pop()) |v| {
                     var val = v;
-                    val.deinit(self.allocator);
+                    val.deinit(self.allocator, self.stack_alloc);
                 } else {
                     return error.StackUnderflow;
                 }
@@ -4913,7 +4983,7 @@ pub const SimContext = struct {
                 // Pop value and file object, print value to file
                 if (self.stack.pop()) |v| {
                     var val = v;
-                    val.deinit(self.allocator);
+                    val.deinit(self.allocator, self.stack_alloc);
                 } else {
                     return error.StackUnderflow;
                 }
@@ -4924,7 +4994,7 @@ pub const SimContext = struct {
                 // Pop file object, print newline to it
                 if (self.stack.pop()) |v| {
                     var val = v;
-                    val.deinit(self.allocator);
+                    val.deinit(self.allocator, self.stack_alloc);
                 } else {
                     return error.StackUnderflow;
                 }

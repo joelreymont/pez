@@ -146,6 +146,8 @@ pub const Decompiler = struct {
     cond_seen: GenSet,
     /// Scratch DFS stack for conditional reachability.
     cond_stack: std.ArrayListUnmanaged(u32),
+    /// Scratch simulator for stack cloning.
+    clone_sim: SimContext,
 
     pub fn init(allocator: Allocator, code: *const pyc.Code, version: Version) DecompileError!Decompiler {
         var arena = std.heap.ArenaAllocator.init(allocator);
@@ -194,6 +196,7 @@ pub const Decompiler = struct {
             .range_in_progress = std.AutoHashMap(u64, void).init(allocator),
             .cond_seen = cond_seen,
             .cond_stack = cond_stack,
+            .clone_sim = SimContext.init(allocator, allocator, code, version),
         };
 
         try decomp.initStackFlow();
@@ -203,6 +206,7 @@ pub const Decompiler = struct {
     }
 
     pub fn deinit(self: *Decompiler) void {
+        self.clone_sim.deinit();
         for (self.nested_decompilers.items) |nested| {
             nested.deinit();
             self.allocator.destroy(nested);
@@ -326,7 +330,7 @@ pub const Decompiler = struct {
                     if (sim.lenient) return null;
                     return error.StackUnderflow;
                 };
-                errdefer value.deinit(self.allocator);
+                errdefer value.deinit(sim.allocator, sim.stack_alloc);
                 return try self.handleStoreValue(name, value);
             },
             .POP_TOP => {
@@ -345,7 +349,7 @@ pub const Decompiler = struct {
                         };
                     },
                     else => {
-                        val.deinit(self.allocator);
+                        val.deinit(sim.allocator, sim.stack_alloc);
                         return null;
                     },
                 }
@@ -402,10 +406,10 @@ pub const Decompiler = struct {
                         stmt.* = .{ .raise_stmt = .{ .exc = val.expr, .cause = null } };
                         return stmt;
                     }
-                    val.deinit(self.allocator);
+                    val.deinit(sim.allocator, sim.stack_alloc);
                 } else if (inst.arg == 2) {
                     const cause_val = sim.stack.pop() orelse return error.StackUnderflow;
-                    errdefer cause_val.deinit(self.allocator);
+                    errdefer cause_val.deinit(sim.allocator, sim.stack_alloc);
                     const exc_val = sim.stack.pop() orelse return error.StackUnderflow;
                     if (exc_val == .expr and cause_val == .expr) {
                         const a = self.arena.allocator();
@@ -413,8 +417,8 @@ pub const Decompiler = struct {
                         stmt.* = .{ .raise_stmt = .{ .exc = exc_val.expr, .cause = cause_val.expr } };
                         return stmt;
                     }
-                    exc_val.deinit(self.allocator);
-                    cause_val.deinit(self.allocator);
+                    exc_val.deinit(sim.allocator, sim.stack_alloc);
+                    cause_val.deinit(sim.allocator, sim.stack_alloc);
                 }
                 return null;
             },
@@ -426,11 +430,11 @@ pub const Decompiler = struct {
         }
     }
 
-    fn deinitStackValuesSlice(allocator: Allocator, values: []StackValue) void {
+    fn deinitStackValuesSlice(ast_alloc: Allocator, stack_alloc: Allocator, values: []StackValue) void {
         for (values) |val| {
-            val.deinit(allocator);
+            val.deinit(ast_alloc, stack_alloc);
         }
-        if (values.len > 0) allocator.free(values);
+        if (values.len > 0) stack_alloc.free(values);
     }
 
     fn isDocstringStmt(stmt: *const Stmt) bool {
@@ -490,20 +494,18 @@ pub const Decompiler = struct {
 
     fn cloneStackValues(
         self: *Decompiler,
-        sim: *SimContext,
         values: []const StackValue,
     ) DecompileError![]StackValue {
         const out = try self.allocator.alloc(StackValue, values.len);
         var count: usize = 0;
         errdefer {
             for (out[0..count]) |val| {
-                val.deinit(self.allocator);
+                val.deinit(self.allocator, self.allocator);
             }
             self.allocator.free(out);
         }
-        _ = sim;
-        var clone_sim = SimContext.init(self.allocator, self.allocator, self.code, self.version);
-        defer clone_sim.deinit();
+        var clone_sim = &self.clone_sim;
+        clone_sim.resetForClone();
 
         for (values, 0..) |val, idx| {
             out[idx] = try clone_sim.cloneStackValue(val);
@@ -521,12 +523,12 @@ pub const Decompiler = struct {
         const out = try self.allocator.alloc(StackValue, values.len + 1);
         var count: usize = 0;
         errdefer {
-            for (out[0..count]) |val| val.deinit(self.allocator);
+            for (out[0..count]) |val| val.deinit(self.allocator, self.allocator);
             self.allocator.free(out);
         }
 
-        var clone_sim = SimContext.init(self.allocator, self.allocator, self.code, self.version);
-        defer clone_sim.deinit();
+        var clone_sim = &self.clone_sim;
+        clone_sim.resetForClone();
 
         for (values, 0..) |val, idx| {
             out[idx] = try clone_sim.cloneStackValue(val);
@@ -612,6 +614,24 @@ pub const Decompiler = struct {
         const max_len = @max(existing_len, incoming_len);
         const existing_off = max_len - existing_len;
         const incoming_off = max_len - incoming_len;
+
+        if (existing_len == max_len) {
+            var unchanged = true;
+            for (0..max_len) |idx| {
+                const cur = existing[idx];
+                const inc_opt: ?StackValue = if (idx >= incoming_off) incoming[idx - incoming_off] else null;
+                const next: StackValue = if (inc_opt) |inc| blk: {
+                    if (cur == .unknown) break :blk cur;
+                    if (stack_mod.stackValueEqual(cur, inc)) break :blk cur;
+                    break :blk .unknown;
+                } else .unknown;
+                if (!stack_mod.stackValueEqual(cur, next)) {
+                    unchanged = false;
+                    break;
+                }
+            }
+            if (unchanged) return null;
+        }
 
         var changed = false;
         const out = try self.allocator.alloc(StackValue, max_len);
@@ -902,7 +922,7 @@ pub const Decompiler = struct {
                                 try sim.simulate(store_inst);
                                 const container = sim.stack.pop() orelse break;
                                 if (container != .expr) {
-                                    container.deinit(sim.allocator);
+                                    container.deinit(sim.allocator, sim.stack_alloc);
                                     break;
                                 }
                                 const attr_name = sim.getName(next.arg) orelse break;
@@ -919,12 +939,12 @@ pub const Decompiler = struct {
                                     try sim.simulate(idx_inst);
                                     const idx_val = sim.stack.pop() orelse break;
                                     const cont_val = sim.stack.pop() orelse {
-                                        idx_val.deinit(sim.allocator);
+                                        idx_val.deinit(sim.allocator, sim.stack_alloc);
                                         break;
                                     };
                                     if (cont_val != .expr or idx_val != .expr) {
-                                        cont_val.deinit(sim.allocator);
-                                        idx_val.deinit(sim.allocator);
+                                        cont_val.deinit(sim.allocator, sim.stack_alloc);
+                                        idx_val.deinit(sim.allocator, sim.stack_alloc);
                                         break;
                                     }
                                     const target = try ast.makeSubscript(arena, cont_val.expr, idx_val.expr, .store);
@@ -1283,7 +1303,7 @@ pub const Decompiler = struct {
                         }
                     }
                     const value = value_opt orelse StackValue.unknown;
-                    errdefer value.deinit(self.allocator);
+                    errdefer value.deinit(sim.allocator, sim.stack_alloc);
 
                     // Check for augmented assignment: x = x + 5 -> x += 5
                     if (value == .expr and value.expr.* == .bin_op) {
@@ -2034,7 +2054,7 @@ pub const Decompiler = struct {
         }
 
         const expr = try cond_sim.stack.popExpr();
-        const base_vals = try self.cloneStackValues(&cond_sim, cond_sim.stack.items.items);
+        const base_vals = try self.cloneStackValues(cond_sim.stack.items.items);
         return .{ .expr = expr, .base_vals = base_vals };
     }
 
@@ -2323,7 +2343,7 @@ pub const Decompiler = struct {
 
         self.pending_ternary_expr = if_expr;
         if (base_owned.*) {
-            deinitStackValuesSlice(self.allocator, base_vals);
+            deinitStackValuesSlice(self.allocator, self.allocator, base_vals);
             base_owned.* = false;
         }
     }
@@ -2381,7 +2401,7 @@ pub const Decompiler = struct {
         };
         const base_vals = cond_res.base_vals;
         var base_owned = true;
-        defer if (base_owned) deinitStackValuesSlice(self.allocator, base_vals);
+        defer if (base_owned) deinitStackValuesSlice(self.allocator, self.allocator, base_vals);
 
         var in_stack = try std.DynamicBitSet.initEmpty(self.allocator, self.cfg.blocks.len);
         defer in_stack.deinit();
@@ -2443,7 +2463,7 @@ pub const Decompiler = struct {
             // Note: expressions are arena-allocated, so no explicit cleanup needed
             defer {
                 if (base_owned) {
-                    deinitStackValuesSlice(self.allocator, base_vals);
+                    deinitStackValuesSlice(self.allocator, self.allocator, base_vals);
                 }
             }
 
@@ -2515,7 +2535,7 @@ pub const Decompiler = struct {
         // Note: expressions are arena-allocated, so no explicit cleanup needed
         defer {
             if (base_owned) {
-                deinitStackValuesSlice(self.allocator, base_vals);
+                deinitStackValuesSlice(self.allocator, self.allocator, base_vals);
             }
         }
 
@@ -2857,8 +2877,8 @@ pub const Decompiler = struct {
             return null;
         };
 
-        const base_vals = try self.cloneStackValues(&cond_sim, cond_sim.stack.items.items);
-        defer deinitStackValuesSlice(self.allocator, base_vals);
+        const base_vals = try self.cloneStackValues(cond_sim.stack.items.items);
+        defer deinitStackValuesSlice(self.allocator, self.allocator, base_vals);
 
         // Build potentially nested BoolOp expression
         const bool_result = self.buildBoolOpExpr(first, pattern, base_vals) catch |err| {
@@ -2882,7 +2902,7 @@ pub const Decompiler = struct {
         if (merge_entry != null) {
             if (merge_sim.stack.pop()) |v| {
                 var val = v;
-                val.deinit(merge_sim.allocator);
+                val.deinit(merge_sim.allocator, merge_sim.stack_alloc);
             }
         }
         try merge_sim.stack.push(.{ .expr = bool_expr });
@@ -3713,10 +3733,10 @@ pub const Decompiler = struct {
         self.chained_cmp_next_block = null;
 
         // Save remaining stack values to transfer to branches
-        const base_vals = try self.cloneStackValues(&sim, sim.stack.items.items);
+        const base_vals = try self.cloneStackValues(sim.stack.items.items);
         var base_owned = true;
         errdefer if (base_owned) {
-            deinitStackValuesSlice(self.allocator, base_vals);
+            deinitStackValuesSlice(self.allocator, self.allocator, base_vals);
         };
 
         // For JUMP_IF_FALSE/TRUE (Python 3.0), skip the leading POP_TOP in each branch
@@ -3738,8 +3758,8 @@ pub const Decompiler = struct {
             },
             else => {},
         };
-        defer if (then_owned) deinitStackValuesSlice(self.allocator, then_vals);
-        defer if (else_owned) deinitStackValuesSlice(self.allocator, else_vals);
+        defer if (then_owned) deinitStackValuesSlice(self.allocator, self.allocator, then_vals);
+        defer if (else_owned) deinitStackValuesSlice(self.allocator, self.allocator, else_vals);
 
         // Decompile the then body with inherited stack
         const then_end = pattern.else_block orelse pattern.merge_block;
@@ -3749,7 +3769,7 @@ pub const Decompiler = struct {
         // Check for assert pattern: if cond: pass else: raise AssertionError
         if (pattern.else_block) |else_id| {
             if (try self.tryDecompileAssert(pattern, condition, else_id, then_body, base_vals, skip)) |assert_stmt| {
-                deinitStackValuesSlice(self.allocator, base_vals);
+                deinitStackValuesSlice(self.allocator, self.allocator, base_vals);
                 base_owned = false;
                 return assert_stmt;
             }
@@ -3760,7 +3780,7 @@ pub const Decompiler = struct {
             // Check if else is an elif
             if (pattern.is_elif) {
                 // Elif needs to start with fresh stack
-                deinitStackValuesSlice(self.allocator, base_vals);
+                deinitStackValuesSlice(self.allocator, self.allocator, base_vals);
                 base_owned = false;
                 if (else_id <= pattern.condition_block) {
                     break :blk &[_]*Stmt{};
@@ -3781,13 +3801,13 @@ pub const Decompiler = struct {
             }
             // Regular else with inherited stack
             defer {
-                deinitStackValuesSlice(self.allocator, base_vals);
+                deinitStackValuesSlice(self.allocator, self.allocator, base_vals);
                 base_owned = false;
             }
             break :blk try self.decompileBranchRange(else_id, pattern.merge_block, else_vals, skip);
         } else blk: {
             // No else block - clean up base_vals
-            deinitStackValuesSlice(self.allocator, base_vals);
+            deinitStackValuesSlice(self.allocator, self.allocator, base_vals);
             base_owned = false;
             break :blk &[_]*Stmt{};
         };
@@ -8030,7 +8050,7 @@ pub const Decompiler = struct {
                             .expr => |e| exc_type = e,
                             else => {
                                 var v = val;
-                                v.deinit(a);
+                                v.deinit(sim.allocator, sim.stack_alloc);
                             },
                         }
                     }
@@ -8042,7 +8062,7 @@ pub const Decompiler = struct {
                             .expr => |e| exc_type = e,
                             else => {
                                 var v = val;
-                                v.deinit(a);
+                                v.deinit(sim.allocator, sim.stack_alloc);
                             },
                         }
                     }
@@ -8219,7 +8239,7 @@ pub const Decompiler = struct {
                                 if (err != error.SkipStatement) return err;
                             }
                         },
-                        else => val.deinit(self.allocator),
+                        else => val.deinit(sim.allocator, sim.stack_alloc),
                     }
                 },
                 else => {
@@ -8837,13 +8857,13 @@ pub const Decompiler = struct {
                     if (skip_store_count > 0) {
                         skip_store_count -= 1;
                         const val = sim.stack.pop() orelse StackValue.unknown;
-                        val.deinit(self.allocator);
+                        val.deinit(sim.allocator, sim.stack_alloc);
                         continue;
                     }
                     if (skip_first_store.*) {
                         skip_first_store.* = false;
                         const val = sim.stack.pop() orelse StackValue.unknown;
-                        val.deinit(self.allocator);
+                        val.deinit(sim.allocator, sim.stack_alloc);
                         continue;
                     }
                     const name = switch (inst.opcode) {
@@ -9008,7 +9028,7 @@ pub const Decompiler = struct {
             },
             else => {
                 // Discard non-expression values (e.g., intermediate stack values)
-                val.deinit(self.allocator);
+                val.deinit(sim.allocator, sim.stack_alloc);
             },
         }
     }
