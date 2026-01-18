@@ -127,6 +127,22 @@ test "snapshot if return else fallthrough 3.9" {
     );
 }
 
+test "snapshot if prelude then if 3.9" {
+    try runSnapshot(@src(), "test/corpus/if_prelude_then_if.3.9.pyc",
+        \\[]u8
+        \\  "def f(data):
+        \\    if len(data) < 1:
+        \\        raise ValueError('short')
+        \\    else:
+        \\        x = data[0]
+        \\        if x:
+        \\            return 1
+        \\        else:
+        \\            return 2
+        \\"
+    );
+}
+
 test "snapshot try import 3.9" {
     try runSnapshot(@src(), "test/corpus/try_import.3.9.pyc",
         \\[]u8

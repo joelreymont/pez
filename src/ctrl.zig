@@ -809,6 +809,24 @@ pub const Analyzer = struct {
         };
     }
 
+    fn hasStmtPrelude(block: *const BasicBlock) bool {
+        for (block.instructions) |inst| {
+            if (Analyzer.isConditionalJump(undefined, inst.opcode)) break;
+            const name = inst.opcode.name();
+            if (std.mem.startsWith(u8, name, "STORE_") or
+                std.mem.startsWith(u8, name, "DELETE_") or
+                std.mem.startsWith(u8, name, "IMPORT_") or
+                std.mem.startsWith(u8, name, "RETURN_") or
+                std.mem.startsWith(u8, name, "RAISE_") or
+                std.mem.startsWith(u8, name, "YIELD_") or
+                std.mem.eql(u8, name, "POP_TOP"))
+            {
+                return true;
+            }
+        }
+        return false;
+    }
+
     /// Detect if/elif/else pattern.
     fn detectIfPattern(self: *Analyzer, block_id: u32) !?IfPattern {
         const block = &self.cfg.blocks[block_id];
@@ -862,7 +880,7 @@ pub const Analyzer = struct {
             if (merge_id == null or merge_id.? != else_id) {
                 const else_blk = &self.cfg.blocks[else_id];
                 if (else_blk.terminator()) |else_term| {
-                    if (self.isConditionalJump(else_term.opcode)) {
+                    if (self.isConditionalJump(else_term.opcode) and !hasStmtPrelude(else_blk)) {
                         is_elif = true;
                     }
                 }

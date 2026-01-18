@@ -3125,26 +3125,25 @@ pub const Decompiler = struct {
 
     /// Find the last block that's part of an if-elif-else chain.
     fn findIfChainEnd(self: *Decompiler, pattern: ctrl.IfPattern) DecompileError!u32 {
-        var max_block = pattern.then_block;
-
-        if (pattern.else_block) |else_id| {
-            max_block = @max(max_block, else_id);
-
-            // If this is an elif, recursively find its end
-            if (pattern.is_elif) {
-                const else_pattern = try self.analyzer.detectPattern(else_id);
-                if (else_pattern == .if_stmt) {
-                    max_block = @max(max_block, try self.findIfChainEnd(else_pattern.if_stmt));
-                }
-            }
-        }
-
         if (pattern.merge_block) |merge| {
             if (merge > pattern.condition_block) return merge;
         }
 
-        // No merge point - return past the last block in the chain
-        return max_block + 1;
+        var end = try self.branchEnd(pattern.then_block, null);
+        if (pattern.else_block) |else_id| {
+            if (pattern.is_elif) {
+                const else_pattern = try self.analyzer.detectPattern(else_id);
+                if (else_pattern == .if_stmt) {
+                    end = @max(end, try self.findIfChainEnd(else_pattern.if_stmt));
+                } else {
+                    end = @max(end, try self.branchEnd(else_id, null));
+                }
+            } else {
+                end = @max(end, try self.branchEnd(else_id, null));
+            }
+        }
+
+        return end;
     }
 
     fn needsPredecessorSeed(self: *Decompiler, block: *const BasicBlock) bool {
