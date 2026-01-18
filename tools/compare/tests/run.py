@@ -10,6 +10,7 @@ ROOT = Path(__file__).resolve().parents[3]
 COMPARE = ROOT / "tools" / "compare" / "compare.py"
 COMPARE_DIR = ROOT / "tools" / "compare" / "compare_dir.py"
 ANALYZE = ROOT / "tools" / "compare" / "analyze_xdis.py"
+UNIT_DIFF = ROOT / "tools" / "compare" / "unit_diff.py"
 XDIS_PY = Path("/private/tmp/xdis-venv39/bin/python")
 PY39 = Path("/Users/joel/.local/share/uv/python/cpython-3.9.24-macos-aarch64-none/bin/python3.9")
 
@@ -134,6 +135,30 @@ def test_compare_dir_outdir(tmpdir: Path):
     assert data["summary"]["total"] == 1
 
 
+def test_unit_diff(tmpdir: Path):
+    src = tmpdir / "m_unit.py"
+    src.write_text("def f(x):\n    return x * 3\n")
+    pyc = tmpdir / "m_unit.pyc"
+    compile_src(PY39, src, pyc)
+    out = run(
+        [
+            str(XDIS_PY),
+            str(UNIT_DIFF),
+            "--orig",
+            str(pyc),
+            "--src",
+            str(src),
+            "--path",
+            "<module>.f",
+            "--xdis-python",
+            str(XDIS_PY),
+        ]
+    )
+    data = json.loads(out)
+    assert data["path"] == "<module>.f"
+    assert "orig_unit" in data and "comp_unit" in data
+
+
 def main():
     if not XDIS_PY.exists():
         raise RuntimeError("missing xdis python")
@@ -146,6 +171,7 @@ def main():
         test_compare_exact(tmpdir)
         test_compare_auto_py(tmpdir)
         test_compare_dir_outdir(tmpdir)
+        test_unit_diff(tmpdir)
 
 
 if __name__ == "__main__":
