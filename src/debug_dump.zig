@@ -6,6 +6,7 @@ const ctrl = @import("ctrl.zig");
 const decoder = @import("decoder.zig");
 
 const Allocator = std.mem.Allocator;
+const DumpError = anyerror;
 
 pub const Sections = struct {
     bytecode: bool = false,
@@ -71,14 +72,14 @@ pub fn dumpModule(
 ) !void {
     const dump = try buildCodeDump(allocator, code, version, sections);
     defer dump.deinit(allocator);
-    try std.json.stringify(dump, .{}, writer);
+    try std.json.Stringify.value(dump, .{}, writer);
 }
 
 const Dump = struct {
     meta: Meta,
     code: CodeDump,
 
-    fn deinit(self: *Dump, allocator: Allocator) void {
+    fn deinit(self: *const Dump, allocator: Allocator) void {
         self.code.deinit(allocator);
     }
 };
@@ -103,7 +104,7 @@ const CodeDump = struct {
     passes: ?PassDump,
     children: ?[]const CodeDump,
 
-    fn deinit(self: *CodeDump, allocator: Allocator) void {
+    fn deinit(self: *const CodeDump, allocator: Allocator) void {
         if (self.bytecode) |items| allocator.free(items);
         if (self.cfg) |*cfg| cfg.deinit(allocator);
         if (self.dom) |*dom| dom.deinit(allocator);
@@ -142,7 +143,7 @@ const BlockDump = struct {
     successors: []const EdgeDump,
     instructions: []const InstDump,
 
-    fn deinit(self: *BlockDump, allocator: Allocator) void {
+    fn deinit(self: *const BlockDump, allocator: Allocator) void {
         allocator.free(self.predecessors);
         allocator.free(self.successors);
         allocator.free(self.instructions);
@@ -153,7 +154,7 @@ const CfgDump = struct {
     entry: u32,
     blocks: []const BlockDump,
 
-    fn deinit(self: *CfgDump, allocator: Allocator) void {
+    fn deinit(self: *const CfgDump, allocator: Allocator) void {
         for (self.blocks) |*blk| blk.deinit(allocator);
         allocator.free(self.blocks);
     }
@@ -168,7 +169,7 @@ const DomDump = struct {
     idom: []const u32,
     loops: []const LoopDump,
 
-    fn deinit(self: *DomDump, allocator: Allocator) void {
+    fn deinit(self: *const DomDump, allocator: Allocator) void {
         allocator.free(self.idom);
         for (self.loops) |loop| allocator.free(loop.body);
         allocator.free(self.loops);
@@ -205,13 +206,13 @@ const PassDump = struct {
     patterns: PatternCounts,
     unreachable_blocks: []const u32,
 
-    fn deinit(self: *PassDump, allocator: Allocator) void {
+    fn deinit(self: *const PassDump, allocator: Allocator) void {
         allocator.free(self.stages);
         allocator.free(self.unreachable_blocks);
     }
 };
 
-fn buildCodeDump(allocator: Allocator, code: *const pyc.Code, version: decoder.Version, sections: Sections) !Dump {
+fn buildCodeDump(allocator: Allocator, code: *const pyc.Code, version: decoder.Version, sections: Sections) DumpError!Dump {
     const child_list = try collectChildren(allocator, code, version, sections);
     var code_dump = CodeDump{
         .name = code.name,
@@ -261,12 +262,12 @@ fn buildCodeDump(allocator: Allocator, code: *const pyc.Code, version: decoder.V
             }
             if (sections.patterns or sections.passes) {
                 analyzer = try ctrl.Analyzer.init(allocator, &cfg_ref, &dom_ref);
-                const analyzer_ref = analyzer.?;
+                const analyzer_ref = &analyzer.?;
                 if (sections.patterns) {
-                    code_dump.patterns = try buildPatternDump(allocator, &analyzer_ref);
+                    code_dump.patterns = try buildPatternDump(allocator, analyzer_ref);
                 }
                 if (sections.passes) {
-                    code_dump.passes = try buildPassDump(allocator, &cfg_ref, &analyzer_ref);
+                    code_dump.passes = try buildPassDump(allocator, &cfg_ref, analyzer_ref);
                 }
             }
         }
@@ -278,7 +279,7 @@ fn buildCodeDump(allocator: Allocator, code: *const pyc.Code, version: decoder.V
     };
 }
 
-fn collectChildren(allocator: Allocator, code: *const pyc.Code, version: decoder.Version, sections: Sections) !?[]const CodeDump {
+fn collectChildren(allocator: Allocator, code: *const pyc.Code, version: decoder.Version, sections: Sections) DumpError!?[]const CodeDump {
     var children: std.ArrayList(CodeDump) = .{};
     errdefer {
         for (children.items) |*child| child.deinit(allocator);
@@ -296,7 +297,8 @@ fn collectChildren(allocator: Allocator, code: *const pyc.Code, version: decoder
         }
     }
     if (children.items.len == 0) return null;
-    return children.toOwnedSlice(allocator);
+    const slice = try children.toOwnedSlice(allocator);
+    return slice;
 }
 
 fn collectInsts(allocator: Allocator, code: *const pyc.Code, version: decoder.Version) ![]const InstDump {
