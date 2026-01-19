@@ -21,5 +21,6 @@ Thumbs.db
 
 # Dot tool state
 .beads/
+.dots/archive/
 .zig-global-cache/
 tmp_test/

@@ -195,6 +195,16 @@ test "snapshot class method annotations 3.9" {
     );
 }
 
+test "snapshot bool or call 3.9" {
+    try runSnapshot(@src(), "test/corpus/bool_or_call.3.9.pyc",
+        \\[]u8
+        \\  "def f(parameters = None):
+        \\    x = 1
+        \\    return dict(a=parameters or {})
+        \\"
+    );
+}
+
 test "snapshot loop header body 3.9" {
     try runSnapshot(@src(), "test/corpus/while_header_body.3.9.pyc",
         \\[]u8

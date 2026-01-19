@@ -3283,6 +3283,18 @@ pub const Decompiler = struct {
         }
 
         const cond_block = &self.cfg.blocks[pattern.condition_block];
+        const jump_idx = blk: {
+            var idx: ?usize = null;
+            for (cond_block.instructions, 0..) |inst, i| {
+                if (ctrl.Analyzer.isConditionalJump(undefined, inst.opcode)) {
+                    idx = i;
+                    break;
+                }
+            }
+            break :blk idx orelse return null;
+        };
+        var skip_first_store = false;
+        try self.processPartialBlock(cond_block, stmts, stmts_allocator, &skip_first_store, jump_idx);
         var cond_sim = self.initSim(self.arena.allocator(), self.arena.allocator(), self.code, self.version);
         defer cond_sim.deinit();
         if (pattern.condition_block < self.stack_in.len) {
@@ -3315,7 +3327,6 @@ pub const Decompiler = struct {
             // Simulate condition block up to conditional jump
             for (cond_block.instructions) |inst| {
                 if (ctrl.Analyzer.isConditionalJump(undefined, inst.opcode)) break;
-                if (isStatementOpcode(inst.opcode)) return null;
                 cond_sim.simulate(inst) catch |err| {
                     if (err == error.OutOfMemory) return err;
                     return null;
@@ -3343,18 +3354,10 @@ pub const Decompiler = struct {
         // Process merge block with the bool expression on stack
         var merge_sim = self.initSim(self.arena.allocator(), self.arena.allocator(), self.code, self.version);
         defer merge_sim.deinit();
-        const merge_entry = if (final_merge < self.stack_in.len) self.stack_in[final_merge] else null;
-        const merge_seed = merge_entry orelse base_vals;
-        if (merge_seed.len > 0) {
-            for (merge_seed) |val| {
+        if (base_vals.len > 0) {
+            for (base_vals) |val| {
                 const cloned = try merge_sim.cloneStackValue(val);
                 try merge_sim.stack.push(cloned);
-            }
-        }
-        if (merge_entry != null) {
-            if (merge_sim.stack.pop()) |v| {
-                var val = v;
-                val.deinit(merge_sim.allocator, merge_sim.stack_alloc);
             }
         }
         try merge_sim.stack.push(.{ .expr = bool_expr });
