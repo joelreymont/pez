@@ -183,10 +183,14 @@ pub const Decompiler = struct {
     cond_seen: GenSet,
     /// Scratch DFS stack for conditional reachability.
     cond_stack: std.ArrayListUnmanaged(u32),
+    /// Blocks already emitted into statements.
+    consumed: GenSet,
     /// Scratch simulator for stack cloning.
     clone_sim: SimContext,
     /// Override for fallthrough after single-branch if.
     if_next: ?u32 = null,
+    /// Override for next block after loop when folding exit guards.
+    loop_next: ?u32 = null,
     /// Optional limit for branchEnd traversal.
     br_limit: ?u32 = null,
 
@@ -215,6 +219,8 @@ pub const Decompiler = struct {
 
         var cond_seen = try GenSet.init(allocator, cfg.blocks.len);
         errdefer cond_seen.deinit(allocator);
+        var consumed = try GenSet.init(allocator, cfg.blocks.len);
+        errdefer consumed.deinit(allocator);
         var cond_stack: std.ArrayListUnmanaged(u32) = .{};
         errdefer cond_stack.deinit(allocator);
         if (cfg.blocks.len > 0) {
@@ -237,6 +243,7 @@ pub const Decompiler = struct {
             .range_in_progress = std.AutoHashMap(u64, void).init(allocator),
             .cond_seen = cond_seen,
             .cond_stack = cond_stack,
+            .consumed = consumed,
             .clone_sim = SimContext.init(allocator, allocator, code, version),
             .class_name = null,
         };
@@ -273,6 +280,7 @@ pub const Decompiler = struct {
         }
         self.cond_seen.deinit(self.allocator);
         self.cond_stack.deinit(self.allocator);
+        self.consumed.deinit(self.allocator);
         self.arena.deinit();
         self.statements.deinit(self.allocator);
     }
@@ -1430,7 +1438,7 @@ pub const Decompiler = struct {
                     errdefer value.deinit(sim.allocator, sim.stack_alloc);
 
                     // Check for augmented assignment: x = x + 5 -> x += 5
-                    if (value == .expr and value.expr.* == .bin_op) {
+                    if (value == .expr and value.expr.* == .bin_op and sim.isInplaceExpr(value.expr)) {
                         const binop = &value.expr.bin_op;
                         if (binop.left.* == .name and std.mem.eql(u8, binop.left.name.id, name)) {
                             const arena = self.arena.allocator();
@@ -1666,6 +1674,13 @@ pub const Decompiler = struct {
                         // Get the value
                         const value = sim.stack.pop() orelse return error.StackUnderflow;
                         if (value == .expr and targets.items.len > 0) {
+                            if (targets.items.len == 1) {
+                                if (try self.tryMakeAugAssign(sim, targets.items[0], value.expr)) |stmt| {
+                                    try stmts.append(stmts_allocator, stmt);
+                                    i = j - 1;
+                                    continue;
+                                }
+                            }
                             const stmt = try arena.create(Stmt);
                             stmt.* = .{ .assign = .{
                                 .targets = targets.items,
@@ -1736,8 +1751,12 @@ pub const Decompiler = struct {
                             .slice = key,
                             .ctx = .store,
                         } };
-                        const stmt = try self.makeAssign(subscript, value);
-                        try stmts.append(stmts_allocator, stmt);
+                        if (try self.tryMakeAugAssign(sim, subscript, value)) |stmt| {
+                            try stmts.append(stmts_allocator, stmt);
+                        } else {
+                            const stmt = try self.makeAssign(subscript, value);
+                            try stmts.append(stmts_allocator, stmt);
+                        }
                     }
                 },
                 .STORE_SLICE => {
@@ -1780,8 +1799,12 @@ pub const Decompiler = struct {
                         .slice = slice_expr,
                         .ctx = .store,
                     } };
-                    const stmt = try self.makeAssign(subscript, value);
-                    try stmts.append(stmts_allocator, stmt);
+                    if (try self.tryMakeAugAssign(sim, subscript, value)) |stmt| {
+                        try stmts.append(stmts_allocator, stmt);
+                    } else {
+                        const stmt = try self.makeAssign(subscript, value);
+                        try stmts.append(stmts_allocator, stmt);
+                    }
                 },
                 .STORE_ATTR => {
                     // STORE_ATTR: TOS.attr = TOS1
@@ -1876,6 +1899,13 @@ pub const Decompiler = struct {
                         // Get the value
                         const value = sim.stack.pop() orelse return error.StackUnderflow;
                         if (value == .expr and targets.items.len > 0) {
+                            if (targets.items.len == 1) {
+                                if (try self.tryMakeAugAssign(sim, targets.items[0], value.expr)) |stmt| {
+                                    try stmts.append(stmts_allocator, stmt);
+                                    i = j - 1;
+                                    continue;
+                                }
+                            }
                             const stmt = try arena.create(Stmt);
                             stmt.* = .{ .assign = .{
                                 .targets = targets.items,
@@ -1903,8 +1933,12 @@ pub const Decompiler = struct {
 
                     const attr_name = sim.getName(inst.arg) orelse "<unknown>";
                     const attr_expr = try self.makeAttribute(container, attr_name, .store);
-                    const stmt = try self.makeAssign(attr_expr, value);
-                    try stmts.append(stmts_allocator, stmt);
+                    if (try self.tryMakeAugAssign(sim, attr_expr, value)) |stmt| {
+                        try stmts.append(stmts_allocator, stmt);
+                    } else {
+                        const stmt = try self.makeAssign(attr_expr, value);
+                        try stmts.append(stmts_allocator, stmt);
+                    }
                 },
                 .RETURN_VALUE => {
                     if (self.saw_classcell) {
@@ -3593,6 +3627,10 @@ pub const Decompiler = struct {
         var block_idx: u32 = 0;
         while (block_idx < self.cfg.blocks.len) {
             const prev_idx = block_idx;
+            if (self.consumed.isSet(block_idx)) {
+                block_idx += 1;
+                continue;
+            }
             if (block_idx != self.cfg.entry and self.cfg.blocks[block_idx].predecessors.len == 0) {
                 block_idx += 1;
                 continue;
@@ -3665,22 +3703,27 @@ pub const Decompiler = struct {
                     if (stmt) |s| {
                         try self.statements.append(self.allocator, s);
                     }
-                    const header = &self.cfg.blocks[p.header_block];
-                    const term = header.terminator();
-                    const legacy_cond = if (term) |t| t.opcode == .JUMP_IF_FALSE or t.opcode == .JUMP_IF_TRUE else false;
-                    const exit_block = &self.cfg.blocks[p.exit_block];
-                    if (legacy_cond and exit_block.instructions.len > 0 and exit_block.instructions[0].opcode == .POP_TOP) {
-                        const exit_stmts = try self.decompileBlockRangeWithStackAndSkip(
-                            p.exit_block,
-                            p.exit_block + 1,
-                            &.{},
-                            1,
-                        );
-                        defer self.arena.allocator().free(exit_stmts);
-                        try self.statements.appendSlice(self.allocator, exit_stmts);
-                        block_idx = p.exit_block + 1;
+                    if (self.loop_next) |next| {
+                        block_idx = next;
+                        self.loop_next = null;
                     } else {
-                        block_idx = p.exit_block;
+                        const header = &self.cfg.blocks[p.header_block];
+                        const term = header.terminator();
+                        const legacy_cond = if (term) |t| t.opcode == .JUMP_IF_FALSE or t.opcode == .JUMP_IF_TRUE else false;
+                        const exit_block = &self.cfg.blocks[p.exit_block];
+                        if (legacy_cond and exit_block.instructions.len > 0 and exit_block.instructions[0].opcode == .POP_TOP) {
+                            const exit_stmts = try self.decompileBlockRangeWithStackAndSkip(
+                                p.exit_block,
+                                p.exit_block + 1,
+                                &.{},
+                                1,
+                            );
+                            defer self.arena.allocator().free(exit_stmts);
+                            try self.statements.appendSlice(self.allocator, exit_stmts);
+                            block_idx = p.exit_block + 1;
+                        } else {
+                            block_idx = p.exit_block;
+                        }
                     }
                 },
                 .for_loop => |p| {
@@ -4306,8 +4349,7 @@ pub const Decompiler = struct {
                 .JUMP_IF_TRUE,
                 => {
                     if (else_block) |else_id| {
-                        const not_expr = try ast.makeUnaryOp(self.arena.allocator(), .not_, condition);
-                        condition = not_expr;
+                        condition = try self.invertConditionExpr(condition);
                         then_block = else_id;
                         else_block = pattern.then_block;
                         is_elif = false;
@@ -4499,6 +4541,7 @@ pub const Decompiler = struct {
 
     /// Decompile a while loop pattern.
     fn decompileWhile(self: *Decompiler, pattern: ctrl.WhilePattern) DecompileError!?*Stmt {
+        self.loop_next = null;
         const header = &self.cfg.blocks[pattern.header_block];
         var body_true = true;
         for (header.successors) |edge| {
@@ -4601,17 +4644,127 @@ pub const Decompiler = struct {
             try self.processPartialBlock(header, &header_stmts, a, &skip_first_store, cond_idx);
         }
 
+        var guard_if: ?*Stmt = null;
+        var guard_next: ?u32 = null;
+        if (pattern.exit_block < self.cfg.blocks.len) {
+            const exit_block = &self.cfg.blocks[pattern.exit_block];
+            if (exit_block.predecessors.len == 1 and exit_block.predecessors[0] == pattern.header_block) {
+                var has_cond = false;
+                for (exit_block.instructions) |inst| {
+                    if (ctrl.Analyzer.isConditionalJump(undefined, inst.opcode)) {
+                        has_cond = true;
+                        break;
+                    }
+                }
+                if (!has_cond) {
+                    var succ: ?u32 = null;
+                    var multi_succ = false;
+                    for (exit_block.successors) |edge| {
+                        if (edge.edge_type == .exception) continue;
+                        if (succ != null) {
+                            multi_succ = true;
+                            break;
+                        }
+                        succ = edge.target;
+                    }
+                    if (!multi_succ) {
+                        const succ_outside = if (succ) |sid| !self.dom.isInLoop(sid, pattern.header_block) else true;
+                        if (succ_outside and (succ == null or self.isTerminalBlock(succ.?))) {
+                            const exit_stmts = try self.decompileBlockRangeWithStackAndSkip(
+                                pattern.exit_block,
+                                pattern.exit_block + 1,
+                                &.{},
+                                0,
+                            );
+                            const succ_stmts = if (succ) |sid|
+                                try self.decompileBlockRangeWithStackAndSkip(sid, sid + 1, &.{}, 0)
+                            else
+                                &.{};
+
+                            const guard_cond = if (body_true)
+                                try self.invertConditionExpr(condition)
+                            else
+                                condition;
+
+                            const guard_len = exit_stmts.len + succ_stmts.len;
+                            const needs_break = if (guard_len == 0) true else blk: {
+                                const last = if (succ_stmts.len > 0)
+                                    succ_stmts[succ_stmts.len - 1]
+                                else
+                                    exit_stmts[exit_stmts.len - 1];
+                                break :blk !self.stmtIsTerminal(last);
+                            };
+                            const extra = if (needs_break) @as(usize, 1) else 0;
+                            const guard_body = try a.alloc(*Stmt, guard_len + extra);
+                            if (exit_stmts.len > 0) {
+                                std.mem.copyForwards(*Stmt, guard_body[0..exit_stmts.len], exit_stmts);
+                            }
+                            if (succ_stmts.len > 0) {
+                                std.mem.copyForwards(
+                                    *Stmt,
+                                    guard_body[exit_stmts.len .. exit_stmts.len + succ_stmts.len],
+                                    succ_stmts,
+                                );
+                            }
+                            if (needs_break) {
+                                guard_body[guard_len] = try self.makeBreak();
+                            }
+
+                            const gs = try a.create(Stmt);
+                            gs.* = .{ .if_stmt = .{
+                                .condition = guard_cond,
+                                .body = guard_body,
+                                .else_body = &.{},
+                            } };
+                            guard_if = gs;
+                            try self.consumed.set(self.allocator, pattern.exit_block);
+                            if (succ) |sid| {
+                                try self.consumed.set(self.allocator, sid);
+                            }
+                            if (self.dom.getLoopBody(pattern.header_block)) |body_set| {
+                                var next_block: u32 = pattern.exit_block;
+                                const limit: u32 = @intCast(self.cfg.blocks.len);
+                                while (next_block < limit) : (next_block += 1) {
+                                    if (next_block == pattern.exit_block) continue;
+                                    if (body_set.isSet(@intCast(next_block))) continue;
+                                    break;
+                                }
+                                guard_next = next_block;
+                            } else {
+                                guard_next = pattern.exit_block + 1;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
         var loop_cond = condition;
         if (!body_true) {
-            loop_cond = try ast.makeUnaryOp(a, .not_, condition);
+            loop_cond = try self.invertConditionExpr(condition);
         }
 
         var final_condition = loop_cond;
         var final_body = body;
-        if (header_stmts.items.len > 0) {
+        if (guard_if) |gs| {
+            const true_expr = try ast.makeConstant(a, .true_);
+            const new_body = try a.alloc(*Stmt, header_stmts.items.len + 1 + body.len);
+            if (header_stmts.items.len > 0) {
+                std.mem.copyForwards(*Stmt, new_body[0..header_stmts.items.len], header_stmts.items);
+            }
+            new_body[header_stmts.items.len] = gs;
+            if (body.len > 0) {
+                std.mem.copyForwards(*Stmt, new_body[header_stmts.items.len + 1 ..], body);
+            }
+            final_condition = true_expr;
+            final_body = new_body;
+            if (guard_next) |next| {
+                self.loop_next = next;
+            }
+        } else if (header_stmts.items.len > 0) {
             const true_expr = try ast.makeConstant(a, .true_);
             const guard_cond = if (body_true)
-                try ast.makeUnaryOp(a, .not_, condition)
+                try self.invertConditionExpr(condition)
             else
                 condition;
             const break_stmt = try self.makeBreak();
@@ -6080,7 +6233,7 @@ pub const Decompiler = struct {
             .POP_JUMP_IF_TRUE,
             .POP_JUMP_FORWARD_IF_TRUE,
             .POP_JUMP_BACKWARD_IF_TRUE,
-            => try ast.makeUnaryOp(self.arena.allocator(), .not_, cond),
+            => try self.invertConditionExpr(cond),
             .POP_JUMP_IF_NONE,
             .POP_JUMP_FORWARD_IF_NONE,
             .POP_JUMP_BACKWARD_IF_NONE,
@@ -6114,6 +6267,21 @@ pub const Decompiler = struct {
             .JUMP_IF_FALSE,
             => true,
             else => false,
+        };
+    }
+
+    fn invertJumpOpcode(self: *Decompiler, op: Opcode) Opcode {
+        _ = self;
+        return switch (op) {
+            .POP_JUMP_IF_TRUE => .POP_JUMP_IF_FALSE,
+            .POP_JUMP_FORWARD_IF_TRUE => .POP_JUMP_FORWARD_IF_FALSE,
+            .POP_JUMP_BACKWARD_IF_TRUE => .POP_JUMP_BACKWARD_IF_FALSE,
+            .JUMP_IF_TRUE => .JUMP_IF_FALSE,
+            .POP_JUMP_IF_FALSE => .POP_JUMP_IF_TRUE,
+            .POP_JUMP_FORWARD_IF_FALSE => .POP_JUMP_FORWARD_IF_TRUE,
+            .POP_JUMP_BACKWARD_IF_FALSE => .POP_JUMP_BACKWARD_IF_TRUE,
+            .JUMP_IF_FALSE => .JUMP_IF_TRUE,
+            else => op,
         };
     }
 
@@ -6256,9 +6424,83 @@ pub const Decompiler = struct {
         return expr;
     }
 
+    fn invertCompareOp(op: ast.CmpOp) ?ast.CmpOp {
+        return switch (op) {
+            .eq => .not_eq,
+            .not_eq => .eq,
+            .lt => .gte,
+            .lte => .gt,
+            .gt => .lte,
+            .gte => .lt,
+            .is => .is_not,
+            .is_not => .is,
+            .in_ => .not_in,
+            .not_in => .in_,
+        };
+    }
+
+    fn invertConditionExpr(self: *Decompiler, expr: *Expr) DecompileError!*Expr {
+        if (expr.* == .unary_op and expr.unary_op.op == .not_) {
+            return expr.unary_op.operand;
+        }
+        if (expr.* == .compare) {
+            const cmp = expr.compare;
+            if (cmp.ops.len == 1 and cmp.comparators.len == 1) {
+                if (invertCompareOp(cmp.ops[0])) |inv| {
+                    const a = self.arena.allocator();
+                    const ops = try a.alloc(ast.CmpOp, 1);
+                    ops[0] = inv;
+                    const comps = try a.alloc(*Expr, 1);
+                    comps[0] = cmp.comparators[0];
+                    const out = try a.create(Expr);
+                    out.* = .{ .compare = .{ .left = cmp.left, .ops = ops, .comparators = comps } };
+                    return out;
+                }
+            }
+        }
+        return ast.makeUnaryOp(self.arena.allocator(), .not_, expr);
+    }
+
     fn sameExpr(self: *Decompiler, left: *const Expr, right: *const Expr) bool {
         _ = self;
         return ast.exprEqual(left, right);
+    }
+
+    fn sameAugAssignTarget(self: *Decompiler, target: *const Expr, left: *const Expr) bool {
+        _ = self;
+        return switch (target.*) {
+            .name => left.* == .name and std.mem.eql(u8, target.name.id, left.name.id),
+            .attribute => left.* == .attribute and std.mem.eql(u8, target.attribute.attr, left.attribute.attr) and
+                ast.exprEqual(target.attribute.value, left.attribute.value),
+            .subscript => left.* == .subscript and ast.exprEqual(target.subscript.value, left.subscript.value) and
+                ast.exprEqual(target.subscript.slice, left.subscript.slice),
+            else => ast.exprEqual(target, left),
+        };
+    }
+
+    fn tryMakeAugAssign(
+        self: *Decompiler,
+        sim: *SimContext,
+        target: *Expr,
+        value: *Expr,
+    ) DecompileError!?*Stmt {
+        if (value.* != .bin_op) return null;
+        if (!sim.isInplaceExpr(value)) return null;
+        const binop = value.bin_op;
+        if (!self.sameAugAssignTarget(target, binop.left)) return null;
+
+        const a = self.arena.allocator();
+        binop.left.deinit(a);
+        a.destroy(binop.left);
+
+        const stmt = try a.create(Stmt);
+        stmt.* = .{ .aug_assign = .{
+            .target = target,
+            .op = binop.op,
+            .value = binop.right,
+        } };
+        a.destroy(value);
+        return stmt;
     }
 
     fn mergeCompareChain(self: *Decompiler, left: *Expr, right: *Expr) DecompileError!?*Expr {
@@ -8194,6 +8436,10 @@ pub const Decompiler = struct {
         while (block_idx < limit) {
             const prev_idx = block_idx;
             const stmts_len = stmts.items.len;
+            if (self.consumed.isSet(block_idx)) {
+                block_idx += 1;
+                continue;
+            }
             if (block_idx != start and self.cfg.blocks[block_idx].predecessors.len == 0) {
                 block_idx += 1;
                 continue;
@@ -8295,7 +8541,12 @@ pub const Decompiler = struct {
                     if (stmt) |s| {
                         try stmts.append(a, s);
                     }
-                    block_idx = p.exit_block;
+                    if (self.loop_next) |next| {
+                        block_idx = next;
+                        self.loop_next = null;
+                    } else {
+                        block_idx = p.exit_block;
+                    }
                 },
                 .for_loop => |p| {
                     if (try self.tryDecompileInlineListComp(p)) |result| {
@@ -9492,6 +9743,10 @@ pub const Decompiler = struct {
 
         while (block_idx < self.cfg.blocks.len) {
             // Use dominator tree to check loop membership
+            if (self.consumed.isSet(block_idx)) {
+                block_idx += 1;
+                continue;
+            }
             if (!self.dom.isInLoop(block_idx, header_block_id)) break;
             if (block_idx == header_block_id and block_idx != body_block_id) break;
 
@@ -9565,7 +9820,12 @@ pub const Decompiler = struct {
                         try stmts.append(a, s);
                     }
                     self.markLoopVisited(p.header_block, &visited);
-                    block_idx = p.exit_block;
+                    if (self.loop_next) |next| {
+                        block_idx = next;
+                        self.loop_next = null;
+                    } else {
+                        block_idx = p.exit_block;
+                    }
                     continue;
                 },
                 .try_stmt => |p| {
@@ -10484,13 +10744,22 @@ pub const Decompiler = struct {
             }
         }
 
+        if (self.isTrueJump(cond_op) and else_block != null) {
+            condition = try self.invertConditionExpr(condition);
+            const tmp = then_block;
+            then_block = else_block.?;
+            else_block = tmp;
+            is_elif = false;
+            cond_op = self.invertJumpOpcode(cond_op);
+        }
+
         const then_res = self.resolveJumpOnlyBlock(then_block);
         const else_res = if (else_block) |else_id| self.resolveJumpOnlyBlock(else_id) else null;
         var then_to_header = then_res == loop_header;
         var else_to_header = if (else_res) |res| res == loop_header else false;
 
         if (then_to_header and else_block != null and !else_to_header) {
-            condition = try ast.makeUnaryOp(self.arena.allocator(), .not_, condition);
+            condition = try self.invertConditionExpr(condition);
             then_block = else_block.?;
             else_block = null;
             is_elif = false;
@@ -10515,7 +10784,17 @@ pub const Decompiler = struct {
         var skip_first = false;
         const then_block_ptr = &self.cfg.blocks[then_block];
         var seed_then = legacy_cond and then_block_ptr.instructions.len > 0 and then_block_ptr.instructions[0].opcode == .POP_TOP;
-        const then_body = try self.decompileLoopBody(
+        const then_body = if (!then_in_loop and else_is_continuation and self.isTerminalBlock(then_block)) blk: {
+            const skip_then: usize = if (seed_then) 1 else 0;
+            const body = try self.decompileBlockRangeWithStackAndSkip(
+                then_block,
+                then_block + 1,
+                &.{},
+                skip_then,
+            );
+            try self.consumed.set(self.allocator, then_block);
+            break :blk body;
+        } else try self.decompileLoopBody(
             then_block,
             loop_header,
             &skip_first,
@@ -10680,6 +10959,10 @@ pub const Decompiler = struct {
             if (stop_block) |stop_id| {
                 if (block_idx == stop_id) break;
             }
+            if (self.consumed.isSet(block_idx)) {
+                block_idx += 1;
+                continue;
+            }
             // Use dominator tree for membership check
             if (!self.dom.isInLoop(block_idx, loop_header)) break;
             if (block_idx == loop_header and block_idx != start_block) break;
@@ -10769,7 +11052,12 @@ pub const Decompiler = struct {
                         try stmts.append(a, s);
                     }
                     self.markLoopVisited(p.header_block, visited);
-                    block_idx = p.exit_block;
+                    if (self.loop_next) |next| {
+                        block_idx = next;
+                        self.loop_next = null;
+                    } else {
+                        block_idx = p.exit_block;
+                    }
                     continue;
                 },
                 .for_loop => |p| {

@@ -527,6 +527,8 @@ pub const SimContext = struct {
     class_name: ?[]const u8 = null,
     /// Current stack state.
     stack: Stack,
+    /// Expressions produced by inplace ops (for aug-assign detection).
+    inplace_exprs: std.AutoHashMapUnmanaged(*Expr, bool) = .{},
     /// Override for iterator locals (used for genexpr/listcomp code objects).
     iter_override: ?IterOverride = null,
     /// Optional comprehension builder not stored on the stack.
@@ -555,6 +557,7 @@ pub const SimContext = struct {
             .lenient = false,
             .flow_mode = false,
             .class_name = null,
+            .inplace_exprs = .{},
         };
     }
 
@@ -570,6 +573,7 @@ pub const SimContext = struct {
         self.pending_await = false;
         self.lenient = false;
         self.flow_mode = false;
+        self.inplace_exprs.clearRetainingCapacity();
     }
 
     pub fn deinit(self: *SimContext) void {
@@ -578,6 +582,7 @@ pub const SimContext = struct {
             return;
         }
         self.stack.deinit();
+        self.inplace_exprs.deinit(self.stack_alloc);
         if (self.iter_override) |ov| {
             if (ov.expr) |expr| {
                 expr.deinit(self.allocator);
@@ -597,6 +602,18 @@ pub const SimContext = struct {
     fn makeAttribute(self: *SimContext, value: *Expr, attr: []const u8, ctx: ast.ExprContext) !*Expr {
         const unmangled = try name_mangle.unmangleClassName(self.allocator, self.class_name, attr);
         return ast.makeAttribute(self.allocator, value, unmangled, ctx);
+    }
+
+    fn markInplaceExpr(self: *SimContext, expr: *Expr) !void {
+        try self.inplace_exprs.put(self.stack_alloc, expr, true);
+    }
+
+    pub fn isInplaceExpr(self: *const SimContext, expr: *const Expr) bool {
+        return self.inplace_exprs.get(@constCast(expr)) != null;
+    }
+
+    fn clearInplaceExpr(self: *SimContext, expr: *const Expr) void {
+        _ = self.inplace_exprs.remove(@constCast(expr));
     }
 
     /// Get a name from the code object's names tuple.
@@ -1306,7 +1323,13 @@ pub const SimContext = struct {
 
     pub fn cloneStackValue(self: *SimContext, value: StackValue) !StackValue {
         return switch (value) {
-            .expr => |e| .{ .expr = try ast.cloneExpr(self.allocator, e) },
+            .expr => |e| blk: {
+                const cloned = try ast.cloneExpr(self.allocator, e);
+                if (self.isInplaceExpr(e)) {
+                    try self.markInplaceExpr(cloned);
+                }
+                break :blk .{ .expr = cloned };
+            },
             .function_obj => |func| .{ .function_obj = try self.cloneFunctionValue(func) },
             .class_obj => |cls| .{ .class_obj = try self.cloneClassValue(cls) },
             .comp_builder => |builder| .{ .comp_builder = try self.cloneCompBuilder(builder) },
@@ -2130,6 +2153,9 @@ pub const SimContext = struct {
                     const op = binOpFromArg(inst.arg);
                     const expr = try ast.makeBinOp(self.allocator, left, op, right);
                     try self.stack.push(.{ .expr = expr });
+                    if (inst.arg >= 13 and inst.arg <= 25) {
+                        try self.markInplaceExpr(expr);
+                    }
                 }
             },
 
@@ -2193,6 +2219,23 @@ pub const SimContext = struct {
                 };
                 const expr = try ast.makeBinOp(self.allocator, left, op, right);
                 try self.stack.push(.{ .expr = expr });
+                if (inst.opcode == .INPLACE_ADD or
+                    inst.opcode == .INPLACE_SUBTRACT or
+                    inst.opcode == .INPLACE_MULTIPLY or
+                    inst.opcode == .INPLACE_MODULO or
+                    inst.opcode == .INPLACE_POWER or
+                    inst.opcode == .INPLACE_TRUE_DIVIDE or
+                    inst.opcode == .INPLACE_FLOOR_DIVIDE or
+                    inst.opcode == .INPLACE_LSHIFT or
+                    inst.opcode == .INPLACE_RSHIFT or
+                    inst.opcode == .INPLACE_AND or
+                    inst.opcode == .INPLACE_XOR or
+                    inst.opcode == .INPLACE_OR or
+                    inst.opcode == .INPLACE_MATRIX_MULTIPLY or
+                    inst.opcode == .INPLACE_DIVIDE)
+                {
+                    try self.markInplaceExpr(expr);
+                }
             },
 
             .COMPARE_OP => {

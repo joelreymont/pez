@@ -173,6 +173,37 @@ test "snapshot loop or condition 3.9" {
     );
 }
 
+test "snapshot loop if not 3.9" {
+    try runSnapshot(@src(), "test/corpus/loop_if_not.3.9.pyc",
+        \\[]u8
+        \\  "def f(items):
+        \\    out = []
+        \\    for x in items:
+        \\        if not is_valid(x):
+        \\            out.append(x)
+        \\        else:
+        \\            out.append(x + 1)
+        \\    return out
+        \\"
+    );
+}
+
+test "snapshot loop guard return 3.9" {
+    try runSnapshot(@src(), "test/corpus/loop_guard_return.3.9.pyc",
+        \\[]u8
+        \\  "def f(data):
+        \\    out = []
+        \\    i = 0
+        \\    while True:
+        \\        if data[i] == 0:
+        \\            out.append(i)
+        \\            return out
+        \\        out.append(data[i])
+        \\        i = i + 1
+        \\"
+    );
+}
+
 test "snapshot class metaclass 3.9" {
     try runSnapshot(@src(), "test/corpus/class_metaclass.3.9.pyc",
         \\[]u8
@@ -201,6 +232,29 @@ test "snapshot bool or call 3.9" {
         \\  "def f(parameters = None):
         \\    x = 1
         \\    return dict(a=parameters or {})
+        \\"
+    );
+}
+
+test "snapshot bytes constants 3.9" {
+    try runSnapshot(@src(), "test/corpus/bytes_constants.3.9.pyc",
+        \\[]u8
+        \\  "def f():
+        \\    return (b'\xff\xe0', b'Exif\x00\x00', b'abc')
+        \\"
+    );
+}
+
+test "snapshot aug assign targets 3.9" {
+    try runSnapshot(@src(), "test/corpus/aug_assign_targets.3.9.pyc",
+        \\[]u8
+        \\  "class C:
+        \\    def __init__(self):
+        \\        self.items = []
+        \\    def add(self, value):
+        \\        self.items += [value]
+        \\def add_video(codecs, codec):
+        \\    codecs['video'] += [codec]
         \\"
     );
 }
