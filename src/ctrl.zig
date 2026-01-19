@@ -931,6 +931,22 @@ pub const Analyzer = struct {
                 }
             }
         }
+        if (!is_elif) {
+            if (else_block) |else_id| {
+                if (merge != null and merge.? == else_id) {
+                    const else_blk = &self.cfg.blocks[else_id];
+                    if (else_blk.terminator()) |else_term| {
+                        if (self.isConditionalJump(else_term.opcode) and !hasStmtPrelude(else_blk)) {
+                            const cond_off = self.cfg.blocks[block_id].start_offset;
+                            if (else_blk.start_offset > cond_off) {
+                                is_elif = true;
+                                merge = null;
+                            }
+                        }
+                    }
+                }
+            }
+        }
         if (is_elif and merge != null and merge.? == then_id) {
             merge = null;
         }
@@ -1966,6 +1982,41 @@ pub const Analyzer = struct {
         // If else block returns (no successors), merge is after the then branch (if any).
         const else_blk = &self.cfg.blocks[else_id];
         if (else_blk.successors.len == 0) {
+            // If then-branch reaches terminal else, treat it as merge.
+            var seen = try std.DynamicBitSet.initEmpty(self.allocator, self.cfg.blocks.len);
+            defer seen.deinit();
+            var stack: std.ArrayList(u32) = .{};
+            defer stack.deinit(self.allocator);
+            try stack.append(self.allocator, then_block);
+            var reaches_else = false;
+            while (stack.items.len > 0 and !reaches_else) {
+                const bid = stack.items[stack.items.len - 1];
+                stack.items.len -= 1;
+                if (bid >= self.cfg.blocks.len) continue;
+                if (seen.isSet(bid)) continue;
+                seen.set(bid);
+                if (bid == else_id) {
+                    reaches_else = true;
+                    break;
+                }
+                const blk = &self.cfg.blocks[bid];
+                const term = blk.terminator();
+                const cond_only = if (term) |t|
+                    self.isConditionalJump(t.opcode) and !hasStmtPrelude(blk)
+                else
+                    false;
+                for (blk.successors) |edge| {
+                    if (edge.edge_type == .exception or edge.edge_type == .loop_back) continue;
+                    if (cond_only and edge.edge_type == .conditional_false and edge.target == else_id) continue;
+                    if (edge.target >= self.cfg.blocks.len) continue;
+                    if (self.cfg.blocks[edge.target].start_offset <= cond_off) continue;
+                    if (!seen.isSet(edge.target)) {
+                        try stack.append(self.allocator, edge.target);
+                    }
+                }
+            }
+            if (reaches_else) return else_id;
+
             const cond_blk = &self.cfg.blocks[cond_block];
             const term = cond_blk.terminator() orelse return null;
             var else_edge: ?EdgeType = null;
@@ -2033,8 +2084,14 @@ pub const Analyzer = struct {
             self.merge_then_seen[bid] = gen;
 
             const blk = &self.cfg.blocks[bid];
+            const term = blk.terminator();
+            const cond_only = if (term) |t|
+                self.isConditionalJump(t.opcode) and !hasStmtPrelude(blk)
+            else
+                false;
             for (blk.successors) |edge| {
                 if (edge.edge_type == .exception or edge.edge_type == .loop_back) continue;
+                if (cond_only and edge.edge_type == .conditional_false and edge.target == else_id) continue;
                 if (edge.target >= self.cfg.blocks.len) continue;
                 if (self.cfg.blocks[edge.target].start_offset <= cond_off) continue;
                 if (edge.target < self.merge_then_seen.len and self.merge_then_seen[edge.target] != gen) {
@@ -2055,7 +2112,20 @@ pub const Analyzer = struct {
             self.merge_else_seen[bid] = gen;
 
             if (bid < self.merge_then_seen.len and self.merge_then_seen[bid] == gen) {
-                return bid;
+                if (bid == else_id) {
+                    const else_blk_local = &self.cfg.blocks[else_id];
+                    if (else_blk_local.terminator()) |else_term| {
+                        if (self.isConditionalJump(else_term.opcode) and !hasStmtPrelude(else_blk_local)) {
+                            // Else block is part of a conditional chain (elif); skip as merge.
+                        } else {
+                            return bid;
+                        }
+                    } else {
+                        return bid;
+                    }
+                } else {
+                    return bid;
+                }
             }
 
             const blk = &self.cfg.blocks[bid];

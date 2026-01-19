@@ -1194,7 +1194,12 @@ pub const Module = struct {
                 const imag: f64 = @bitCast(try reader.readU64());
                 break :blk .{ .complex = .{ .real = real, .imag = imag } };
             },
-            .TYPE_STRING, .TYPE_ASCII => blk: {
+            .TYPE_STRING => blk: {
+                const len = try reader.readU32();
+                const slice = try reader.readSlice(len);
+                break :blk .{ .bytes = try self.allocator.dupe(u8, slice) };
+            },
+            .TYPE_ASCII => blk: {
                 const len = try reader.readU32();
                 const slice = try reader.readSlice(len);
                 break :blk .{ .string = try self.allocator.dupe(u8, slice) };

@@ -173,6 +173,37 @@ test "snapshot loop or condition 3.9" {
     );
 }
 
+test "snapshot loop if not 3.9" {
+    try runSnapshot(@src(), "test/corpus/loop_if_not.3.9.pyc",
+        \\[]u8
+        \\  "def f(items):
+        \\    out = []
+        \\    for x in items:
+        \\        if not is_valid(x):
+        \\            out.append(x)
+        \\        else:
+        \\            out.append(x + 1)
+        \\    return out
+        \\"
+    );
+}
+
+test "snapshot loop guard return 3.9" {
+    try runSnapshot(@src(), "test/corpus/loop_guard_return.3.9.pyc",
+        \\[]u8
+        \\  "def f(data):
+        \\    out = []
+        \\    i = 0
+        \\    while True:
+        \\        if data[i] == 0:
+        \\            out.append(i)
+        \\            return out
+        \\        out.append(data[i])
+        \\        i = i + 1
+        \\"
+    );
+}
+
 test "snapshot class metaclass 3.9" {
     try runSnapshot(@src(), "test/corpus/class_metaclass.3.9.pyc",
         \\[]u8
@@ -201,6 +232,29 @@ test "snapshot bool or call 3.9" {
         \\  "def f(parameters = None):
         \\    x = 1
         \\    return dict(a=parameters or {})
+        \\"
+    );
+}
+
+test "snapshot bytes constants 3.9" {
+    try runSnapshot(@src(), "test/corpus/bytes_constants.3.9.pyc",
+        \\[]u8
+        \\  "def f():
+        \\    return (b'\xff\xe0', b'Exif\x00\x00', b'abc')
+        \\"
+    );
+}
+
+test "snapshot aug assign targets 3.9" {
+    try runSnapshot(@src(), "test/corpus/aug_assign_targets.3.9.pyc",
+        \\[]u8
+        \\  "class C:
+        \\    def __init__(self):
+        \\        self.items = []
+        \\    def add(self, value):
+        \\        self.items += [value]
+        \\def add_video(codecs, codec):
+        \\    codecs['video'] += [codec]
         \\"
     );
 }
@@ -372,6 +426,43 @@ test "snapshot try or 3.9" {
         \\        return x
         \\    except Exception as e:
         \\        print(e)
+        \\"
+    );
+}
+
+test "snapshot merge segments 3.9" {
+    try runSnapshot(@src(), "test/corpus/merge_segments.3.9.pyc",
+        \\[]u8
+        \\  "def merge_segments(segments, exif = b''):
+        \\    if segments[1][0:2] == b'\xff\xe0' and segments[2][0:2] == b'\xff\xe1' and segments[2][4:10] == b'Exif\x00\x00':
+        \\        if exif:
+        \\            segments[2] = exif
+        \\            segments.pop(1)
+        \\        elif exif is None:
+        \\            segments.pop(2)
+        \\        else:
+        \\            segments.pop(1)
+        \\    elif segments[1][0:2] == b'\xff\xe0':
+        \\        if exif:
+        \\            segments[1] = exif
+        \\    elif segments[1][0:2] == b'\xff\xe1':
+        \\        if segments[1][4:10] == b'Exif\x00\x00':
+        \\            if exif:
+        \\                segments[1] = exif
+        \\            elif exif is None:
+        \\                segments.pop(1)
+        \\    return b''.join(segments)
+        \\"
+    );
+}
+
+test "snapshot guard or 3.9" {
+    try runSnapshot(@src(), "test/corpus/guard_or.3.9.pyc",
+        \\[]u8
+        \\  "def guard(a, b):
+        \\    if not (a or b):
+        \\        raise ValueError('x')
+        \\    return (a, b)
         \\"
     );
 }
