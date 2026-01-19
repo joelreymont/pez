@@ -4,6 +4,10 @@
 
 Decompiler parity spec: `~/.claude/plans/composed-wishing-diffie.md`
 
+## Dot
+
+- Run dot without asking when task tracking helps.
+
 ## Build
 
 ```bash
