@@ -162,6 +162,24 @@ test "snapshot loop guard continue 3.9" {
     );
 }
 
+test "snapshot loop guard try continue 3.9" {
+    try runSnapshot(@src(), "test/corpus/loop_guard_try_continue.3.9.pyc",
+        \\[]u8
+        \\  "import time
+        \\def f(sock):
+        \\    while True:
+        \\        try:
+        \\            data = sock.recv(1024)
+        \\            if not data:
+        \\                continue
+        \\            sock.send(data)
+        \\        except Exception as e:
+        \\            print(e)
+        \\            time.sleep(1)
+        \\"
+    );
+}
+
 test "snapshot loop or condition 3.9" {
     try runSnapshot(@src(), "test/corpus/loop_or_condition.3.9.pyc",
         \\[]u8

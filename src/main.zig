@@ -32,6 +32,9 @@ pub fn main() !void {
     var filename: ?[]const u8 = null;
     var dump_sections: ?[]const u8 = null;
     var dump_json: ?[]const u8 = null;
+    var focus: ?[]const u8 = null;
+    var trace_loop_guards = false;
+    var trace_sim_block: ?u32 = null;
 
     for (args[1..]) |arg| {
         if (std.mem.eql(u8, arg, "-d") or std.mem.eql(u8, arg, "--disasm")) {
@@ -54,6 +57,17 @@ pub fn main() !void {
             try stdout.print("pez {s}\n", .{version.full});
             try stdout.flush();
             return;
+        } else if (std.mem.startsWith(u8, arg, "--focus=")) {
+            focus = arg["--focus=".len..];
+        } else if (std.mem.eql(u8, arg, "--trace-loop-guards")) {
+            trace_loop_guards = true;
+        } else if (std.mem.startsWith(u8, arg, "--trace-sim=")) {
+            const raw = arg["--trace-sim=".len..];
+            trace_sim_block = std.fmt.parseInt(u32, raw, 10) catch {
+                try stderr.print("Invalid --trace-sim value: {s}\n", .{raw});
+                try stderr.flush();
+                std.process.exit(1);
+            };
         } else if (arg[0] != '-') {
             filename = arg;
         }
@@ -82,11 +96,14 @@ pub fn main() !void {
     }
 
     if (filename == null) {
-        try stderr.print("Usage: {s} [-d|--disasm|--cfg|--dump|--test|--golden] <file.pyc>\n", .{args[0]});
+        try stderr.print("Usage: {s} [-d|--disasm|--cfg|--dump|--test|--golden] [--focus=PATH] [--trace-loop-guards] [--trace-sim=BLOCK] <file.pyc>\n", .{args[0]});
         try stderr.print("  -d, --disasm  Disassemble only\n", .{});
         try stderr.print("  --cfg         Dump CFG analysis\n", .{});
         try stderr.print("  --dump[=list] Dump JSON (bytecode,cfg,dom,loops,patterns,passes)\n", .{});
         try stderr.print("  --dump-json=PATH  Write dump JSON to PATH\n", .{});
+        try stderr.print("  --focus=PATH  Decompile only a code path\n", .{});
+        try stderr.print("  --trace-loop-guards  JSONL loop-guard trace to stderr\n", .{});
+        try stderr.print("  --trace-sim=BLOCK  JSONL sim trace for block id to stderr\n", .{});
         try stderr.print("  --test        Run test suite (decompile check)\n", .{});
         try stderr.print("  --golden      Compare with golden .py files\n", .{});
         try stderr.print("  -V, --version Show version\n", .{});
@@ -121,7 +138,17 @@ pub fn main() !void {
             try stdout.print("# Python {d}.{d}\n", .{ module.major_ver, module.minor_ver });
             try stdout.print("# Decompiled by pez {s}\n\n", .{version.full});
             if (module.code) |code| {
-                try decompile.decompileToSourceWithContext(allocator, code, py_ver, stdout, std.fs.File.stderr());
+                const trace_file: ?std.fs.File = if (trace_loop_guards or trace_sim_block != null)
+                    std.fs.File.stderr()
+                else
+                    null;
+                const opts = decompile.DecompileOptions{
+                    .focus = focus,
+                    .trace_loop_guards = trace_loop_guards,
+                    .trace_sim_block = trace_sim_block,
+                    .trace_file = trace_file,
+                };
+                try decompile.decompileToSourceWithOptions(allocator, code, py_ver, stdout, std.fs.File.stderr(), opts);
             }
         },
         .dump => {

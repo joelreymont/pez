@@ -27,7 +27,11 @@ pub const Stmt = ast.Stmt;
 const ExprContext = ast.ExprContext;
 const StackValue = stack_mod.StackValue;
 const Opcode = decoder.Opcode;
-pub const DecompileError = stack_mod.SimError || error{ UnexpectedEmptyWorklist, InvalidBlock, SkipStatement };
+pub const DecompileError = stack_mod.SimError || std.fs.File.WriteError || std.Io.Writer.Error || std.json.Stringify.Error || error{
+    UnexpectedEmptyWorklist,
+    InvalidBlock,
+    SkipStatement,
+};
 
 fn isSoftSimErr(err: anyerror) bool {
     return switch (err) {
@@ -76,6 +80,46 @@ pub const ErrorContext = struct {
     block_id: u32,
     offset: u32,
     opcode: []const u8,
+};
+
+pub const DecompileOptions = struct {
+    focus: ?[]const u8 = null,
+    trace_loop_guards: bool = false,
+    trace_sim_block: ?u32 = null,
+    trace_file: ?std.fs.File = null,
+};
+
+const TraceStackVal = struct {
+    tag: []const u8,
+    text: ?[]const u8 = null,
+};
+
+const GuardTrace = struct {
+    kind: []const u8,
+    block: u32,
+    header: u32,
+    term_op: []const u8,
+    target: u32,
+    continues_path: []const u32,
+    stack_in: []const TraceStackVal,
+    guard_expr: []const u8,
+    insert_idx: usize,
+};
+
+const SimTrace = struct {
+    kind: []const u8,
+    block: u32,
+    offset: u32,
+    op: []const u8,
+    arg: u32,
+    stack_before: []const TraceStackVal,
+    stack_after: []const TraceStackVal,
+};
+
+const GuardBranch = struct {
+    target: u32,
+    taken: bool,
+    path: []const u32,
 };
 
 const GenSet = struct {
@@ -201,6 +245,12 @@ pub const Decompiler = struct {
     loop_next: ?u32 = null,
     /// Optional limit for branchEnd traversal.
     br_limit: ?u32 = null,
+    /// Trace loop guard insertion.
+    trace_loop_guards: bool = false,
+    /// Trace stack simulation for a block.
+    trace_sim_block: ?u32 = null,
+    /// Trace output file.
+    trace_file: ?std.fs.File = null,
 
     pub fn init(allocator: Allocator, code: *const pyc.Code, version: Version) DecompileError!Decompiler {
         var arena = std.heap.ArenaAllocator.init(allocator);
@@ -254,6 +304,9 @@ pub const Decompiler = struct {
             .consumed = consumed,
             .clone_sim = SimContext.init(allocator, allocator, code, version),
             .class_name = null,
+            .trace_loop_guards = false,
+            .trace_sim_block = null,
+            .trace_file = null,
         };
 
         try decomp.initStackFlow();
@@ -5067,6 +5120,17 @@ pub const Decompiler = struct {
             }
         }
 
+        const trace_on = self.trace_loop_guards and self.trace_file != null;
+        var exit_path: std.ArrayListUnmanaged(u32) = .{};
+        const exit_to_header = if (pattern.exit_block < self.cfg.blocks.len)
+            try self.continuesToHeader(
+                pattern.exit_block,
+                pattern.header_block,
+                if (trace_on) &exit_path else null,
+            )
+        else
+            false;
+
         var loop_cond = condition;
         if (!body_true) {
             loop_cond = try self.invertConditionExpr(condition);
@@ -5095,15 +5159,31 @@ pub const Decompiler = struct {
                 try self.invertConditionExpr(condition)
             else
                 condition;
-            const break_stmt = try self.makeBreak();
+            const loop_stmt = if (exit_to_header)
+                try self.makeContinue()
+            else
+                try self.makeBreak();
             const break_body = try a.alloc(*Stmt, 1);
-            break_body[0] = break_stmt;
+            break_body[0] = loop_stmt;
             const guard_stmt = try a.create(Stmt);
             guard_stmt.* = .{ .if_stmt = .{
                 .condition = guard_cond,
                 .body = break_body,
                 .else_body = &.{},
             } };
+            if (trace_on) {
+                if (term) |t| {
+                    try self.emitGuardTrace(
+                        pattern.header_block,
+                        pattern.header_block,
+                        t,
+                        pattern.exit_block,
+                        guard_cond,
+                        header_stmts.items.len,
+                        exit_path.items,
+                    );
+                }
+            }
 
             const new_body = try a.alloc(*Stmt, header_stmts.items.len + 1 + body.len);
             std.mem.copyForwards(*Stmt, new_body[0..header_stmts.items.len], header_stmts.items);
@@ -5134,6 +5214,73 @@ pub const Decompiler = struct {
         var visited = try std.DynamicBitSet.initEmpty(self.allocator, self.cfg.blocks.len);
         defer visited.deinit();
 
+        var guard_stmt: ?*Stmt = null;
+        var header_stmt_count: usize = 0;
+        const trace_on = self.trace_loop_guards and self.trace_file != null;
+        if (header < self.cfg.blocks.len) {
+            const header_block = &self.cfg.blocks[header];
+            if (header_block.terminator()) |term| {
+                if (ctrl.Analyzer.isConditionalJump(undefined, term.opcode)) {
+                    if (try self.guardBranchToHeader(header_block, term, header, trace_on)) |branch| {
+                        var sim = self.initSim(self.arena.allocator(), self.arena.allocator(), self.code, self.version);
+                        defer sim.deinit();
+                        sim.lenient = true;
+                        sim.stack.allow_underflow = true;
+                        if (header < self.stack_in.len) {
+                            if (self.stack_in[header]) |entry| {
+                                for (entry) |val| {
+                                    const cloned = try sim.cloneStackValue(val);
+                                    try sim.stack.push(cloned);
+                                }
+                            }
+                        }
+                        for (header_block.instructions) |inst| {
+                            if (ctrl.Analyzer.isConditionalJump(undefined, inst.opcode)) break;
+                            try sim.simulate(inst);
+                        }
+                        const cond = try sim.stack.popExpr();
+                        const guard_cond = try self.guardCondForBranch(cond, term.opcode, branch.taken);
+                        var tmp: std.ArrayList(*Stmt) = .{};
+                        defer tmp.deinit(self.arena.allocator());
+                        var skip_first_store = false;
+                        var term_idx: usize = header_block.instructions.len;
+                        for (header_block.instructions, 0..) |inst, idx| {
+                            if (inst.offset == term.offset) {
+                                term_idx = idx;
+                                break;
+                            }
+                        }
+                        if (term_idx > 0) {
+                            try self.processPartialBlock(header_block, &tmp, self.arena.allocator(), &skip_first_store, term_idx);
+                            header_stmt_count = tmp.items.len;
+                        }
+                        const a = self.arena.allocator();
+                        const cont_stmt = try self.makeContinue();
+                        const body = try a.alloc(*Stmt, 1);
+                        body[0] = cont_stmt;
+                        const if_stmt = try a.create(Stmt);
+                        if_stmt.* = .{ .if_stmt = .{
+                            .condition = guard_cond,
+                            .body = body,
+                            .else_body = &.{},
+                        } };
+                        guard_stmt = if_stmt;
+                        if (trace_on) {
+                            try self.emitGuardTrace(
+                                header,
+                                header,
+                                term,
+                                branch.target,
+                                guard_cond,
+                                header_stmt_count,
+                                branch.path,
+                            );
+                        }
+                    }
+                }
+            }
+        }
+
         var skip_first = false;
         var seed_pop = false;
         const body = try self.decompileLoopBody(
@@ -5148,11 +5295,44 @@ pub const Decompiler = struct {
 
         const a = self.arena.allocator();
         const cond = try ast.makeConstant(a, .true_);
+        var final_body = body;
+        if (guard_stmt) |gs| {
+            if (final_body.len > 0 and final_body[0].* == .try_stmt and header_stmt_count <= final_body[0].try_stmt.body.len) {
+                const old = final_body[0].try_stmt.body;
+                const new_body = try a.alloc(*Stmt, old.len + 1);
+                if (header_stmt_count > 0) {
+                    std.mem.copyForwards(*Stmt, new_body[0..header_stmt_count], old[0..header_stmt_count]);
+                }
+                new_body[header_stmt_count] = gs;
+                if (header_stmt_count < old.len) {
+                    std.mem.copyForwards(
+                        *Stmt,
+                        new_body[header_stmt_count + 1 ..],
+                        old[header_stmt_count..],
+                    );
+                }
+                final_body[0].try_stmt.body = new_body;
+            } else if (header_stmt_count <= final_body.len) {
+                const new_body = try a.alloc(*Stmt, final_body.len + 1);
+                if (header_stmt_count > 0) {
+                    std.mem.copyForwards(*Stmt, new_body[0..header_stmt_count], final_body[0..header_stmt_count]);
+                }
+                new_body[header_stmt_count] = gs;
+                if (header_stmt_count < final_body.len) {
+                    std.mem.copyForwards(
+                        *Stmt,
+                        new_body[header_stmt_count + 1 ..],
+                        final_body[header_stmt_count..],
+                    );
+                }
+                final_body = new_body;
+            }
+        }
         const stmt = try a.create(Stmt);
         stmt.* = .{
             .while_stmt = .{
                 .condition = cond,
-                .body = body,
+                .body = final_body,
                 .else_body = &.{},
             },
         };
@@ -6574,6 +6754,30 @@ pub const Decompiler = struct {
         };
     }
 
+    fn guardCondForBranch(self: *Decompiler, cond: *Expr, op: Opcode, taken: bool) DecompileError!*Expr {
+        return switch (op) {
+            .POP_JUMP_IF_FALSE,
+            .POP_JUMP_FORWARD_IF_FALSE,
+            .POP_JUMP_BACKWARD_IF_FALSE,
+            .JUMP_IF_FALSE,
+            => if (taken) try self.invertConditionExpr(cond) else cond,
+            .POP_JUMP_IF_TRUE,
+            .POP_JUMP_FORWARD_IF_TRUE,
+            .POP_JUMP_BACKWARD_IF_TRUE,
+            .JUMP_IF_TRUE,
+            => if (taken) cond else try self.invertConditionExpr(cond),
+            .POP_JUMP_IF_NONE,
+            .POP_JUMP_FORWARD_IF_NONE,
+            .POP_JUMP_BACKWARD_IF_NONE,
+            => if (taken) try self.makeIsNoneCompare(cond, true) else try self.makeIsNoneCompare(cond, false),
+            .POP_JUMP_IF_NOT_NONE,
+            .POP_JUMP_FORWARD_IF_NOT_NONE,
+            .POP_JUMP_BACKWARD_IF_NOT_NONE,
+            => if (taken) try self.makeIsNoneCompare(cond, false) else try self.makeIsNoneCompare(cond, true),
+            else => if (taken) cond else try self.invertConditionExpr(cond),
+        };
+    }
+
     fn isTrueJump(self: *Decompiler, op: Opcode) bool {
         _ = self;
         return switch (op) {
@@ -6965,11 +7169,22 @@ pub const Decompiler = struct {
     }
 
     fn jumpTargetIfJumpOnly(self: *Decompiler, block_id: u32, allow_pop: bool) ?u32 {
+        return self.jumpTargetIfJumpOnlyEdge(block_id, allow_pop, false);
+    }
+
+    fn jumpTargetIfJumpOnlyEdge(
+        self: *Decompiler,
+        block_id: u32,
+        allow_pop: bool,
+        allow_loop: bool,
+    ) ?u32 {
         if (block_id >= self.cfg.blocks.len) return null;
         const blk = &self.cfg.blocks[block_id];
         if (blk.instructions.len == 0) {
             for (blk.successors) |edge| {
-                if (edge.edge_type == .normal) return edge.target;
+                if (edge.edge_type == .normal or (allow_loop and edge.edge_type == .loop_back)) {
+                    return edge.target;
+                }
             }
             return null;
         }
@@ -6991,7 +7206,9 @@ pub const Decompiler = struct {
         }
         if (!saw_jump) return null;
         for (blk.successors) |edge| {
-            if (edge.edge_type == .normal) return edge.target;
+            if (edge.edge_type == .normal or (allow_loop and edge.edge_type == .loop_back)) {
+                return edge.target;
+            }
         }
         return null;
     }
@@ -10277,6 +10494,208 @@ pub const Decompiler = struct {
         return count == 1 and only.? == target;
     }
 
+    fn continuesToHeader(
+        self: *Decompiler,
+        start: u32,
+        header: u32,
+        path_out: ?*std.ArrayListUnmanaged(u32),
+    ) DecompileError!bool {
+        var cur = start;
+        var steps: usize = 0;
+        if (path_out) |p| {
+            p.* = .{};
+            try p.append(self.arena.allocator(), cur);
+        }
+        while (cur < self.cfg.blocks.len and steps < 8) {
+            if (self.jumpTargetIfJumpOnlyEdge(cur, true, true)) |target| {
+                if (path_out) |p| {
+                    try p.append(self.arena.allocator(), target);
+                }
+                return target == header;
+            }
+            const blk = &self.cfg.blocks[cur];
+            var only_cleanup = true;
+            for (blk.instructions) |inst| {
+                switch (inst.opcode) {
+                    .POP_BLOCK, .POP_TOP, .NOP, .NOT_TAKEN, .CACHE => {},
+                    else => {
+                        only_cleanup = false;
+                        break;
+                    },
+                }
+            }
+            if (!only_cleanup) return false;
+            var next: ?u32 = null;
+            for (blk.successors) |edge| {
+                if (edge.edge_type == .exception) continue;
+                if (next != null) return false;
+                next = edge.target;
+            }
+            if (next == null) return false;
+            cur = next.?;
+            steps += 1;
+            if (path_out) |p| {
+                try p.append(self.arena.allocator(), cur);
+            }
+        }
+        return false;
+    }
+
+    fn guardBranchToHeader(
+        self: *Decompiler,
+        block: *const cfg_mod.BasicBlock,
+        term: decoder.Instruction,
+        header: u32,
+        trace_on: bool,
+    ) DecompileError!?GuardBranch {
+        const target_off = term.jumpTarget(self.cfg.version) orelse return null;
+        const jump_id = self.cfg.blockAtOffset(target_off) orelse return null;
+        var fall_id: ?u32 = null;
+        for (block.successors) |edge| {
+            if (edge.edge_type == .exception) continue;
+            if (edge.target == jump_id) continue;
+            if (fall_id != null) return null;
+            fall_id = edge.target;
+        }
+        if (fall_id == null) return null;
+        var jump_path: std.ArrayListUnmanaged(u32) = .{};
+        var fall_path: std.ArrayListUnmanaged(u32) = .{};
+        const jump_cont = try self.continuesToHeader(
+            jump_id,
+            header,
+            if (trace_on) &jump_path else null,
+        );
+        const fall_cont = try self.continuesToHeader(
+            fall_id.?,
+            header,
+            if (trace_on) &fall_path else null,
+        );
+        if (jump_cont == fall_cont) return null;
+        if (jump_cont) {
+            return .{
+                .target = jump_id,
+                .taken = true,
+                .path = if (trace_on) jump_path.items else &.{},
+            };
+        }
+        return .{
+            .target = fall_id.?,
+            .taken = false,
+            .path = if (trace_on) fall_path.items else &.{},
+        };
+    }
+
+    fn writeTrace(self: *Decompiler, value: anytype) DecompileError!void {
+        const file = self.trace_file orelse return;
+        var buf: [2048]u8 = undefined;
+        var writer = file.writerStreaming(&buf);
+        const out = &writer.interface;
+        try std.json.Stringify.value(value, .{}, out);
+        try out.writeAll("\n");
+        try out.flush();
+    }
+
+    fn exprToString(self: *Decompiler, expr: *const Expr) DecompileError![]const u8 {
+        var cg = codegen.Writer.init(self.arena.allocator());
+        defer cg.deinit(self.arena.allocator());
+        try cg.writeExpr(self.arena.allocator(), expr);
+        return try cg.getOutput(self.arena.allocator());
+    }
+
+    fn stackTraceVal(self: *Decompiler, val: StackValue) DecompileError!TraceStackVal {
+        return switch (val) {
+            .expr => |e| .{ .tag = "expr", .text = try self.exprToString(e) },
+            .function_obj => |f| .{ .tag = "func", .text = f.code.name },
+            .class_obj => |c| .{ .tag = "class", .text = c.name },
+            .comp_builder => .{ .tag = "comp_builder", .text = null },
+            .comp_obj => |c| .{ .tag = "comp", .text = @tagName(c.kind) },
+            .code_obj => |c| .{ .tag = "code", .text = c.name },
+            .import_module => |m| .{ .tag = "import", .text = m.module },
+            .null_marker => .{ .tag = "null", .text = null },
+            .saved_local => |name| .{ .tag = "saved_local", .text = name },
+            .unknown => .{ .tag = "unknown", .text = null },
+        };
+    }
+
+    fn stackTraceSlice(self: *Decompiler, vals: []const StackValue) DecompileError![]const TraceStackVal {
+        const a = self.arena.allocator();
+        if (vals.len == 0) return &.{};
+        const out = try a.alloc(TraceStackVal, vals.len);
+        for (vals, 0..) |val, idx| {
+            out[idx] = try self.stackTraceVal(val);
+        }
+        return out;
+    }
+
+    fn emitGuardTrace(
+        self: *Decompiler,
+        block_id: u32,
+        header_id: u32,
+        term: decoder.Instruction,
+        target_id: u32,
+        guard_cond: *Expr,
+        insert_idx: usize,
+        path: []const u32,
+    ) DecompileError!void {
+        if (!self.trace_loop_guards or self.trace_file == null) return;
+        const stack_vals = if (block_id < self.stack_in.len)
+            (self.stack_in[block_id] orelse &.{})
+        else
+            &.{};
+        const stack_in = try self.stackTraceSlice(stack_vals);
+        const guard_expr = try self.exprToString(guard_cond);
+        const ev = GuardTrace{
+            .kind = "loop_guard",
+            .block = block_id,
+            .header = header_id,
+            .term_op = @tagName(term.opcode),
+            .target = target_id,
+            .continues_path = path,
+            .stack_in = stack_in,
+            .guard_expr = guard_expr,
+            .insert_idx = insert_idx,
+        };
+        try self.writeTrace(ev);
+    }
+
+    fn traceSimBlock(self: *Decompiler, block_id: u32) DecompileError!void {
+        if (self.trace_file == null) return;
+        const target = self.trace_sim_block orelse return;
+        if (target != block_id) return;
+        if (block_id >= self.cfg.blocks.len) return error.InvalidBlock;
+        const block = &self.cfg.blocks[block_id];
+        var sim = self.initSim(self.arena.allocator(), self.arena.allocator(), self.code, self.version);
+        defer sim.deinit();
+        sim.lenient = true;
+        sim.stack.allow_underflow = true;
+        if (block_id < self.stack_in.len) {
+            if (self.stack_in[block_id]) |entry| {
+                for (entry) |val| {
+                    const cloned = try sim.cloneStackValue(val);
+                    try sim.stack.push(cloned);
+                }
+            }
+        }
+        for (block.instructions) |inst| {
+            const before = try self.stackTraceSlice(sim.stack.items.items);
+            try sim.simulate(inst);
+            const after = try self.stackTraceSlice(sim.stack.items.items);
+            const ev = SimTrace{
+                .kind = "sim_step",
+                .block = block_id,
+                .offset = inst.offset,
+                .op = @tagName(inst.opcode),
+                .arg = inst.arg,
+                .stack_before = before,
+                .stack_after = after,
+            };
+            try self.writeTrace(ev);
+            if (block.terminator()) |term| {
+                if (term.offset == inst.offset) break;
+            }
+        }
+    }
+
     fn emitStoreSubscr(
         self: *Decompiler,
         sim: *SimContext,
@@ -10636,6 +11055,42 @@ pub const Decompiler = struct {
             if (returnCleanupSkip(instructions, idx)) |skip| {
                 idx += skip - 1;
                 continue;
+            }
+            if (loop_header) |header_id| {
+                if (ctrl.Analyzer.isConditionalJump(undefined, inst.opcode)) {
+                    if (block.terminator()) |blk_term| {
+                        if (blk_term.offset == inst.offset) {
+                            const trace_on = self.trace_loop_guards and self.trace_file != null;
+                            if (try self.guardBranchToHeader(block, inst, header_id, trace_on)) |branch| {
+                                const cond = try sim.stack.popExpr();
+                                const guard_cond = try self.guardCondForBranch(cond, inst.opcode, branch.taken);
+                                if (trace_on) {
+                                    const insert_idx = stmts.items.len;
+                                    try self.emitGuardTrace(
+                                        block_id,
+                                        header_id,
+                                        inst,
+                                        branch.target,
+                                        guard_cond,
+                                        insert_idx,
+                                        branch.path,
+                                    );
+                                }
+                                const cont = try self.makeContinue();
+                                const body = try a.alloc(*Stmt, 1);
+                                body[0] = cont;
+                                const guard_stmt = try a.create(Stmt);
+                                guard_stmt.* = .{ .if_stmt = .{
+                                    .condition = guard_cond,
+                                    .body = body,
+                                    .else_body = &.{},
+                                } };
+                                try stmts.append(a, guard_stmt);
+                                return;
+                            }
+                        }
+                    }
+                }
             }
             switch (inst.opcode) {
                 .UNPACK_SEQUENCE, .UNPACK_EX => {
@@ -12335,7 +12790,7 @@ pub fn computeStackDepthsForTest(
 
 /// Decompile a code object and write Python source to writer.
 pub fn decompileToSource(allocator: Allocator, code: *const pyc.Code, version: Version, writer: anytype) !void {
-    return decompileToSourceWithContext(allocator, code, version, writer, null);
+    return decompileToSourceWithOptions(allocator, code, version, writer, null, .{});
 }
 
 /// Decompile with error context output.
@@ -12346,10 +12801,50 @@ pub fn decompileToSourceWithContext(
     writer: anytype,
     err_writer: ?std.fs.File,
 ) !void {
+    return decompileToSourceWithOptions(allocator, code, version, writer, err_writer, .{});
+}
+
+const FocusError = error{
+    AmbiguousCodePath,
+    CodePathNotFound,
+    InvalidFocusPath,
+};
+
+pub fn decompileToSourceWithOptions(
+    allocator: Allocator,
+    code: *const pyc.Code,
+    version: Version,
+    writer: anytype,
+    err_writer: ?std.fs.File,
+    opts: DecompileOptions,
+) !void {
+    var target = code;
+    if (opts.focus) |path| {
+        target = findCodeByPath(code, path) catch |err| {
+            if (err_writer) |ew| {
+                var buf: [256]u8 = undefined;
+                const msg = switch (err) {
+                    error.InvalidFocusPath => try std.fmt.bufPrint(&buf, "Invalid focus path: {s}\n", .{path}),
+                    error.CodePathNotFound => try std.fmt.bufPrint(&buf, "Focus path not found: {s}\n", .{path}),
+                    error.AmbiguousCodePath => try std.fmt.bufPrint(&buf, "Ambiguous focus path: {s}\n", .{path}),
+                };
+                _ = try ew.write(msg);
+            }
+            return err;
+        };
+    }
+    var use_opts = opts;
+    use_opts.focus = null;
     // Handle module-level code
-    if (std.mem.eql(u8, code.name, "<module>")) {
-        var decompiler = try Decompiler.init(allocator, code, version);
+    if (std.mem.eql(u8, target.name, "<module>")) {
+        var decompiler = try Decompiler.init(allocator, target, version);
         defer decompiler.deinit();
+        decompiler.trace_loop_guards = use_opts.trace_loop_guards;
+        decompiler.trace_sim_block = use_opts.trace_sim_block;
+        decompiler.trace_file = use_opts.trace_file;
+        if (use_opts.trace_sim_block) |bid| {
+            try decompiler.traceSimBlock(bid);
+        }
 
         const stmts = decompiler.decompile() catch |err| {
             if (err_writer) |ew| {
@@ -12400,12 +12895,19 @@ pub fn decompileToSourceWithContext(
         try writer.writeAll(output);
         return;
     } else {
-        try decompileFunctionToSource(allocator, code, version, writer, 0);
+        try decompileFunctionToSource(allocator, target, version, writer, 0, use_opts);
     }
 }
 
 /// Decompile a function and write to writer.
-fn decompileFunctionToSource(allocator: Allocator, code: *const pyc.Code, version: Version, writer: anytype, indent: u32) !void {
+fn decompileFunctionToSource(
+    allocator: Allocator,
+    code: *const pyc.Code,
+    version: Version,
+    writer: anytype,
+    indent: u32,
+    opts: DecompileOptions,
+) !void {
     // Write indent
     var i: u32 = 0;
     while (i < indent) : (i += 1) {
@@ -12501,6 +13003,12 @@ fn decompileFunctionToSource(allocator: Allocator, code: *const pyc.Code, versio
     if (code.code.len > 0) {
         var decompiler = try Decompiler.init(allocator, code, version);
         defer decompiler.deinit();
+        decompiler.trace_loop_guards = opts.trace_loop_guards;
+        decompiler.trace_sim_block = opts.trace_sim_block;
+        decompiler.trace_file = opts.trace_file;
+        if (opts.trace_sim_block) |bid| {
+            try decompiler.traceSimBlock(bid);
+        }
 
         const stmts = try decompiler.decompile();
 
@@ -12539,16 +13047,54 @@ fn decompileFunctionToSource(allocator: Allocator, code: *const pyc.Code, versio
         try writer.writeAll("pass\n");
     }
 
+    const child_opts: DecompileOptions = .{};
     // Process nested functions
     for (code.consts) |c| {
         if (c == .code) {
             const nested = c.code;
             if (!std.mem.eql(u8, nested.name, "<lambda>")) {
                 try writer.writeByte('\n');
-                try decompileFunctionToSource(allocator, nested, version, writer, indent + 1);
+                try decompileFunctionToSource(allocator, nested, version, writer, indent + 1, child_opts);
             }
         }
     }
+}
+
+fn findCodeByPath(code: *const pyc.Code, path: []const u8) FocusError!*const pyc.Code {
+    if (path.len == 0) return error.InvalidFocusPath;
+    var it = std.mem.splitScalar(u8, path, '.');
+    var cur = code;
+    var first = true;
+    while (it.next()) |seg| {
+        if (seg.len == 0) return error.InvalidFocusPath;
+        if (first) {
+            if (std.mem.eql(u8, seg, "<module>") or std.mem.eql(u8, seg, cur.name)) {
+                first = false;
+                continue;
+            }
+        }
+        first = false;
+        var found: ?*const pyc.Code = null;
+        for (cur.consts) |c| {
+            const child = switch (c) {
+                .code => c.code,
+                .code_ref => c.code_ref,
+                else => null,
+            };
+            if (child) |cc| {
+                if (std.mem.eql(u8, cc.name, seg)) {
+                    if (found == null) {
+                        found = cc;
+                    } else if (found.? != cc) {
+                        return error.AmbiguousCodePath;
+                    }
+                }
+            }
+        }
+        if (found == null) return error.CodePathNotFound;
+        cur = found.?;
+    }
+    return cur;
 }
 
 // ============================================================================
