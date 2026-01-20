@@ -468,6 +468,57 @@ pub const Decompiler = struct {
         }
     }
 
+    fn condChainFalseTarget(self: *Decompiler, start: u32, then_block: u32) DecompileError!?u32 {
+        if (start >= self.cfg.blocks.len) return null;
+        if (then_block >= self.cfg.blocks.len) return null;
+        var seen = try std.DynamicBitSet.initEmpty(self.allocator, self.cfg.blocks.len);
+        defer seen.deinit();
+        var cur = start;
+        while (true) {
+            if (cur >= self.cfg.blocks.len) return null;
+            if (seen.isSet(cur)) return null;
+            seen.set(cur);
+            const blk = &self.cfg.blocks[cur];
+            const term = blk.terminator() orelse return null;
+            if (!ctrl.Analyzer.isConditionalJump(undefined, term.opcode)) return null;
+            if (condBlockHasPrelude(blk)) return null;
+            var t_id: ?u32 = null;
+            var f_id: ?u32 = null;
+            for (blk.successors) |edge| {
+                if (edge.edge_type == .exception) continue;
+                if (edge.edge_type == .conditional_false) {
+                    f_id = edge.target;
+                } else if (edge.edge_type == .conditional_true or edge.edge_type == .normal) {
+                    t_id = edge.target;
+                }
+            }
+            if (t_id == null or f_id == null) return null;
+            var next: u32 = undefined;
+            if (t_id.? == then_block and f_id.? != then_block) {
+                next = f_id.?;
+            } else if (f_id.? == then_block and t_id.? != then_block) {
+                next = t_id.?;
+            } else {
+                return null;
+            }
+            if (next >= self.cfg.blocks.len) return null;
+            const next_blk = &self.cfg.blocks[next];
+            const next_term = next_blk.terminator() orelse return next;
+            if (!ctrl.Analyzer.isConditionalJump(undefined, next_term.opcode)) return next;
+            if (condBlockHasPrelude(next_blk)) return next;
+            var next_has_then = false;
+            for (next_blk.successors) |edge| {
+                if (edge.edge_type == .exception) continue;
+                if (edge.target == then_block) {
+                    next_has_then = true;
+                    break;
+                }
+            }
+            if (!next_has_then) return next;
+            cur = next;
+        }
+    }
+
     /// Try to emit a statement for the given opcode from the current stack state.
     /// Returns the statement if one was emitted, null otherwise.
     fn tryEmitStatement(self: *Decompiler, inst: decoder.Instruction, sim: *SimContext) DecompileError!?*Stmt {
@@ -4589,23 +4640,7 @@ pub const Decompiler = struct {
                 const else_blk = &self.cfg.blocks[else_id];
                 if (else_blk.terminator()) |else_term| {
                     if (ctrl.Analyzer.isConditionalJump(undefined, else_term.opcode)) {
-                        var t_id: ?u32 = null;
-                        var f_id: ?u32 = null;
-                        for (else_blk.successors) |edge| {
-                            if (edge.edge_type == .exception) continue;
-                            if (edge.edge_type == .conditional_false) {
-                                f_id = edge.target;
-                            } else if (edge.edge_type == .conditional_true or edge.edge_type == .normal) {
-                                t_id = edge.target;
-                            }
-                        }
-                        const false_block = if (t_id != null and t_id.? == then_block and f_id != null)
-                            f_id.?
-                        else if (f_id != null and f_id.? == then_block and t_id != null)
-                            t_id.?
-                        else
-                            null;
-                        if (false_block) |fb| {
+                        if (try self.condChainFalseTarget(else_id, then_block)) |fb| {
                             var in_stack = try std.DynamicBitSet.initEmpty(self.allocator, self.cfg.blocks.len);
                             defer in_stack.deinit();
                             var memo: std.AutoHashMapUnmanaged(u32, *Expr) = .{};
@@ -4646,26 +4681,7 @@ pub const Decompiler = struct {
                 }
             }
         }
-        if (term) |t| switch (t.opcode) {
-            .POP_JUMP_IF_TRUE,
-            .POP_JUMP_FORWARD_IF_TRUE,
-            .POP_JUMP_BACKWARD_IF_TRUE,
-            .JUMP_IF_TRUE,
-            => {
-                if (else_block) |else_id| {
-                    if (self.isTerminalBlock(else_id) and !self.isTerminalBlock(then_block)) {
-                        condition = try self.invertConditionExpr(condition);
-                        then_block = else_id;
-                        else_block = pattern.then_block;
-                        is_elif = false;
-                        inverted = true;
-                    }
-                }
-            },
-            else => {},
-        };
-
-        if (!inverted and !cond_tree_applied) {
+        if (!inverted) {
             if (term) |t| switch (t.opcode) {
                 .POP_JUMP_IF_TRUE,
                 .POP_JUMP_FORWARD_IF_TRUE,
@@ -4673,25 +4689,20 @@ pub const Decompiler = struct {
                 .JUMP_IF_TRUE,
                 => {
                     if (else_block) |else_id| {
-                        condition = try self.invertConditionExpr(condition);
-                        then_block = else_id;
-                        else_block = pattern.then_block;
-                        is_elif = false;
+                        if (self.isTerminalBlock(else_id) and !self.isTerminalBlock(then_block)) {
+                            if (try self.condChainAllTrueJumps(pattern.condition_block, else_id)) {
+                                condition = try self.invertConditionExpr(condition);
+                                then_block = else_id;
+                                else_block = pattern.then_block;
+                                is_elif = false;
+                                inverted = true;
+                            }
+                        }
                     }
                 },
                 else => {},
             };
         }
-
-        if (!is_elif) {
-            if (else_block) |else_id| {
-                if (self.isTerminalBlock(else_id) and try self.reachesBlock(then_block, else_id, pattern.condition_block)) {
-                    else_block = null;
-                    self.if_next = else_id;
-                }
-            }
-        }
-
         var fallthrough: ?u32 = null;
         if (!is_elif) {
             if (else_block) |else_id| {
@@ -4856,6 +4867,16 @@ pub const Decompiler = struct {
             if (else_id > pattern.condition_block and else_body.len > 0 and try self.reachesBlock(then_block, else_id, pattern.condition_block)) {
                 else_body = &[_]*Stmt{};
                 self.if_next = else_id;
+            }
+        }
+
+        if (then_body.len == 0 and else_body.len > 0) {
+            const else_is_if = else_body.len == 1 and else_body[0].* == .if_stmt;
+            const else_is_pass = else_body.len == 1 and else_body[0].* == .pass;
+            if (!else_is_if and !else_is_pass) {
+                condition = try self.invertConditionExpr(condition);
+                then_body = else_body;
+                else_body = &[_]*Stmt{};
             }
         }
 
@@ -5904,6 +5925,12 @@ pub const Decompiler = struct {
                 scan_block += 1;
             }
             var body = try self.decompileHandlerBody(info.body_block, body_end, info.skip_first_store, info.skip);
+            if (body.len == 0 and (info.skip_first_store or info.skip > 0)) {
+                body = try self.decompileHandlerBody(info.body_block, body_end, false, 0);
+            }
+            if (body.len == 0) {
+                body = try self.decompileHandlerBodyLinear(info.body_block, body_end, info.skip);
+            }
             if (info.name) |handler_name| {
                 if (body.len > 0) {
                     const first = body[0];
@@ -8942,19 +8969,27 @@ pub const Decompiler = struct {
     }
 
     fn decompileStructuredRange(self: *Decompiler, start: u32, end: u32) DecompileError![]const *Stmt {
-        return self.decompileStructuredRangeWithStackInner(start, end, &.{}, false);
+        return self.decompileStructuredRangeWithStackInner(start, end, &.{}, false, false);
     }
 
     fn decompileStructuredRangeNoTry(self: *Decompiler, start: u32, end: u32) DecompileError![]const *Stmt {
-        return self.decompileStructuredRangeWithStackInner(start, end, &.{}, true);
+        return self.decompileStructuredRangeWithStackInner(start, end, &.{}, true, false);
     }
 
     fn decompileStructuredRangeWithStack(self: *Decompiler, start: u32, end: u32, init_stack: []const StackValue) DecompileError![]const *Stmt {
-        return self.decompileStructuredRangeWithStackInner(start, end, init_stack, false);
+        return self.decompileStructuredRangeWithStackInner(start, end, init_stack, false, false);
     }
 
     fn decompileStructuredRangeNoTryWithStack(self: *Decompiler, start: u32, end: u32, init_stack: []const StackValue) DecompileError![]const *Stmt {
-        return self.decompileStructuredRangeWithStackInner(start, end, init_stack, true);
+        return self.decompileStructuredRangeWithStackInner(start, end, init_stack, true, false);
+    }
+
+    fn decompileStructuredRangeWithStackAllowHandlers(self: *Decompiler, start: u32, end: u32, init_stack: []const StackValue) DecompileError![]const *Stmt {
+        return self.decompileStructuredRangeWithStackInner(start, end, init_stack, false, true);
+    }
+
+    fn decompileStructuredRangeNoTryWithStackAllowHandlers(self: *Decompiler, start: u32, end: u32, init_stack: []const StackValue) DecompileError![]const *Stmt {
+        return self.decompileStructuredRangeWithStackInner(start, end, init_stack, true, true);
     }
 
     fn decompileStructuredRangeWithStackInner(
@@ -8963,6 +8998,7 @@ pub const Decompiler = struct {
         end: u32,
         init_stack: []const StackValue,
         skip_try: bool,
+        allow_handlers: bool,
     ) DecompileError![]const *Stmt {
         // Handle empty range (start == end)
         if (start >= end) return &[_]*Stmt{};
@@ -8989,7 +9025,7 @@ pub const Decompiler = struct {
                 block_idx += 1;
                 continue;
             }
-            if (self.cfg.blocks[block_idx].is_exception_handler) {
+            if (!allow_handlers and self.cfg.blocks[block_idx].is_exception_handler) {
                 block_idx += 1;
                 continue;
             }
@@ -9834,6 +9870,19 @@ pub const Decompiler = struct {
                     break;
                 }
                 skip = idx;
+                if (skip >= body.instructions.len) {
+                    var next_body: ?u32 = null;
+                    for (body.successors) |edge| {
+                        if (edge.edge_type == .normal) {
+                            next_body = edge.target;
+                            break;
+                        }
+                    }
+                    if (next_body) |nb| {
+                        body_block = nb;
+                        skip = 0;
+                    }
+                }
             }
         } else {
             for (block.instructions) |inst| {
@@ -9967,6 +10016,11 @@ pub const Decompiler = struct {
                         else => val.deinit(sim.allocator, sim.stack_alloc),
                     }
                 },
+                .RAISE_VARARGS, .DELETE_NAME, .DELETE_FAST, .DELETE_GLOBAL, .DELETE_DEREF, .DELETE_ATTR, .DELETE_SUBSCR => {
+                    if (try self.tryEmitStatement(inst, &sim)) |stmt| {
+                        try stmts.append(a, stmt);
+                    }
+                },
                 else => {
                     try sim.simulate(inst);
                 },
@@ -9984,8 +10038,42 @@ pub const Decompiler = struct {
                 placeholder.* = .{ .name = .{ .id = "__exception__", .ctx = .load } };
                 slot.* = .{ .expr = placeholder };
             }
-            const rest = try self.decompileStructuredRangeWithStack(start + 1, end, &exc_stack);
+            const rest = try self.decompileStructuredRangeNoTryWithStackAllowHandlers(start + 1, end, &exc_stack);
             try stmts.appendSlice(a, rest);
+        }
+
+        return stmts.toOwnedSlice(a);
+    }
+
+    fn decompileHandlerBodyLinear(
+        self: *Decompiler,
+        start: u32,
+        end: u32,
+        skip: usize,
+    ) DecompileError![]const *Stmt {
+        if (start >= end or start >= self.cfg.blocks.len) return &[_]*Stmt{};
+        const a = self.arena.allocator();
+        var stmts: std.ArrayList(*Stmt) = .{};
+        errdefer stmts.deinit(a);
+
+        var sim = self.initSim(a, a, self.code, self.version);
+        defer sim.deinit();
+        sim.lenient = true;
+        sim.stack.allow_underflow = true;
+
+        for (0..3) |_| {
+            const placeholder = try a.create(Expr);
+            placeholder.* = .{ .name = .{ .id = "__exception__", .ctx = .load } };
+            try sim.stack.push(.{ .expr = placeholder });
+        }
+
+        var bid = start;
+        var first = true;
+        while (bid < end and bid < self.cfg.blocks.len) : (bid += 1) {
+            const block = &self.cfg.blocks[bid];
+            const skip_first = if (first) skip else 0;
+            try self.processBlockWithSimAndSkip(block, &sim, &stmts, a, skip_first);
+            first = false;
         }
 
         return stmts.toOwnedSlice(a);
@@ -13047,17 +13135,6 @@ fn decompileFunctionToSource(
         try writer.writeAll("pass\n");
     }
 
-    const child_opts: DecompileOptions = .{};
-    // Process nested functions
-    for (code.consts) |c| {
-        if (c == .code) {
-            const nested = c.code;
-            if (!std.mem.eql(u8, nested.name, "<lambda>")) {
-                try writer.writeByte('\n');
-                try decompileFunctionToSource(allocator, nested, version, writer, indent + 1, child_opts);
-            }
-        }
-    }
 }
 
 fn findCodeByPath(code: *const pyc.Code, path: []const u8) FocusError!*const pyc.Code {
