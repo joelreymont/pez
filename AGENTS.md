@@ -8,6 +8,10 @@ Decompiler parity spec: `~/.claude/plans/composed-wishing-diffie.md`
 
 - Run dot without asking when task tracking helps.
 
+## Tools
+
+- When new tooling would speed or unblock work, add it plus skills/triggers, then use it.
+
 ## Build
 
 ```bash
