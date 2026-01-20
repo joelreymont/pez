@@ -42,9 +42,7 @@ test "snapshot loop guard 3.9" {
         \\        pass
         \\    def set_continue(self):
         \\        self._set_stopinfo(self.botframe, None, -1)
-        \\        if self.breaks:
-        \\            pass
-        \\        else:
+        \\        if not self.breaks:
         \\            sys.settrace(None)
         \\            frame = sys._getframe().f_back
         \\            while frame and frame is not self.botframe:
@@ -187,6 +185,29 @@ test "snapshot loop or condition 3.9" {
         \\    for mod in mods:
         \\        if mod == package or mod.startswith(f'{package}.'):
         \\            mods.append(mod)
+        \\"
+    );
+}
+
+test "snapshot if or chain 3.9" {
+    try runSnapshot(@src(), "test/corpus/if_or_chain.3.9.pyc",
+        \\[]u8
+        \\  "def f(a, b, c):
+        \\    if a == '' or b == '' or c == '':
+        \\        raise Exception('x')
+        \\    else:
+        \\        return None
+        \\"
+    );
+}
+
+test "snapshot guard return 3.9" {
+    try runSnapshot(@src(), "test/corpus/guard_return.3.9.pyc",
+        \\[]u8
+        \\  "def guard_return(x):
+        \\    if not x:
+        \\        return None
+        \\    return 1
         \\"
     );
 }
@@ -388,6 +409,19 @@ test "snapshot try except return 3.9" {
         \\        x()
         \\    except Exception:
         \\        y()
+        \\"
+    );
+}
+
+test "snapshot try except raise 3.9" {
+    try runSnapshot(@src(), "test/corpus/try_except_raise.3.9.pyc",
+        \\[]u8
+        \\  "def try_except_raise(do):
+        \\    try:
+        \\        do()
+        \\    except Exception:
+        \\        print('err')
+        \\        raise
         \\"
     );
 }
