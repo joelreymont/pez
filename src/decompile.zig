@@ -4397,6 +4397,15 @@ pub const Decompiler = struct {
         }
         self.chained_cmp_next_block = null;
 
+        var chain_else: ?u32 = null;
+        if (!is_elif) {
+            if (else_block) |else_id| {
+                if (self.jumpTargetIfJumpOnly(else_id, true)) |target| {
+                    chain_else = target;
+                }
+            }
+        }
+
         // Save remaining stack values to transfer to branches
         const base_vals = try self.cloneStackValues(sim.stack.items.items);
         var base_owned = true;
@@ -4405,55 +4414,117 @@ pub const Decompiler = struct {
         };
 
         // Collapse chained condition blocks on the then-path (x and y and z).
-        if (else_block) |else_id| {
-            var seen = try std.DynamicBitSet.initEmpty(self.allocator, self.cfg.blocks.len);
-            defer seen.deinit();
-            var cur = then_block;
-            var final_then = then_block;
-            var progressed = false;
-            while (cur < self.cfg.blocks.len) {
-                if (seen.isSet(cur)) break;
-                seen.set(cur);
-                const blk = &self.cfg.blocks[cur];
-                const blk_term = blk.terminator() orelse break;
-                if (!ctrl.Analyzer.isConditionalJump(undefined, blk_term.opcode)) break;
-                if (condBlockHasPrelude(blk)) break;
-                var t_id: ?u32 = null;
-                var f_id: ?u32 = null;
-                for (blk.successors) |edge| {
-                    if (edge.edge_type == .exception) continue;
-                    if (edge.edge_type == .conditional_false) {
-                        f_id = edge.target;
-                    } else if (edge.edge_type == .conditional_true or edge.edge_type == .normal) {
-                        t_id = edge.target;
+        var chained_cmp = false;
+        var else_resolved = false;
+        if (chain_else != null and condition.* == .compare) {
+            const else_target = chain_else.?;
+            if (then_block < self.cfg.blocks.len) {
+                const then_blk = &self.cfg.blocks[then_block];
+                if (!condBlockHasPrelude(then_blk)) {
+                    if (then_blk.terminator()) |then_term| {
+                        if (ctrl.Analyzer.isConditionalJump(undefined, then_term.opcode)) {
+                            var t_id: ?u32 = null;
+                            var f_id: ?u32 = null;
+                            for (then_blk.successors) |edge| {
+                                if (edge.edge_type == .exception) continue;
+                                if (edge.edge_type == .conditional_false) {
+                                    f_id = edge.target;
+                                } else if (edge.edge_type == .conditional_true or edge.edge_type == .normal) {
+                                    t_id = edge.target;
+                                }
+                            }
+                            if (t_id != null and f_id != null and f_id.? == else_target) {
+                                const cmp1 = condition.compare;
+                                if (cmp1.comparators.len > 0) {
+                                    const mid = cmp1.comparators[cmp1.comparators.len - 1];
+                                    var then_sim = self.initSim(self.arena.allocator(), self.arena.allocator(), self.code, self.version);
+                                    defer then_sim.deinit();
+                                    then_sim.lenient = true;
+                                    then_sim.stack.allow_underflow = true;
+                                    try then_sim.stack.push(.{ .expr = mid });
+                                    if (try self.condExprFromBlock(then_block, &then_sim, t_id.?, f_id.?)) |cond2| {
+                                        if (cond2.* == .compare and ast.exprEqual(mid, cond2.compare.left)) {
+                                            const cmp2 = cond2.compare;
+                                            const a = self.arena.allocator();
+                                            const ops = try a.alloc(ast.CmpOp, cmp1.ops.len + cmp2.ops.len);
+                                            const comparators = try a.alloc(*Expr, cmp1.comparators.len + cmp2.comparators.len);
+                                            std.mem.copyForwards(ast.CmpOp, ops[0..cmp1.ops.len], cmp1.ops);
+                                            std.mem.copyForwards(ast.CmpOp, ops[cmp1.ops.len..], cmp2.ops);
+                                            std.mem.copyForwards(*Expr, comparators[0..cmp1.comparators.len], cmp1.comparators);
+                                            std.mem.copyForwards(*Expr, comparators[cmp1.comparators.len..], cmp2.comparators);
+                                            const chain_expr = try a.create(Expr);
+                                            chain_expr.* = .{ .compare = .{
+                                                .left = cmp1.left,
+                                                .ops = ops,
+                                                .comparators = comparators,
+                                            } };
+                                            condition = chain_expr;
+                                            then_block = self.resolveJumpOnlyBlock(t_id.?);
+                                            else_block = else_target;
+                                            is_elif = false;
+                                            chained_cmp = true;
+                                            else_resolved = true;
+                                        }
+                                    }
+                                }
+                            }
+                        }
                     }
                 }
-                if (t_id == null or f_id == null) break;
-                if (f_id.? != else_id) break;
-                if (t_id.? == else_id) break;
-                progressed = true;
-                final_then = t_id.?;
-                cur = t_id.?;
             }
-            if (progressed and final_then != then_block) {
-                var in_stack = try std.DynamicBitSet.initEmpty(self.allocator, self.cfg.blocks.len);
-                defer in_stack.deinit();
-                var memo: std.AutoHashMapUnmanaged(u32, *Expr) = .{};
-                defer memo.deinit(self.allocator);
-                if (try self.buildCondTree(
-                    pattern.condition_block,
-                    pattern.condition_block,
-                    condition,
-                    final_then,
-                    else_id,
-                    base_vals,
-                    null,
-                    null,
-                    &in_stack,
-                    &memo,
-                )) |expr| {
-                    condition = expr;
-                    then_block = final_then;
+        }
+
+        if (!chained_cmp) {
+            if (else_block) |else_id| {
+                var seen = try std.DynamicBitSet.initEmpty(self.allocator, self.cfg.blocks.len);
+                defer seen.deinit();
+                var cur = then_block;
+                var final_then = then_block;
+                var progressed = false;
+                while (cur < self.cfg.blocks.len) {
+                    if (seen.isSet(cur)) break;
+                    seen.set(cur);
+                    const blk = &self.cfg.blocks[cur];
+                    const blk_term = blk.terminator() orelse break;
+                    if (!ctrl.Analyzer.isConditionalJump(undefined, blk_term.opcode)) break;
+                    if (condBlockHasPrelude(blk)) break;
+                    var t_id: ?u32 = null;
+                    var f_id: ?u32 = null;
+                    for (blk.successors) |edge| {
+                        if (edge.edge_type == .exception) continue;
+                        if (edge.edge_type == .conditional_false) {
+                            f_id = edge.target;
+                        } else if (edge.edge_type == .conditional_true or edge.edge_type == .normal) {
+                            t_id = edge.target;
+                        }
+                    }
+                    if (t_id == null or f_id == null) break;
+                    if (f_id.? != else_id) break;
+                    if (t_id.? == else_id) break;
+                    progressed = true;
+                    final_then = t_id.?;
+                    cur = t_id.?;
+                }
+                if (progressed and final_then != then_block) {
+                    var in_stack = try std.DynamicBitSet.initEmpty(self.allocator, self.cfg.blocks.len);
+                    defer in_stack.deinit();
+                    var memo: std.AutoHashMapUnmanaged(u32, *Expr) = .{};
+                    defer memo.deinit(self.allocator);
+                    if (try self.buildCondTree(
+                        pattern.condition_block,
+                        pattern.condition_block,
+                        condition,
+                        final_then,
+                        else_id,
+                        base_vals,
+                        null,
+                        null,
+                        &in_stack,
+                        &memo,
+                    )) |expr| {
+                        condition = expr;
+                        then_block = final_then;
+                    }
                 }
             }
         }
@@ -4651,8 +4722,32 @@ pub const Decompiler = struct {
                 deinitStackValuesSlice(self.allocator, self.allocator, base_vals);
                 base_owned = false;
             }
+            var else_next: ?u32 = null;
+            if (else_resolved and else_id < self.cfg.blocks.len) {
+                var succ: ?u32 = null;
+                var multi = false;
+                for (self.cfg.blocks[else_id].successors) |edge| {
+                    if (edge.edge_type == .exception) continue;
+                    if (succ != null) {
+                        multi = true;
+                        break;
+                    }
+                    succ = edge.target;
+                }
+                if (!multi) {
+                    else_next = succ;
+                    if (self.if_next == null) self.if_next = succ;
+                }
+            }
             const else_end = if (pattern.merge_block) |merge_id|
-                merge_id
+                if (else_resolved and merge_id == else_id and else_next != null)
+                    else_next.?
+                else if (else_resolved and merge_id == else_id)
+                    try self.branchEnd(else_id, null)
+                else
+                    merge_id
+            else if (else_resolved and else_next != null)
+                else_next.?
             else
                 try self.branchEnd(else_id, null);
             break :blk try self.decompileBranchRange(else_id, else_end, else_vals, skip);

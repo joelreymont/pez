@@ -466,3 +466,15 @@ test "snapshot guard or 3.9" {
         \\"
     );
 }
+
+test "snapshot chained compare 3.9" {
+    try runSnapshot(@src(), "test/corpus/chained_compare.3.9.pyc",
+        \\[]u8
+        \\  "def f(time_s):
+        \\    if 0 < time_s < 2000:
+        \\        y = time_s
+        \\    else:
+        \\        print('Error set time slice')
+        \\"
+    );
+}
