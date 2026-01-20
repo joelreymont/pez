@@ -1941,8 +1941,8 @@ test "marshal TYPE_STRING" {
     var obj = try module.readAnyObject(&reader);
     defer obj.deinit(allocator);
 
-    try testing.expectEqual(Object.string, std.meta.activeTag(obj));
-    try testing.expectEqualStrings("hello", obj.string);
+    try testing.expectEqual(Object.bytes, std.meta.activeTag(obj));
+    try testing.expectEqualStrings("hello", obj.bytes);
 }
 
 test "marshal TYPE_ASCII" {
