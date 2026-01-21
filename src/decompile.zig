@@ -5930,11 +5930,18 @@ pub const Decompiler = struct {
                             const succ_outside = if (succ) |sid| !self.analyzer.inLoop(sid, pattern.header_block) else true;
                             if (succ_outside and (succ == null or self.isTerminalBlock(succ.?))) {
                                 var next_block: u32 = pattern.exit_block;
-                                const limit: u32 = @intCast(self.cfg.blocks.len);
-                                while (next_block < limit) : (next_block += 1) {
-                                    if (next_block == pattern.exit_block) continue;
-                                    if (self.analyzer.inLoop(next_block, pattern.header_block)) continue;
-                                    break;
+                                if (succ) |sid| {
+                                    if (!self.analyzer.inLoop(sid, pattern.header_block)) {
+                                        next_block = sid;
+                                    }
+                                }
+                                if (next_block == pattern.exit_block) {
+                                    const limit: u32 = @intCast(self.cfg.blocks.len);
+                                    while (next_block < limit) : (next_block += 1) {
+                                        if (next_block == pattern.exit_block) continue;
+                                        if (self.analyzer.inLoop(next_block, pattern.header_block)) continue;
+                                        break;
+                                    }
                                 }
                                 const exit_stmts = try self.decompileBlockRangeWithStackAndSkip(
                                     pattern.exit_block,
