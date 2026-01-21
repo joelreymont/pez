@@ -697,6 +697,19 @@ pub const Decompiler = struct {
         return null;
     }
 
+    fn markCondChainConsumed(
+        self: *Decompiler,
+        first_block: u32,
+        memo: *const std.AutoHashMapUnmanaged(u32, *Expr),
+    ) DecompileError!void {
+        var it = memo.iterator();
+        while (it.next()) |entry| {
+            const bid = entry.key_ptr.*;
+            if (bid == first_block) continue;
+            try self.consumed.set(self.allocator, bid);
+        }
+    }
+
     fn isDocstringStmt(stmt: *const Stmt) bool {
         return switch (stmt.*) {
             .expr_stmt => |e| e.value.* == .constant and e.value.constant == .string,
@@ -10815,7 +10828,7 @@ pub const Decompiler = struct {
                     }
                     if (loop_exit) {
                         if (vis_ptr) |v| {
-                            if (try self.loopIfParts(if_pat, header, v)) |parts| {
+                            if (try self.loopIfParts(if_pat, header, v, null)) |parts| {
                                 const else_cont = if (parts.else_is_continuation and parts.else_block != null) blk: {
                                     const else_id = parts.else_block.?;
                                     if (self.resolveJumpOnlyBlock(else_id) == header or self.loopBlockLeadsToContinue(else_id, header)) {
@@ -11705,7 +11718,7 @@ pub const Decompiler = struct {
                     // Process statements before the condition
                     try self.processPartialBlock(block, &stmts, a, &skip_first_store, null);
 
-                    const parts = try self.loopIfParts(p, header_block_id, &visited) orelse {
+                    const parts = try self.loopIfParts(p, header_block_id, &visited, null) orelse {
                         block_idx += 1;
                         continue;
                     };
@@ -12019,6 +12032,18 @@ pub const Decompiler = struct {
             cur = next_id;
         }
         return false;
+    }
+
+    fn earlierStopBlock(self: *Decompiler, a: ?u32, b: ?u32) ?u32 {
+        if (a == null) return b;
+        if (b == null) return a;
+        const a_id = a.?;
+        const b_id = b.?;
+        if (a_id >= self.cfg.blocks.len) return b;
+        if (b_id >= self.cfg.blocks.len) return a;
+        const a_off = self.cfg.blocks[a_id].start_offset;
+        const b_off = self.cfg.blocks[b_id].start_offset;
+        return if (a_off <= b_off) a else b;
     }
 
     fn blockLeadsToHeader(self: *Decompiler, block_id: u32, loop_header: u32) bool {
@@ -13177,6 +13202,7 @@ pub const Decompiler = struct {
         pattern: ctrl.IfPattern,
         loop_header: u32,
         visited: *std.DynamicBitSet,
+        stop_block: ?u32,
     ) DecompileError!?LoopIfParts {
         if (self.if_in_progress) |*set| {
             if (set.isSet(pattern.condition_block)) return null;
@@ -13329,6 +13355,7 @@ pub const Decompiler = struct {
                     )) |expr| {
                         condition = expr;
                         then_block = final_then;
+                        try self.markCondChainConsumed(pattern.condition_block, &memo);
                     }
                 }
             }
@@ -13361,6 +13388,7 @@ pub const Decompiler = struct {
                                     condition = expr;
                                     else_block = fb;
                                     cond_tree_applied = true;
+                                    try self.markCondChainConsumed(pattern.condition_block, &memo);
                                 }
                             }
                         }
@@ -13422,6 +13450,14 @@ pub const Decompiler = struct {
             false;
         var else_is_continuation = else_to_header or (else_in_loop and !merge_in_loop and !then_in_loop);
         var else_is_fallthrough = false;
+        if (stop_block) |stop_id| {
+            if (else_block) |else_id| {
+                if (else_id == stop_id) {
+                    else_is_continuation = true;
+                    else_is_fallthrough = true;
+                }
+            }
+        }
         if (!else_is_continuation) {
             if (else_block) |else_id| {
                 if (self.hasSingleNormalSuccessor(then_block, else_id)) {
@@ -13450,11 +13486,12 @@ pub const Decompiler = struct {
                 }
             }
         }
+        const scoped_body_stop = self.earlierStopBlock(body_stop, stop_block);
         const then_break_tgt = self.loopBreakTarget(then_block, loop_header);
         const then_exit = then_break_tgt != null or self.isTerminalBlock(then_block);
         const a = self.arena.allocator();
         var then_body = if (!then_in_loop and then_exit) blk: {
-            var end = body_stop;
+            var end = scoped_body_stop;
             if (then_break_tgt) |tgt| {
                 if (end == null or tgt < end.?) end = tgt;
             }
@@ -13466,7 +13503,7 @@ pub const Decompiler = struct {
             &skip_first,
             &seed_then,
             visited,
-            body_stop,
+            scoped_body_stop,
             0,
             false,
         );
@@ -13481,8 +13518,9 @@ pub const Decompiler = struct {
                 pattern.merge_block
             else
                 null;
+            const scoped_else_stop = self.earlierStopBlock(else_stop, stop_block);
             if (!else_in_loop and else_exit) {
-                var end = else_stop;
+                var end = scoped_else_stop;
                 if (else_break_tgt) |tgt| {
                     if (end == null or tgt < end.?) end = tgt;
                 }
@@ -13500,7 +13538,7 @@ pub const Decompiler = struct {
                         &skip,
                         &seed_else,
                         visited,
-                        else_stop,
+                        scoped_else_stop,
                         0,
                         false,
                     );
@@ -13525,7 +13563,7 @@ pub const Decompiler = struct {
                 &skip,
                 &seed_else,
                 visited,
-                else_stop,
+                scoped_else_stop,
                 0,
                 false,
             );
@@ -13600,7 +13638,7 @@ pub const Decompiler = struct {
         loop_header: u32,
         visited: *std.DynamicBitSet,
     ) DecompileError!?*Stmt {
-        const parts = try self.loopIfParts(pattern, loop_header, visited) orelse return null;
+        const parts = try self.loopIfParts(pattern, loop_header, visited, null) orelse return null;
         const a = self.arena.allocator();
         const stmt = try a.create(Stmt);
         stmt.* = .{ .if_stmt = .{
@@ -13791,7 +13829,7 @@ pub const Decompiler = struct {
                 .if_stmt => |p| {
                     try self.processPartialBlock(block, &stmts, a, skip_first_store, null);
 
-                    const parts = try self.loopIfParts(p, loop_header, visited) orelse {
+                    const parts = try self.loopIfParts(p, loop_header, visited, stop_block) orelse {
                         block_idx += 1;
                         continue;
                     };
@@ -13808,7 +13846,24 @@ pub const Decompiler = struct {
                     } else false;
                     const then_guard = parts.then_leads and parts.else_block != null and !parts.else_leads;
                     var consumed_else = false;
-                    if (then_guard) {
+                    if (parts.else_block) |else_id| {
+                        if (parts.else_body.len > 0 and self.blockLeadsToHeader(else_id, loop_header)) {
+                            if (try self.reachesBlock(parts.then_block, else_id, p.condition_block)) {
+                                const if_stmt = try a.create(Stmt);
+                                if_stmt.* = .{ .if_stmt = .{
+                                    .condition = parts.condition,
+                                    .body = parts.then_body,
+                                    .else_body = &.{},
+                                } };
+                                try stmts.append(a, if_stmt);
+                                try stmts.appendSlice(a, parts.else_body);
+                                consumed_else = true;
+                            }
+                        }
+                    }
+                    if (consumed_else) {
+                        // else body already appended as tail merge
+                    } else if (then_guard) {
                         const if_stmt = try a.create(Stmt);
                         if_stmt.* = .{ .if_stmt = .{
                             .condition = parts.condition,
