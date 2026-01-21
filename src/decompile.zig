@@ -5466,7 +5466,8 @@ pub const Decompiler = struct {
         if (!inverted) {
             if (else_block) |else_id| {
                 if (pattern.merge_block != null and pattern.merge_block.? == then_block and
-                    self.isTerminalBlock(else_id) and !self.isAssertRaiseBlock(else_id))
+                    self.isTerminalBlock(else_id) and !self.isTerminalBlock(then_block) and
+                    !self.isAssertRaiseBlock(else_id))
                 {
                     condition = try self.invertConditionExpr(condition);
                     try self.emitDecisionTrace(pattern.condition_block, "if_guard_terminal_else", condition);
@@ -5476,7 +5477,6 @@ pub const Decompiler = struct {
                     is_elif = false;
                     inverted = true;
                     self.if_next = guard_next;
-                    forced_then_end = then_block;
                 }
             }
         }
