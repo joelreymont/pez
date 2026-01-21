@@ -2437,6 +2437,7 @@ pub const Analyzer = struct {
             if (count > 1 or next == null) break;
             cur_else = next.?;
         }
+        const term_else = cur_else;
         if (else_terminal) {
             // If then-branch reaches terminal else, treat it as merge.
             var seen = try std.DynamicBitSet.initEmpty(self.allocator, self.cfg.blocks.len);
@@ -2445,6 +2446,7 @@ pub const Analyzer = struct {
             defer stack.deinit(self.allocator);
             try stack.append(self.allocator, then_block);
             var reaches_else = false;
+            var reaches_term = false;
             while (stack.items.len > 0 and !reaches_else) {
                 const bid = stack.items[stack.items.len - 1];
                 stack.items.len -= 1;
@@ -2453,6 +2455,10 @@ pub const Analyzer = struct {
                 seen.set(bid);
                 if (bid == else_id) {
                     reaches_else = true;
+                    break;
+                }
+                if (bid == term_else) {
+                    reaches_term = true;
                     break;
                 }
                 const blk = &self.cfg.blocks[bid];
@@ -2472,6 +2478,7 @@ pub const Analyzer = struct {
                 }
             }
             if (reaches_else) return else_id;
+            if (reaches_term) return term_else;
 
             const cond_blk = &self.cfg.blocks[cond_block];
             const term = cond_blk.terminator() orelse return null;

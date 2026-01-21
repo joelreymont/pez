@@ -6943,6 +6943,7 @@ pub const Decompiler = struct {
             }
             if (post_try_entry) |entry_id| {
                 if (hid == entry_id) continue;
+                if (scratch.normal_reach.isSet(hid)) continue;
             }
             if (join_block) |join_id| {
                 if (hid == join_id) continue;

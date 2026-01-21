@@ -349,6 +349,25 @@ test "snapshot and or chain 3.9" {
     );
 }
 
+test "snapshot if else tail 3.9" {
+    try runSnapshot(@src(), "test/corpus/if_else_tail.3.9.pyc",
+        \\[]u8
+        \\  "logfp = None
+        \\def dolog(*args):
+        \\    pass
+        \\def nolog(*args):
+        \\    pass
+        \\def initlog(*args):
+        \\    global log
+        \\    if logfp:
+        \\        log = dolog
+        \\    else:
+        \\        log = nolog
+        \\    log(*args)
+        \\"
+    );
+}
+
 test "snapshot bytes constants 3.9" {
     try runSnapshot(@src(), "test/corpus/bytes_constants.3.9.pyc",
         \\[]u8
