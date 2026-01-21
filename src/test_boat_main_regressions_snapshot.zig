@@ -131,6 +131,23 @@ test "snapshot for else break 3.9" {
     );
 }
 
+test "snapshot try finally nested 3.9" {
+    try runSnapshot(@src(), "test/corpus/try_finally_nested.3.9.pyc",
+        \\[]u8
+        \\  "def f(arg):
+        \\    try:
+        \\        try:
+        \\            if arg:
+        \\                raise KeyboardInterrupt()
+        \\        except KeyboardInterrupt:
+        \\            pass
+        \\    finally:
+        \\        arg = False
+        \\        prompt = 'ok'
+        \\"
+    );
+}
+
 test "snapshot future docstring 3.9" {
     try runSnapshot(@src(), "test/corpus/future_docstring.3.9.pyc",
         \\[]u8

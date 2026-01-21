@@ -6768,6 +6768,14 @@ pub const Decompiler = struct {
             return try self.decompileTry311(pattern, handler_blocks.items);
         }
 
+        var has_finally = false;
+        for (handler_blocks.items) |hid| {
+            if (self.isFinallyHandler(hid)) {
+                has_finally = true;
+                break;
+            }
+        }
+
         const scratch = try self.getTryScratch(self.cfg.blocks.len);
         var handler_set = &scratch.handler_set;
         handler_set.reset();
@@ -6810,12 +6818,15 @@ pub const Decompiler = struct {
                 var candidate = edge.target;
                 if (candidate < handler_start) {
                     const resolved = self.resolveJumpOnlyBlock(candidate);
-                    if (resolved <= handler_start) continue;
-                    candidate = resolved;
-                    if (candidate >= self.cfg.blocks.len) continue;
-                    if (protected_set.isSet(candidate)) continue;
-                    if (handler_set.isSet(candidate)) continue;
+                    if (resolved > handler_start) {
+                        candidate = resolved;
+                    } else if (!has_finally) {
+                        continue;
+                    }
                 }
+                if (candidate >= self.cfg.blocks.len) continue;
+                if (protected_set.isSet(candidate)) continue;
+                if (handler_set.isSet(candidate)) continue;
                 post_try_entry = if (post_try_entry) |prev|
                     @min(prev, candidate)
                 else
@@ -6876,14 +6887,6 @@ pub const Decompiler = struct {
         if (exit_block) |exit| {
             if (exit <= handler_start) {
                 exit_block = null;
-            }
-        }
-
-        var has_finally = false;
-        for (handler_blocks.items) |hid| {
-            if (self.isFinallyHandler(hid)) {
-                has_finally = true;
-                break;
             }
         }
 

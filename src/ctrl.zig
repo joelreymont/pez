@@ -1619,6 +1619,71 @@ pub const Analyzer = struct {
         return false;
     }
 
+    fn collectReachableNormal(self: *Analyzer, start: u32, seen: *std.DynamicBitSet) !void {
+        if (start >= self.cfg.blocks.len) return;
+        var queue: std.ArrayList(u32) = .{};
+        defer queue.deinit(self.allocator);
+        try queue.append(self.allocator, start);
+
+        while (queue.items.len > 0) {
+            const bid = queue.items[queue.items.len - 1];
+            queue.items.len -= 1;
+            if (bid >= self.cfg.blocks.len) continue;
+            if (seen.isSet(bid)) continue;
+            seen.set(bid);
+            const blk = &self.cfg.blocks[bid];
+            for (blk.successors) |edge| {
+                if (edge.edge_type == .exception or edge.edge_type == .loop_back) continue;
+                if (edge.target >= self.cfg.blocks.len) continue;
+                if (!seen.isSet(edge.target)) {
+                    try queue.append(self.allocator, edge.target);
+                }
+            }
+        }
+    }
+
+    fn commonReachableNormal(self: *Analyzer, starts: []const u32) !?u32 {
+        if (starts.len == 0) return null;
+
+        var min_off: u32 = std.math.maxInt(u32);
+        for (starts) |s| {
+            if (s < self.cfg.blocks.len) {
+                const off = self.cfg.blocks[s].start_offset;
+                if (off < min_off) min_off = off;
+            }
+        }
+
+        var sets = try self.allocator.alloc(std.DynamicBitSet, starts.len);
+        defer {
+            for (sets) |*set| set.deinit();
+            self.allocator.free(sets);
+        }
+
+        for (starts, 0..) |s, i| {
+            sets[i] = try std.DynamicBitSet.initEmpty(self.allocator, self.cfg.blocks.len);
+            try self.collectReachableNormal(s, &sets[i]);
+        }
+
+        var best: ?u32 = null;
+        var best_off: u32 = 0;
+        for (self.cfg.blocks, 0..) |*blk, id| {
+            if (min_off != std.math.maxInt(u32) and blk.start_offset < min_off) continue;
+            var ok = true;
+            for (sets) |*set| {
+                if (!set.isSet(@intCast(id))) {
+                    ok = false;
+                    break;
+                }
+            }
+            if (!ok) continue;
+            if (best == null or blk.start_offset < best_off) {
+                best = @intCast(id);
+                best_off = blk.start_offset;
+            }
+        }
+        return best;
+    }
+
     fn detectElseBlock311(
         self: *Analyzer,
         try_block: u32,
@@ -1839,33 +1904,7 @@ pub const Analyzer = struct {
 
         if (candidates.items.len == 0) return null;
 
-        // Find common successor
-        var common: ?u32 = null;
-        for (candidates.items) |cand| {
-            var all_reach = true;
-            for (candidates.items) |other| {
-                if (cand == other) continue;
-                var reaches = false;
-                if (other < self.cfg.blocks.len) {
-                    const other_blk = &self.cfg.blocks[other];
-                    for (other_blk.successors) |edge| {
-                        if (edge.target == cand) {
-                            reaches = true;
-                            break;
-                        }
-                    }
-                }
-                if (!reaches) {
-                    all_reach = false;
-                    break;
-                }
-            }
-            if (all_reach) {
-                common = cand;
-                break;
-            }
-        }
-
+        const common = try self.commonReachableNormal(candidates.items);
         if (common == null) return null;
         var candidate = common.?;
 
@@ -2000,36 +2039,7 @@ pub const Analyzer = struct {
 
         if (candidates.items.len == 0) return null;
 
-        // Find common successor - block that all paths reach
-        var common: ?u32 = null;
-        for (candidates.items) |cand| {
-            var all_reach = true;
-            for (candidates.items) |other| {
-                if (cand == other) continue;
-                // Check if other reaches cand
-                var reaches = false;
-                if (other == cand) {
-                    reaches = true;
-                } else if (other < self.cfg.blocks.len) {
-                    const other_blk = &self.cfg.blocks[other];
-                    for (other_blk.successors) |edge| {
-                        if (edge.target == cand) {
-                            reaches = true;
-                            break;
-                        }
-                    }
-                }
-                if (!reaches) {
-                    all_reach = false;
-                    break;
-                }
-            }
-            if (all_reach) {
-                common = cand;
-                break;
-            }
-        }
-
+        const common = try self.commonReachableNormal(candidates.items);
         if (common == null) return null;
         const candidate = common.?;
 
