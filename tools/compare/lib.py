@@ -100,14 +100,18 @@ def select_compile_python(requested_py: str, orig_ver: Optional[Tuple[int, int]]
     return requested_py
 
 
-def compile_source(py: str, src: Path, out_pyc: Path, timeout: int) -> None:
+def compile_source(py: str, src: Path, out_pyc: Path, timeout: int, dfile: Optional[str] = None) -> None:
     code = (
         "import py_compile, sys\n"
         "src = sys.argv[1]\n"
         "dst = sys.argv[2]\n"
-        "py_compile.compile(src, cfile=dst, doraise=True)\n"
+        "dfile = sys.argv[3] if len(sys.argv) > 3 else None\n"
+        "py_compile.compile(src, cfile=dst, dfile=dfile, doraise=True)\n"
     )
-    proc = run_cmd([py, "-c", code, str(src), str(out_pyc)], timeout)
+    cmd = [py, "-c", code, str(src), str(out_pyc)]
+    if dfile:
+        cmd.append(dfile)
+    proc = run_cmd(cmd, timeout)
     if proc.returncode != 0:
         sys.stderr.write(proc.stderr)
         raise SystemExit(proc.returncode)

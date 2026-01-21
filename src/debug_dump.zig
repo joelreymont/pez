@@ -431,6 +431,7 @@ fn buildPatternDump(allocator: Allocator, analyzer: *ctrl.Analyzer) ![]const Pat
                 .block = bid,
                 .kind = "for",
                 .body_block = p.body_block,
+                .else_block = p.else_block,
                 .exit_block = p.exit_block,
             }),
             .try_stmt => |p| {

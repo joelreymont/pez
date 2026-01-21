@@ -86,6 +86,7 @@ pub const DecompileOptions = struct {
     focus: ?[]const u8 = null,
     trace_loop_guards: bool = false,
     trace_sim_block: ?u32 = null,
+    trace_decisions: bool = false,
     trace_file: ?std.fs.File = null,
 };
 
@@ -114,6 +115,13 @@ const SimTrace = struct {
     arg: u32,
     stack_before: []const TraceStackVal,
     stack_after: []const TraceStackVal,
+};
+
+const DecisionTrace = struct {
+    kind: []const u8,
+    block: u32,
+    note: []const u8,
+    cond: ?[]const u8 = null,
 };
 
 const GuardBranch = struct {
@@ -198,6 +206,7 @@ pub const Decompiler = struct {
     cfg: *CFG,
     analyzer: Analyzer,
     dom: *dom_mod.DomTree,
+    postdom_idom: ?[]u32 = null,
 
     /// Accumulated statements.
     statements: std.ArrayList(*Stmt),
@@ -207,6 +216,10 @@ pub const Decompiler = struct {
     chained_cmp_next_block: ?u32 = null,
     /// Pending ternary expression to be consumed by next STORE instruction.
     pending_ternary_expr: ?*Expr = null,
+    /// Pending expression for next STORE (boolop merge with conditional).
+    pending_store_expr: ?*Expr = null,
+    /// Pending stack values to prepend before next pending expr.
+    pending_vals: ?[]StackValue = null,
     /// Accumulated print items for Python 2.x PRINT_ITEM/PRINT_NEWLINE.
     print_items: std.ArrayList(*Expr),
     /// Print destination for PRINT_ITEM_TO.
@@ -249,6 +262,8 @@ pub const Decompiler = struct {
     trace_loop_guards: bool = false,
     /// Trace stack simulation for a block.
     trace_sim_block: ?u32 = null,
+    /// Trace control-flow rewrite decisions.
+    trace_decisions: bool = false,
     /// Trace output file.
     trace_file: ?std.fs.File = null,
 
@@ -293,6 +308,7 @@ pub const Decompiler = struct {
             .cfg = cfg,
             .analyzer = analyzer,
             .dom = dom,
+            .postdom_idom = null,
             .statements = .{},
             .nested_decompilers = .{},
             .print_items = .{},
@@ -306,6 +322,7 @@ pub const Decompiler = struct {
             .class_name = null,
             .trace_loop_guards = false,
             .trace_sim_block = null,
+            .trace_decisions = false,
             .trace_file = null,
         };
 
@@ -324,6 +341,10 @@ pub const Decompiler = struct {
         self.nested_decompilers.deinit(self.allocator);
         self.print_items.deinit(self.allocator);
         self.pending_chain_targets.deinit(self.allocator);
+        if (self.pending_vals) |vals| {
+            deinitStackValuesSlice(self.allocator, self.allocator, vals);
+            self.pending_vals = null;
+        }
         for (self.stack_in) |entry_opt| {
             if (entry_opt) |entry| {
                 if (entry.len > 0) self.allocator.free(entry);
@@ -336,6 +357,9 @@ pub const Decompiler = struct {
         self.analyzer.deinit();
         self.dom.deinit();
         self.allocator.destroy(self.dom);
+        if (self.postdom_idom) |idom| {
+            self.allocator.free(idom);
+        }
         if (self.try_scratch) |*scratch| {
             scratch.deinit(self.allocator);
         }
@@ -424,6 +448,18 @@ pub const Decompiler = struct {
             std.mem.eql(u8, name, "DELETE_FAST") or
             std.mem.eql(u8, name, "DELETE_GLOBAL") or
             std.mem.eql(u8, name, "DELETE_DEREF");
+    }
+
+    fn isExprOnlyBlock(self: *Decompiler, block_id: u32) bool {
+        if (block_id >= self.cfg.blocks.len) return false;
+        const blk = &self.cfg.blocks[block_id];
+        for (blk.instructions) |inst| {
+            if (inst.opcode == .NOT_TAKEN or inst.opcode == .CACHE) continue;
+            if (ctrl.Analyzer.isConditionalJump(undefined, inst.opcode)) return false;
+            if (inst.isUnconditionalJump()) return false;
+            if (isStatementOpcode(inst.opcode)) return false;
+        }
+        return true;
     }
 
     fn condBlockHasPrelude(block: *const BasicBlock) bool {
@@ -1228,6 +1264,18 @@ pub const Decompiler = struct {
         // For inline comprehensions (Python 3.12+), we need to skip cleanup ops
         // before pushing the expression: END_FOR, POP_TOP, SWAP, STORE_FAST (loop var restore)
         var extra_skip: usize = 0;
+        if (self.pending_vals) |vals| {
+            for (vals) |val| {
+                const cloned = try sim.cloneStackValue(val);
+                try sim.stack.push(cloned);
+            }
+            deinitStackValuesSlice(self.allocator, self.allocator, vals);
+            self.pending_vals = null;
+        }
+        if (self.pending_store_expr) |expr| {
+            try sim.stack.push(.{ .expr = expr });
+            self.pending_store_expr = null;
+        }
         if (self.pending_ternary_expr != null) {
             // Skip cleanup ops at start of block
             const cleanup_insts = block.instructions[skip_first..];
@@ -2033,16 +2081,22 @@ pub const Decompiler = struct {
                                 next_inst.opcode == .LOAD_GLOBAL or
                                 next_inst.opcode == .LOAD_DEREF)
                             {
-                                // Final attr target (no DUP)
-                                if (j + 1 < instructions.len and instructions[j + 1].opcode == .STORE_ATTR) {
-                                    try sim.simulate(next_inst);
+                                // Final attr target (no DUP), possibly through LOAD_ATTR chain.
+                                var k: usize = j;
+                                try sim.simulate(instructions[k]);
+                                k += 1;
+                                while (k < instructions.len and instructions[k].opcode == .LOAD_ATTR) {
+                                    try sim.simulate(instructions[k]);
+                                    k += 1;
+                                }
+                                if (k < instructions.len and instructions[k].opcode == .STORE_ATTR) {
                                     const cont_val = sim.stack.pop() orelse return error.StackUnderflow;
                                     if (cont_val == .expr) {
-                                        const attr = sim.getName(instructions[j + 1].arg) orelse "<unknown>";
+                                        const attr = sim.getName(instructions[k].arg) orelse "<unknown>";
                                         const target = try self.makeAttribute(cont_val.expr, attr, .store);
                                         try targets.append(arena, target);
                                     }
-                                    j += 2;
+                                    j = k + 1;
                                 }
                                 break;
                             } else {
@@ -2324,6 +2378,12 @@ pub const Decompiler = struct {
         defer cond_sim.deinit();
         cond_sim.lenient = true;
 
+        if (self.pending_vals) |vals| {
+            for (vals) |val| {
+                const cloned = try cond_sim.cloneStackValue(val);
+                try cond_sim.stack.push(cloned);
+            }
+        }
         if (self.pending_ternary_expr) |expr| {
             try cond_sim.stack.push(.{ .expr = expr });
             self.pending_ternary_expr = null;
@@ -2487,6 +2547,220 @@ pub const Decompiler = struct {
         return true;
     }
 
+    fn postDominates(self: *Decompiler, post: u32, node: u32) DecompileError!bool {
+        const n = self.cfg.blocks.len;
+        if (post >= n or node >= n) return false;
+        try self.ensurePostDom();
+        const idom = self.postdom_idom orelse return false;
+        const total: u32 = @intCast(n + 1);
+        return postdomDominatesIdom(idom, total, @intCast(n), post, node);
+    }
+
+    fn ensurePostDom(self: *Decompiler) DecompileError!void {
+        if (self.postdom_idom != null) return;
+        self.postdom_idom = try self.computePostDomIdom();
+    }
+
+    fn computePostDomIdom(self: *Decompiler) DecompileError![]u32 {
+        const n = self.cfg.blocks.len;
+        const total: usize = n + 1;
+        const exit_id: u32 = @intCast(n);
+
+        var succ_lists = try self.allocator.alloc(std.ArrayListUnmanaged(u32), total);
+        errdefer self.allocator.free(succ_lists);
+        var pred_lists = try self.allocator.alloc(std.ArrayListUnmanaged(u32), total);
+        errdefer self.allocator.free(pred_lists);
+        for (0..total) |i| {
+            succ_lists[i] = .{};
+            pred_lists[i] = .{};
+        }
+        errdefer {
+            for (0..total) |i| {
+                succ_lists[i].deinit(self.allocator);
+                pred_lists[i].deinit(self.allocator);
+            }
+        }
+
+        for (self.cfg.blocks, 0..) |blk, idx| {
+            const u: u32 = @intCast(idx);
+            for (blk.successors) |edge| {
+                if (edge.edge_type == .exception) continue;
+                const v = edge.target;
+                if (v >= n) continue;
+                try succ_lists[@intCast(v)].append(self.allocator, u);
+                try pred_lists[@intCast(u)].append(self.allocator, v);
+            }
+        }
+
+        for (0..n) |i| {
+            const id: u32 = @intCast(i);
+            if (self.isTerminalBlock(id)) {
+                try succ_lists[@intCast(exit_id)].append(self.allocator, id);
+                try pred_lists[@intCast(id)].append(self.allocator, exit_id);
+            }
+        }
+
+        var succs = try self.allocator.alloc([]const u32, total);
+        errdefer self.allocator.free(succs);
+        var preds = try self.allocator.alloc([]const u32, total);
+        errdefer self.allocator.free(preds);
+        for (0..total) |i| {
+            succs[i] = try succ_lists[i].toOwnedSlice(self.allocator);
+            preds[i] = try pred_lists[i].toOwnedSlice(self.allocator);
+        }
+        for (0..total) |i| {
+            succ_lists[i].deinit(self.allocator);
+            pred_lists[i].deinit(self.allocator);
+        }
+        self.allocator.free(succ_lists);
+        self.allocator.free(pred_lists);
+        defer {
+            for (0..total) |i| {
+                if (succs[i].len > 0) self.allocator.free(succs[i]);
+                if (preds[i].len > 0) self.allocator.free(preds[i]);
+            }
+            self.allocator.free(succs);
+            self.allocator.free(preds);
+        }
+
+        return try computePostDomIdomFrom(self.allocator, succs, preds, exit_id);
+    }
+
+    fn computePostDomIdomFrom(
+        allocator: Allocator,
+        succs: []const []const u32,
+        preds: []const []const u32,
+        entry: u32,
+    ) DecompileError![]u32 {
+        const total: u32 = @intCast(succs.len);
+        const count: usize = @intCast(total);
+        const undef = std.math.maxInt(u32);
+
+        var idom = try allocator.alloc(u32, count);
+        @memset(idom, undef);
+
+        const rpo = try computePostDomRpo(allocator, succs, entry);
+        defer allocator.free(rpo);
+
+        if (rpo.len == 0) {
+            for (0..count) |i| {
+                idom[i] = @intCast(i);
+            }
+            return idom;
+        }
+
+        var rpo_index = try allocator.alloc(u32, count);
+        defer allocator.free(rpo_index);
+        @memset(rpo_index, undef);
+        for (rpo, 0..) |node, idx| {
+            rpo_index[@intCast(node)] = @intCast(idx);
+        }
+
+        idom[@intCast(rpo[0])] = rpo[0];
+
+        var changed = true;
+        while (changed) {
+            changed = false;
+            for (rpo[1..]) |node| {
+                const node_idx: usize = @intCast(node);
+                var new_idom: ?u32 = null;
+
+                for (preds[node_idx]) |pred| {
+                    if (idom[@intCast(pred)] == undef) continue;
+                    if (new_idom == null) {
+                        new_idom = pred;
+                    } else {
+                        new_idom = postdomIntersectIdom(idom, rpo_index, pred, new_idom.?);
+                    }
+                }
+
+                if (new_idom == null) continue;
+                if (idom[node_idx] != new_idom.?) {
+                    idom[node_idx] = new_idom.?;
+                    changed = true;
+                }
+            }
+        }
+
+        for (idom, 0..) |*dom, i| {
+            if (dom.* == undef) {
+                dom.* = @intCast(i);
+            }
+        }
+
+        return idom;
+    }
+
+    fn computePostDomRpo(
+        allocator: Allocator,
+        succs: []const []const u32,
+        entry: u32,
+    ) DecompileError![]u32 {
+        if (entry >= succs.len) return &.{};
+        var visited = try std.DynamicBitSet.initEmpty(allocator, succs.len);
+        defer visited.deinit();
+
+        var postorder: std.ArrayList(u32) = .{};
+        errdefer postorder.deinit(allocator);
+
+        var stack: std.ArrayList(struct { node: u32, next_idx: usize }) = .{};
+        defer stack.deinit(allocator);
+
+        visited.set(@intCast(entry));
+        try stack.append(allocator, .{ .node = entry, .next_idx = 0 });
+
+        while (stack.items.len > 0) {
+            var frame = &stack.items[stack.items.len - 1];
+            const node = frame.node;
+            if (frame.next_idx < succs[@intCast(node)].len) {
+                const next = succs[@intCast(node)][frame.next_idx];
+                frame.next_idx += 1;
+                if (next >= succs.len) continue;
+                if (!visited.isSet(@intCast(next))) {
+                    visited.set(@intCast(next));
+                    try stack.append(allocator, .{ .node = next, .next_idx = 0 });
+                }
+            } else {
+                try postorder.append(allocator, node);
+                _ = stack.pop();
+            }
+        }
+
+        const rpo = try postorder.toOwnedSlice(allocator);
+        std.mem.reverse(u32, rpo);
+        return rpo;
+    }
+
+    fn postdomIntersectIdom(idom: []const u32, rpo_index: []const u32, a: u32, b: u32) u32 {
+        var finger1 = a;
+        var finger2 = b;
+        while (finger1 != finger2) {
+            while (rpo_index[@intCast(finger1)] > rpo_index[@intCast(finger2)]) {
+                finger1 = idom[@intCast(finger1)];
+            }
+            while (rpo_index[@intCast(finger2)] > rpo_index[@intCast(finger1)]) {
+                finger2 = idom[@intCast(finger2)];
+            }
+        }
+        return finger1;
+    }
+
+    fn postdomDominatesIdom(idom: []const u32, num_blocks: u32, entry: u32, a: u32, b: u32) bool {
+        if (a >= num_blocks or b >= num_blocks) return false;
+        if (a == b) return true;
+        const b_idx: usize = @intCast(b);
+        if (b != entry and idom[b_idx] == b) return false;
+
+        var current = b;
+        while (current != entry) {
+            const parent = idom[@intCast(current)];
+            if (parent == a) return true;
+            if (parent == current) break;
+            current = parent;
+        }
+        return a == entry;
+    }
+
     const TerminalResult = struct {
         block_id: u32,
         stmt: *Stmt,
@@ -2501,6 +2775,17 @@ pub const Decompiler = struct {
     fn stmtIsTerminal(_: *Decompiler, stmt: *const Stmt) bool {
         return switch (stmt.*) {
             .return_stmt, .raise_stmt => true,
+            else => false,
+        };
+    }
+
+    fn stmtAlwaysTerminal(self: *Decompiler, stmt: *const Stmt) bool {
+        return switch (stmt.*) {
+            .return_stmt, .raise_stmt => true,
+            .if_stmt => |ifs| blk: {
+                if (ifs.body.len == 0 or ifs.else_body.len == 0) break :blk false;
+                break :blk self.bodyEndsTerminal(ifs.body) and self.bodyEndsTerminal(ifs.else_body);
+            },
             else => false,
         };
     }
@@ -2545,7 +2830,7 @@ pub const Decompiler = struct {
 
     fn bodyEndsTerminal(self: *Decompiler, body: []const *Stmt) bool {
         if (body.len == 0) return false;
-        return self.stmtIsTerminal(body[body.len - 1]);
+        return self.stmtAlwaysTerminal(body[body.len - 1]);
     }
 
     fn appendStmt(
@@ -2699,6 +2984,64 @@ pub const Decompiler = struct {
         }
 
         return out.toOwnedSlice(allocator);
+    }
+
+    fn mergeImportFromGroupsDeep(
+        self: *Decompiler,
+        allocator: Allocator,
+        stmts: []const *Stmt,
+    ) DecompileError![]const *Stmt {
+        for (stmts) |stmt| {
+            switch (stmt.*) {
+                .function_def => |*f| {
+                    f.body = try self.mergeImportFromGroupsDeep(allocator, f.body);
+                },
+                .class_def => |*c| {
+                    c.body = try self.mergeImportFromGroupsDeep(allocator, c.body);
+                },
+                .for_stmt => |*f| {
+                    f.body = try self.mergeImportFromGroupsDeep(allocator, f.body);
+                    f.else_body = try self.mergeImportFromGroupsDeep(allocator, f.else_body);
+                },
+                .while_stmt => |*w| {
+                    w.body = try self.mergeImportFromGroupsDeep(allocator, w.body);
+                    w.else_body = try self.mergeImportFromGroupsDeep(allocator, w.else_body);
+                },
+                .if_stmt => |*i| {
+                    i.body = try self.mergeImportFromGroupsDeep(allocator, i.body);
+                    i.else_body = try self.mergeImportFromGroupsDeep(allocator, i.else_body);
+                },
+                .with_stmt => |*w| {
+                    w.body = try self.mergeImportFromGroupsDeep(allocator, w.body);
+                },
+                .try_stmt => |*t| {
+                    t.body = try self.mergeImportFromGroupsDeep(allocator, t.body);
+                    t.else_body = try self.mergeImportFromGroupsDeep(allocator, t.else_body);
+                    t.finalbody = try self.mergeImportFromGroupsDeep(allocator, t.finalbody);
+                    if (t.handlers.len > 0) {
+                        const handlers = try allocator.alloc(ast.ExceptHandler, t.handlers.len);
+                        for (t.handlers, 0..) |h, idx| {
+                            handlers[idx] = h;
+                            handlers[idx].body = try self.mergeImportFromGroupsDeep(allocator, h.body);
+                        }
+                        t.handlers = handlers;
+                    }
+                },
+                .match_stmt => |*m| {
+                    if (m.cases.len > 0) {
+                        const cases = try allocator.alloc(ast.MatchCase, m.cases.len);
+                        for (m.cases, 0..) |c, idx| {
+                            cases[idx] = c;
+                            cases[idx].body = try self.mergeImportFromGroupsDeep(allocator, c.body);
+                        }
+                        m.cases = cases;
+                    }
+                },
+                else => {},
+            }
+        }
+
+        return try self.mergeImportFromGroups(allocator, stmts);
     }
 
     fn reachesBlock(
@@ -3013,7 +3356,14 @@ pub const Decompiler = struct {
         } };
 
         self.pending_ternary_expr = if_expr;
-        if (base_owned.*) {
+        if (self.pending_vals) |vals| {
+            deinitStackValuesSlice(self.allocator, self.allocator, vals);
+            self.pending_vals = null;
+        }
+        if (base_vals.len > 0) {
+            self.pending_vals = base_vals;
+            if (base_owned.*) base_owned.* = false;
+        } else if (base_owned.*) {
             deinitStackValuesSlice(self.allocator, self.allocator, base_vals);
             base_owned.* = false;
         }
@@ -3493,6 +3843,7 @@ pub const Decompiler = struct {
             .setup_block = try_id,
             .header_block = for_block_id.?,
             .body_block = body_block_id.?,
+            .else_block = null,
             .exit_block = exit_block_id.?,
         };
 
@@ -3604,6 +3955,14 @@ pub const Decompiler = struct {
         const final_merge = bool_result.merge_block;
 
         // Process merge block with the bool expression on stack
+        const merge_block = &self.cfg.blocks[final_merge];
+        if (merge_block.terminator()) |mt| {
+            if (ctrl.Analyzer.isConditionalJump(undefined, mt.opcode)) {
+                if (self.pending_ternary_expr != null or self.pending_store_expr != null) return error.InvalidBlock;
+                self.pending_store_expr = bool_expr;
+                return final_merge;
+            }
+        }
         var merge_sim = self.initSim(self.arena.allocator(), self.arena.allocator(), self.code, self.version);
         defer merge_sim.deinit();
         if (base_vals.len > 0) {
@@ -3613,8 +3972,6 @@ pub const Decompiler = struct {
             }
         }
         try merge_sim.stack.push(.{ .expr = bool_expr });
-
-        const merge_block = &self.cfg.blocks[final_merge];
         self.processBlockWithSim(merge_block, &merge_sim, stmts, stmts_allocator) catch |err| {
             switch (err) {
                 error.StackUnderflow, error.NotAnExpression, error.InvalidBlock => return null,
@@ -3731,7 +4088,11 @@ pub const Decompiler = struct {
     /// Find the last block that's part of an if-elif-else chain.
     fn findIfChainEnd(self: *Decompiler, pattern: ctrl.IfPattern) DecompileError!u32 {
         if (pattern.merge_block) |merge| {
-            if (merge > pattern.condition_block) return merge;
+            if (merge > pattern.condition_block and merge != pattern.then_block and
+                (pattern.else_block == null or merge != pattern.else_block.?))
+            {
+                return merge;
+            }
         }
 
         var end = try self.branchEnd(pattern.then_block, null);
@@ -3838,6 +4199,7 @@ pub const Decompiler = struct {
     /// Decompile the code object into a list of statements.
     pub fn decompile(self: *Decompiler) DecompileError![]const *Stmt {
         if (self.cfg.blocks.len == 0) {
+            try self.insertModuleGlobals();
             return self.statements.items;
         }
 
@@ -4030,7 +4392,12 @@ pub const Decompiler = struct {
             }
         }
 
+        try self.insertModuleGlobals();
         return self.statements.items;
+    }
+
+    fn insertModuleGlobals(self: *Decompiler) DecompileError!void {
+        _ = self;
     }
 
     /// Decompile a single basic block into statements.
@@ -4463,6 +4830,28 @@ pub const Decompiler = struct {
         var then_block = pattern.then_block;
         var else_block = pattern.else_block;
         var is_elif = pattern.is_elif;
+        var forced_then_end: ?u32 = null;
+        if (is_elif) {
+            if (else_block) |else_id| {
+                if (self.analyzer.detectBoolOp(else_id)) |bool_pat| {
+                    if (self.isExprOnlyBlock(bool_pat.second_block)) {
+                        is_elif = false;
+                    }
+                }
+                if (is_elif and try self.reachesBlock(else_id, then_block, pattern.condition_block) and
+                    try self.postDominates(then_block, else_id))
+                {
+                    condition = try self.invertConditionExpr(condition);
+                    try self.emitDecisionTrace(pattern.condition_block, "if_invert_elif_merge", condition);
+                    const merge = then_block;
+                    then_block = else_id;
+                    else_block = null;
+                    is_elif = false;
+                    self.if_next = merge;
+                    forced_then_end = merge;
+                }
+            }
+        }
         const merge_forward = if (pattern.merge_block) |merge| merge > pattern.condition_block else false;
         const merge_else = !is_elif and merge_forward and pattern.merge_block != null and pattern.merge_block == pattern.else_block;
         const orig_then = then_block;
@@ -4486,11 +4875,58 @@ pub const Decompiler = struct {
             }
             if (orig_then_reaches_else) {
                 if (orig_else) |else_id| {
-                    if (else_id > orig_then) {
+                    if (else_id > orig_then and try self.postDominates(else_id, orig_then)) {
                         self.if_next = else_id;
                     }
                 }
             }
+        }
+
+        var swapped_true_jump = false;
+        if (!is_elif and !legacy_cond) {
+            if (term) |t| switch (t.opcode) {
+                .POP_JUMP_IF_TRUE,
+                .POP_JUMP_FORWARD_IF_TRUE,
+                .POP_JUMP_BACKWARD_IF_TRUE,
+                .JUMP_IF_TRUE,
+                => {
+                    if (else_block) |else_id| {
+                        var cond_jump_count: usize = 0;
+                        var has_call = false;
+                        var has_cmp = false;
+                        for (cond_block.instructions) |inst| {
+                            if (ctrl.Analyzer.isConditionalJump(undefined, inst.opcode)) cond_jump_count += 1;
+                            switch (inst.opcode) {
+                                .CALL_FUNCTION,
+                                .CALL_METHOD,
+                                .CALL_FUNCTION_KW,
+                                .CALL_FUNCTION_EX,
+                                .CALL,
+                                => has_call = true,
+                                .COMPARE_OP,
+                                .CONTAINS_OP,
+                                .IS_OP,
+                                => has_cmp = true,
+                                else => {},
+                            }
+                        }
+                        if (cond_jump_count <= 1 and self.analyzer.detectBoolOp(pattern.condition_block) == null) {
+                            const is_not = condition.* == .unary_op and condition.unary_op.op == .not_;
+                            const can_invert = has_call and !has_cmp;
+                            if (can_invert and !is_not) {
+                                condition = try self.invertConditionExpr(condition);
+                                try self.emitDecisionTrace(pattern.condition_block, "if_invert_true_jump", condition);
+                                const tmp = then_block;
+                                then_block = else_id;
+                                else_block = tmp;
+                                is_elif = false;
+                                swapped_true_jump = true;
+                            }
+                        }
+                    }
+                },
+                else => {},
+            };
         }
 
         // Check for chained comparison pattern (Python 3.14+)
@@ -4546,7 +4982,7 @@ pub const Decompiler = struct {
                                     then_sim.lenient = true;
                                     then_sim.stack.allow_underflow = true;
                                     try then_sim.stack.push(.{ .expr = mid });
-                                    if (try self.condExprFromBlock(then_block, &then_sim, t_id.?, f_id.?)) |cond2| {
+                                    if (try self.condExprFromBlock(then_block, &then_sim, t_id.?, f_id.?, 0)) |cond2| {
                                         if (cond2.* == .compare and ast.exprEqual(mid, cond2.compare.left)) {
                                             const cmp2 = cond2.compare;
                                             const a = self.arena.allocator();
@@ -4636,7 +5072,7 @@ pub const Decompiler = struct {
         // Collapse short-circuit condition chains that share the same then-block.
         var cond_tree_applied = false;
         if (else_block) |else_id| {
-            if (is_elif and else_id < self.cfg.blocks.len) {
+            if (else_id < self.cfg.blocks.len) {
                 const else_blk = &self.cfg.blocks[else_id];
                 if (else_blk.terminator()) |else_term| {
                     if (ctrl.Analyzer.isConditionalJump(undefined, else_term.opcode)) {
@@ -4669,11 +5105,12 @@ pub const Decompiler = struct {
             }
         }
 
-        var inverted = false;
+        var inverted = swapped_true_jump;
         if (cond_tree_applied) {
             if (else_block) |else_id| {
                 if (try self.condChainAllTrueJumps(pattern.condition_block, else_id)) {
                     condition = try self.invertConditionExpr(condition);
+                    try self.emitDecisionTrace(pattern.condition_block, "if_invert_bool_chain", condition);
                     then_block = else_id;
                     else_block = pattern.then_block;
                     is_elif = false;
@@ -4681,21 +5118,35 @@ pub const Decompiler = struct {
                 }
             }
         }
-        if (!inverted) {
+        if (!inverted and !cond_tree_applied) {
             if (term) |t| switch (t.opcode) {
                 .POP_JUMP_IF_TRUE,
                 .POP_JUMP_FORWARD_IF_TRUE,
                 .POP_JUMP_BACKWARD_IF_TRUE,
                 .JUMP_IF_TRUE,
                 => {
-                    if (else_block) |else_id| {
-                        if (self.isTerminalBlock(else_id) and !self.isTerminalBlock(then_block)) {
-                            if (try self.condChainAllTrueJumps(pattern.condition_block, else_id)) {
-                                condition = try self.invertConditionExpr(condition);
-                                then_block = else_id;
-                                else_block = pattern.then_block;
-                                is_elif = false;
-                                inverted = true;
+                    if (!legacy_cond and !is_elif) {
+                        if (else_block) |else_id| {
+                            condition = try self.invertConditionExpr(condition);
+                            try self.emitDecisionTrace(pattern.condition_block, "if_invert_true_jump", condition);
+                            const tmp = then_block;
+                            then_block = else_id;
+                            else_block = tmp;
+                            is_elif = false;
+                            inverted = true;
+                        }
+                    }
+                    if (!inverted) {
+                        if (else_block) |else_id| {
+                            if (self.isTerminalBlock(else_id) and !self.isTerminalBlock(then_block)) {
+                                if (try self.condChainAllTrueJumps(pattern.condition_block, else_id)) {
+                                    condition = try self.invertConditionExpr(condition);
+                                    try self.emitDecisionTrace(pattern.condition_block, "if_invert_terminal_else", condition);
+                                    then_block = else_id;
+                                    else_block = pattern.then_block;
+                                    is_elif = false;
+                                    inverted = true;
+                                }
                             }
                         }
                     }
@@ -4706,10 +5157,12 @@ pub const Decompiler = struct {
         var fallthrough: ?u32 = null;
         if (!is_elif) {
             if (else_block) |else_id| {
-                if (self.isTerminalBlock(then_block) and else_id > then_block and (inverted or !self.isTerminalBlock(else_id))) {
-                    fallthrough = else_id;
-                    else_block = null;
-                    self.if_next = else_id;
+                if (self.isTerminalBlock(then_block) and else_id > then_block) {
+                    if (!self.isTerminalBlock(else_id)) {
+                        fallthrough = else_id;
+                        else_block = null;
+                        self.if_next = else_id;
+                    }
                 }
             }
         }
@@ -4738,6 +5191,7 @@ pub const Decompiler = struct {
 
         // Decompile the then body with inherited stack
         const then_end = blk: {
+            if (forced_then_end) |ft| break :blk ft;
             if (fallthrough) |fb| break :blk fb;
             if (else_block) |else_id| {
                 if (else_id > then_block) break :blk else_id;
@@ -4779,7 +5233,15 @@ pub const Decompiler = struct {
                         break :blk body;
                     }
                 }
-                break :blk &[_]*Stmt{};
+                const merge_before_else = if (pattern.merge_block) |merge_id| merge_id < else_id else false;
+                const else_end = if (pattern.merge_block) |merge_id|
+                    if (merge_before_else)
+                        try self.branchEnd(else_id, null)
+                    else
+                        merge_id
+                else
+                    try self.branchEnd(else_id, null);
+                break :blk try self.decompileBranchRange(else_id, else_end, &.{}, skip);
             }
             // Regular else with inherited stack
             defer {
@@ -4800,11 +5262,22 @@ pub const Decompiler = struct {
                 }
                 if (!multi) {
                     else_next = succ;
-                    if (self.if_next == null) self.if_next = succ;
+                    if (self.if_next == null) {
+                        if (succ) |sid| {
+                            if (!self.isTerminalBlock(sid)) {
+                                self.if_next = sid;
+                            }
+                        }
+                    }
                 }
             }
+            const merge_before_else = if (pattern.merge_block) |merge_id| merge_id < else_id else false;
             const else_end = if (pattern.merge_block) |merge_id|
-                if (else_resolved and merge_id == else_id and else_next != null)
+                if (merge_before_else)
+                    try self.branchEnd(else_id, null)
+                else if (merge_id == else_id and !else_resolved)
+                    try self.branchEnd(else_id, null)
+                else if (else_resolved and merge_id == else_id and else_next != null)
                     else_next.?
                 else if (else_resolved and merge_id == else_id)
                     try self.branchEnd(else_id, null)
@@ -4822,29 +5295,148 @@ pub const Decompiler = struct {
             break :blk &[_]*Stmt{};
         };
 
+        var synth_else = false;
+        if (else_block != null) {
+            if (else_body.len == 0) {
+                if (pattern.merge_block) |merge_id| {
+                    if (merge_id < self.cfg.blocks.len and merge_id > pattern.condition_block) {
+                        var limit: u32 = @intCast(self.cfg.blocks.len);
+                        if (self.br_limit) |lim| {
+                            const lim_next = lim + 1;
+                            if (lim_next < limit) limit = lim_next;
+                        }
+                        var reach = try self.reachableInRange(then_block, limit, merge_id);
+                        defer reach.deinit();
+                        var next_id: ?u32 = null;
+                        var bid: u32 = merge_id + 1;
+                        while (bid < limit) : (bid += 1) {
+                            if (reach.isSet(bid)) {
+                                next_id = bid;
+                                break;
+                            }
+                        }
+                        if (next_id != null) {
+                            var term_id: ?u32 = null;
+                            var cur = merge_id;
+                            var steps: u32 = 0;
+                            var linear = true;
+                            while (cur < self.cfg.blocks.len) {
+                                steps += 1;
+                                if (steps > self.cfg.blocks.len) {
+                                    linear = false;
+                                    break;
+                                }
+                                const blk = &self.cfg.blocks[cur];
+                                if (blk.terminator()) |t| {
+                                    if (ctrl.Analyzer.isConditionalJump(undefined, t.opcode)) {
+                                        linear = false;
+                                        break;
+                                    }
+                                }
+                                var next: ?u32 = null;
+                                var count: u32 = 0;
+                                for (blk.successors) |edge| {
+                                    if (edge.edge_type == .exception or edge.edge_type == .loop_back) continue;
+                                    count += 1;
+                                    if (count == 1) next = edge.target;
+                                }
+                                if (count == 0) {
+                                    term_id = cur;
+                                    break;
+                                }
+                                if (count > 1 or next == null) {
+                                    linear = false;
+                                    break;
+                                }
+                                cur = next.?;
+                            }
+                            if (linear and term_id != null) {
+                                var tmp: std.ArrayList(*Stmt) = .{};
+                                defer tmp.deinit(a);
+                                try self.decompileBlockIntoWithStackAndSkip(term_id.?, &tmp, a, &.{}, 0);
+                                if (tmp.items.len == 1 and self.stmtIsTerminal(tmp.items[0])) {
+                                    const body = try a.alloc(*Stmt, 1);
+                                    body[0] = tmp.items[0];
+                                    else_body = body;
+                                    synth_else = true;
+
+                                    if (self.if_next == null) {
+                                        self.if_next = next_id.?;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
         var appended_term: ?*Stmt = null;
         if (else_block) |else_id| {
             const then_reaches_else = try self.reachesBlock(then_block, else_id, pattern.condition_block);
             var collapsed_else = false;
-            if (then_reaches_else and else_body.len == 1 and self.stmtIsTerminal(else_body[0]) and self.isTerminalBlock(else_id)) {
+            if (then_reaches_else and else_body.len == 1 and self.stmtIsTerminal(else_body[0]) and self.isTerminalBlock(else_id) and try self.postDominates(else_id, then_block)) {
                 else_body = &[_]*Stmt{};
                 self.if_next = else_id;
                 collapsed_else = true;
             }
-            if (!collapsed_else and !self.bodyEndsTerminal(then_body)) {
+            if (self.if_next == null and pattern.merge_block == null and !collapsed_else) {
+                const else_terminal = self.bodyEndsTerminal(else_body) or self.isTerminalBlock(else_id);
+                if (else_terminal) {
+                    var reach = try self.reachableInRange(then_block, then_end, else_id);
+                    defer reach.deinit();
+                    var candidate: ?u32 = null;
+                    var bid: u32 = 0;
+                    while (bid < self.cfg.blocks.len) : (bid += 1) {
+                        if (!reach.isSet(bid)) continue;
+                        const blk = &self.cfg.blocks[bid];
+                        if (blk.terminator()) |t| {
+                            switch (t.opcode) {
+                                .JUMP_FORWARD,
+                                .JUMP_BACKWARD,
+                                .JUMP_BACKWARD_NO_INTERRUPT,
+                                .JUMP_ABSOLUTE,
+                                => {
+                                    if (t.jumpTarget(self.cfg.version)) |target_off| {
+                                        if (self.cfg.blockAtOffset(target_off)) |target_id| {
+                                            if (target_id == else_id) continue;
+                                            if (target_id < then_end) continue;
+                                            if (candidate == null or
+                                                self.cfg.blocks[target_id].start_offset <
+                                                    self.cfg.blocks[candidate.?].start_offset)
+                                            {
+                                                candidate = target_id;
+                                            }
+                                        }
+                                    }
+                                },
+                                else => {},
+                            }
+                        }
+                    }
+                    if (candidate) |next_id| {
+                        self.if_next = next_id;
+                    }
+                }
+            }
+            if (!collapsed_else and !synth_else and !self.bodyEndsTerminal(then_body)) {
                 if (try self.findTerminalStmtFrom(then_block, else_id)) |term_res| {
-                    const term_off = self.cfg.blocks[term_res.block_id].start_offset;
-                    const else_off = self.cfg.blocks[else_id].start_offset;
-                    const same_block = term_res.block_id == else_id;
-                    const term_before_else = term_off < else_off or same_block;
-                    if (same_block and then_reaches_else and else_body.len == 1 and self.stmtIsTerminal(else_body[0]) and self.terminalStmtEqual(else_body[0], term_res.stmt)) {
-                        else_body = &[_]*Stmt{};
-                        self.if_next = else_id;
-                    } else {
-                        const else_reaches = if (same_block) false else try self.reachesBlock(else_id, term_res.block_id, null);
-                        if (term_before_else and !else_reaches) {
-                            then_body = try self.appendStmt(a, then_body, term_res.stmt);
-                            appended_term = term_res.stmt;
+                    const term_from_else = try self.reachesBlock(else_id, term_res.block_id, pattern.condition_block);
+                    if (!term_from_else) {
+                        const term_off = self.cfg.blocks[term_res.block_id].start_offset;
+                        const else_off = self.cfg.blocks[else_id].start_offset;
+                        const same_block = term_res.block_id == else_id;
+                        const term_before_else = term_off < else_off or same_block;
+                        if (same_block and then_reaches_else and else_body.len == 1 and self.stmtIsTerminal(else_body[0]) and self.terminalStmtEqual(else_body[0], term_res.stmt) and try self.postDominates(else_id, then_block)) {
+                            else_body = &[_]*Stmt{};
+                            self.if_next = else_id;
+                        } else {
+                            const else_reaches = if (same_block) false else try self.reachesBlock(else_id, term_res.block_id, null);
+                            const term_postdom = try self.postDominates(term_res.block_id, then_block);
+                            if (term_before_else and !else_reaches and term_postdom) {
+                                then_body = try self.appendStmt(a, then_body, term_res.stmt);
+                                appended_term = term_res.stmt;
+                            }
                         }
                     }
                 }
@@ -4855,7 +5447,6 @@ pub const Decompiler = struct {
                 else_body = &[_]*Stmt{};
             }
         }
-
         if (merge_else) {
             if (pattern.merge_block) |merge| {
                 self.if_next = merge;
@@ -4864,7 +5455,7 @@ pub const Decompiler = struct {
         }
 
         if (else_block) |else_id| {
-            if (else_id > pattern.condition_block and else_body.len > 0 and try self.reachesBlock(then_block, else_id, pattern.condition_block)) {
+            if (else_id > pattern.condition_block and else_body.len > 0 and try self.reachesBlock(then_block, else_id, pattern.condition_block) and try self.postDominates(else_id, then_block)) {
                 else_body = &[_]*Stmt{};
                 self.if_next = else_id;
             }
@@ -4873,10 +5464,29 @@ pub const Decompiler = struct {
         if (then_body.len == 0 and else_body.len > 0) {
             const else_is_if = else_body.len == 1 and else_body[0].* == .if_stmt;
             const else_is_pass = else_body.len == 1 and else_body[0].* == .pass;
-            if (!else_is_if and !else_is_pass) {
+            const can_invert = if (term) |t| switch (t.opcode) {
+                .POP_JUMP_IF_TRUE,
+                .POP_JUMP_FORWARD_IF_TRUE,
+                .POP_JUMP_BACKWARD_IF_TRUE,
+                .JUMP_IF_TRUE,
+                => true,
+                else => false,
+            } else false;
+            if (can_invert and !else_is_if and !else_is_pass) {
                 condition = try self.invertConditionExpr(condition);
+                try self.emitDecisionTrace(pattern.condition_block, "if_invert_empty_then", condition);
                 then_body = else_body;
                 else_body = &[_]*Stmt{};
+            }
+        }
+        if (else_block) |else_id| {
+            if (self.if_next == null and else_id > pattern.condition_block and
+                condition.* == .unary_op and condition.unary_op.op == .not_ and
+                else_body.len == 1 and self.stmtIsTerminal(else_body[0]) and
+                self.bodyEndsTerminal(then_body))
+            {
+                else_body = &[_]*Stmt{};
+                self.if_next = else_id;
             }
         }
 
@@ -4966,6 +5576,15 @@ pub const Decompiler = struct {
         var condition = try sim.stack.popExpr();
 
         var body_block_id = pattern.body_block;
+        var ignore_header_while = false;
+        const exit_is_continue = self.blockLeadsToHeader(pattern.exit_block, pattern.header_block);
+        if (exit_is_continue) {
+            const a = self.arena.allocator();
+            condition = try ast.makeConstant(a, .true_);
+            body_block_id = pattern.header_block;
+            ignore_header_while = true;
+            cond_idx = 0;
+        }
         if (body_block_id < self.cfg.blocks.len) {
             const body_pattern = try self.analyzer.detectPattern(body_block_id);
             if (body_pattern == .if_stmt) {
@@ -4975,7 +5594,7 @@ pub const Decompiler = struct {
                     const merge_is_then = guard.merge_block != null and
                         (guard.merge_block.? == guard.then_block or guard.merge_block.? == pattern.header_block);
                     const else_is_exit = else_id == pattern.exit_block;
-                    const then_in_loop = self.dom.isInLoop(guard.then_block, pattern.header_block);
+                    const then_in_loop = self.analyzer.inLoop(guard.then_block, pattern.header_block);
                     const can_merge = (merge_is_then or (guard.merge_block == null and else_is_exit)) and then_in_loop;
                     if (can_merge and else_is_exit) {
                         var guard_sim = self.initSim(self.arena.allocator(), self.arena.allocator(), self.code, self.version);
@@ -5007,7 +5626,7 @@ pub const Decompiler = struct {
         const legacy_cond = if (term) |t| t.opcode == .JUMP_IF_FALSE or t.opcode == .JUMP_IF_TRUE else false;
         const body_block = &self.cfg.blocks[body_block_id];
         var body_skip: usize = 0;
-        if (body_block_id == pattern.header_block) {
+        if (body_block_id == pattern.header_block and !ignore_header_while) {
             for (header.instructions, 0..) |inst, idx| {
                 if (ctrl.Analyzer.isConditionalJump(undefined, inst.opcode)) {
                     body_skip = idx + 1;
@@ -5025,6 +5644,9 @@ pub const Decompiler = struct {
                 seed_pop = true;
             }
         }
+        if (ignore_header_while) {
+            seed_pop = false;
+        }
         const body = try self.decompileLoopBody(
             body_block_id,
             pattern.header_block,
@@ -5033,6 +5655,7 @@ pub const Decompiler = struct {
             &visited,
             null,
             body_skip,
+            ignore_header_while,
         );
 
         const a = self.arena.allocator();
@@ -5069,72 +5692,68 @@ pub const Decompiler = struct {
                     if (!multi_succ) {
                         const exit_jump = self.jumpTargetIfJumpOnly(pattern.exit_block, true);
                         if (exit_jump == null or (succ != null and exit_jump.? != succ.?)) {
-                        const succ_outside = if (succ) |sid| !self.dom.isInLoop(sid, pattern.header_block) else true;
-                        if (succ_outside and (succ == null or self.isTerminalBlock(succ.?))) {
-                            const exit_stmts = try self.decompileBlockRangeWithStackAndSkip(
-                                pattern.exit_block,
-                                pattern.exit_block + 1,
-                                &.{},
-                                0,
-                            );
-                            const succ_stmts = if (succ) |sid|
-                                try self.decompileBlockRangeWithStackAndSkip(sid, sid + 1, &.{}, 0)
-                            else
-                                &.{};
-
-                            const guard_cond = if (body_true)
-                                try self.invertConditionExpr(condition)
-                            else
-                                condition;
-
-                            const guard_len = exit_stmts.len + succ_stmts.len;
-                            const needs_break = if (guard_len == 0) true else blk: {
-                                const last = if (succ_stmts.len > 0)
-                                    succ_stmts[succ_stmts.len - 1]
-                                else
-                                    exit_stmts[exit_stmts.len - 1];
-                                break :blk !self.stmtIsTerminal(last);
-                            };
-                            const extra = if (needs_break) @as(usize, 1) else 0;
-                            const guard_body = try a.alloc(*Stmt, guard_len + extra);
-                            if (exit_stmts.len > 0) {
-                                std.mem.copyForwards(*Stmt, guard_body[0..exit_stmts.len], exit_stmts);
-                            }
-                            if (succ_stmts.len > 0) {
-                                std.mem.copyForwards(
-                                    *Stmt,
-                                    guard_body[exit_stmts.len .. exit_stmts.len + succ_stmts.len],
-                                    succ_stmts,
+                            const succ_outside = if (succ) |sid| !self.analyzer.inLoop(sid, pattern.header_block) else true;
+                            if (succ_outside and (succ == null or self.isTerminalBlock(succ.?))) {
+                                const exit_stmts = try self.decompileBlockRangeWithStackAndSkip(
+                                    pattern.exit_block,
+                                    pattern.exit_block + 1,
+                                    &.{},
+                                    0,
                                 );
-                            }
-                            if (needs_break) {
-                                guard_body[guard_len] = try self.makeBreak();
-                            }
+                                const succ_stmts = if (succ) |sid|
+                                    try self.decompileBlockRangeWithStackAndSkip(sid, sid + 1, &.{}, 0)
+                                else
+                                    &.{};
 
-                            const gs = try a.create(Stmt);
-                            gs.* = .{ .if_stmt = .{
-                                .condition = guard_cond,
-                                .body = guard_body,
-                                .else_body = &.{},
-                            } };
-                            guard_if = gs;
-                            try self.consumed.set(self.allocator, pattern.exit_block);
-                            if (succ) |sid| {
-                                try self.consumed.set(self.allocator, sid);
-                            }
-                            if (self.dom.getLoopBody(pattern.header_block)) |body_set| {
+                                const guard_cond = if (body_true)
+                                    try self.invertConditionExpr(condition)
+                                else
+                                    condition;
+
+                                const guard_len = exit_stmts.len + succ_stmts.len;
+                                const needs_break = if (guard_len == 0) true else blk: {
+                                    const last = if (succ_stmts.len > 0)
+                                        succ_stmts[succ_stmts.len - 1]
+                                    else
+                                        exit_stmts[exit_stmts.len - 1];
+                                    break :blk !self.stmtIsTerminal(last);
+                                };
+                                const extra = if (needs_break) @as(usize, 1) else 0;
+                                const guard_body = try a.alloc(*Stmt, guard_len + extra);
+                                if (exit_stmts.len > 0) {
+                                    std.mem.copyForwards(*Stmt, guard_body[0..exit_stmts.len], exit_stmts);
+                                }
+                                if (succ_stmts.len > 0) {
+                                    std.mem.copyForwards(
+                                        *Stmt,
+                                        guard_body[exit_stmts.len .. exit_stmts.len + succ_stmts.len],
+                                        succ_stmts,
+                                    );
+                                }
+                                if (needs_break) {
+                                    guard_body[guard_len] = try self.makeBreak();
+                                }
+
+                                const gs = try a.create(Stmt);
+                                gs.* = .{ .if_stmt = .{
+                                    .condition = guard_cond,
+                                    .body = guard_body,
+                                    .else_body = &.{},
+                                } };
+                                guard_if = gs;
+                                try self.consumed.set(self.allocator, pattern.exit_block);
+                                if (succ) |sid| {
+                                    try self.consumed.set(self.allocator, sid);
+                                }
                                 var next_block: u32 = pattern.exit_block;
                                 const limit: u32 = @intCast(self.cfg.blocks.len);
                                 while (next_block < limit) : (next_block += 1) {
                                     if (next_block == pattern.exit_block) continue;
-                                    if (body_set.isSet(@intCast(next_block))) continue;
+                                    if (self.analyzer.inLoop(next_block, pattern.header_block)) continue;
                                     break;
                                 }
                                 guard_next = next_block;
-                            } else {
-                                guard_next = pattern.exit_block + 1;
                             }
-                        }
                         }
                     }
                 }
@@ -5229,7 +5848,7 @@ pub const Decompiler = struct {
     }
 
     fn decompileLoopHeader(self: *Decompiler, header: u32) DecompileError!?PatternResult {
-        const body_set = self.dom.getLoopBody(header) orelse return null;
+        const body_set = self.analyzer.loopSet(header) orelse return null;
         if (!body_set.isSet(@intCast(header))) return null;
 
         var visited = try std.DynamicBitSet.initEmpty(self.allocator, self.cfg.blocks.len);
@@ -5312,41 +5931,80 @@ pub const Decompiler = struct {
             &visited,
             null,
             0,
+            false,
         );
 
         const a = self.arena.allocator();
         const cond = try ast.makeConstant(a, .true_);
         var final_body = body;
         if (guard_stmt) |gs| {
-            if (final_body.len > 0 and final_body[0].* == .try_stmt and header_stmt_count <= final_body[0].try_stmt.body.len) {
+            var wrapped_guard = false;
+            if (gs.* == .if_stmt) {
+                const guard_if = gs.if_stmt;
+                const guard_body = guard_if.body;
+                if (guard_if.else_body.len == 0 and guard_body.len == 1 and guard_body[0].* == .continue_stmt) {
+                    if (header_stmt_count <= final_body.len) {
+                        const rest = final_body[header_stmt_count..];
+                        if (rest.len > 0) {
+                            const exec_cond = try self.invertConditionExpr(guard_if.condition);
+                            const wrap_stmt = try a.create(Stmt);
+                            wrap_stmt.* = .{ .if_stmt = .{
+                                .condition = exec_cond,
+                                .body = rest,
+                                .else_body = &.{},
+                            } };
+                            const new_body = try a.alloc(*Stmt, header_stmt_count + 1);
+                            if (header_stmt_count > 0) {
+                                std.mem.copyForwards(*Stmt, new_body[0..header_stmt_count], final_body[0..header_stmt_count]);
+                            }
+                            new_body[header_stmt_count] = wrap_stmt;
+                            final_body = new_body;
+                            wrapped_guard = true;
+                        }
+                    }
+                }
+            }
+            if (!wrapped_guard and final_body.len > 0 and final_body[0].* == .try_stmt and header_stmt_count <= final_body[0].try_stmt.body.len) {
                 const old = final_body[0].try_stmt.body;
-                const new_body = try a.alloc(*Stmt, old.len + 1);
-                if (header_stmt_count > 0) {
-                    std.mem.copyForwards(*Stmt, new_body[0..header_stmt_count], old[0..header_stmt_count]);
+                const guard_dup = if (gs.* == .if_stmt and header_stmt_count < old.len)
+                    self.isContGuard(old[header_stmt_count], gs.if_stmt.condition)
+                else
+                    false;
+                if (!guard_dup) {
+                    const new_body = try a.alloc(*Stmt, old.len + 1);
+                    if (header_stmt_count > 0) {
+                        std.mem.copyForwards(*Stmt, new_body[0..header_stmt_count], old[0..header_stmt_count]);
+                    }
+                    new_body[header_stmt_count] = gs;
+                    if (header_stmt_count < old.len) {
+                        std.mem.copyForwards(
+                            *Stmt,
+                            new_body[header_stmt_count + 1 ..],
+                            old[header_stmt_count..],
+                        );
+                    }
+                    final_body[0].try_stmt.body = new_body;
                 }
-                new_body[header_stmt_count] = gs;
-                if (header_stmt_count < old.len) {
-                    std.mem.copyForwards(
-                        *Stmt,
-                        new_body[header_stmt_count + 1 ..],
-                        old[header_stmt_count..],
-                    );
+            } else if (!wrapped_guard and header_stmt_count <= final_body.len) {
+                const guard_dup = if (gs.* == .if_stmt and header_stmt_count < final_body.len)
+                    self.isContGuard(final_body[header_stmt_count], gs.if_stmt.condition)
+                else
+                    false;
+                if (!guard_dup) {
+                    const new_body = try a.alloc(*Stmt, final_body.len + 1);
+                    if (header_stmt_count > 0) {
+                        std.mem.copyForwards(*Stmt, new_body[0..header_stmt_count], final_body[0..header_stmt_count]);
+                    }
+                    new_body[header_stmt_count] = gs;
+                    if (header_stmt_count < final_body.len) {
+                        std.mem.copyForwards(
+                            *Stmt,
+                            new_body[header_stmt_count + 1 ..],
+                            final_body[header_stmt_count..],
+                        );
+                    }
+                    final_body = new_body;
                 }
-                final_body[0].try_stmt.body = new_body;
-            } else if (header_stmt_count <= final_body.len) {
-                const new_body = try a.alloc(*Stmt, final_body.len + 1);
-                if (header_stmt_count > 0) {
-                    std.mem.copyForwards(*Stmt, new_body[0..header_stmt_count], final_body[0..header_stmt_count]);
-                }
-                new_body[header_stmt_count] = gs;
-                if (header_stmt_count < final_body.len) {
-                    std.mem.copyForwards(
-                        *Stmt,
-                        new_body[header_stmt_count + 1 ..],
-                        final_body[header_stmt_count..],
-                    );
-                }
-                final_body = new_body;
             }
         }
         const stmt = try a.create(Stmt);
@@ -5680,6 +6338,15 @@ pub const Decompiler = struct {
     }
 
     fn decompileTry(self: *Decompiler, pattern: ctrl.TryPattern) DecompileError!PatternResult {
+        return self.decompileTryWithLoop(pattern, null, null);
+    }
+
+    fn decompileTryWithLoop(
+        self: *Decompiler,
+        pattern: ctrl.TryPattern,
+        loop_header: ?u32,
+        visited: ?*std.DynamicBitSet,
+    ) DecompileError!PatternResult {
         if (pattern.handlers_owned) {
             defer self.allocator.free(pattern.handlers);
         }
@@ -5728,6 +6395,13 @@ pub const Decompiler = struct {
                 }
             }
         }
+        if (visited) |v| {
+            for (protected_set.list.items) |bid| {
+                if (bid < self.cfg.blocks.len) {
+                    v.set(bid);
+                }
+            }
+        }
 
         var post_try_entry: ?u32 = null;
         for (protected_set.list.items) |bid| {
@@ -5754,11 +6428,13 @@ pub const Decompiler = struct {
         }
 
         var handler_reach = &scratch.handler_reach;
+        const allow_loop_back = loop_header == null;
         try self.collectReachableNoExceptionFromStarts(
             handler_blocks.items,
             handler_set,
             handler_reach,
             &scratch.queue,
+            allow_loop_back,
         );
 
         var join_block: ?u32 = null;
@@ -5769,6 +6445,7 @@ pub const Decompiler = struct {
                 &scratch.normal_reach,
                 &scratch.queue,
                 false,
+                allow_loop_back,
             );
             for (scratch.normal_reach.list.items) |bid| {
                 if (handler_reach.isSet(bid)) {
@@ -5778,7 +6455,20 @@ pub const Decompiler = struct {
             }
         }
 
-        const effective_exit: ?u32 = if (pattern.exit_block) |exit|
+        var pattern_exit = pattern.exit_block;
+        if (pattern_exit) |exit| {
+            if (handler_reach.isSet(exit)) {
+                var in_normal = false;
+                if (post_try_entry != null) {
+                    in_normal = scratch.normal_reach.isSet(exit);
+                }
+                if (!in_normal) {
+                    pattern_exit = null;
+                }
+            }
+        }
+
+        const effective_exit: ?u32 = if (pattern_exit) |exit|
             self.resolveJumpOnlyBlock(exit)
         else if (join_block) |join|
             self.resolveJumpOnlyBlock(join)
@@ -5801,7 +6491,61 @@ pub const Decompiler = struct {
             }
         }
 
-        const effective_finally_block = if (has_finally) pattern.finally_block else null;
+        var effective_finally_block = if (has_finally) pattern.finally_block else null;
+        if (effective_finally_block != null) {
+            var try_entry: ?u32 = null;
+            const try_blk = &self.cfg.blocks[pattern.try_block];
+            for (try_blk.successors) |edge| {
+                if (edge.edge_type == .normal) {
+                    try_entry = edge.target;
+                    break;
+                }
+            }
+            if (effective_finally_block.? == pattern.try_block or (try_entry != null and effective_finally_block.? == try_entry.?)) {
+                var cleanup_candidate: ?u32 = null;
+                for (self.cfg.blocks) |*blk| {
+                    if (blk.instructions.len != 1) continue;
+                    if (blk.instructions[0].opcode != .POP_BLOCK) continue;
+                    var has_exc = false;
+                    var normal_target: ?u32 = null;
+                    var multi = false;
+                    for (blk.successors) |edge| {
+                        if (edge.edge_type == .exception) {
+                            for (handler_blocks.items) |hid| {
+                                if (edge.target == hid) {
+                                    has_exc = true;
+                                    break;
+                                }
+                            }
+                        } else if (edge.edge_type == .normal) {
+                            if (normal_target != null) {
+                                multi = true;
+                                break;
+                            }
+                            normal_target = edge.target;
+                        }
+                    }
+                    if (multi or !has_exc or normal_target == null) continue;
+                    var is_handler = false;
+                    for (handler_blocks.items) |hid| {
+                        if (normal_target.? == hid) {
+                            is_handler = true;
+                            break;
+                        }
+                    }
+                    if (is_handler) continue;
+                    if (cleanup_candidate == null or
+                        self.cfg.blocks[normal_target.?].start_offset <
+                            self.cfg.blocks[cleanup_candidate.?].start_offset)
+                    {
+                        cleanup_candidate = normal_target.?;
+                    }
+                }
+                if (cleanup_candidate) |cand| {
+                    effective_finally_block = cand;
+                }
+            }
+        }
 
         var except_count: usize = 0;
         for (handler_blocks.items) |hid| {
@@ -5822,6 +6566,24 @@ pub const Decompiler = struct {
         if (has_finally and except_count == 0) {
             else_start = null;
         }
+        if (loop_header) |header_id| {
+            if (else_start) |start| {
+                const resolved = self.resolveJumpOnlyBlock(start);
+                if (!self.analyzer.inLoop(resolved, header_id) or resolved == header_id or
+                    self.loopBlockLeadsToContinue(start, header_id))
+                {
+                    else_start = null;
+                }
+            }
+        }
+
+        const exit_for_range: ?u32 = if (exit_block) |exit|
+            if (else_start) |start|
+                (if (exit == start) null else exit)
+            else
+                exit
+        else
+            null;
 
         const finally_start: ?u32 = effective_finally_block orelse blk: {
             if (has_finally) {
@@ -5839,13 +6601,38 @@ pub const Decompiler = struct {
         }
 
         const try_body = if (pattern.try_block < try_end)
-            try self.decompileTryBody(pattern.try_block, try_end)
+            try self.decompileTryBody(pattern.try_block, try_end, loop_header, visited)
         else
             &[_]*Stmt{};
 
         const a = self.arena.allocator();
 
-        var else_end: u32 = exit_block orelse @as(u32, @intCast(self.cfg.blocks.len));
+        var loop_exit: ?u32 = null;
+        if (loop_header) |header_id| {
+            if (header_id < self.cfg.blocks.len) {
+                const header_blk = &self.cfg.blocks[header_id];
+                for (header_blk.successors) |edge| {
+                    if (edge.edge_type == .conditional_false) {
+                        loop_exit = edge.target;
+                        break;
+                    }
+                }
+            }
+        }
+
+        var else_end: u32 = @as(u32, @intCast(self.cfg.blocks.len));
+        if (exit_for_range) |exit| {
+            if (else_start) |start| {
+                if (exit > start) else_end = exit;
+            } else {
+                else_end = exit;
+            }
+        }
+        if (loop_exit) |exit| {
+            if (else_start) |start| {
+                if (exit > start and exit < else_end) else_end = exit;
+            }
+        }
         if (else_start) |start| {
             if (handler_start > start and handler_start < else_end) else_end = handler_start;
             if (finally_start) |final_start| {
@@ -5856,12 +6643,60 @@ pub const Decompiler = struct {
             }
         }
 
-        const else_body = if (else_start) |start| blk: {
+        var else_body = if (else_start) |start| blk: {
             if (start >= else_end) break :blk &[_]*Stmt{};
+            if (loop_header != null) {
+                break :blk try self.decompileBranchRange(start, else_end, &.{}, 0);
+            }
             break :blk try self.decompileStructuredRange(start, else_end);
         } else &[_]*Stmt{};
+        if (else_body.len == 1 and Decompiler.isReturnNone(else_body[0])) {
+            else_body = &[_]*Stmt{};
+        }
 
-        var final_end: u32 = exit_block orelse @as(u32, @intCast(self.cfg.blocks.len));
+        if (loop_header) |header_id| {
+            if (else_start) |start| {
+                var needs_break = false;
+                var bid = start;
+                while (bid < else_end and bid < self.cfg.blocks.len) : (bid += 1) {
+                    const exit = self.analyzer.detectLoopExit(bid, &[_]u32{header_id});
+                    if (exit == .break_stmt or self.loopBlockLeadsToBreak(bid, header_id)) {
+                        needs_break = true;
+                        break;
+                    }
+                }
+                if (needs_break) {
+                    if (else_body.len == 0) {
+                        const br = try self.makeBreak();
+                        const body = try self.arena.allocator().alloc(*Stmt, 1);
+                        body[0] = br;
+                        else_body = body;
+                    } else {
+                        const last = else_body[else_body.len - 1];
+                        const terminal = switch (last.*) {
+                            .break_stmt, .return_stmt, .raise_stmt, .continue_stmt => true,
+                            else => false,
+                        };
+                        if (!terminal) {
+                            const br = try self.makeBreak();
+                            const body = try self.arena.allocator().alloc(*Stmt, else_body.len + 1);
+                            std.mem.copyForwards(*Stmt, body[0..else_body.len], else_body);
+                            body[else_body.len] = br;
+                            else_body = body;
+                        }
+                    }
+                }
+            }
+        }
+
+        var final_end: u32 = @as(u32, @intCast(self.cfg.blocks.len));
+        if (exit_for_range) |exit| {
+            if (finally_start) |start| {
+                if (exit > start) final_end = exit;
+            } else {
+                final_end = exit;
+            }
+        }
         if (finally_start) |final_start| {
             if (handler_start > final_start and handler_start < final_end) {
                 final_end = handler_start;
@@ -5878,6 +6713,23 @@ pub const Decompiler = struct {
             }
             break :blk try self.decompileStructuredRangeWithStack(start, final_end, &exc_stack);
         } else &[_]*Stmt{};
+
+        var next_block: u32 = final_end;
+        if (next_block < try_end) next_block = try_end;
+        if (else_start) |start| {
+            if (start > next_block) next_block = start;
+        }
+        if (exit_for_range) |exit| {
+            if (exit > next_block) next_block = exit;
+        }
+        const last_handler = handler_blocks.items[handler_blocks.items.len - 1];
+        if (next_block <= last_handler) {
+            next_block = last_handler + 1;
+        }
+        const loop_has_tail = if (loop_header) |header_id|
+            next_block < self.cfg.blocks.len and next_block != header_id and self.analyzer.inLoop(next_block, header_id)
+        else
+            false;
 
         var handler_nodes = try a.alloc(ast.ExceptHandler, except_count);
         var handler_count: usize = 0;
@@ -5951,6 +6803,14 @@ pub const Decompiler = struct {
                     body = inner.body;
                 }
             }
+            if (loop_header) |header_id| {
+                if (loop_has_tail and body.len == 0 and self.handlerIsContinue(info.body_block, body_end, header_id)) {
+                    const cont = try self.makeContinue();
+                    const body_one = try a.alloc(*Stmt, 1);
+                    body_one[0] = cont;
+                    body = body_one;
+                }
+            }
             const is_bare = info.exc_type == null;
             if (is_bare and seen_bare and isEmptyHandlerBody(body)) {
                 continue;
@@ -5977,6 +6837,24 @@ pub const Decompiler = struct {
             handler_count += 1;
         }
 
+        for (handler_reach.list.items) |hid| {
+            if (effective_exit) |exit_id| {
+                if (hid == exit_id) continue;
+            }
+            if (post_try_entry) |entry_id| {
+                if (hid == entry_id) continue;
+            }
+            if (join_block) |join_id| {
+                if (hid == join_id) continue;
+            }
+            if (loop_header) |header_id| {
+                if (hid >= next_block and self.analyzer.inLoop(hid, header_id)) continue;
+            }
+            if (!self.consumed.isSet(hid)) {
+                try self.consumed.set(self.allocator, hid);
+            }
+        }
+
         const handlers_slice = handler_nodes[0..handler_count];
         const stmt = try a.create(Stmt);
         stmt.* = .{
@@ -5987,20 +6865,6 @@ pub const Decompiler = struct {
                 .finalbody = final_body,
             },
         };
-
-        var next_block: u32 = final_end;
-        if (next_block < try_end) next_block = try_end;
-        if (else_start) |start| {
-            if (start > next_block) next_block = start;
-        }
-        if (exit_block) |exit| {
-            if (exit > next_block) next_block = exit;
-        }
-
-        const last_handler = handler_blocks.items[handler_blocks.items.len - 1];
-        if (next_block <= last_handler) {
-            next_block = last_handler + 1;
-        }
 
         return .{ .stmt = stmt, .next_block = next_block };
     }
@@ -6815,6 +7679,34 @@ pub const Decompiler = struct {
             => true,
             else => false,
         };
+    }
+
+    fn elseIsJumpTarget(self: *Decompiler, op: Opcode) bool {
+        _ = self;
+        return switch (op) {
+            .POP_JUMP_IF_FALSE,
+            .POP_JUMP_FORWARD_IF_FALSE,
+            .POP_JUMP_BACKWARD_IF_FALSE,
+            .JUMP_IF_FALSE,
+            .POP_JUMP_IF_NONE,
+            .POP_JUMP_FORWARD_IF_NONE,
+            .POP_JUMP_BACKWARD_IF_NONE,
+            .POP_JUMP_IF_NOT_NONE,
+            .POP_JUMP_FORWARD_IF_NOT_NONE,
+            .POP_JUMP_BACKWARD_IF_NOT_NONE,
+            .JUMP_IF_FALSE_OR_POP,
+            => true,
+            else => false,
+        };
+    }
+
+    fn isContGuard(self: *Decompiler, stmt: *const Stmt, cond: *const Expr) bool {
+        _ = self;
+        if (stmt.* != .if_stmt) return false;
+        const ifs = stmt.if_stmt;
+        if (ifs.else_body.len != 0) return false;
+        if (ifs.body.len != 1 or ifs.body[0].* != .continue_stmt) return false;
+        return ast.exprEqual(ifs.condition, cond);
     }
 
     fn isFalseJump(self: *Decompiler, op: Opcode) bool {
@@ -9594,7 +10486,13 @@ pub const Decompiler = struct {
         return .{ .stmt = try_stmt, .next_block = actual_end };
     }
 
-    fn decompileTryBody(self: *Decompiler, start: u32, end: u32) DecompileError![]const *Stmt {
+    fn decompileTryBody(
+        self: *Decompiler,
+        start: u32,
+        end: u32,
+        loop_header: ?u32,
+        visited: ?*std.DynamicBitSet,
+    ) DecompileError![]const *Stmt {
         if (start >= end or start >= self.cfg.blocks.len) return &[_]*Stmt{};
         const start_block = &self.cfg.blocks[start];
         const prev_limit = self.br_limit;
@@ -9609,7 +10507,10 @@ pub const Decompiler = struct {
         }
 
         if (has_cond) {
-            const pattern = try self.analyzer.detectPatternNoTry(start);
+            const pattern = if (loop_header != null)
+                try self.analyzer.detectPatternNoTryInLoop(start)
+            else
+                try self.analyzer.detectPatternNoTry(start);
             if (pattern == .if_stmt) {
                 const if_pat = pattern.if_stmt;
                 var last_stmt_idx: ?usize = null;
@@ -9639,12 +10540,94 @@ pub const Decompiler = struct {
                 }
 
                 const skip_cond = last_stmt_idx orelse 0;
-                const stmt = if (skip_cond > 0)
-                    try self.decompileIfWithSkip(if_pat, skip_cond)
-                else
-                    try self.decompileIf(if_pat);
+                var local_vis: ?std.DynamicBitSet = null;
+                var vis_ptr = visited;
+                if (loop_header != null and vis_ptr == null) {
+                    local_vis = try std.DynamicBitSet.initEmpty(self.allocator, self.cfg.blocks.len);
+                    vis_ptr = &local_vis.?;
+                }
+                defer if (local_vis) |*v| v.deinit();
+
+                const a = self.arena.allocator();
+                var stmt: ?*Stmt = null;
+                var guard_then: ?[]const *Stmt = null;
+                if (loop_header) |header| {
+                    var loop_exit = self.loopBlockLeadsToContinue(if_pat.then_block, header) or
+                        self.loopBlockLeadsToBreak(if_pat.then_block, header);
+                    if (!loop_exit) {
+                        if (if_pat.else_block) |else_id| {
+                            loop_exit = self.loopBlockLeadsToContinue(else_id, header) or
+                                self.loopBlockLeadsToBreak(else_id, header);
+                        }
+                    }
+                    if (loop_exit) {
+                        if (vis_ptr) |v| {
+                            if (try self.loopIfParts(if_pat, header, v)) |parts| {
+                                const else_cont = if (parts.else_is_continuation and parts.else_block != null) blk: {
+                                    const else_id = parts.else_block.?;
+                                    if (self.resolveJumpOnlyBlock(else_id) == header or self.loopBlockLeadsToContinue(else_id, header)) {
+                                        break :blk true;
+                                    }
+                                    break :blk false;
+                                } else false;
+                                if (else_cont) {
+                                    const else_is_jump_target = self.elseIsJumpTarget(parts.cond_op);
+                                    if (else_is_jump_target) {
+                                        const if_stmt = try a.create(Stmt);
+                                        if_stmt.* = .{ .if_stmt = .{
+                                            .condition = parts.condition,
+                                            .body = parts.then_body,
+                                            .else_body = parts.else_body,
+                                        } };
+                                        stmt = if_stmt;
+                                    } else {
+                                        const guard_cond = try self.guardCondForBranch(parts.condition, parts.cond_op, else_is_jump_target);
+                                        var guard_body = parts.else_body;
+                                        var needs_continue = true;
+                                        if (guard_body.len > 0) {
+                                            const last = guard_body[guard_body.len - 1];
+                                            if (last.* == .continue_stmt or self.stmtIsTerminal(last)) {
+                                                needs_continue = false;
+                                            }
+                                        }
+                                        if (needs_continue) {
+                                            const cont = try self.makeContinue();
+                                            const next_body = try a.alloc(*Stmt, guard_body.len + 1);
+                                            if (guard_body.len > 0) {
+                                                std.mem.copyForwards(*Stmt, next_body[0..guard_body.len], guard_body);
+                                            }
+                                            next_body[guard_body.len] = cont;
+                                            guard_body = next_body;
+                                        }
+                                        const guard_stmt = try a.create(Stmt);
+                                        guard_stmt.* = .{ .if_stmt = .{
+                                            .condition = guard_cond,
+                                            .body = guard_body,
+                                            .else_body = &.{},
+                                        } };
+                                        stmt = guard_stmt;
+                                        guard_then = parts.then_body;
+                                    }
+                                } else {
+                                    const if_stmt = try a.create(Stmt);
+                                    if_stmt.* = .{ .if_stmt = .{
+                                        .condition = parts.condition,
+                                        .body = parts.then_body,
+                                        .else_body = parts.else_body,
+                                    } };
+                                    stmt = if_stmt;
+                                }
+                            }
+                        }
+                    }
+                }
+                if (stmt == null) {
+                    stmt = if (skip_cond > 0)
+                        try self.decompileIfWithSkip(if_pat, skip_cond)
+                    else
+                        try self.decompileIf(if_pat);
+                }
                 if (stmt) |s| {
-                    const a = self.arena.allocator();
                     var stmts: std.ArrayList(*Stmt) = .{};
                     errdefer stmts.deinit(a);
                     if (skip_cond > 0) {
@@ -9652,6 +10635,11 @@ pub const Decompiler = struct {
                         try self.processPartialBlock(start_block, &stmts, a, &skip_first_store, skip_cond);
                     }
                     try stmts.append(a, s);
+                    if (guard_then) |body| {
+                        if (body.len > 0) {
+                            try stmts.appendSlice(a, body);
+                        }
+                    }
                     var next = try self.findIfChainEnd(if_pat);
                     if (self.if_next) |override| {
                         next = override;
@@ -9662,7 +10650,10 @@ pub const Decompiler = struct {
                         self.chained_cmp_next_block = null;
                     }
                     if (next < end and next < self.cfg.blocks.len) {
-                        const rest = try self.decompileStructuredRange(next, end);
+                        const rest = if (loop_header != null)
+                            try self.decompileTryBody(next, end, loop_header, vis_ptr)
+                        else
+                            try self.decompileStructuredRange(next, end);
                         try stmts.appendSlice(a, rest);
                     }
                     return stmts.toOwnedSlice(a);
@@ -9683,7 +10674,7 @@ pub const Decompiler = struct {
             &skip_store,
             &seed_pop,
             true,
-            null,
+            loop_header,
             0,
         );
 
@@ -9951,6 +10942,27 @@ pub const Decompiler = struct {
             head.instructions = head.instructions[skip..];
         }
 
+        if (!skip_first_store and skip == 0) {
+            var has_exc_match = false;
+            for (head.instructions) |inst| {
+                if (inst.opcode == .CHECK_EXC_MATCH or inst.opcode == .JUMP_IF_NOT_EXC_MATCH or
+                    (inst.opcode == .COMPARE_OP and inst.arg == 10))
+                {
+                    has_exc_match = true;
+                    break;
+                }
+            }
+            if (!has_exc_match) {
+                var exc_stack: [3]StackValue = undefined;
+                for (&exc_stack) |*slot| {
+                    const placeholder = try a.create(Expr);
+                    placeholder.* = .{ .name = .{ .id = "__exception__", .ctx = .load } };
+                    slot.* = .{ .expr = placeholder };
+                }
+                return try self.decompileStructuredRangeNoTryWithStackAllowHandlers(start, end, &exc_stack);
+            }
+        }
+
         var sim = self.initSim(a, a, self.code, self.version);
         defer sim.deinit();
         sim.lenient = true;
@@ -9964,10 +10976,10 @@ pub const Decompiler = struct {
             try sim.stack.push(.{ .expr = placeholder });
         }
 
-        for (head.instructions) |inst| {
-            if (inst.opcode == .POP_EXCEPT) {
-                break;
-            }
+        var i: usize = 0;
+        while (i < head.instructions.len) : (i += 1) {
+            const inst = head.instructions[i];
+            if (inst.opcode == .POP_EXCEPT) break;
             errdefer if (self.last_error_ctx == null) {
                 self.last_error_ctx = .{
                     .code_name = self.code.name,
@@ -9976,6 +10988,13 @@ pub const Decompiler = struct {
                     .opcode = inst.opcode.name(),
                 };
             };
+
+            if (inst.opcode == .IMPORT_NAME) {
+                if (try self.tryDecompileImportFromGroup(&sim, head.instructions, i, &stmts, a)) |end_idx| {
+                    i = end_idx;
+                    continue;
+                }
+            }
 
             switch (inst.opcode) {
                 .STORE_FAST, .STORE_NAME, .STORE_GLOBAL, .STORE_DEREF => {
@@ -10086,6 +11105,7 @@ pub const Decompiler = struct {
         visited: *GenSet,
         queue: *std.ArrayListUnmanaged(u32),
         allow_start_in_handler: bool,
+        allow_loop_back: bool,
     ) DecompileError!void {
         visited.reset();
         queue.clearRetainingCapacity();
@@ -10102,6 +11122,7 @@ pub const Decompiler = struct {
             const block = &self.cfg.blocks[node];
             for (block.successors) |edge| {
                 if (edge.edge_type == .exception) continue;
+                if (!allow_loop_back and edge.edge_type == .loop_back) continue;
                 if (edge.target >= self.cfg.blocks.len) continue;
                 if (handler_set.isSet(edge.target)) continue;
                 if (!visited.isSet(edge.target)) {
@@ -10118,6 +11139,7 @@ pub const Decompiler = struct {
         handler_set: *const GenSet,
         visited: *GenSet,
         queue: *std.ArrayListUnmanaged(u32),
+        allow_loop_back: bool,
     ) DecompileError!void {
         visited.reset();
         queue.clearRetainingCapacity();
@@ -10135,6 +11157,7 @@ pub const Decompiler = struct {
             const block = &self.cfg.blocks[node];
             for (block.successors) |edge| {
                 if (edge.edge_type == .exception) continue;
+                if (!allow_loop_back and edge.edge_type == .loop_back) continue;
                 if (edge.target >= self.cfg.blocks.len) continue;
                 if (handler_set.isSet(edge.target)) continue;
                 if (!visited.isSet(edge.target)) {
@@ -10359,12 +11382,17 @@ pub const Decompiler = struct {
 
         // Decompile the body (skip the first STORE_FAST which is the target)
         const body_stmts = try self.decompileForBody(pattern.body_block, pattern.header_block);
+        var else_body: []const *Stmt = &.{};
+        if (pattern.else_block) |else_id| {
+            const end_block: ?u32 = if (pattern.exit_block > else_id) pattern.exit_block else null;
+            else_body = try self.decompileBranchRange(else_id, end_block, &.{}, 0);
+        }
         const stmt = try a.create(Stmt);
         stmt.* = .{ .for_stmt = .{
             .target = target,
             .iter = iter_expr,
             .body = body_stmts,
-            .else_body = &.{},
+            .else_body = else_body,
             .type_comment = null,
             .is_async = false,
         } };
@@ -10372,7 +11400,7 @@ pub const Decompiler = struct {
         return stmt;
     }
 
-    /// Decompile a for loop body using dominator-based loop membership.
+    /// Decompile a for loop body using loop-region membership.
     fn decompileForBody(self: *Decompiler, body_block_id: u32, header_block_id: u32) DecompileError![]const *Stmt {
         const a = self.arena.allocator();
         var stmts: std.ArrayList(*Stmt) = .{};
@@ -10384,17 +11412,31 @@ pub const Decompiler = struct {
         var skip_first_store = true;
         var seed_pop = false;
         var block_idx = body_block_id;
+        var loop_end_offset: ?u32 = null;
+        if (header_block_id < self.cfg.blocks.len) {
+            const header = &self.cfg.blocks[header_block_id];
+            for (header.successors) |edge| {
+                if (edge.edge_type == .conditional_false and edge.target < self.cfg.blocks.len) {
+                    loop_end_offset = self.cfg.blocks[edge.target].start_offset;
+                    break;
+                }
+            }
+        }
 
         while (block_idx < self.cfg.blocks.len) {
-            // Use dominator tree to check loop membership
+            const block = &self.cfg.blocks[block_idx];
+            if (loop_end_offset) |end_off| {
+                if (block.start_offset >= end_off) break;
+            }
             if (self.consumed.isSet(block_idx)) {
                 block_idx += 1;
                 continue;
             }
-            if (!self.dom.isInLoop(block_idx, header_block_id)) break;
+            if (!self.analyzer.inLoop(block_idx, header_block_id)) {
+                block_idx += 1;
+                continue;
+            }
             if (block_idx == header_block_id and block_idx != body_block_id) break;
-
-            const block = &self.cfg.blocks[block_idx];
 
             if (visited.isSet(block_idx)) {
                 block_idx += 1;
@@ -10415,19 +11457,47 @@ pub const Decompiler = struct {
                         continue;
                     };
                     if (parts.else_is_continuation and parts.else_block != null and self.isTrueJump(parts.cond_op)) {
-                        const guard_cond = try self.guardCondFromJump(parts.condition, parts.cond_op);
-                        const guard_stmt = try a.create(Stmt);
-                        const cont = try self.makeContinue();
-                        const body = try a.alloc(*Stmt, 1);
-                        body[0] = cont;
-                        guard_stmt.* = .{ .if_stmt = .{
-                            .condition = guard_cond,
-                            .body = body,
-                            .else_body = &.{},
-                        } };
-                        try stmts.append(a, guard_stmt);
-                        if (parts.then_body.len > 0) {
-                            try stmts.appendSlice(a, parts.then_body);
+                        const else_is_jump_target = self.elseIsJumpTarget(parts.cond_op);
+                        const prefer_if = parts.condition.* == .bool_op;
+                        if ((else_is_jump_target and parts.else_body.len == 0 and parts.then_body.len > 0) or
+                            (prefer_if and !else_is_jump_target and parts.else_body.len == 0 and parts.then_body.len > 0 and !self.bodyEndsTerminal(parts.then_body)))
+                        {
+                            const if_stmt = try a.create(Stmt);
+                            if_stmt.* = .{ .if_stmt = .{
+                                .condition = parts.condition,
+                                .body = parts.then_body,
+                                .else_body = &.{},
+                            } };
+                            try stmts.append(a, if_stmt);
+                        } else {
+                            const guard_cond = try self.guardCondFromJump(parts.condition, parts.cond_op);
+                            var guard_body = parts.else_body;
+                            var needs_continue = true;
+                            if (guard_body.len > 0) {
+                                const last = guard_body[guard_body.len - 1];
+                                if (last.* == .continue_stmt or self.stmtIsTerminal(last)) {
+                                    needs_continue = false;
+                                }
+                            }
+                            if (needs_continue) {
+                                const cont = try self.makeContinue();
+                                const next_body = try a.alloc(*Stmt, guard_body.len + 1);
+                                if (guard_body.len > 0) {
+                                    std.mem.copyForwards(*Stmt, next_body[0..guard_body.len], guard_body);
+                                }
+                                next_body[guard_body.len] = cont;
+                                guard_body = next_body;
+                            }
+                            const guard_stmt = try a.create(Stmt);
+                            guard_stmt.* = .{ .if_stmt = .{
+                                .condition = guard_cond,
+                                .body = guard_body,
+                                .else_body = &.{},
+                            } };
+                            try stmts.append(a, guard_stmt);
+                            if (parts.then_body.len > 0) {
+                                try stmts.appendSlice(a, parts.then_body);
+                            }
                         }
                     } else {
                         const if_stmt = try a.create(Stmt);
@@ -10480,7 +11550,7 @@ pub const Decompiler = struct {
                         block_idx = result.next_block;
                         continue;
                     }
-                    const result = try self.decompileTry(p);
+                    const result = try self.decompileTryWithLoop(p, header_block_id, &visited);
                     const leave_loop = self.tryNeedsBreak(&p, header_block_id);
                     if (result.stmt) |s| {
                         if (leave_loop) {
@@ -10542,7 +11612,7 @@ pub const Decompiler = struct {
     }
 
     fn markLoopVisited(self: *Decompiler, header_id: u32, visited: *std.DynamicBitSet) void {
-        if (self.dom.getLoopBody(header_id)) |body| {
+        if (self.analyzer.loopSet(header_id)) |body| {
             visited.setUnion(body.*);
         }
     }
@@ -10552,20 +11622,157 @@ pub const Decompiler = struct {
         var steps: usize = 0;
         while (cur < self.cfg.blocks.len and steps < 8) {
             const blk = &self.cfg.blocks[cur];
-            if (blk.instructions.len != 1) break;
-            const inst = blk.instructions[0];
-            if (inst.opcode != .JUMP_FORWARD and inst.opcode != .JUMP_ABSOLUTE) break;
-            if (inst.jumpTarget(self.cfg.version)) |target_offset| {
-                if (self.cfg.blockAtOffset(target_offset)) |target_id| {
-                    if (target_id == cur) break;
-                    cur = target_id;
-                    steps += 1;
-                    continue;
+            const insts = blk.instructions;
+            if (insts.len == 0) break;
+            var jump_inst: ?decoder.Instruction = null;
+            if (insts.len == 1) {
+                const inst = insts[0];
+                if (inst.opcode == .JUMP_FORWARD or inst.opcode == .JUMP_ABSOLUTE) {
+                    jump_inst = inst;
+                } else break;
+            } else {
+                const last = insts[insts.len - 1];
+                if (last.opcode != .JUMP_FORWARD and last.opcode != .JUMP_ABSOLUTE) break;
+                var cleanup_only = true;
+                for (insts[0 .. insts.len - 1]) |inst| {
+                    switch (inst.opcode) {
+                        .POP_BLOCK, .POP_TOP, .POP_EXCEPT, .END_FINALLY, .END_FOR, .NOP => {},
+                        else => {
+                            cleanup_only = false;
+                            break;
+                        },
+                    }
+                }
+                if (!cleanup_only) break;
+                jump_inst = last;
+            }
+            if (jump_inst) |inst| {
+                if (inst.jumpTarget(self.cfg.version)) |target_offset| {
+                    if (self.cfg.blockAtOffset(target_offset)) |target_id| {
+                        if (target_id == cur) break;
+                        cur = target_id;
+                        steps += 1;
+                        continue;
+                    }
                 }
             }
             break;
         }
         return cur;
+    }
+
+    fn blockIsCleanupOnly(self: *Decompiler, block: *const cfg_mod.BasicBlock) bool {
+        _ = self;
+        for (block.instructions) |inst| {
+            switch (inst.opcode) {
+                .POP_BLOCK, .POP_TOP, .POP_EXCEPT, .END_FINALLY, .END_FOR, .NOP => {},
+                else => return false,
+            }
+        }
+        return true;
+    }
+
+    fn loopBlockLeadsToBreak(self: *Decompiler, block_id: u32, loop_header: u32) bool {
+        if (block_id >= self.cfg.blocks.len) return false;
+        const blk = &self.cfg.blocks[block_id];
+        if (!self.blockIsCleanupOnly(blk)) return false;
+        var succ: ?u32 = null;
+        for (blk.successors) |edge| {
+            if (edge.edge_type == .exception) continue;
+            if (succ != null) return false;
+            succ = edge.target;
+        }
+        if (succ == null) return false;
+        return switch (self.analyzer.detectLoopExit(succ.?, &[_]u32{loop_header})) {
+            .break_stmt => true,
+            else => false,
+        };
+    }
+
+    fn loopBlockLeadsToContinue(self: *Decompiler, block_id: u32, loop_header: u32) bool {
+        var cur = block_id;
+        var steps: usize = 0;
+        while (cur < self.cfg.blocks.len and steps < 8) : (steps += 1) {
+            const blk = &self.cfg.blocks[cur];
+            const jump_only = self.resolveJumpOnlyBlock(cur) != cur;
+            if (!jump_only and !self.blockIsCleanupOnly(blk)) return false;
+            const exit = self.analyzer.detectLoopExit(cur, &[_]u32{loop_header});
+            switch (exit) {
+                .continue_stmt => return true,
+                else => {},
+            }
+            var next: ?u32 = null;
+            for (blk.successors) |edge| {
+                if (edge.edge_type == .exception) continue;
+                if (next != null) return false;
+                next = edge.target;
+            }
+            if (next == null) return false;
+            const next_id = next.?;
+            if (next_id == loop_header) return true;
+            if (!self.analyzer.inLoop(next_id, loop_header)) return false;
+            if (next_id == cur) return false;
+            var pred_count: u32 = 0;
+            for (self.cfg.blocks[next_id].predecessors) |pred_id| {
+                if (pred_id >= self.cfg.blocks.len) continue;
+                const pred = &self.cfg.blocks[pred_id];
+                for (pred.successors) |edge| {
+                    if (edge.target != next_id) continue;
+                    if (edge.edge_type == .exception) continue;
+                    pred_count += 1;
+                    break;
+                }
+                if (pred_count > 1) return false;
+            }
+            if (pred_count == 0) return false;
+            cur = next_id;
+        }
+        return false;
+    }
+
+    fn blockLeadsToHeader(self: *Decompiler, block_id: u32, loop_header: u32) bool {
+        var cur = block_id;
+        var steps: usize = 0;
+        while (cur < self.cfg.blocks.len and steps < 8) : (steps += 1) {
+            var next: ?u32 = null;
+            for (self.cfg.blocks[cur].successors) |edge| {
+                if (edge.edge_type == .exception) continue;
+                if (next != null) return false;
+                next = edge.target;
+            }
+            if (next == null) return false;
+            const next_id = next.?;
+            if (next_id == loop_header) return true;
+            if (next_id == cur) return false;
+            cur = next_id;
+        }
+        return false;
+    }
+
+    fn handlerIsContinue(self: *Decompiler, start: u32, end: u32, loop_header: u32) bool {
+        var bid = start;
+        while (bid < end and bid < self.cfg.blocks.len) : (bid += 1) {
+            if (self.cfg.blocks[bid].is_exception_handler) continue;
+            const exit = self.analyzer.detectLoopExit(bid, &[_]u32{loop_header});
+            if (exit == .continue_stmt and !self.isLoopTailBack(bid, loop_header)) return true;
+        }
+        return false;
+    }
+
+    fn isLoopTailBack(self: *Decompiler, block_id: u32, loop_header: u32) bool {
+        if (block_id >= self.cfg.blocks.len) return false;
+        const blk = &self.cfg.blocks[block_id];
+        if (!self.hasLoopBackEdge(blk, loop_header)) return false;
+        const body = self.analyzer.loopSet(loop_header) orelse return false;
+        const off = blk.start_offset;
+        var i: u32 = 0;
+        while (i < self.cfg.blocks.len) : (i += 1) {
+            if (i == loop_header) continue;
+            if (!body.isSet(@intCast(i))) continue;
+            if (self.cfg.blocks[i].predecessors.len == 0) continue;
+            if (self.cfg.blocks[i].start_offset > off) return false;
+        }
+        return true;
     }
 
     fn hasSingleNormalSuccessor(self: *Decompiler, block_id: u32, target: u32) bool {
@@ -10659,6 +11866,7 @@ pub const Decompiler = struct {
             if (trace_on) &fall_path else null,
         );
         if (jump_cont == fall_cont) return null;
+        if (jump_cont and self.elseIsJumpTarget(term.opcode)) return null;
         if (jump_cont) {
             return .{
                 .target = jump_id,
@@ -10681,6 +11889,23 @@ pub const Decompiler = struct {
         try std.json.Stringify.value(value, .{}, out);
         try out.writeAll("\n");
         try out.flush();
+    }
+
+    fn emitDecisionTrace(
+        self: *Decompiler,
+        block_id: u32,
+        note: []const u8,
+        cond: ?*Expr,
+    ) DecompileError!void {
+        if (!self.trace_decisions or self.trace_file == null) return;
+        const cond_text = if (cond) |c| try self.exprToString(c) else null;
+        const ev = DecisionTrace{
+            .kind = "decision",
+            .block = block_id,
+            .note = note,
+            .cond = cond_text,
+        };
+        try self.writeTrace(ev);
     }
 
     fn exprToString(self: *Decompiler, expr: *const Expr) DecompileError![]const u8 {
@@ -10952,20 +12177,32 @@ pub const Decompiler = struct {
                     next_inst.opcode == .LOAD_GLOBAL or
                     next_inst.opcode == .LOAD_DEREF)
                 {
-                    // Final attr target (no DUP)
-                    if (j + 1 < instructions.len) {
+                    // Final attr target (no DUP), possibly through LOAD_ATTR chain.
+                    if (limit) |lim| {
+                        if (j >= lim) break;
+                    }
+                    var k: usize = j;
+                    try sim.simulate(instructions[k]);
+                    k += 1;
+                    while (k < instructions.len and instructions[k].opcode == .LOAD_ATTR) {
                         if (limit) |lim| {
-                            if (j + 1 >= lim) break;
+                            if (k >= lim) break;
                         }
-                        if (instructions[j + 1].opcode == .STORE_ATTR) {
-                            try sim.simulate(next_inst);
+                        try sim.simulate(instructions[k]);
+                        k += 1;
+                    }
+                    if (k < instructions.len) {
+                        if (limit) |lim| {
+                            if (k >= lim) break;
+                        }
+                        if (instructions[k].opcode == .STORE_ATTR) {
                             const cont_val = sim.stack.pop() orelse return error.StackUnderflow;
                             if (cont_val == .expr) {
-                                const attr = sim.getName(instructions[j + 1].arg) orelse "<unknown>";
+                                const attr = sim.getName(instructions[k].arg) orelse "<unknown>";
                                 const target = try self.makeAttribute(cont_val.expr, attr, .store);
                                 try targets.append(a, target);
                             }
-                            j += 2;
+                            j = k + 1;
                         }
                     }
                     break;
@@ -11140,6 +12377,12 @@ pub const Decompiler = struct {
                     .opcode = inst.opcode.name(),
                 };
             };
+            if (inst.opcode == .IMPORT_NAME) {
+                if (try self.tryDecompileImportFromGroup(&sim, instructions, idx, stmts, a)) |end_idx| {
+                    idx = end_idx;
+                    continue;
+                }
+            }
             if (returnCleanupSkip(instructions, idx)) |skip| {
                 idx += skip - 1;
                 continue;
@@ -11383,6 +12626,14 @@ pub const Decompiler = struct {
                 }
             }
         }
+        if (self.pending_store_expr) |expr| {
+            try sim.stack.push(.{ .expr = expr });
+            self.pending_store_expr = null;
+        }
+        if (self.pending_ternary_expr) |expr| {
+            try sim.stack.push(.{ .expr = expr });
+            self.pending_ternary_expr = null;
+        }
 
         const instructions = block.instructions;
         var idx: usize = 0;
@@ -11396,6 +12647,12 @@ pub const Decompiler = struct {
             if (ctrl.Analyzer.isConditionalJump(undefined, inst.opcode)) break;
             if (inst.opcode == .JUMP_BACKWARD or inst.opcode == .JUMP_BACKWARD_NO_INTERRUPT) break;
 
+            if (inst.opcode == .IMPORT_NAME) {
+                if (try self.tryDecompileImportFromGroup(&sim, instructions, idx, stmts, stmts_allocator)) |end_idx| {
+                    idx = end_idx;
+                    continue;
+                }
+            }
             switch (inst.opcode) {
                 .UNPACK_SEQUENCE, .UNPACK_EX => {
                     const count = if (inst.opcode == .UNPACK_EX) blk: {
@@ -11495,6 +12752,8 @@ pub const Decompiler = struct {
         then_body: []const *Stmt,
         else_body: []const *Stmt,
         else_is_continuation: bool,
+        then_leads: bool,
+        else_leads: bool,
         cond_op: Opcode,
         then_block: u32,
         else_block: ?u32,
@@ -11506,6 +12765,7 @@ pub const Decompiler = struct {
         sim: *SimContext,
         then_block: u32,
         else_block: ?u32,
+        skip_first: usize,
     ) DecompileError!?*Expr {
         if (block_id >= self.cfg.blocks.len) return null;
         const block = &self.cfg.blocks[block_id];
@@ -11515,7 +12775,10 @@ pub const Decompiler = struct {
         var targets: [2]?u32 = .{ null, null };
         var cond_count: usize = 0;
 
-        for (block.instructions) |inst| {
+        const instructions = block.instructions;
+        var idx: usize = if (skip_first > instructions.len) instructions.len else skip_first;
+        while (idx < instructions.len) : (idx += 1) {
+            const inst = instructions[idx];
             if (inst.opcode == .NOT_TAKEN or inst.opcode == .CACHE) continue;
             if (ctrl.Analyzer.isConditionalJump(undefined, inst.opcode)) {
                 const cond = try sim.stack.popExpr();
@@ -11556,12 +12819,18 @@ pub const Decompiler = struct {
         return conds[0];
     }
 
+    const LoopCond = struct {
+        expr: *Expr,
+        base_vals: []StackValue,
+    };
+
     fn loopCondExpr(
         self: *Decompiler,
         block_id: u32,
         then_block: u32,
         else_block: ?u32,
-    ) DecompileError!?*Expr {
+        skip_first: usize,
+    ) DecompileError!?LoopCond {
         if (block_id >= self.cfg.blocks.len) return null;
         const cond_block = &self.cfg.blocks[block_id];
 
@@ -11590,7 +12859,9 @@ pub const Decompiler = struct {
             try self.seedFromPredecessors(block_id, &sim);
         }
 
-        return self.condExprFromBlock(block_id, &sim, then_block, else_block);
+        const expr = (try self.condExprFromBlock(block_id, &sim, then_block, else_block, skip_first)) orelse return null;
+        const base_vals = try self.cloneStackValues(sim.stack.items.items);
+        return .{ .expr = expr, .base_vals = base_vals };
     }
 
     fn loopIfParts(
@@ -11609,11 +12880,42 @@ pub const Decompiler = struct {
         var cond_op = term.opcode;
         const legacy_cond = cond_op == .JUMP_IF_FALSE or cond_op == .JUMP_IF_TRUE;
 
-        var condition = (try self.loopCondExpr(
+        var last_stmt_idx: ?usize = null;
+        for (cond_block.instructions, 0..) |inst, idx| {
+            if (ctrl.Analyzer.isConditionalJump(undefined, inst.opcode)) break;
+            if (inst.opcode == .JUMP_BACKWARD or inst.opcode == .JUMP_BACKWARD_NO_INTERRUPT) break;
+            switch (inst.opcode) {
+                .STORE_FAST,
+                .STORE_NAME,
+                .STORE_GLOBAL,
+                .STORE_DEREF,
+                .STORE_ATTR,
+                .STORE_SUBSCR,
+                .POP_TOP,
+                .DELETE_NAME,
+                .DELETE_FAST,
+                .DELETE_GLOBAL,
+                .DELETE_DEREF,
+                .DELETE_ATTR,
+                .DELETE_SUBSCR,
+                .RETURN_VALUE,
+                .RETURN_CONST,
+                .RAISE_VARARGS,
+                => last_stmt_idx = idx + 1,
+                else => {},
+            }
+        }
+        const skip_cond = last_stmt_idx orelse 0;
+
+        const cond_res = (try self.loopCondExpr(
             pattern.condition_block,
             pattern.then_block,
             pattern.else_block,
+            skip_cond,
         )) orelse return null;
+        var condition = cond_res.expr;
+        const base_vals = cond_res.base_vals;
+        defer deinitStackValuesSlice(self.allocator, self.allocator, base_vals);
         var then_block = pattern.then_block;
         var else_block = pattern.else_block;
         var is_elif = pattern.is_elif;
@@ -11626,8 +12928,36 @@ pub const Decompiler = struct {
                     if (elif_pat.then_block == then_block and elif_pat.else_block != null and
                         self.resolveJumpOnlyBlock(elif_pat.else_block.?) == loop_header)
                     {
-                        if (try self.loopCondExpr(elif_pat.condition_block, elif_pat.then_block, elif_pat.else_block)) |elif_cond| {
-                            condition = try self.makeBoolPair(condition, elif_cond, .or_);
+                        const elif_block = &self.cfg.blocks[elif_pat.condition_block];
+                        var elif_last: ?usize = null;
+                        for (elif_block.instructions, 0..) |inst, idx| {
+                            if (ctrl.Analyzer.isConditionalJump(undefined, inst.opcode)) break;
+                            if (inst.opcode == .JUMP_BACKWARD or inst.opcode == .JUMP_BACKWARD_NO_INTERRUPT) break;
+                            switch (inst.opcode) {
+                                .STORE_FAST,
+                                .STORE_NAME,
+                                .STORE_GLOBAL,
+                                .STORE_DEREF,
+                                .STORE_ATTR,
+                                .STORE_SUBSCR,
+                                .POP_TOP,
+                                .DELETE_NAME,
+                                .DELETE_FAST,
+                                .DELETE_GLOBAL,
+                                .DELETE_DEREF,
+                                .DELETE_ATTR,
+                                .DELETE_SUBSCR,
+                                .RETURN_VALUE,
+                                .RETURN_CONST,
+                                .RAISE_VARARGS,
+                                => elif_last = idx + 1,
+                                else => {},
+                            }
+                        }
+                        const elif_skip = elif_last orelse 0;
+                        if (try self.loopCondExpr(elif_pat.condition_block, elif_pat.then_block, elif_pat.else_block, elif_skip)) |elif_res| {
+                            defer deinitStackValuesSlice(self.allocator, self.allocator, elif_res.base_vals);
+                            condition = try self.makeBoolPair(condition, elif_res.expr, .or_);
                             if (self.cfg.blocks[elif_pat.condition_block].terminator()) |elif_term| {
                                 cond_op = elif_term.opcode;
                             }
@@ -11640,10 +12970,47 @@ pub const Decompiler = struct {
             }
         }
 
-        if (self.isTrueJump(cond_op) and else_block != null) {
+        var cond_tree_applied = false;
+        if (!is_elif) {
+            if (else_block) |else_id| {
+                if (else_id < self.cfg.blocks.len) {
+                    const else_blk = &self.cfg.blocks[else_id];
+                    if (else_blk.terminator()) |else_term| {
+                        if (ctrl.Analyzer.isConditionalJump(undefined, else_term.opcode)) {
+                            if (try self.condChainFalseTarget(else_id, then_block)) |fb| {
+                                var in_stack = try std.DynamicBitSet.initEmpty(self.allocator, self.cfg.blocks.len);
+                                defer in_stack.deinit();
+                                var memo: std.AutoHashMapUnmanaged(u32, *Expr) = .{};
+                                defer memo.deinit(self.allocator);
+                                if (try self.buildCondTree(
+                                    pattern.condition_block,
+                                    pattern.condition_block,
+                                    condition,
+                                    then_block,
+                                    fb,
+                                    base_vals,
+                                    null,
+                                    null,
+                                    &in_stack,
+                                    &memo,
+                                )) |expr| {
+                                    condition = expr;
+                                    else_block = fb;
+                                    cond_tree_applied = true;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        if (!cond_tree_applied and self.isTrueJump(cond_op) and else_block != null) {
             const else_res = self.resolveJumpOnlyBlock(else_block.?);
-            if (else_res != loop_header) {
+            const else_cont = else_res == loop_header or self.loopBlockLeadsToContinue(else_block.?, loop_header);
+            if (!else_cont) {
                 condition = try self.invertConditionExpr(condition);
+                try self.emitDecisionTrace(pattern.condition_block, "loop_if_invert_true_jump", condition);
                 const tmp = then_block;
                 then_block = else_block.?;
                 else_block = tmp;
@@ -11654,11 +13021,23 @@ pub const Decompiler = struct {
 
         const then_res = self.resolveJumpOnlyBlock(then_block);
         const else_res = if (else_block) |else_id| self.resolveJumpOnlyBlock(else_id) else null;
-        var then_to_header = then_res == loop_header;
-        var else_to_header = if (else_res) |res| res == loop_header else false;
+        var then_to_header = then_res == loop_header or self.loopBlockLeadsToContinue(then_block, loop_header);
+        var else_to_header = false;
+        if (else_block) |else_id| {
+            if (else_res) |res| {
+                if (res == loop_header) else_to_header = true;
+            }
+            if (!else_to_header and self.loopBlockLeadsToContinue(else_id, loop_header)) {
+                else_to_header = true;
+            }
+        }
 
-        if (then_to_header and else_block != null and !else_to_header) {
+        const then_is_continue = then_res == loop_header;
+        const then_empty = then_is_continue or self.blockIsCleanupOnly(&self.cfg.blocks[then_block]);
+        const else_has_body = else_res != null and else_res.? != loop_header;
+        if (then_to_header and then_empty and else_block != null and (!else_to_header or (then_is_continue and else_has_body))) {
             condition = try self.invertConditionExpr(condition);
+            try self.emitDecisionTrace(pattern.condition_block, "loop_if_invert_then_to_header", condition);
             then_block = else_block.?;
             else_block = null;
             is_elif = false;
@@ -11668,20 +13047,22 @@ pub const Decompiler = struct {
 
         if (then_to_header and else_block == null) return null;
 
-        const then_in_loop = self.dom.isInLoop(then_block, loop_header);
+        const then_in_loop = self.analyzer.inLoop(then_block, loop_header);
         const else_in_loop = if (else_block) |else_id|
-            self.dom.isInLoop(else_id, loop_header)
+            self.analyzer.inLoop(else_id, loop_header)
         else
             false;
         const merge_in_loop = if (pattern.merge_block) |merge_id|
-            self.dom.isInLoop(merge_id, loop_header)
+            self.analyzer.inLoop(merge_id, loop_header)
         else
             false;
         var else_is_continuation = else_to_header or (else_in_loop and !merge_in_loop and !then_in_loop);
+        var else_is_fallthrough = false;
         if (!else_is_continuation) {
             if (else_block) |else_id| {
                 if (self.hasSingleNormalSuccessor(then_block, else_id)) {
                     else_is_continuation = true;
+                    else_is_fallthrough = true;
                 }
             }
         }
@@ -11690,8 +13071,23 @@ pub const Decompiler = struct {
         var skip_first = false;
         const then_block_ptr = &self.cfg.blocks[then_block];
         var seed_then = legacy_cond and then_block_ptr.instructions.len > 0 and then_block_ptr.instructions[0].opcode == .POP_TOP;
-        const body_stop = if (else_is_continuation) else_block else if (merge_in_loop) pattern.merge_block else null;
-        const then_body = if (!then_in_loop and else_is_continuation and self.isTerminalBlock(then_block)) blk: {
+        var body_stop: ?u32 = null;
+        if (else_block) |else_id| {
+            if (else_id > then_block) {
+                body_stop = else_id;
+            } else if (else_is_continuation) {
+                body_stop = else_id;
+            }
+        }
+        if (merge_in_loop) {
+            if (pattern.merge_block) |merge_id| {
+                if (merge_id > then_block and (body_stop == null or merge_id < body_stop.?)) {
+                    body_stop = merge_id;
+                }
+            }
+        }
+        const a = self.arena.allocator();
+        var then_body = if (!then_in_loop and else_is_continuation and self.isTerminalBlock(then_block)) blk: {
             const skip_then: usize = if (seed_then) 1 else 0;
             const body = try self.decompileBlockRangeWithStackAndSkip(
                 then_block,
@@ -11709,17 +13105,31 @@ pub const Decompiler = struct {
             visited,
             body_stop,
             0,
+            false,
         );
+        if (then_body.len == 0 and then_in_loop and self.loopBlockLeadsToBreak(then_block, loop_header)) {
+            const br = try self.makeBreak();
+            const body = try a.alloc(*Stmt, 1);
+            body[0] = br;
+            then_body = body;
+        }
 
         // Decompile the else body if present
-        const else_body = if (else_block) |else_id| blk: {
-            if (else_is_continuation) break :blk &[_]*Stmt{};
+        var else_body = if (else_block) |else_id| blk: {
+            if (else_is_continuation) {
+                if (else_is_fallthrough) break :blk &[_]*Stmt{};
+                if (self.resolveJumpOnlyBlock(else_id) == loop_header) {
+                    break :blk &[_]*Stmt{};
+                }
+                const else_end = try self.branchEnd(else_id, null);
+                break :blk try self.decompileBranchRange(else_id, else_end, &.{}, 0);
+            }
             if (is_elif) {
                 const else_pattern = try self.analyzer.detectPattern(else_id);
                 if (else_pattern == .if_stmt) {
                     const elif_stmt = try self.decompileLoopIf(else_pattern.if_stmt, loop_header, visited);
                     if (elif_stmt) |s| {
-                        const body = try self.arena.allocator().alloc(*Stmt, 1);
+                        const body = try a.alloc(*Stmt, 1);
                         body[0] = s;
                         break :blk body;
                     }
@@ -11728,22 +13138,62 @@ pub const Decompiler = struct {
             var skip = false;
             const else_block_ptr = &self.cfg.blocks[else_id];
             var seed_else = legacy_cond and else_block_ptr.instructions.len > 0 and else_block_ptr.instructions[0].opcode == .POP_TOP;
+            const else_stop = if (merge_in_loop and pattern.merge_block != null and pattern.merge_block.? != else_id)
+                pattern.merge_block
+            else
+                null;
             break :blk try self.decompileLoopBody(
                 else_id,
                 loop_header,
                 &skip,
                 &seed_else,
                 visited,
-                if (merge_in_loop) pattern.merge_block else null,
+                else_stop,
                 0,
+                false,
             );
         } else &[_]*Stmt{};
+        if (else_body.len == 0 and else_block != null and else_in_loop and self.loopBlockLeadsToBreak(else_block.?, loop_header)) {
+            const br = try self.makeBreak();
+            const body = try a.alloc(*Stmt, 1);
+            body[0] = br;
+            else_body = body;
+        }
+        const then_leads = self.resolveJumpOnlyBlock(then_block) == loop_header or
+            self.blockLeadsToHeader(then_block, loop_header);
+        var else_leads = false;
+        if (else_block) |else_id| {
+            const else_res2 = self.resolveJumpOnlyBlock(else_id);
+            else_leads = else_res2 == loop_header or self.blockLeadsToHeader(else_id, loop_header);
+        }
+        if (then_leads and else_block != null and !else_leads) {
+            if (then_body.len == 0 or !self.bodyEndsTerminal(then_body)) {
+                const cont = try self.makeContinue();
+                const body = try a.alloc(*Stmt, then_body.len + 1);
+                if (then_body.len > 0) {
+                    std.mem.copyForwards(*Stmt, body[0..then_body.len], then_body);
+                }
+                body[then_body.len] = cont;
+                then_body = body;
+            }
+        }
+        if (else_leads and !then_leads and else_body.len > 0 and then_body.len == 0) {
+            if (!self.bodyEndsTerminal(else_body)) {
+                const cont = try self.makeContinue();
+                const body = try a.alloc(*Stmt, else_body.len + 1);
+                std.mem.copyForwards(*Stmt, body[0..else_body.len], else_body);
+                body[else_body.len] = cont;
+                else_body = body;
+            }
+        }
 
         return .{
             .condition = condition,
             .then_body = then_body,
             .else_body = else_body,
             .else_is_continuation = else_is_continuation,
+            .then_leads = then_leads,
+            .else_leads = else_leads,
             .cond_op = cond_op,
             .then_block = then_block,
             .else_block = else_block,
@@ -11780,35 +13230,54 @@ pub const Decompiler = struct {
             }
         }
         if (normal_target) |target_id| {
-            const resolved = self.resolveJumpOnlyBlock(target_id);
-            if (self.dom.isInLoop(resolved, loop_header)) return false;
+            const exit = self.analyzer.detectLoopExit(target_id, &[_]u32{loop_header});
+            if (exit != .break_stmt) return false;
         } else {
             return false;
         }
         for (pattern.handlers) |handler| {
             if (handler.handler_block >= self.cfg.blocks.len) continue;
-            if (self.dom.isInLoop(handler.handler_block, loop_header)) return true;
+            if (self.analyzer.inLoop(handler.handler_block, loop_header)) return true;
         }
         return false;
     }
 
     fn appendTryBreak(self: *Decompiler, stmt: *Stmt) DecompileError!void {
         if (stmt.* != .try_stmt) return;
-        const body = stmt.try_stmt.body;
-        if (body.len > 0) {
-            switch (body[body.len - 1].*) {
+        const else_body = stmt.try_stmt.else_body;
+        if (else_body.len > 0) {
+            switch (else_body[else_body.len - 1].*) {
                 .break_stmt, .return_stmt, .raise_stmt, .continue_stmt => return,
                 else => {},
             }
         }
         const a = self.arena.allocator();
         const br = try self.makeBreak();
-        const new_body = try a.alloc(*Stmt, body.len + 1);
-        if (body.len > 0) {
-            std.mem.copyForwards(*Stmt, new_body[0..body.len], body);
+        const new_body = try a.alloc(*Stmt, else_body.len + 1);
+        if (else_body.len > 0) {
+            std.mem.copyForwards(*Stmt, new_body[0..else_body.len], else_body);
         }
-        new_body[body.len] = br;
-        stmt.try_stmt.body = new_body;
+        new_body[else_body.len] = br;
+        stmt.try_stmt.else_body = new_body;
+
+        if (stmt.try_stmt.handlers.len > 0) {
+            const handlers = stmt.try_stmt.handlers;
+            var replaced = false;
+            const next_handlers = try a.alloc(ast.ExceptHandler, handlers.len);
+            for (handlers, 0..) |h, idx| {
+                next_handlers[idx] = h;
+                if (h.body.len == 0) {
+                    const cont = try self.makeContinue();
+                    const body = try a.alloc(*Stmt, 1);
+                    body[0] = cont;
+                    next_handlers[idx].body = body;
+                    replaced = true;
+                }
+            }
+            if (replaced) {
+                stmt.try_stmt.handlers = next_handlers;
+            }
+        }
     }
 
     fn nextLoopBlockAfterIf(
@@ -11823,7 +13292,7 @@ pub const Decompiler = struct {
                 if (merge_id == stop_id) return null;
             }
             if (merge_id == loop_header) return null;
-            if (!self.dom.isInLoop(merge_id, loop_header)) return null;
+            if (!self.analyzer.inLoop(merge_id, loop_header)) return null;
             return merge_id;
         }
 
@@ -11840,12 +13309,12 @@ pub const Decompiler = struct {
             if (next_id == stop_id) return null;
         }
         if (next_id == loop_header) return null;
-        if (!self.dom.isInLoop(next_id, loop_header)) return null;
+        if (!self.analyzer.inLoop(next_id, loop_header)) return null;
         if (next_id <= cur_block) return null;
         return next_id;
     }
 
-    /// Decompile a body within a loop using dominator-based membership.
+    /// Decompile a body within a loop using loop-region membership.
     fn decompileLoopBody(
         self: *Decompiler,
         start_block: u32,
@@ -11855,23 +13324,53 @@ pub const Decompiler = struct {
         visited: *std.DynamicBitSet,
         stop_block: ?u32,
         skip_first: usize,
+        ignore_header_while: bool,
     ) DecompileError![]const *Stmt {
         const a = self.arena.allocator();
         var stmts: std.ArrayList(*Stmt) = .{};
         errdefer stmts.deinit(a);
 
         var block_idx = start_block;
+        var loop_end_offset: ?u32 = null;
+        const start_offset: u32 = if (start_block < self.cfg.blocks.len)
+            self.cfg.blocks[start_block].start_offset
+        else
+            0;
+        const stop_offset: ?u32 = if (stop_block) |stop_id| blk: {
+            if (stop_id < self.cfg.blocks.len) break :blk self.cfg.blocks[stop_id].start_offset;
+            break :blk null;
+        } else null;
+        if (loop_header < self.cfg.blocks.len) {
+            const header = &self.cfg.blocks[loop_header];
+            for (header.successors) |edge| {
+                if (edge.edge_type == .conditional_false and edge.target < self.cfg.blocks.len) {
+                    if (!self.analyzer.inLoop(edge.target, loop_header)) {
+                        loop_end_offset = self.cfg.blocks[edge.target].start_offset;
+                        break;
+                    }
+                }
+            }
+        }
 
         while (block_idx < self.cfg.blocks.len) {
+            const block = &self.cfg.blocks[block_idx];
             if (stop_block) |stop_id| {
                 if (block_idx == stop_id) break;
+            }
+            if (stop_offset) |stop_off| {
+                if (stop_off > start_offset and block.start_offset >= stop_off) break;
+            }
+            if (loop_end_offset) |end_off| {
+                if (block.start_offset >= end_off) break;
             }
             if (self.consumed.isSet(block_idx)) {
                 block_idx += 1;
                 continue;
             }
-            // Use dominator tree for membership check
-            if (!self.dom.isInLoop(block_idx, loop_header)) break;
+            if (!self.analyzer.inLoop(block_idx, loop_header)) {
+                block_idx += 1;
+                continue;
+            }
             if (block_idx == loop_header and block_idx != start_block) break;
             if (visited.isSet(block_idx)) {
                 block_idx += 1;
@@ -11879,11 +13378,10 @@ pub const Decompiler = struct {
             }
             visited.set(block_idx);
 
-            const block = &self.cfg.blocks[block_idx];
             const has_back_edge = self.hasLoopBackEdge(block, loop_header);
             var pattern = try self.analyzer.detectPatternInLoop(block_idx);
-            if (block_idx == start_block and skip_first > 0 and pattern == .while_loop) {
-                if (pattern.while_loop.header_block == loop_header) {
+            if (block_idx == start_block and pattern == .while_loop and pattern.while_loop.header_block == loop_header) {
+                if (skip_first > 0 or ignore_header_while) {
                     pattern = .unknown;
                 }
             }
@@ -11902,21 +13400,76 @@ pub const Decompiler = struct {
                         continue;
                     };
 
-                    if (parts.else_is_continuation and parts.else_block != null and self.isTrueJump(parts.cond_op)) {
-                        const guard_cond = try self.guardCondFromJump(parts.condition, parts.cond_op);
-                        const guard_stmt = try a.create(Stmt);
-                        const cont = try self.makeContinue();
-                        const body = try a.alloc(*Stmt, 1);
-                        body[0] = cont;
-                        guard_stmt.* = .{ .if_stmt = .{
-                            .condition = guard_cond,
-                            .body = body,
+                    const else_cont = if (parts.else_is_continuation and parts.else_block != null) blk: {
+                        const else_id = parts.else_block.?;
+                        if (self.resolveJumpOnlyBlock(else_id) == loop_header or
+                            self.loopBlockLeadsToContinue(else_id, loop_header) or
+                            self.blockLeadsToHeader(else_id, loop_header))
+                        {
+                            break :blk true;
+                        }
+                        break :blk false;
+                    } else false;
+                    const then_guard = parts.then_leads and parts.else_block != null and !parts.else_leads;
+                    var consumed_else = false;
+                    if (then_guard) {
+                        const if_stmt = try a.create(Stmt);
+                        if_stmt.* = .{ .if_stmt = .{
+                            .condition = parts.condition,
+                            .body = parts.then_body,
                             .else_body = &.{},
                         } };
-                        try stmts.append(a, guard_stmt);
-                        if (parts.then_body.len > 0) {
+                        try stmts.append(a, if_stmt);
+                        if (parts.else_body.len > 0) {
+                            try stmts.appendSlice(a, parts.else_body);
+                        }
+                        consumed_else = true;
+                    } else if (else_cont) {
+                        const else_is_jump_target = self.elseIsJumpTarget(parts.cond_op);
+                        var emitted_then_if = false;
+                        const prefer_if = parts.condition.* == .bool_op;
+                        if ((else_is_jump_target and parts.else_body.len == 0 and parts.then_body.len > 0) or
+                            (prefer_if and !else_is_jump_target and parts.else_body.len == 0 and parts.then_body.len > 0 and !self.bodyEndsTerminal(parts.then_body)))
+                        {
+                            const if_stmt = try a.create(Stmt);
+                            if_stmt.* = .{ .if_stmt = .{
+                                .condition = parts.condition,
+                                .body = parts.then_body,
+                                .else_body = &.{},
+                            } };
+                            try stmts.append(a, if_stmt);
+                            emitted_then_if = true;
+                        } else {
+                            const guard_cond = try self.guardCondForBranch(parts.condition, parts.cond_op, else_is_jump_target);
+                            var guard_body = parts.else_body;
+                            var needs_continue = true;
+                            if (guard_body.len > 0) {
+                                const last = guard_body[guard_body.len - 1];
+                                if (last.* == .continue_stmt or self.stmtIsTerminal(last)) {
+                                    needs_continue = false;
+                                }
+                            }
+                            if (needs_continue) {
+                                const cont = try self.makeContinue();
+                                const next_body = try a.alloc(*Stmt, guard_body.len + 1);
+                                if (guard_body.len > 0) {
+                                    std.mem.copyForwards(*Stmt, next_body[0..guard_body.len], guard_body);
+                                }
+                                next_body[guard_body.len] = cont;
+                                guard_body = next_body;
+                            }
+                            const guard_stmt = try a.create(Stmt);
+                            guard_stmt.* = .{ .if_stmt = .{
+                                .condition = guard_cond,
+                                .body = guard_body,
+                                .else_body = &.{},
+                            } };
+                            try stmts.append(a, guard_stmt);
+                        }
+                        if (!emitted_then_if and parts.then_body.len > 0) {
                             try stmts.appendSlice(a, parts.then_body);
                         }
+                        consumed_else = true;
                     } else {
                         const if_stmt = try a.create(Stmt);
                         if_stmt.* = .{ .if_stmt = .{
@@ -11927,7 +13480,7 @@ pub const Decompiler = struct {
                         try stmts.append(a, if_stmt);
                     }
 
-                    if (parts.else_is_continuation) {
+                    if (parts.else_is_continuation and !consumed_else) {
                         if (parts.else_block) |else_id| {
                             const else_res = self.resolveJumpOnlyBlock(else_id);
                             if (else_res != loop_header and else_id > block_idx) {
@@ -11944,7 +13497,8 @@ pub const Decompiler = struct {
                         block_idx = next_id;
                         continue;
                     }
-                    break;
+                    block_idx += 1;
+                    continue;
                 },
                 .try_stmt => |p| {
                     if (try self.tryDecompileAsyncFor(p)) |result| {
@@ -11954,7 +13508,7 @@ pub const Decompiler = struct {
                         block_idx = result.next_block;
                         continue;
                     }
-                    const result = try self.decompileTry(p);
+                    const result = try self.decompileTryWithLoop(p, loop_header, visited);
                     const leave_loop = self.tryNeedsBreak(&p, loop_header);
                     if (result.stmt) |s| {
                         if (leave_loop) {
@@ -12455,11 +14009,11 @@ pub const Decompiler = struct {
             } };
             try stmts.append(stmts_allocator, stmt);
 
-            while (idx < instructions.len) : (idx += 1) {
-                try sim.simulate(instructions[idx]);
-                if (instructions[idx].opcode == .POP_TOP) return idx;
+            var sim_idx: usize = start_idx;
+            while (sim_idx <= idx) : (sim_idx += 1) {
+                try sim.simulate(instructions[sim_idx]);
             }
-            return null;
+            return idx;
         }
 
         while (idx + 1 < instructions.len) {
@@ -12929,6 +14483,7 @@ pub fn decompileToSourceWithOptions(
         defer decompiler.deinit();
         decompiler.trace_loop_guards = use_opts.trace_loop_guards;
         decompiler.trace_sim_block = use_opts.trace_sim_block;
+        decompiler.trace_decisions = use_opts.trace_decisions;
         decompiler.trace_file = use_opts.trace_file;
         if (use_opts.trace_sim_block) |bid| {
             try decompiler.traceSimBlock(bid);
@@ -12961,7 +14516,7 @@ pub fn decompileToSourceWithOptions(
         if (effective_stmts.len == 0) return;
 
         effective_stmts = try Decompiler.reorderFutureImports(decompiler.arena.allocator(), effective_stmts);
-        effective_stmts = try decompiler.mergeImportFromGroups(decompiler.arena.allocator(), effective_stmts);
+        effective_stmts = try decompiler.mergeImportFromGroupsDeep(decompiler.arena.allocator(), effective_stmts);
 
         var cg = codegen.Writer.init(allocator);
         defer cg.deinit(allocator);
@@ -12980,7 +14535,9 @@ pub fn decompileToSourceWithOptions(
 
         const output = try cg.getOutput(allocator);
         defer allocator.free(output);
-        try writer.writeAll(output);
+        const aligned = try alignDefLines(allocator, target, output);
+        defer allocator.free(aligned);
+        try writer.writeAll(aligned);
         return;
     } else {
         try decompileFunctionToSource(allocator, target, version, writer, 0, use_opts);
@@ -13093,6 +14650,7 @@ fn decompileFunctionToSource(
         defer decompiler.deinit();
         decompiler.trace_loop_guards = opts.trace_loop_guards;
         decompiler.trace_sim_block = opts.trace_sim_block;
+        decompiler.trace_decisions = opts.trace_decisions;
         decompiler.trace_file = opts.trace_file;
         if (opts.trace_sim_block) |bid| {
             try decompiler.traceSimBlock(bid);
@@ -13134,7 +14692,6 @@ fn decompileFunctionToSource(
         }
         try writer.writeAll("pass\n");
     }
-
 }
 
 fn findCodeByPath(code: *const pyc.Code, path: []const u8) FocusError!*const pyc.Code {
@@ -13172,6 +14729,242 @@ fn findCodeByPath(code: *const pyc.Code, path: []const u8) FocusError!*const pyc
         cur = found.?;
     }
     return cur;
+}
+
+const LineInfo = struct {
+    text: []const u8,
+    indent: usize,
+    is_blank: bool,
+};
+
+fn splitLines(allocator: Allocator, src: []const u8) ![]LineInfo {
+    var lines: std.ArrayList(LineInfo) = .{};
+    errdefer lines.deinit(allocator);
+    var it = std.mem.splitScalar(u8, src, '\n');
+    while (it.next()) |line| {
+        const trimmed = std.mem.trim(u8, line, " \t\r");
+        const is_blank = trimmed.len == 0;
+        var indent: usize = 0;
+        if (!is_blank) {
+            while (indent < line.len and line[indent] == ' ') : (indent += 1) {}
+        }
+        try lines.append(allocator, .{
+            .text = line,
+            .indent = indent,
+            .is_blank = is_blank,
+        });
+    }
+    if (lines.items.len > 0) {
+        const last = lines.items[lines.items.len - 1];
+        if (last.is_blank and last.text.len == 0) {
+            lines.items.len -= 1;
+        }
+    }
+    return lines.toOwnedSlice(allocator);
+}
+
+fn collectDefCodeObjects(allocator: Allocator, code: *const pyc.Code) ![]const *const pyc.Code {
+    var items: std.ArrayList(*const pyc.Code) = .{};
+    errdefer items.deinit(allocator);
+    for (code.consts) |c| {
+        const child = switch (c) {
+            .code => c.code,
+            .code_ref => c.code_ref,
+            else => null,
+        };
+        if (child) |cc| {
+            if (cc.name.len == 0) continue;
+            if (cc.name[0] == '<') continue;
+            try items.append(allocator, cc);
+        }
+    }
+    return items.toOwnedSlice(allocator);
+}
+
+fn parseNameAfterPrefix(rest: []const u8) ?[]const u8 {
+    if (rest.len == 0) return null;
+    var end: usize = 0;
+    while (end < rest.len) : (end += 1) {
+        const c = rest[end];
+        if (c == '(' or c == ':' or c == ' ' or c == '\t') break;
+    }
+    if (end == 0) return null;
+    return rest[0..end];
+}
+
+fn parseDefName(line: []const u8, indent: usize) ?[]const u8 {
+    if (line.len <= indent) return null;
+    const rest = line[indent..];
+    if (std.mem.startsWith(u8, rest, "async def ")) {
+        return parseNameAfterPrefix(rest["async def ".len..]);
+    }
+    if (std.mem.startsWith(u8, rest, "def ")) {
+        return parseNameAfterPrefix(rest["def ".len..]);
+    }
+    return null;
+}
+
+fn parseClassName(line: []const u8, indent: usize) ?[]const u8 {
+    if (line.len <= indent) return null;
+    const rest = line[indent..];
+    if (!std.mem.startsWith(u8, rest, "class ")) return null;
+    return parseNameAfterPrefix(rest["class ".len..]);
+}
+
+fn isDecoratorLine(line: []const u8, indent: usize) bool {
+    return line.len > indent and line[indent] == '@';
+}
+
+fn nextChildByName(children: []const *const pyc.Code, idx: *usize, name: []const u8) ?*const pyc.Code {
+    var i = idx.*;
+    while (i < children.len) : (i += 1) {
+        if (std.mem.eql(u8, children[i].name, name)) {
+            idx.* = i + 1;
+            return children[i];
+        }
+    }
+    return null;
+}
+
+fn writeLine(out: *std.ArrayList(u8), allocator: Allocator, line: []const u8) !void {
+    try out.appendSlice(allocator, line);
+    try out.append(allocator, '\n');
+}
+
+fn padToLine(out: *std.ArrayList(u8), allocator: Allocator, line_no: *u32, target: u32) !void {
+    _ = out;
+    _ = allocator;
+    _ = line_no;
+    _ = target;
+}
+
+fn processBlock(
+    allocator: Allocator,
+    out: *std.ArrayList(u8),
+    lines: []const LineInfo,
+    idx: *usize,
+    indent: usize,
+    code: ?*const pyc.Code,
+    base_line: u32,
+) !u32 {
+    var line_no = base_line;
+    var children: []const *const pyc.Code = &.{};
+    if (code) |c| {
+        children = try collectDefCodeObjects(allocator, c);
+    }
+    defer if (children.len > 0) allocator.free(children);
+    var child_pos: usize = 0;
+
+    while (idx.* < lines.len) {
+        const line = lines[idx.*];
+        if (!line.is_blank and line.indent < indent) break;
+
+        if (line.is_blank) {
+            try writeLine(out, allocator, line.text);
+            line_no += 1;
+            idx.* += 1;
+            continue;
+        }
+
+        if (line.indent != indent) {
+            try writeLine(out, allocator, line.text);
+            line_no += 1;
+            idx.* += 1;
+            continue;
+        }
+
+        if (isDecoratorLine(line.text, indent)) {
+            const deco_start = idx.*;
+            var deco_count: usize = 0;
+            while (deco_start + deco_count < lines.len) : (deco_count += 1) {
+                const cur = lines[deco_start + deco_count];
+                if (cur.is_blank or cur.indent != indent) break;
+                if (!isDecoratorLine(cur.text, indent)) break;
+            }
+            const def_idx = deco_start + deco_count;
+            if (def_idx < lines.len) {
+                const def_line = lines[def_idx];
+                if (!def_line.is_blank and def_line.indent == indent) {
+                    const def_name = parseDefName(def_line.text, indent);
+                    const cls_name = if (def_name == null) parseClassName(def_line.text, indent) else null;
+                    const name = def_name orelse cls_name;
+                    if (name) |nm| {
+                        var child: ?*const pyc.Code = null;
+                        if (children.len > 0) {
+                            child = nextChildByName(children, &child_pos, nm);
+                        }
+                        if (child) |cc| {
+                            if (cc.firstlineno > 0) {
+                                const deco_u32: u32 = @intCast(deco_count);
+                                const target = if (cc.firstlineno > deco_u32)
+                                    cc.firstlineno - deco_u32
+                                else
+                                    cc.firstlineno;
+                                try padToLine(out, allocator, &line_no, target);
+                            }
+                        }
+                        var j: usize = 0;
+                        while (j < deco_count) : (j += 1) {
+                            try writeLine(out, allocator, lines[deco_start + j].text);
+                            line_no += 1;
+                        }
+                        try writeLine(out, allocator, def_line.text);
+                        line_no += 1;
+                        idx.* = def_idx + 1;
+                        const body_indent = indent + 4;
+                        line_no = try processBlock(allocator, out, lines, idx, body_indent, child, line_no);
+                        continue;
+                    }
+                }
+            }
+            // Not followed by def/class; emit decorators as-is.
+            var j: usize = 0;
+            while (j < deco_count) : (j += 1) {
+                try writeLine(out, allocator, lines[deco_start + j].text);
+                line_no += 1;
+            }
+            idx.* = deco_start + deco_count;
+            continue;
+        }
+
+        const def_name = parseDefName(line.text, indent);
+        const cls_name = if (def_name == null) parseClassName(line.text, indent) else null;
+        const name = def_name orelse cls_name;
+        if (name) |nm| {
+            var child: ?*const pyc.Code = null;
+            if (children.len > 0) {
+                child = nextChildByName(children, &child_pos, nm);
+            }
+            if (child) |cc| {
+                if (cc.firstlineno > 0) {
+                    try padToLine(out, allocator, &line_no, cc.firstlineno);
+                }
+            }
+            try writeLine(out, allocator, line.text);
+            line_no += 1;
+            idx.* += 1;
+            const body_indent = indent + 4;
+            line_no = try processBlock(allocator, out, lines, idx, body_indent, child, line_no);
+            continue;
+        }
+
+        try writeLine(out, allocator, line.text);
+        line_no += 1;
+        idx.* += 1;
+    }
+
+    return line_no;
+}
+
+fn alignDefLines(allocator: Allocator, code: *const pyc.Code, src: []const u8) ![]const u8 {
+    const lines = try splitLines(allocator, src);
+    defer allocator.free(lines);
+    var out: std.ArrayList(u8) = .{};
+    errdefer out.deinit(allocator);
+    var idx: usize = 0;
+    const base_line: u32 = 1;
+    _ = try processBlock(allocator, &out, lines, &idx, 0, code, base_line);
+    return out.toOwnedSlice(allocator);
 }
 
 // ============================================================================

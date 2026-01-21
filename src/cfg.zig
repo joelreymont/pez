@@ -466,7 +466,46 @@ fn collectLegacyExceptionEntries(
 
     const multiplier: u32 = if (version.gte(3, 10)) 2 else 1;
 
-    for (instructions) |inst| {
+    const isEarlyReturn = struct {
+        fn check(insts: []const Instruction, idx: usize) bool {
+            var i = idx + 1;
+            while (i < insts.len) : (i += 1) {
+                const next = insts[i];
+                switch (next.opcode) {
+                    .CACHE, .NOP => continue,
+                    else => {},
+                }
+                if (next.isBlockTerminator()) {
+                    return switch (next.opcode) {
+                        .RETURN_VALUE,
+                        .RETURN_CONST,
+                        .RAISE_VARARGS,
+                        .RERAISE,
+                        => true,
+                        else => false,
+                    };
+                }
+                if (next.isJump()) return false;
+            }
+            return false;
+        }
+    }.check;
+
+    for (instructions, 0..) |inst, inst_idx| {
+        // Drop exception setups once we reach their handler target.
+        while (stack.items.len > 0) {
+            const top = stack.items[stack.items.len - 1];
+            switch (top.kind) {
+                .except, .finally, .with => {
+                    if (inst.offset >= top.target) {
+                        _ = stack.pop();
+                        continue;
+                    }
+                },
+                else => {},
+            }
+            break;
+        }
         switch (inst.opcode) {
             .SETUP_LOOP => {
                 try stack.append(allocator, .{
@@ -504,7 +543,7 @@ fn collectLegacyExceptionEntries(
             },
             .POP_BLOCK => {
                 if (stack.items.len == 0) continue;
-                const entry = stack.pop() orelse continue;
+                const entry = stack.items[stack.items.len - 1];
                 switch (entry.kind) {
                     .except, .finally, .with => {
                         try entries.append(allocator, .{
@@ -514,8 +553,13 @@ fn collectLegacyExceptionEntries(
                             .depth = 0,
                             .push_lasti = false,
                         });
+                        if (!isEarlyReturn(instructions, inst_idx)) {
+                            _ = stack.pop();
+                        }
                     },
-                    else => {},
+                    else => {
+                        _ = stack.pop();
+                    },
                 }
             },
             else => {},

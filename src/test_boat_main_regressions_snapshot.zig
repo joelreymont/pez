@@ -42,7 +42,9 @@ test "snapshot loop guard 3.9" {
         \\        pass
         \\    def set_continue(self):
         \\        self._set_stopinfo(self.botframe, None, -1)
-        \\        if not self.breaks:
+        \\        if self.breaks:
+        \\            pass
+        \\        else:
         \\            sys.settrace(None)
         \\            frame = sys._getframe().f_back
         \\            while frame and frame is not self.botframe:
@@ -80,6 +82,51 @@ test "snapshot import dotted 3.9" {
         \\[]u8
         \\  "import a.b
         \\import a.b as c
+        \\"
+    );
+}
+
+test "snapshot import star follow 3.9" {
+    try runSnapshot(@src(), "test/corpus/import_star_follow.3.9.pyc",
+        \\[]u8
+        \\  "from mod import *
+        \\from mod import a
+        \\"
+    );
+}
+
+test "snapshot import star elif 3.9" {
+    try runSnapshot(@src(), "test/corpus/import_star_elif.3.9.pyc",
+        \\[]u8
+        \\  "from mod import *
+        \\import sys
+        \\if sys.platform == 'cli':
+        \\    from mod2 import Serial
+        \\else:
+        \\    import os
+        \\    if os.name == 'nt':
+        \\        from mod3 import Serial
+        \\    elif os.name == 'posix':
+        \\        from mod4 import Serial
+        \\    else:
+        \\        raise ImportError('no impl')
+        \\"
+    );
+}
+
+test "snapshot for else break 3.9" {
+    try runSnapshot(@src(), "test/corpus/for_else_break.3.9.pyc",
+        \\[]u8
+        \\  "def find_pkg(pkgs):
+        \\    for pkg in pkgs:
+        \\        try:
+        \\            if pkg == 'ok':
+        \\                break
+        \\        except ImportError:
+        \\            pass
+        \\    else:
+        \\        raise ValueError('no pkg')
+        \\    return pkg
         \\"
     );
 }
@@ -254,6 +301,24 @@ test "snapshot class metaclass 3.9" {
     );
 }
 
+test "snapshot class if merge 3.9" {
+    try runSnapshot(@src(), "test/corpus/class_if_merge.3.9.pyc",
+        \\[]u8
+        \\  "nt = True
+        \\supports_symlinks = False
+        \\class C:
+        \\    if nt:
+        \\        if supports_symlinks:
+        \\            symlink = 1
+        \\        else:
+        \\            symlink = 2
+        \\    else:
+        \\        symlink = 3
+        \\    utime = 4
+        \\"
+    );
+}
+
 test "snapshot class method annotations 3.9" {
     try runSnapshot(@src(), "test/corpus/class_method_annotations.3.9.pyc",
         \\[]u8
@@ -280,6 +345,31 @@ test "snapshot bytes constants 3.9" {
         \\[]u8
         \\  "def f():
         \\    return (b'\xff\xe0', b'Exif\x00\x00', b'abc')
+        \\"
+    );
+}
+
+test "snapshot float integral 3.9" {
+    try runSnapshot(@src(), "test/corpus/float_integral.3.9.pyc",
+        \\[]u8
+        \\  "x = 10000000.0
+        \\y = int(10000000.0)
+        \\"
+    );
+}
+
+test "snapshot set update 3.9" {
+    try runSnapshot(@src(), "test/corpus/set_update.3.9.pyc",
+        \\[]u8
+        \\  "S = {'d', 'l', 'j', 'n', 'k', 'c', 'm', 'b', 'h', 'g', 'a', 'f', 'o', 'e', 'i'}
+        \\"
+    );
+}
+
+test "snapshot lambda boolop 3.9" {
+    try runSnapshot(@src(), "test/corpus/lambda_boolop.3.9.pyc",
+        \\[]u8
+        \\  "f = lambda x: x.endswith('_codec') is False and x not in {'a', 'b', 'c'}
         \\"
     );
 }
@@ -347,6 +437,22 @@ test "snapshot with body if return 3.9" {
     );
 }
 
+test "snapshot with if else return 3.9" {
+    try runSnapshot(@src(), "test/corpus/with_if_else_return.3.9.pyc",
+        \\[]u8
+        \\  "import threading
+        \\_lock = threading.RLock()
+        \\def f(x):
+        \\    with _lock:
+        \\        if x:
+        \\            x = x + 1
+        \\        else:
+        \\            return None
+        \\    return x
+        \\"
+    );
+}
+
 test "snapshot if return fallthrough 3.9" {
     try runSnapshot(@src(), "test/corpus/if_return_fallthrough.3.9.pyc",
         \\[]u8
@@ -401,6 +507,28 @@ test "snapshot try import 3.9" {
     );
 }
 
+test "snapshot try import multi 3.9" {
+    try runSnapshot(@src(), "test/corpus/try_import_multi.3.9.pyc",
+        \\[]u8
+        \\  "try:
+        \\    from mod import a as b, c as d
+        \\except ImportError:
+        \\    pass
+        \\"
+    );
+}
+
+test "snapshot try import star 3.9" {
+    try runSnapshot(@src(), "test/corpus/try_import_star.3.9.pyc",
+        \\[]u8
+        \\  "try:
+        \\    from mod import *
+        \\except ImportError:
+        \\    from mod2 import *
+        \\"
+    );
+}
+
 test "snapshot try except return 3.9" {
     try runSnapshot(@src(), "test/corpus/try_except_return.3.9.pyc",
         \\[]u8
@@ -422,6 +550,22 @@ test "snapshot try except raise 3.9" {
         \\    except Exception:
         \\        print('err')
         \\        raise
+        \\"
+    );
+}
+
+test "snapshot except with fallback 3.9" {
+    try runSnapshot(@src(), "test/corpus/except_with_fallback.3.9.pyc",
+        \\[]u8
+        \\  "import json
+        \\def load_config():
+        \\    try:
+        \\        with open('config.json', 'r') as f:
+        \\            data = json.load(f)
+        \\    except:
+        \\        with open('config.bin', 'rb') as f:
+        \\            data = json.loads(f.read().decode('utf-8'))
+        \\    return data
         \\"
     );
 }

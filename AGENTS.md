@@ -10,7 +10,7 @@ Decompiler parity spec: `~/.claude/plans/composed-wishing-diffie.md`
 
 ## Tools
 
-- When new tooling would speed or unblock work, add it plus skills/triggers, then use it.
+- When new tooling would speed or unblock work, add it plus local skills/triggers, then use it.
 
 ## Build
 

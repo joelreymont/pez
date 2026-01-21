@@ -109,7 +109,7 @@ def main() -> None:
     py = select_compile_python(args.py, tuple(orig_ver_list[:2]), args.timeout)
     tmpdir = Path(tempfile.mkdtemp(prefix="pez-unit-diff-"))
     compiled_pyc = tmpdir / "compiled.pyc"
-    compile_source(py, Path(args.src), compiled_pyc, args.timeout)
+    compile_source(py, Path(args.src), compiled_pyc, args.timeout, orig_code.co_filename)
 
     comp_ver, comp_code = ax.load_code(str(compiled_pyc))
     comp_ver_list = list(comp_ver)

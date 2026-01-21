@@ -438,7 +438,7 @@ pub const Writer = struct {
                 const out = self.output.writer(allocator);
                 try v.format("", .{}, out);
             },
-            .float => |v| try self.writeFmt(allocator, "{d}", .{v}),
+            .float => |v| try self.writeFloatLiteral(allocator, v),
             .complex => |v| {
                 if (v.real != 0) {
                     try self.writeFmt(allocator, "({d}", .{v.real});
@@ -482,6 +482,29 @@ pub const Writer = struct {
                 try self.writeByte(allocator, ')');
             },
             .code => try self.write(allocator, "<code>"),
+        }
+    }
+
+    fn writeFloatLiteral(self: *Writer, allocator: std.mem.Allocator, v: f64) !void {
+        var buf: [128]u8 = undefined;
+        const s = std.fmt.bufPrint(&buf, "{d}", .{v}) catch |err| switch (err) {
+            error.NoSpaceLeft => {
+                const heap = try std.fmt.allocPrint(allocator, "{d}", .{v});
+                defer allocator.free(heap);
+                return self.writeFloatLiteralSlice(allocator, heap);
+            },
+        };
+        try self.writeFloatLiteralSlice(allocator, s);
+    }
+
+    fn writeFloatLiteralSlice(self: *Writer, allocator: std.mem.Allocator, s: []const u8) !void {
+        const has_alpha = std.mem.indexOfAny(u8, s, "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ") != null;
+        const has_dot = std.mem.indexOfScalar(u8, s, '.') != null;
+        const has_exp = std.mem.indexOfAny(u8, s, "eE") != null;
+        if (!has_alpha and !has_dot and !has_exp) {
+            try self.writeFmt(allocator, "{s}.0", .{s});
+        } else {
+            try self.write(allocator, s);
         }
     }
 

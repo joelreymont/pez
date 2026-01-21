@@ -495,7 +495,7 @@ def main():
     opc = op_imports.get_opcode_module(ver)
     out = []
     walk(code, opc, code.co_name, out)
-    print(json.dumps({"version": list(ver), "units": out}))
+    print(json.dumps({"version": list(ver), "units": out, "filename": code.co_filename}))
 
 
 if __name__ == "__main__":

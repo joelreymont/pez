@@ -126,7 +126,8 @@ def main() -> None:
         py = select_compile_python(args.py, orig_ver, args.timeout)
 
         compiled_pyc = tmpdir / "compiled.pyc"
-        compile_source(py, src, compiled_pyc, args.timeout)
+        orig_filename = orig_data.get("filename")
+        compile_source(py, src, compiled_pyc, args.timeout, orig_filename)
         comp_data = disassemble_with_xdis(xdis_py, compiled_pyc, args.timeout)
 
         version_mismatch = orig_data["version"] != comp_data["version"]
