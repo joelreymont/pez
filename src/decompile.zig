@@ -4982,29 +4982,38 @@ pub const Decompiler = struct {
         i += 1;
         if (i >= block.instructions.len) return null;
 
-        // Check for optional message: LOAD_CONST followed by CALL
-        var msg: ?*Expr = null;
-        if (block.instructions[i].opcode == .LOAD_CONST) {
-            const const_idx = block.instructions[i].arg;
-            var sim = self.initSim(self.arena.allocator(), self.arena.allocator(), self.code, self.version);
-            defer sim.deinit();
-            if (sim.getConst(const_idx)) |obj| {
-                msg = try sim.objToExpr(obj);
+        var raise_idx: ?usize = null;
+        var call_idx: ?usize = null;
+        var j = i;
+        while (j < block.instructions.len) : (j += 1) {
+            const inst = block.instructions[j];
+            if (inst.opcode == .RAISE_VARARGS and inst.arg == 1) {
+                raise_idx = j;
+                break;
             }
-            i += 1;
-            if (i < block.instructions.len and block.instructions[i].opcode == .CALL) {
-                i += 1;
+            switch (inst.opcode) {
+                .CALL,
+                .CALL_FUNCTION,
+                .CALL_FUNCTION_KW,
+                .CALL_FUNCTION_EX,
+                .CALL_METHOD,
+                => call_idx = j,
+                else => {},
             }
         }
+        if (raise_idx == null) return null;
 
-        // Check for RAISE_VARARGS 1
-        if (i >= block.instructions.len) return null;
-        if (block.instructions[i].opcode != .RAISE_VARARGS or block.instructions[i].arg != 1) {
-            if (msg) |m| {
-                m.deinit(self.arena.allocator());
-                self.arena.allocator().destroy(m);
+        var msg: ?*Expr = null;
+        if (call_idx != null) {
+            var sim = self.initSim(self.arena.allocator(), self.arena.allocator(), self.code, self.version);
+            defer sim.deinit();
+            sim.lenient = true;
+            sim.stack.allow_underflow = true;
+            try sim.stack.push(.unknown);
+            for (block.instructions[i..call_idx.?]) |inst| {
+                if (!try simOpt(&sim, inst)) return null;
             }
-            return null;
+            msg = try popExprOpt(&sim);
         }
 
         // Create assert statement
@@ -5019,6 +5028,26 @@ pub const Decompiler = struct {
         }
         try self.consumed.set(self.allocator, resolved_else);
         return stmt;
+    }
+
+    fn isAssertRaiseBlock(self: *Decompiler, block_id: u32) bool {
+        if (block_id >= self.cfg.blocks.len) return false;
+        const resolved = self.resolveJumpOnlyBlock(block_id);
+        if (resolved >= self.cfg.blocks.len) return false;
+        const block = &self.cfg.blocks[resolved];
+        var i: usize = 0;
+        while (i < block.instructions.len and block.instructions[i].opcode == .NOT_TAKEN) : (i += 1) {}
+        if (i >= block.instructions.len) return false;
+        const load_inst = block.instructions[i];
+        const is_assertion_error = (load_inst.opcode == .LOAD_COMMON_CONSTANT and load_inst.arg == 0) or
+            load_inst.opcode == .LOAD_ASSERTION_ERROR;
+        if (!is_assertion_error) return false;
+        i += 1;
+        if (i >= block.instructions.len) return false;
+        for (block.instructions[i..]) |inst| {
+            if (inst.opcode == .RAISE_VARARGS and inst.arg == 1) return true;
+        }
+        return false;
     }
 
     /// Try to decompile assert pattern: if cond: pass else: raise AssertionError[(...)]
@@ -5167,13 +5196,16 @@ pub const Decompiler = struct {
                             const is_not = condition.* == .unary_op and condition.unary_op.op == .not_;
                             const can_invert = has_call and !has_cmp;
                             if (can_invert and !is_not) {
-                                condition = try self.invertConditionExpr(condition);
-                                try self.emitDecisionTrace(pattern.condition_block, "if_invert_true_jump", condition);
-                                const tmp = then_block;
-                                then_block = else_id;
-                                else_block = tmp;
-                                is_elif = false;
-                                swapped_true_jump = true;
+                                const is_assert = self.isAssertRaiseBlock(else_id);
+                                if (!is_assert) {
+                                    condition = try self.invertConditionExpr(condition);
+                                    try self.emitDecisionTrace(pattern.condition_block, "if_invert_true_jump", condition);
+                                    const tmp = then_block;
+                                    then_block = else_id;
+                                    else_block = tmp;
+                                    is_elif = false;
+                                    swapped_true_jump = true;
+                                }
                             }
                         }
                     }
@@ -5400,19 +5432,23 @@ pub const Decompiler = struct {
                 => {
                     if (!legacy_cond and !is_elif) {
                         if (else_block) |else_id| {
-                            condition = try self.invertConditionExpr(condition);
-                            try self.emitDecisionTrace(pattern.condition_block, "if_invert_true_jump", condition);
-                            const tmp = then_block;
-                            then_block = else_id;
-                            else_block = tmp;
-                            is_elif = false;
-                            inverted = true;
+                            if (!self.isAssertRaiseBlock(else_id)) {
+                                condition = try self.invertConditionExpr(condition);
+                                try self.emitDecisionTrace(pattern.condition_block, "if_invert_true_jump", condition);
+                                const tmp = then_block;
+                                then_block = else_id;
+                                else_block = tmp;
+                                is_elif = false;
+                                inverted = true;
+                            }
                         }
                     }
                     if (!inverted) {
                         if (else_block) |else_id| {
                             if (self.isTerminalBlock(else_id) and !self.isTerminalBlock(then_block)) {
-                                if (try self.condChainAllTrueJumps(pattern.condition_block, else_id)) {
+                                if (!self.isAssertRaiseBlock(else_id) and
+                                    try self.condChainAllTrueJumps(pattern.condition_block, else_id))
+                                {
                                     condition = try self.invertConditionExpr(condition);
                                     try self.emitDecisionTrace(pattern.condition_block, "if_invert_terminal_else", condition);
                                     then_block = else_id;
@@ -5426,6 +5462,23 @@ pub const Decompiler = struct {
                 },
                 else => {},
             };
+        }
+        if (!inverted) {
+            if (else_block) |else_id| {
+                if (pattern.merge_block != null and pattern.merge_block.? == then_block and
+                    self.isTerminalBlock(else_id) and !self.isAssertRaiseBlock(else_id))
+                {
+                    condition = try self.invertConditionExpr(condition);
+                    try self.emitDecisionTrace(pattern.condition_block, "if_guard_terminal_else", condition);
+                    const guard_next = then_block;
+                    then_block = else_id;
+                    else_block = null;
+                    is_elif = false;
+                    inverted = true;
+                    self.if_next = guard_next;
+                    forced_then_end = then_block;
+                }
+            }
         }
         var fallthrough: ?u32 = null;
         if (!is_elif) {
@@ -5465,7 +5518,9 @@ pub const Decompiler = struct {
 
         if (else_block) |else_id| {
             const resolved_else = self.resolveJumpOnlyBlock(else_id);
-            if (pattern.merge_block != null and pattern.merge_block.? == resolved_else) {
+            if (pattern.merge_block != null and
+                (pattern.merge_block.? == resolved_else or pattern.merge_block.? == then_block))
+            {
                 if (try self.tryDecompileAssertBlock(condition, else_id, skip)) |assert_stmt| {
                     deinitStackValuesSlice(self.allocator, self.allocator, base_vals_buf);
                     base_owned = false;
