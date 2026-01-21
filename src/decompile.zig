@@ -5134,6 +5134,22 @@ pub const Decompiler = struct {
                 }
             }
         }
+        if (!is_elif) {
+            if (pattern.merge_block) |merge_id| {
+                if (else_block) |else_id| {
+                    const resolved_else = self.resolveJumpOnlyBlock(else_id);
+                    if (resolved_else == merge_id and !self.isTerminalBlock(merge_id)) {
+                        else_block = null;
+                        if (self.if_next == null) {
+                            self.if_next = merge_id;
+                        }
+                        if (resolved_else != else_id) {
+                            try self.consumed.set(self.allocator, else_id);
+                        }
+                    }
+                }
+            }
+        }
         const merge_forward = if (pattern.merge_block) |merge| merge > pattern.condition_block else false;
         const merge_else = !is_elif and merge_forward and pattern.merge_block != null and pattern.merge_block == pattern.else_block;
         const orig_then = then_block;
@@ -5435,14 +5451,20 @@ pub const Decompiler = struct {
                 => {
                     if (!legacy_cond and !is_elif) {
                         if (else_block) |else_id| {
-                            if (!self.isAssertRaiseBlock(else_id)) {
-                                condition = try self.invertConditionExpr(condition);
-                                try self.emitDecisionTrace(pattern.condition_block, "if_invert_true_jump", condition);
-                                const tmp = then_block;
-                                then_block = else_id;
-                                else_block = tmp;
-                                is_elif = false;
-                                inverted = true;
+                            const then_term = self.isTerminalBlock(then_block);
+                            const else_term = self.isTerminalBlock(else_id);
+                            if (!then_term or else_term) {
+                                if (self.isAssertRaiseBlock(else_id)) {
+                                    // keep condition; assert handling wants the original branch
+                                } else {
+                                    condition = try self.invertConditionExpr(condition);
+                                    try self.emitDecisionTrace(pattern.condition_block, "if_invert_true_jump", condition);
+                                    const tmp = then_block;
+                                    then_block = else_id;
+                                    else_block = tmp;
+                                    is_elif = false;
+                                    inverted = true;
+                                }
                             }
                         }
                     }
@@ -5497,12 +5519,45 @@ pub const Decompiler = struct {
         var fallthrough: ?u32 = null;
         if (!is_elif) {
             if (else_block) |else_id| {
-                if (self.isTerminalBlock(then_block) and else_id > then_block) {
+                if (self.isTerminalBlock(then_block)) {
                     const else_term = self.isTerminalBlock(else_id);
-                    if (!else_term or chained_cmp or cond_chain_then) {
+                    if (!else_term) {
+                        if (term) |t| {
+                            const else_is_jump_target = self.elseIsJumpTarget(t.opcode);
+                            if (!else_is_jump_target and else_id < then_block) {
+                                else_block = null;
+                                self.if_next = else_id;
+                            } else if (else_id > then_block) {
+                                fallthrough = else_id;
+                                else_block = null;
+                                self.if_next = else_id;
+                            }
+                        } else if (else_id > then_block) {
+                            fallthrough = else_id;
+                            else_block = null;
+                            self.if_next = else_id;
+                        }
+                    } else if (else_id > then_block and (chained_cmp or cond_chain_then)) {
                         fallthrough = else_id;
                         else_block = null;
                         self.if_next = else_id;
+                    }
+                }
+            }
+        }
+
+        if (!is_elif) {
+            if (else_block) |else_id| {
+                if (pattern.merge_block) |merge_id| {
+                    const resolved_else = self.resolveJumpOnlyBlock(else_id);
+                    if (resolved_else == merge_id and !self.isTerminalBlock(resolved_else) and !self.isTerminalBlock(then_block)) {
+                        else_block = null;
+                        if (self.if_next == null) {
+                            self.if_next = resolved_else;
+                        }
+                        if (resolved_else != else_id) {
+                            try self.consumed.set(self.allocator, else_id);
+                        }
                     }
                 }
             }
@@ -6768,14 +6823,6 @@ pub const Decompiler = struct {
             return try self.decompileTry311(pattern, handler_blocks.items);
         }
 
-        var has_finally = false;
-        for (handler_blocks.items) |hid| {
-            if (self.isFinallyHandler(hid)) {
-                has_finally = true;
-                break;
-            }
-        }
-
         const scratch = try self.getTryScratch(self.cfg.blocks.len);
         var handler_set = &scratch.handler_set;
         handler_set.reset();
@@ -6804,6 +6851,14 @@ pub const Decompiler = struct {
                 if (bid < self.cfg.blocks.len) {
                     v.set(bid);
                 }
+            }
+        }
+
+        var has_finally = false;
+        for (handler_blocks.items) |hid| {
+            if (try self.isFinallyHandler(hid, scratch)) {
+                has_finally = true;
+                break;
             }
         }
 
@@ -6890,6 +6945,23 @@ pub const Decompiler = struct {
             }
         }
 
+        var handler_tail: ?u32 = null;
+        for (handler_reach.list.items) |hid| {
+            if (effective_exit) |exit_id| {
+                if (hid == exit_id) continue;
+            }
+            if (post_try_entry) |entry_id| {
+                if (hid == entry_id) continue;
+                if (scratch.normal_reach.isSet(hid)) continue;
+            }
+            if (join_block) |join_id| {
+                if (hid == join_id) continue;
+            }
+            if (handler_tail == null or hid > handler_tail.?) {
+                handler_tail = hid;
+            }
+        }
+
         var effective_finally_block = if (has_finally) pattern.finally_block else null;
         if (effective_finally_block != null) {
             var try_entry: ?u32 = null;
@@ -6948,7 +7020,7 @@ pub const Decompiler = struct {
 
         var except_count: usize = 0;
         for (handler_blocks.items) |hid| {
-            if (!self.isFinallyHandler(hid)) except_count += 1;
+            if (!try self.isFinallyHandler(hid, scratch)) except_count += 1;
         }
 
         var else_start: ?u32 = pattern.else_block orelse blk: {
@@ -7149,6 +7221,11 @@ pub const Decompiler = struct {
         if (next_block <= last_handler) {
             next_block = last_handler + 1;
         }
+        if (handler_tail) |tail| {
+            if (next_block <= tail) {
+                next_block = tail + 1;
+            }
+        }
         const loop_has_tail = if (loop_header) |header_id|
             next_block < self.cfg.blocks.len and next_block != header_id and self.analyzer.inLoop(next_block, header_id)
         else
@@ -7169,7 +7246,7 @@ pub const Decompiler = struct {
 
         var seen_bare = false;
         for (handler_blocks.items, 0..) |hid, idx| {
-            if (self.isFinallyHandler(hid)) continue;
+            if (try self.isFinallyHandler(hid, scratch)) continue;
             const handler_end = blk: {
                 const next_handler = if (idx + 1 < handler_blocks.items.len)
                     handler_blocks.items[idx + 1]
@@ -10324,6 +10401,14 @@ pub const Decompiler = struct {
         try self.range_in_progress.put(range_key, {});
         defer _ = self.range_in_progress.remove(range_key);
 
+        const prev_limit = self.br_limit;
+        if (self.br_limit) |lim| {
+            if (end < lim) self.br_limit = end;
+        } else {
+            self.br_limit = end;
+        }
+        defer self.br_limit = prev_limit;
+
         const a = self.arena.allocator();
         var stmts: std.ArrayList(*Stmt) = .{};
         errdefer stmts.deinit(a);
@@ -11597,14 +11682,40 @@ pub const Decompiler = struct {
         }
     }
 
-    fn isFinallyHandler(self: *Decompiler, handler_block: u32) bool {
+    fn isFinallyHandler(self: *Decompiler, handler_block: u32, scratch: *TryScratch) DecompileError!bool {
+        if (handler_block >= self.cfg.blocks.len) return false;
         const block = &self.cfg.blocks[handler_block];
+        if (self.hasExceptionHandlerOpcodes(block)) return false;
         for (block.instructions) |inst| {
             if (inst.opcode == .CHECK_EXC_MATCH) return false;
             if (inst.opcode == .COMPARE_OP and inst.arg == 10) return false;
+            if (inst.opcode == .POP_EXCEPT) return false;
         }
         for (block.instructions) |inst| {
             if (inst.opcode == .RERAISE or inst.opcode == .END_FINALLY) return true;
+        }
+
+        scratch.normal_reach.reset();
+        scratch.queue.clearRetainingCapacity();
+        try scratch.queue.append(self.allocator, handler_block);
+
+        while (scratch.queue.items.len > 0) {
+            const bid = scratch.queue.items[scratch.queue.items.len - 1];
+            scratch.queue.items.len -= 1;
+            if (bid >= self.cfg.blocks.len) continue;
+            if (scratch.normal_reach.isSet(bid)) continue;
+            try scratch.normal_reach.set(self.allocator, bid);
+            const blk = &self.cfg.blocks[bid];
+            for (blk.instructions) |inst| {
+                if (inst.opcode == .RERAISE or inst.opcode == .END_FINALLY) return true;
+            }
+            for (blk.successors) |edge| {
+                if (edge.edge_type == .exception or edge.edge_type == .loop_back) continue;
+                if (edge.target >= self.cfg.blocks.len) continue;
+                if (!scratch.normal_reach.isSet(edge.target)) {
+                    try scratch.queue.append(self.allocator, edge.target);
+                }
+            }
         }
         return false;
     }
