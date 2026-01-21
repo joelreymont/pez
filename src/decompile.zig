@@ -5162,8 +5162,9 @@ pub const Decompiler = struct {
         var chain_else: ?u32 = null;
         if (!is_elif) {
             if (else_block) |else_id| {
-                if (self.jumpTargetIfJumpOnly(else_id, true)) |target| {
-                    chain_else = target;
+                const resolved = self.resolveJumpOnlyBlock(else_id);
+                if (resolved != else_id) {
+                    chain_else = resolved;
                 }
             }
         }
@@ -5294,7 +5295,7 @@ pub const Decompiler = struct {
                         pattern.condition_block,
                         condition,
                         final_then,
-                        else_id,
+                        else_res,
                         base_vals,
                         null,
                         null,
@@ -5303,6 +5304,7 @@ pub const Decompiler = struct {
                     )) |expr| {
                         condition = expr;
                         then_block = final_then;
+                        else_block = else_res;
                         cond_chain_then = true;
                     }
                 }
