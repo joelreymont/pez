@@ -347,6 +347,15 @@ pub const Analyzer = struct {
     fn loopExitBlock(self: *Analyzer, header: u32) ?u32 {
         if (header >= self.cfg.blocks.len) return null;
         const block = &self.cfg.blocks[header];
+        if (self.dom.getLoopBody(header)) |body| {
+            for (block.successors) |edge| {
+                if (edge.edge_type == .exception) continue;
+                if (edge.target >= self.cfg.blocks.len) continue;
+                if (!body.isSet(@intCast(edge.target))) {
+                    return edge.target;
+                }
+            }
+        }
         if (block.terminator() == null) return null;
         var exit_id: ?u32 = null;
         for (block.successors) |edge| {
@@ -361,6 +370,13 @@ pub const Analyzer = struct {
     fn loopBodySeed(self: *Analyzer, header: u32) ?u32 {
         if (header >= self.cfg.blocks.len) return null;
         const block = &self.cfg.blocks[header];
+        if (self.dom.getLoopBody(header)) |body| {
+            for (block.successors) |edge| {
+                if (edge.edge_type == .exception) continue;
+                if (edge.target >= self.cfg.blocks.len) continue;
+                if (body.isSet(@intCast(edge.target))) return edge.target;
+            }
+        }
         var body_id: ?u32 = null;
         for (block.successors) |edge| {
             if (edge.edge_type == .conditional_true) return edge.target;
@@ -387,9 +403,7 @@ pub const Analyzer = struct {
         if (self.reachesHeader(exit_id, header)) return error.NoLoopExit;
         const header_block = &self.cfg.blocks[header];
         const exit_block = &self.cfg.blocks[exit_id];
-        const body_block = &self.cfg.blocks[body_id];
         if (exit_block.start_offset <= header_block.start_offset) return error.NoLoopExit;
-        if (exit_block.start_offset <= body_block.start_offset) return error.NoLoopExit;
 
         var body = try std.DynamicBitSet.initEmpty(self.allocator, self.cfg.blocks.len);
         body.set(@intCast(header));
@@ -404,6 +418,7 @@ pub const Analyzer = struct {
             if (id == exit_id) continue;
             const blk = &self.cfg.blocks[id];
             if (blk.start_offset >= exit_block.start_offset) continue;
+            if (!self.dom.dominates(header, id)) continue;
             if (body.isSet(@intCast(id))) continue;
             body.set(@intCast(id));
             for (blk.successors) |edge| {
@@ -419,7 +434,7 @@ pub const Analyzer = struct {
         if (block == header) return true;
         if (self.loopRegion(header)) |body| {
             if (block >= self.cfg.blocks.len) return false;
-            return body.isSet(@intCast(block));
+            if (body.isSet(@intCast(block))) return true;
         }
         return self.dom.isInLoop(block, header);
     }
@@ -587,6 +602,24 @@ pub const Analyzer = struct {
             if (edge.edge_type != .exception) return false;
         }
         return true;
+    }
+
+    pub fn isTerminalGuardBlock(self: *const Analyzer, block_id: u32) bool {
+        if (block_id >= self.cfg.blocks.len) return false;
+        const blk = &self.cfg.blocks[block_id];
+        const term = blk.terminator() orelse return false;
+        if (!self.isConditionalJump(term.opcode)) return false;
+        var count: usize = 0;
+        for (blk.successors) |edge| {
+            if (edge.edge_type == .exception) continue;
+            count += 1;
+            var tgt = edge.target;
+            if (self.jumpOnlyTarget(tgt)) |jump_tgt| {
+                tgt = jump_tgt;
+            }
+            if (!self.isTerminalBlock(tgt)) return false;
+        }
+        return count > 0;
     }
 
     /// Check if block has BEFORE_WITH setup.
@@ -881,7 +914,16 @@ pub const Analyzer = struct {
     pub fn detectBoolOp(self: *const Analyzer, block_id: u32) ?BoolOpPattern {
         if (block_id >= self.cfg.blocks.len) return null;
         const block = &self.cfg.blocks[block_id];
-        if (block.successors.len != 2) return null;
+        var non_exc: [2]Edge = undefined;
+        var non_exc_len: usize = 0;
+        for (block.successors) |edge| {
+            if (edge.edge_type == .exception) continue;
+            if (non_exc_len < non_exc.len) {
+                non_exc[non_exc_len] = edge;
+            }
+            non_exc_len += 1;
+        }
+        if (non_exc_len != 2) return null;
 
         // Check for COPY, TO_BOOL, POP_JUMP pattern at end of block
         const insts = block.instructions;
@@ -932,7 +974,7 @@ pub const Analyzer = struct {
         var second_block: ?u32 = null;
         var short_circuit_block: ?u32 = null;
 
-        for (block.successors) |edge| {
+        for (non_exc[0..2]) |edge| {
             switch (edge.edge_type) {
                 .conditional_true, .normal => second_block = edge.target,
                 .conditional_false => short_circuit_block = edge.target,
@@ -944,7 +986,7 @@ pub const Analyzer = struct {
         // For 'or', true branch short-circuits, false branch continues
         if (is_and) {
             // POP_JUMP_IF_FALSE: fallthrough is second_block, jump is short_circuit
-            for (block.successors) |edge| {
+            for (non_exc[0..2]) |edge| {
                 switch (edge.edge_type) {
                     .conditional_true, .normal => second_block = edge.target,
                     .conditional_false => short_circuit_block = edge.target,
@@ -953,7 +995,7 @@ pub const Analyzer = struct {
             }
         } else {
             // POP_JUMP_IF_TRUE: fallthrough is second_block, jump is short_circuit
-            for (block.successors) |edge| {
+            for (non_exc[0..2]) |edge| {
                 switch (edge.edge_type) {
                     .conditional_false, .normal => second_block = edge.target,
                     .conditional_true => short_circuit_block = edge.target,
@@ -981,6 +1023,7 @@ pub const Analyzer = struct {
         // Both paths should merge at the same point
         const sec_merge = blk: {
             for (sec_blk.successors) |edge| {
+                if (edge.edge_type == .exception) continue;
                 if (edge.edge_type == .normal) break :blk edge.target;
             }
             break :blk null;
@@ -992,6 +1035,7 @@ pub const Analyzer = struct {
             const short_blk = &self.cfg.blocks[short_id];
             const short_merge = blk: {
                 for (short_blk.successors) |edge| {
+                    if (edge.edge_type == .exception) continue;
                     if (edge.edge_type == .normal) break :blk edge.target;
                 }
                 break :blk null;
@@ -1117,7 +1161,8 @@ pub const Analyzer = struct {
                     const else_blk = &self.cfg.blocks[else_id];
                     if (else_blk.terminator()) |else_term| {
                         if (self.isConditionalJump(else_term.opcode) and !hasStmtPrelude(else_blk) and
-                            else_blk.predecessors.len == 1 and else_blk.predecessors[0] == block_id)
+                            else_blk.predecessors.len == 1 and else_blk.predecessors[0] == block_id and
+                            !self.isTerminalGuardBlock(else_id))
                         {
                             // If else branch can reach then-block, it's not an elif chain.
                             var reaches_then = false;
@@ -1218,7 +1263,6 @@ pub const Analyzer = struct {
         if (!self.inLoop(body_id, block_id)) return null;
         if (self.inLoop(exit_id, block_id)) return null;
         if (self.exitLeadsToHeader(exit_id, block_id)) return null;
-        if (self.reachesHeader(exit_id, block_id)) return null;
 
         return WhilePattern{
             .header_block = block_id,
@@ -1371,7 +1415,7 @@ pub const Analyzer = struct {
                     }
                     if (multi) break;
                 }
-                if (!multi and break_target != null and break_target.? > exit_id) {
+                if (!multi and break_target != null) {
                     const exit_blk = &self.cfg.blocks[exit_id];
                     var only_from_header = true;
                     for (exit_blk.predecessors) |pred_id| {

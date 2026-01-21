@@ -266,11 +266,15 @@ pub const Writer = struct {
             },
             .if_exp => |i| {
                 // Ternary: body if condition else else_body
+                const prec: u8 = 2;
+                const needs_parens = prec < parent_prec;
+                if (needs_parens) try self.writeByte(allocator, '(');
                 try self.writeExprPrec(allocator, i.body, 0);
                 try self.write(allocator, " if ");
                 try self.writeExprPrec(allocator, i.condition, 0);
                 try self.write(allocator, " else ");
                 try self.writeExprPrec(allocator, i.else_body, 0);
+                if (needs_parens) try self.writeByte(allocator, ')');
             },
             .call => |c| {
                 try self.writeExprPrec(allocator, c.func, 15);

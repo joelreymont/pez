@@ -553,9 +553,26 @@ fn collectLegacyExceptionEntries(
                             .depth = 0,
                             .push_lasti = false,
                         });
-                        if (!isEarlyReturn(instructions, inst_idx)) {
-                            _ = stack.pop();
+                        var pop = !isEarlyReturn(instructions, inst_idx);
+                        if (pop) {
+                            var j = inst_idx + 1;
+                            while (j < instructions.len) : (j += 1) {
+                                const next = instructions[j];
+                                switch (next.opcode) {
+                                    .CACHE, .NOP => continue,
+                                    else => {},
+                                }
+                                if (next.isJump()) {
+                                    if (next.jumpTarget(version)) |tgt| {
+                                        if (tgt < entry.target) {
+                                            pop = false;
+                                        }
+                                    }
+                                }
+                                break;
+                            }
                         }
+                        if (pop) _ = stack.pop();
                     },
                     else => {
                         _ = stack.pop();
