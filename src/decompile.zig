@@ -11900,6 +11900,23 @@ pub const Decompiler = struct {
                     }
                 }
             }
+            if (self.blockIsCleanupOnly(blk)) {
+                var next: ?u32 = null;
+                for (blk.successors) |edge| {
+                    if (edge.edge_type == .exception) continue;
+                    if (next != null) {
+                        next = null;
+                        break;
+                    }
+                    next = edge.target;
+                }
+                if (next) |target_id| {
+                    if (target_id == cur) break;
+                    cur = target_id;
+                    steps += 1;
+                    continue;
+                }
+            }
             break;
         }
         return cur;
