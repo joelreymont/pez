@@ -3194,17 +3194,20 @@ pub const Decompiler = struct {
                 return null;
             }
         }
-        const t_is_false = t_id == false_block or (stop_false != null and t_id == stop_false.?);
-        const f_is_false = f_id == false_block or (stop_false != null and f_id == stop_false.?);
+        const t_res = self.resolveJumpOnlyBlock(t_id);
+        const f_res = self.resolveJumpOnlyBlock(f_id);
+        const false_target = stop_false orelse false_block;
+        const t_is_false = t_res == false_target;
+        const f_is_false = f_res == false_target;
 
-        if (t_id == true_block and f_is_false) {
+        if (t_res == true_block and f_is_false) {
             try memo.put(self.allocator, block_id, expr);
             return expr;
         }
 
         if (t_is_false and f_is_false) return null;
 
-        if (t_id == true_block) {
+        if (t_res == true_block) {
             const rhs = (try self.buildCondTree(
                 f_id,
                 first_block,
