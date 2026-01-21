@@ -580,6 +580,15 @@ pub const Analyzer = struct {
         return self.block_flags[block.id].has_exception_edge;
     }
 
+    fn isTerminalBlock(self: *const Analyzer, block_id: u32) bool {
+        if (block_id >= self.cfg.blocks.len) return true;
+        const block = &self.cfg.blocks[block_id];
+        for (block.successors) |edge| {
+            if (edge.edge_type != .exception) return false;
+        }
+        return true;
+    }
+
     /// Check if block has BEFORE_WITH setup.
     fn hasWithSetup(self: *const Analyzer, block: *const BasicBlock) bool {
         if (block.id >= self.block_flags.len) return false;
@@ -1094,54 +1103,57 @@ pub const Analyzer = struct {
         }
 
         const then_id = then_block orelse return null;
+        const then_terminal = self.isTerminalBlock(then_id);
 
         // Find merge point - where both branches converge
         var merge = try self.findMergePoint(block_id, then_id, else_block);
 
         // Check if else block is actually an elif
         var is_elif = false;
-        if (else_block) |else_id| {
-            const merge_id = merge;
-            if (merge_id == null or merge_id.? != else_id) {
-                const else_blk = &self.cfg.blocks[else_id];
-                if (else_blk.terminator()) |else_term| {
-                    if (self.isConditionalJump(else_term.opcode) and !hasStmtPrelude(else_blk) and
-                        else_blk.predecessors.len == 1 and else_blk.predecessors[0] == block_id)
-                    {
-                        // If else branch can reach then-block, it's not an elif chain.
-                        var reaches_then = false;
-                        var seen = try std.DynamicBitSet.initEmpty(self.allocator, self.cfg.blocks.len);
-                        defer seen.deinit();
-                        var queue: std.ArrayList(u32) = .{};
-                        defer queue.deinit(self.allocator);
-                        try queue.append(self.allocator, else_id);
-                        while (queue.items.len > 0 and !reaches_then) {
-                            const bid = queue.items[queue.items.len - 1];
-                            queue.items.len -= 1;
-                            if (bid >= self.cfg.blocks.len) continue;
-                            if (seen.isSet(bid)) continue;
-                            seen.set(bid);
-                            if (bid == then_id) {
-                                reaches_then = true;
-                                break;
-                            }
-                            const blk = &self.cfg.blocks[bid];
-                            for (blk.successors) |edge| {
-                                if (edge.edge_type == .exception or edge.edge_type == .loop_back) continue;
-                                if (edge.target >= self.cfg.blocks.len) continue;
-                                if (!seen.isSet(edge.target)) {
-                                    try queue.append(self.allocator, edge.target);
+        if (!then_terminal) {
+            if (else_block) |else_id| {
+                const merge_id = merge;
+                if (merge_id == null or merge_id.? != else_id) {
+                    const else_blk = &self.cfg.blocks[else_id];
+                    if (else_blk.terminator()) |else_term| {
+                        if (self.isConditionalJump(else_term.opcode) and !hasStmtPrelude(else_blk) and
+                            else_blk.predecessors.len == 1 and else_blk.predecessors[0] == block_id)
+                        {
+                            // If else branch can reach then-block, it's not an elif chain.
+                            var reaches_then = false;
+                            var seen = try std.DynamicBitSet.initEmpty(self.allocator, self.cfg.blocks.len);
+                            defer seen.deinit();
+                            var queue: std.ArrayList(u32) = .{};
+                            defer queue.deinit(self.allocator);
+                            try queue.append(self.allocator, else_id);
+                            while (queue.items.len > 0 and !reaches_then) {
+                                const bid = queue.items[queue.items.len - 1];
+                                queue.items.len -= 1;
+                                if (bid >= self.cfg.blocks.len) continue;
+                                if (seen.isSet(bid)) continue;
+                                seen.set(bid);
+                                if (bid == then_id) {
+                                    reaches_then = true;
+                                    break;
+                                }
+                                const blk = &self.cfg.blocks[bid];
+                                for (blk.successors) |edge| {
+                                    if (edge.edge_type == .exception or edge.edge_type == .loop_back) continue;
+                                    if (edge.target >= self.cfg.blocks.len) continue;
+                                    if (!seen.isSet(edge.target)) {
+                                        try queue.append(self.allocator, edge.target);
+                                    }
                                 }
                             }
-                        }
-                        if (!reaches_then) {
-                            is_elif = true;
+                            if (!reaches_then) {
+                                is_elif = true;
+                            }
                         }
                     }
                 }
             }
         }
-        if (!is_elif) {
+        if (!is_elif and !then_terminal) {
             if (else_block) |else_id| {
                 if (merge != null and merge.? == else_id) {
                     const else_blk = &self.cfg.blocks[else_id];
