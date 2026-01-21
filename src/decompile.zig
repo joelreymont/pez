@@ -4957,20 +4957,12 @@ pub const Decompiler = struct {
         };
     }
 
-    /// Try to decompile assert pattern: if cond: pass else: raise AssertionError[(...)]
-    fn tryDecompileAssert(
+    fn tryDecompileAssertBlock(
         self: *Decompiler,
-        pattern: ctrl.IfPattern,
         cond: *Expr,
         else_block: u32,
-        then_body: []const *Stmt,
-        base_vals: []const StackValue,
         skip: usize,
     ) DecompileError!?*Stmt {
-        _ = pattern;
-        _ = base_vals;
-        // Assert has empty then body and else raises AssertionError
-        if (then_body.len != 0) return null;
         if (else_block >= self.cfg.blocks.len) return null;
 
         const resolved_else = self.resolveJumpOnlyBlock(else_block);
@@ -5027,6 +5019,23 @@ pub const Decompiler = struct {
         }
         try self.consumed.set(self.allocator, resolved_else);
         return stmt;
+    }
+
+    /// Try to decompile assert pattern: if cond: pass else: raise AssertionError[(...)]
+    fn tryDecompileAssert(
+        self: *Decompiler,
+        pattern: ctrl.IfPattern,
+        cond: *Expr,
+        else_block: u32,
+        then_body: []const *Stmt,
+        base_vals: []const StackValue,
+        skip: usize,
+    ) DecompileError!?*Stmt {
+        _ = pattern;
+        _ = base_vals;
+        // Assert has empty then body and else raises AssertionError
+        if (then_body.len != 0) return null;
+        return self.tryDecompileAssertBlock(cond, else_block, skip);
     }
 
     /// Decompile an if statement pattern.
@@ -5453,6 +5462,18 @@ pub const Decompiler = struct {
         };
         defer if (then_owned) deinitStackValuesSlice(self.allocator, self.allocator, then_vals);
         defer if (else_owned) deinitStackValuesSlice(self.allocator, self.allocator, else_vals);
+
+        if (else_block) |else_id| {
+            const resolved_else = self.resolveJumpOnlyBlock(else_id);
+            if (pattern.merge_block != null and pattern.merge_block.? == resolved_else) {
+                if (try self.tryDecompileAssertBlock(condition, else_id, skip)) |assert_stmt| {
+                    deinitStackValuesSlice(self.allocator, self.allocator, base_vals_buf);
+                    base_owned = false;
+                    self.if_next = then_block;
+                    return assert_stmt;
+                }
+            }
+        }
 
         // Decompile the then body with inherited stack
         const then_end = blk: {
@@ -11904,7 +11925,7 @@ pub const Decompiler = struct {
                 const inst = insts[0];
                 if (inst.opcode == .JUMP_FORWARD or inst.opcode == .JUMP_ABSOLUTE) {
                     jump_inst = inst;
-                } else break;
+                }
             } else {
                 const last = insts[insts.len - 1];
                 if (last.opcode != .JUMP_FORWARD and last.opcode != .JUMP_ABSOLUTE) break;
