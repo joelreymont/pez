@@ -340,6 +340,15 @@ test "snapshot bool or call 3.9" {
     );
 }
 
+test "snapshot and or chain 3.9" {
+    try runSnapshot(@src(), "test/corpus/and_or_chain.3.9.pyc",
+        \\[]u8
+        \\  "def switch_role(self, ice_controlling):
+        \\    self.log('Switching to %s role', ice_controlling and 'controlling' or 'controlled')
+        \\"
+    );
+}
+
 test "snapshot bytes constants 3.9" {
     try runSnapshot(@src(), "test/corpus/bytes_constants.3.9.pyc",
         \\[]u8

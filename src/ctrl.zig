@@ -213,6 +213,18 @@ pub const BoolOpPattern = struct {
     kind: BoolOpKind,
 };
 
+/// Pattern for "x and y or z" short-circuit chain.
+pub const AndOrPattern = struct {
+    /// Block containing the condition test (x).
+    condition_block: u32,
+    /// Block containing the true value (y).
+    true_block: u32,
+    /// Block containing the false value (z).
+    false_block: u32,
+    /// Block where both branches merge.
+    merge_block: u32,
+};
+
 const BlockFlags = struct {
     has_exception_edge: bool = false,
     has_with_setup: bool = false,
@@ -658,6 +670,69 @@ pub const Analyzer = struct {
             .true_block = true_id,
             .false_block = false_id,
             .merge_block = merge,
+        };
+    }
+
+    /// Detect "x and y or z" short-circuit pattern.
+    pub fn detectAndOr(self: *const Analyzer, block_id: u32) ?AndOrPattern {
+        if (block_id >= self.cfg.blocks.len) return null;
+        const cond_blk = &self.cfg.blocks[block_id];
+        const term = cond_blk.terminator() orelse return null;
+        switch (term.opcode) {
+            .POP_JUMP_IF_FALSE, .POP_JUMP_FORWARD_IF_FALSE, .POP_JUMP_BACKWARD_IF_FALSE => {},
+            else => return null,
+        }
+        if (cond_blk.successors.len != 2) return null;
+
+        var true_id: ?u32 = null;
+        var false_id: ?u32 = null;
+        for (cond_blk.successors) |edge| {
+            if (edge.edge_type == .conditional_true or edge.edge_type == .normal) {
+                true_id = edge.target;
+            } else if (edge.edge_type == .conditional_false) {
+                false_id = edge.target;
+            }
+        }
+        const t_id = true_id orelse return null;
+        const f_id = false_id orelse return null;
+
+        const true_blk = &self.cfg.blocks[t_id];
+        const true_term = true_blk.terminator() orelse return null;
+        if (true_term.opcode != .JUMP_IF_TRUE_OR_POP) return null;
+        if (true_blk.successors.len != 2) return null;
+
+        var t_true: ?u32 = null;
+        var t_false: ?u32 = null;
+        for (true_blk.successors) |edge| {
+            if (edge.edge_type == .conditional_true or edge.edge_type == .normal) {
+                t_true = edge.target;
+            } else if (edge.edge_type == .conditional_false) {
+                t_false = edge.target;
+            }
+        }
+        const merge_id = t_true orelse return null;
+        if (t_false == null or t_false.? != f_id) return null;
+
+        const false_blk = &self.cfg.blocks[f_id];
+        var false_merge: ?u32 = null;
+        for (false_blk.successors) |edge| {
+            if (edge.edge_type == .normal) {
+                false_merge = edge.target;
+                break;
+            }
+        }
+        if (false_merge == null or false_merge.? != merge_id) return null;
+
+        const merge_blk = &self.cfg.blocks[merge_id];
+        for (merge_blk.predecessors) |pred| {
+            if (pred != t_id and pred != f_id) return null;
+        }
+
+        return .{
+            .condition_block = block_id,
+            .true_block = t_id,
+            .false_block = f_id,
+            .merge_block = merge_id,
         };
     }
 

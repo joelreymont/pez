@@ -3872,6 +3872,86 @@ pub const Decompiler = struct {
         return null;
     }
 
+    fn tryDecompileAndOrInto(
+        self: *Decompiler,
+        block_id: u32,
+        limit: u32,
+        stmts: *std.ArrayList(*Stmt),
+        stmts_allocator: Allocator,
+    ) DecompileError!?u32 {
+        if (self.pending_ternary_expr != null or self.pending_store_expr != null or self.pending_vals != null) {
+            return null;
+        }
+        const pattern = self.analyzer.detectAndOr(block_id) orelse return null;
+        if (pattern.true_block >= limit or pattern.false_block >= limit or pattern.merge_block >= limit) {
+            return null;
+        }
+        if (pattern.merge_block <= block_id) return null;
+
+        const stmts_len = stmts.items.len;
+        const cond_res = (try self.initCondSim(pattern.condition_block, stmts, stmts_allocator)) orelse {
+            stmts.items.len = stmts_len;
+            return null;
+        };
+        const base_vals = cond_res.base_vals;
+        var base_owned = true;
+        defer if (base_owned) deinitStackValuesSlice(self.allocator, self.allocator, base_vals);
+
+        const true_blk = &self.cfg.blocks[pattern.true_block];
+        const false_blk = &self.cfg.blocks[pattern.false_block];
+        const true_skip = self.boolOpBlockSkip(true_blk, .or_pop);
+        const false_skip = self.boolOpBlockSkip(false_blk, .or_pop);
+
+        const true_expr = (try self.simulateValueExprSkip(pattern.true_block, base_vals, true_skip)) orelse {
+            stmts.items.len = stmts_len;
+            return null;
+        };
+        const false_expr = (try self.simulateValueExprSkip(pattern.false_block, base_vals, false_skip)) orelse {
+            stmts.items.len = stmts_len;
+            return null;
+        };
+
+        const and_expr = try self.makeBoolPair(cond_res.expr, true_expr, .and_);
+        const or_expr = try self.makeBoolPair(and_expr, false_expr, .or_);
+
+        const merge_block = &self.cfg.blocks[pattern.merge_block];
+        if (merge_block.terminator()) |mt| {
+            if (ctrl.Analyzer.isConditionalJump(undefined, mt.opcode)) {
+                if (self.pending_ternary_expr != null or self.pending_store_expr != null) return null;
+                self.pending_store_expr = or_expr;
+                if (base_vals.len > 0) {
+                    if (self.pending_vals) |vals| {
+                        deinitStackValuesSlice(self.allocator, self.allocator, vals);
+                    }
+                    self.pending_vals = base_vals;
+                    base_owned = false;
+                }
+                return pattern.merge_block;
+            }
+        }
+
+        var merge_sim = self.initSim(self.arena.allocator(), self.arena.allocator(), self.code, self.version);
+        defer merge_sim.deinit();
+        if (base_vals.len > 0) {
+            for (base_vals) |val| {
+                const cloned = try merge_sim.cloneStackValue(val);
+                try merge_sim.stack.push(cloned);
+            }
+        }
+        try merge_sim.stack.push(.{ .expr = or_expr });
+        self.processBlockWithSim(merge_block, &merge_sim, stmts, stmts_allocator) catch |err| {
+            switch (err) {
+                error.StackUnderflow, error.NotAnExpression, error.InvalidBlock => {
+                    stmts.items.len = stmts_len;
+                    return null;
+                },
+                else => return err,
+            }
+        };
+
+        return pattern.merge_block + 1;
+    }
+
     /// Try to decompile a short-circuit boolean expression (x and y, x or y).
     fn tryDecompileBoolOpInto(
         self: *Decompiler,
@@ -4250,6 +4330,26 @@ pub const Decompiler = struct {
                             .block_id = prev_idx,
                             .offset = self.cfg.blocks[prev_idx].start_offset,
                             .opcode = "ternary_no_progress",
+                        };
+                    }
+                    return error.InvalidBlock;
+                }
+                continue;
+            }
+            if (try self.tryDecompileAndOrInto(
+                block_idx,
+                @intCast(self.cfg.blocks.len),
+                &self.statements,
+                self.allocator,
+            )) |next_block| {
+                block_idx = next_block;
+                if (block_idx <= prev_idx) {
+                    if (self.last_error_ctx == null) {
+                        self.last_error_ctx = .{
+                            .code_name = self.code.name,
+                            .block_id = prev_idx,
+                            .offset = self.cfg.blocks[prev_idx].start_offset,
+                            .opcode = "and_or_no_progress",
                         };
                     }
                     return error.InvalidBlock;
