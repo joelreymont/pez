@@ -5150,6 +5150,45 @@ pub const Decompiler = struct {
                 }
             }
         }
+        if (else_block) |else_id| {
+            if (self.br_limit) |lim| {
+                if (else_id < lim and else_id < self.cfg.blocks.len) {
+                    var reach = try std.DynamicBitSet.initEmpty(self.allocator, self.cfg.blocks.len);
+                    defer reach.deinit();
+                    var queue: std.ArrayList(u32) = .{};
+                    defer queue.deinit(self.allocator);
+                    try queue.append(self.allocator, pattern.condition_block);
+                    while (queue.items.len > 0) {
+                        const bid = queue.items[queue.items.len - 1];
+                        queue.items.len -= 1;
+                        if (bid >= lim or bid >= self.cfg.blocks.len) continue;
+                        if (reach.isSet(bid)) continue;
+                        reach.set(bid);
+                        const blk = &self.cfg.blocks[bid];
+                        for (blk.successors) |edge| {
+                            if (edge.edge_type == .exception or edge.edge_type == .loop_back) continue;
+                            if (edge.target >= lim or edge.target >= self.cfg.blocks.len) continue;
+                            if (!reach.isSet(edge.target)) {
+                                try queue.append(self.allocator, edge.target);
+                            }
+                        }
+                    }
+                    var outside_pred = false;
+                    for (self.cfg.blocks[else_id].predecessors) |pred_id| {
+                        if (!reach.isSet(pred_id)) {
+                            outside_pred = true;
+                            break;
+                        }
+                    }
+                    if (outside_pred) {
+                        else_block = null;
+                        if (self.if_next == null) {
+                            self.if_next = else_id;
+                        }
+                    }
+                }
+            }
+        }
         const merge_forward = if (pattern.merge_block) |merge| merge > pattern.condition_block else false;
         const merge_else = !is_elif and merge_forward and pattern.merge_block != null and pattern.merge_block == pattern.else_block;
         const orig_then = then_block;
