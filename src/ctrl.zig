@@ -387,7 +387,9 @@ pub const Analyzer = struct {
         if (self.reachesHeader(exit_id, header)) return error.NoLoopExit;
         const header_block = &self.cfg.blocks[header];
         const exit_block = &self.cfg.blocks[exit_id];
+        const body_block = &self.cfg.blocks[body_id];
         if (exit_block.start_offset <= header_block.start_offset) return error.NoLoopExit;
+        if (exit_block.start_offset <= body_block.start_offset) return error.NoLoopExit;
 
         var body = try std.DynamicBitSet.initEmpty(self.allocator, self.cfg.blocks.len);
         body.set(@intCast(header));
@@ -2477,7 +2479,11 @@ pub const Analyzer = struct {
                     }
                 }
             }
-            if (reaches_else) return else_id;
+            if (reaches_else) {
+                const else_blk = &self.cfg.blocks[else_id];
+                if (else_blk.predecessors.len <= 1) return else_id;
+                return null;
+            }
             if (reaches_term) return term_else;
 
             const cond_blk = &self.cfg.blocks[cond_block];
