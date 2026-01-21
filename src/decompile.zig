@@ -5086,8 +5086,11 @@ pub const Decompiler = struct {
                 if (merge_forward) {
                     if (else_block) |else_id| {
                         if (merge == else_id) {
-                            else_block = null;
-                            self.if_next = merge;
+                            const else_term = self.isTerminalBlock(else_id);
+                            if (!else_term) {
+                                else_block = null;
+                                self.if_next = merge;
+                            }
                         }
                     }
                 }
@@ -5176,6 +5179,7 @@ pub const Decompiler = struct {
         // Collapse chained condition blocks on the then-path (x and y and z).
         var chained_cmp = false;
         var else_resolved = false;
+        var cond_chain_then = false;
         if (chain_else != null and condition.* == .compare) {
             const else_target = chain_else.?;
             if (then_block < self.cfg.blocks.len) {
@@ -5299,6 +5303,7 @@ pub const Decompiler = struct {
                     )) |expr| {
                         condition = expr;
                         then_block = final_then;
+                        cond_chain_then = true;
                     }
                 }
             }
@@ -5393,7 +5398,8 @@ pub const Decompiler = struct {
         if (!is_elif) {
             if (else_block) |else_id| {
                 if (self.isTerminalBlock(then_block) and else_id > then_block) {
-                    if (!self.isTerminalBlock(else_id)) {
+                    const else_term = self.isTerminalBlock(else_id);
+                    if (!else_term or chained_cmp or cond_chain_then) {
                         fallthrough = else_id;
                         else_block = null;
                         self.if_next = else_id;
@@ -5431,7 +5437,9 @@ pub const Decompiler = struct {
             if (else_block) |else_id| {
                 if (else_id > then_block) break :blk else_id;
             }
-            if (pattern.merge_block) |merge_id| break :blk merge_id;
+            if (pattern.merge_block) |merge_id| {
+                if (merge_id > then_block) break :blk merge_id;
+            }
             break :blk try self.branchEnd(then_block, null);
         };
         var then_body = try self.decompileBranchRange(then_block, then_end, then_vals, skip);
@@ -5610,7 +5618,8 @@ pub const Decompiler = struct {
         if (else_block) |else_id| {
             const then_reaches_else = try self.reachesBlock(then_block, else_id, pattern.condition_block);
             var collapsed_else = false;
-            if (then_reaches_else and else_body.len == 1 and self.stmtIsTerminal(else_body[0]) and self.isTerminalBlock(else_id) and try self.postDominates(else_id, then_block)) {
+            const else_preds = if (else_id < self.cfg.blocks.len) self.cfg.blocks[else_id].predecessors.len else 0;
+            if (then_reaches_else and else_body.len == 1 and self.stmtIsTerminal(else_body[0]) and self.isTerminalBlock(else_id) and try self.postDominates(else_id, then_block) and else_preds == 1) {
                 else_body = &[_]*Stmt{};
                 self.if_next = else_id;
                 collapsed_else = true;
@@ -5618,38 +5627,27 @@ pub const Decompiler = struct {
             if (self.if_next == null and pattern.merge_block == null and !collapsed_else) {
                 const else_terminal = self.bodyEndsTerminal(else_body) or self.isTerminalBlock(else_id);
                 if (else_terminal) {
-                    var reach = try self.reachableInRange(then_block, then_end, else_id);
+                    var limit = then_end;
+                    if (then_end <= else_id) {
+                        limit = @intCast(self.cfg.blocks.len);
+                    }
+                    var reach = try self.reachableInRange(then_block, limit, else_id);
                     defer reach.deinit();
-                    var candidate: ?u32 = null;
+                    const else_off = self.cfg.blocks[else_id].start_offset;
+                    var fall_candidate: ?u32 = null;
                     var bid: u32 = 0;
                     while (bid < self.cfg.blocks.len) : (bid += 1) {
                         if (!reach.isSet(bid)) continue;
-                        const blk = &self.cfg.blocks[bid];
-                        if (blk.terminator()) |t| {
-                            switch (t.opcode) {
-                                .JUMP_FORWARD,
-                                .JUMP_BACKWARD,
-                                .JUMP_BACKWARD_NO_INTERRUPT,
-                                .JUMP_ABSOLUTE,
-                                => {
-                                    if (t.jumpTarget(self.cfg.version)) |target_off| {
-                                        if (self.cfg.blockAtOffset(target_off)) |target_id| {
-                                            if (target_id == else_id) continue;
-                                            if (target_id < then_end) continue;
-                                            if (candidate == null or
-                                                self.cfg.blocks[target_id].start_offset <
-                                                    self.cfg.blocks[candidate.?].start_offset)
-                                            {
-                                                candidate = target_id;
-                                            }
-                                        }
-                                    }
-                                },
-                                else => {},
-                            }
+                        if (bid == else_id) continue;
+                        const off = self.cfg.blocks[bid].start_offset;
+                        if (off <= else_off) continue;
+                        if (fall_candidate == null or
+                            off < self.cfg.blocks[fall_candidate.?].start_offset)
+                        {
+                            fall_candidate = bid;
                         }
                     }
-                    if (candidate) |next_id| {
+                    if (fall_candidate) |next_id| {
                         self.if_next = next_id;
                     }
                 }
@@ -5929,16 +5927,31 @@ pub const Decompiler = struct {
                         if (exit_jump == null or (succ != null and exit_jump.? != succ.?)) {
                             const succ_outside = if (succ) |sid| !self.analyzer.inLoop(sid, pattern.header_block) else true;
                             if (succ_outside and (succ == null or self.isTerminalBlock(succ.?))) {
+                                var next_block: u32 = pattern.exit_block;
+                                const limit: u32 = @intCast(self.cfg.blocks.len);
+                                while (next_block < limit) : (next_block += 1) {
+                                    if (next_block == pattern.exit_block) continue;
+                                    if (self.analyzer.inLoop(next_block, pattern.header_block)) continue;
+                                    break;
+                                }
                                 const exit_stmts = try self.decompileBlockRangeWithStackAndSkip(
                                     pattern.exit_block,
                                     pattern.exit_block + 1,
                                     &.{},
                                     0,
                                 );
-                                const succ_stmts = if (succ) |sid|
-                                    try self.decompileBlockRangeWithStackAndSkip(sid, sid + 1, &.{}, 0)
-                                else
-                                    &.{};
+                                var succ_stmts: []const *Stmt = &.{};
+                                var inline_succ = false;
+                                if (succ) |sid| {
+                                    if (sid != next_block) {
+                                        inline_succ = true;
+                                    }
+                                }
+                                if (inline_succ) {
+                                    if (succ) |sid| {
+                                        succ_stmts = try self.decompileBlockRangeWithStackAndSkip(sid, sid + 1, &.{}, 0);
+                                    }
+                                }
 
                                 const guard_cond = if (body_true)
                                     try self.invertConditionExpr(condition)
@@ -5977,15 +5990,10 @@ pub const Decompiler = struct {
                                 } };
                                 guard_if = gs;
                                 try self.consumed.set(self.allocator, pattern.exit_block);
-                                if (succ) |sid| {
-                                    try self.consumed.set(self.allocator, sid);
-                                }
-                                var next_block: u32 = pattern.exit_block;
-                                const limit: u32 = @intCast(self.cfg.blocks.len);
-                                while (next_block < limit) : (next_block += 1) {
-                                    if (next_block == pattern.exit_block) continue;
-                                    if (self.analyzer.inLoop(next_block, pattern.header_block)) continue;
-                                    break;
+                                if (inline_succ) {
+                                    if (succ) |sid| {
+                                        try self.consumed.set(self.allocator, sid);
+                                    }
                                 }
                                 guard_next = next_block;
                             }
@@ -11908,7 +11916,28 @@ pub const Decompiler = struct {
         return true;
     }
 
+    fn loopBreakTarget(self: *Decompiler, block_id: u32, loop_header: u32) ?u32 {
+        if (block_id >= self.cfg.blocks.len) return null;
+        const blk = &self.cfg.blocks[block_id];
+        const term = blk.terminator() orelse return null;
+        switch (term.opcode) {
+            .JUMP_FORWARD,
+            .JUMP_BACKWARD,
+            .JUMP_BACKWARD_NO_INTERRUPT,
+            .JUMP_ABSOLUTE,
+            => {},
+            else => return null,
+        }
+        if (term.jumpTarget(self.cfg.version)) |target_offset| {
+            if (self.cfg.blockAtOffset(target_offset)) |target_id| {
+                if (!self.analyzer.inLoop(target_id, loop_header)) return target_id;
+            }
+        }
+        return null;
+    }
+
     fn loopBlockLeadsToBreak(self: *Decompiler, block_id: u32, loop_header: u32) bool {
+        if (self.loopBreakTarget(block_id, loop_header) != null) return true;
         if (block_id >= self.cfg.blocks.len) return false;
         const blk = &self.cfg.blocks[block_id];
         if (!self.blockIsCleanupOnly(blk)) return false;
@@ -13100,6 +13129,23 @@ pub const Decompiler = struct {
         return .{ .expr = expr, .base_vals = base_vals };
     }
 
+    fn decompileLoopExitBranch(
+        self: *Decompiler,
+        block_id: u32,
+        end_block: ?u32,
+        seed_pop: bool,
+    ) DecompileError![]const *Stmt {
+        _ = end_block;
+        const skip: usize = if (seed_pop) 1 else 0;
+        if (self.jumpTargetIfJumpOnly(block_id, true) != null) {
+            try self.consumed.set(self.allocator, block_id);
+            return &[_]*Stmt{};
+        }
+        const body = try self.decompileBlockRangeWithStackAndSkip(block_id, block_id + 1, &.{}, skip);
+        try self.consumed.set(self.allocator, block_id);
+        return body;
+    }
+
     fn loopIfParts(
         self: *Decompiler,
         pattern: ctrl.IfPattern,
@@ -13378,16 +13424,15 @@ pub const Decompiler = struct {
                 }
             }
         }
+        const then_break_tgt = self.loopBreakTarget(then_block, loop_header);
+        const then_exit = then_break_tgt != null or self.isTerminalBlock(then_block);
         const a = self.arena.allocator();
-        var then_body = if (!then_in_loop and else_is_continuation and self.isTerminalBlock(then_block)) blk: {
-            const skip_then: usize = if (seed_then) 1 else 0;
-            const body = try self.decompileBlockRangeWithStackAndSkip(
-                then_block,
-                then_block + 1,
-                &.{},
-                skip_then,
-            );
-            try self.consumed.set(self.allocator, then_block);
+        var then_body = if (!then_in_loop and then_exit) blk: {
+            var end = body_stop;
+            if (then_break_tgt) |tgt| {
+                if (end == null or tgt < end.?) end = tgt;
+            }
+            const body = try self.decompileLoopExitBranch(then_block, end, seed_then);
             break :blk body;
         } else try self.decompileLoopBody(
             then_block,
@@ -13401,12 +13446,38 @@ pub const Decompiler = struct {
         );
         // Decompile the else body if present
         var else_body = if (else_block) |else_id| blk: {
+            var skip = false;
+            const else_block_ptr = &self.cfg.blocks[else_id];
+            var seed_else = legacy_cond and else_block_ptr.instructions.len > 0 and else_block_ptr.instructions[0].opcode == .POP_TOP;
+            const else_break_tgt = self.loopBreakTarget(else_id, loop_header);
+            const else_exit = else_break_tgt != null or self.isTerminalBlock(else_id);
+            const else_stop = if (merge_in_loop and pattern.merge_block != null and pattern.merge_block.? != else_id)
+                pattern.merge_block
+            else
+                null;
+            if (!else_in_loop and else_exit) {
+                var end = else_stop;
+                if (else_break_tgt) |tgt| {
+                    if (end == null or tgt < end.?) end = tgt;
+                }
+                break :blk try self.decompileLoopExitBranch(else_id, end, seed_else);
+            }
             if (else_is_continuation) {
                 if (else_is_fallthrough) break :blk &[_]*Stmt{};
-                if (self.resolveJumpOnlyBlock(else_id) == loop_header and
-                    self.blockIsCleanupOnly(&self.cfg.blocks[else_id]))
-                {
+                if (self.resolveJumpOnlyBlock(else_id) == loop_header) {
                     break :blk &[_]*Stmt{};
+                }
+                if (else_in_loop) {
+                    break :blk try self.decompileLoopBody(
+                        else_id,
+                        loop_header,
+                        &skip,
+                        &seed_else,
+                        visited,
+                        else_stop,
+                        0,
+                        false,
+                    );
                 }
                 const else_end = try self.branchEnd(else_id, null);
                 break :blk try self.decompileBranchRange(else_id, else_end, &.{}, 0);
@@ -13422,13 +13493,6 @@ pub const Decompiler = struct {
                     }
                 }
             }
-            var skip = false;
-            const else_block_ptr = &self.cfg.blocks[else_id];
-            var seed_else = legacy_cond and else_block_ptr.instructions.len > 0 and else_block_ptr.instructions[0].opcode == .POP_TOP;
-            const else_stop = if (merge_in_loop and pattern.merge_block != null and pattern.merge_block.? != else_id)
-                pattern.merge_block
-            else
-                null;
             break :blk try self.decompileLoopBody(
                 else_id,
                 loop_header,
@@ -13648,8 +13712,11 @@ pub const Decompiler = struct {
             for (header.successors) |edge| {
                 if (edge.edge_type == .conditional_false and edge.target < self.cfg.blocks.len) {
                     if (!self.analyzer.inLoop(edge.target, loop_header)) {
-                        loop_end_offset = self.cfg.blocks[edge.target].start_offset;
-                        break;
+                        const end_off = self.cfg.blocks[edge.target].start_offset;
+                        if (end_off > start_offset) {
+                            loop_end_offset = end_off;
+                            break;
+                        }
                     }
                 }
             }
