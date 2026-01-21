@@ -1003,7 +1003,11 @@ pub const Module = struct {
 
         // Add to refs if FLAG_REF is set (refs owns its own copy)
         if (add_ref) {
-            try self.refs.append(self.allocator, .{ .string = try self.allocator.dupe(u8, slice) });
+            const ref_obj: Object = if (obj_type == .TYPE_STRING)
+                .{ .bytes = try self.allocator.dupe(u8, slice) }
+            else
+                .{ .string = try self.allocator.dupe(u8, slice) };
+            try self.refs.append(self.allocator, ref_obj);
         }
 
         return str;
