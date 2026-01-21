@@ -4970,7 +4970,9 @@ pub const Decompiler = struct {
         if (then_body.len != 0) return null;
         if (else_block >= self.cfg.blocks.len) return null;
 
-        const block = &self.cfg.blocks[else_block];
+        const resolved_else = self.resolveJumpOnlyBlock(else_block);
+        if (resolved_else >= self.cfg.blocks.len) return null;
+        const block = &self.cfg.blocks[resolved_else];
         // Pattern: [NOT_TAKEN,] LOAD_COMMON_CONSTANT 0, [LOAD_CONST msg, CALL,] RAISE_VARARGS 1
         var i: usize = skip;
         while (i < block.instructions.len and block.instructions[i].opcode == .NOT_TAKEN) : (i += 1) {}
@@ -5017,6 +5019,10 @@ pub const Decompiler = struct {
             .condition = cond,
             .msg = msg,
         } };
+        if (resolved_else != else_block) {
+            try self.consumed.set(self.allocator, else_block);
+        }
+        try self.consumed.set(self.allocator, resolved_else);
         return stmt;
     }
 
