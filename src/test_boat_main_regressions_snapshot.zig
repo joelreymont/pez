@@ -702,3 +702,14 @@ test "snapshot chained compare 3.9" {
         \\"
     );
 }
+
+test "snapshot chained compare and 3.9" {
+    try runSnapshot(@src(), "test/corpus/chained_compare_and.3.9.pyc",
+        \\[]u8
+        \\  "def f(limit, _read):
+        \\    if limit is not None and 0 <= limit <= _read:
+        \\        return True
+        \\    return False
+        \\"
+    );
+}
