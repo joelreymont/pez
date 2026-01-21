@@ -1323,8 +1323,11 @@ pub const Decompiler = struct {
         while (i < instructions.len) : (i += 1) {
             const inst = instructions[i];
 
-            // Stop at POP_EXCEPT - marks end of except handler body, cleanup follows
-            if (inst.opcode == .POP_EXCEPT) break;
+            // POP_EXCEPT marks handler cleanup; allow trailing ops (e.g. return)
+            if (inst.opcode == .POP_EXCEPT) {
+                try sim.simulate(inst);
+                continue;
+            }
             if (returnCleanupSkip(instructions, i)) |skip| {
                 i += skip - 1;
                 continue;
@@ -5465,18 +5468,29 @@ pub const Decompiler = struct {
         }
         if (!inverted) {
             if (else_block) |else_id| {
-                if (pattern.merge_block != null and pattern.merge_block.? == then_block and
-                    self.isTerminalBlock(else_id) and !self.isTerminalBlock(then_block) and
-                    !self.isAssertRaiseBlock(else_id))
+                const resolved_else = self.resolveJumpOnlyBlock(else_id);
+                if (resolved_else < self.cfg.blocks.len and
+                    pattern.merge_block != null and pattern.merge_block.? == resolved_else and
+                    self.isTerminalBlock(resolved_else) and
+                    !self.isTerminalBlock(then_block) and
+                    !self.isAssertRaiseBlock(resolved_else))
                 {
-                    condition = try self.invertConditionExpr(condition);
+                    if (term) |t| {
+                        const else_is_jump_target = self.elseIsJumpTarget(t.opcode);
+                        condition = try self.guardCondForBranch(condition, t.opcode, else_is_jump_target);
+                    } else {
+                        condition = try self.invertConditionExpr(condition);
+                    }
                     try self.emitDecisionTrace(pattern.condition_block, "if_guard_terminal_else", condition);
                     const guard_next = then_block;
-                    then_block = else_id;
+                    then_block = resolved_else;
                     else_block = null;
                     is_elif = false;
                     inverted = true;
                     self.if_next = guard_next;
+                    if (resolved_else != else_id) {
+                        try self.consumed.set(self.allocator, else_id);
+                    }
                 }
             }
         }
@@ -5555,6 +5569,7 @@ pub const Decompiler = struct {
         }
 
         // Decompile the else body
+        var else_end: ?u32 = null;
         var else_body = if (else_block) |else_id| blk: {
             // Check if else is an elif
             if (is_elif) {
@@ -5577,14 +5592,15 @@ pub const Decompiler = struct {
                     }
                 }
                 const merge_before_else = if (pattern.merge_block) |merge_id| merge_id < else_id else false;
-                const else_end = if (pattern.merge_block) |merge_id|
+                const else_end_val = if (pattern.merge_block) |merge_id|
                     if (merge_before_else)
                         try self.branchEnd(else_id, null)
                     else
                         merge_id
                 else
                     try self.branchEnd(else_id, null);
-                break :blk try self.decompileBranchRange(else_id, else_end, &.{}, skip);
+                else_end = else_end_val;
+                break :blk try self.decompileBranchRange(else_id, else_end_val, &.{}, skip);
             }
             // Regular else with inherited stack
             defer {
@@ -5615,7 +5631,7 @@ pub const Decompiler = struct {
                 }
             }
             const merge_before_else = if (pattern.merge_block) |merge_id| merge_id < else_id else false;
-            const else_end = if (pattern.merge_block) |merge_id|
+            const else_end_val = if (pattern.merge_block) |merge_id|
                 if (merge_before_else)
                     try self.branchEnd(else_id, null)
                 else if (merge_id == else_id and !else_resolved)
@@ -5630,13 +5646,39 @@ pub const Decompiler = struct {
                 else_next.?
             else
                 try self.branchEnd(else_id, null);
-            break :blk try self.decompileBranchRange(else_id, else_end, else_vals, skip);
+            else_end = else_end_val;
+            break :blk try self.decompileBranchRange(else_id, else_end_val, else_vals, skip);
         } else blk: {
             // No else block - clean up base_vals
             deinitStackValuesSlice(self.allocator, self.allocator, base_vals_buf);
             base_owned = false;
             break :blk &[_]*Stmt{};
         };
+
+        if (else_block) |else_id| {
+            if (!is_elif) {
+                if (else_end) |end_id| {
+                    if (self.if_next == null and else_id < end_id) {
+                        var reach = try self.reachableInRange(then_block, end_id, null);
+                        defer reach.deinit();
+                        var common_start: ?u32 = null;
+                        var bid: u32 = else_id;
+                        while (bid < end_id) : (bid += 1) {
+                            if (reach.isSet(bid)) {
+                                common_start = bid;
+                                break;
+                            }
+                        }
+                        if (common_start) |mid| {
+                            if (mid > else_id) {
+                                else_body = try self.decompileBranchRange(else_id, mid, else_vals, skip);
+                                self.if_next = mid;
+                            }
+                        }
+                    }
+                }
+            }
+        }
 
         var synth_else = false;
         if (else_block != null) {
@@ -5719,7 +5761,11 @@ pub const Decompiler = struct {
             const then_reaches_else = try self.reachesBlock(then_block, else_id, pattern.condition_block);
             var collapsed_else = false;
             const else_preds = if (else_id < self.cfg.blocks.len) self.cfg.blocks[else_id].predecessors.len else 0;
-            if (then_reaches_else and else_body.len == 1 and self.stmtIsTerminal(else_body[0]) and self.isTerminalBlock(else_id) and try self.postDominates(else_id, then_block) and else_preds == 1) {
+            if (then_reaches_else and else_body.len > 1 and self.isTerminalBlock(else_id)) {
+                else_body = &[_]*Stmt{};
+                self.if_next = else_id;
+                collapsed_else = true;
+            } else if (then_reaches_else and else_body.len == 1 and self.stmtIsTerminal(else_body[0]) and self.isTerminalBlock(else_id) and try self.postDominates(else_id, then_block) and else_preds == 1) {
                 else_body = &[_]*Stmt{};
                 self.if_next = else_id;
                 collapsed_else = true;
@@ -6926,6 +6972,30 @@ pub const Decompiler = struct {
                 }
             }
         }
+        if (else_start) |start| {
+            try self.collectReachableNoExceptionInto(
+                pattern.try_block,
+                handler_set,
+                &scratch.normal_reach,
+                &scratch.queue,
+                false,
+                allow_loop_back,
+            );
+            var has_outside_pred = false;
+            if (start < self.cfg.blocks.len) {
+                const preds = self.cfg.blocks[start].predecessors;
+                for (preds) |pred_id| {
+                    if (handler_set.isSet(pred_id)) continue;
+                    if (!scratch.normal_reach.isSet(pred_id)) {
+                        has_outside_pred = true;
+                        break;
+                    }
+                }
+            }
+            if (has_outside_pred) {
+                else_start = null;
+            }
+        }
 
         const exit_for_range: ?u32 = if (exit_block) |exit|
             if (else_start) |start|
@@ -7133,6 +7203,7 @@ pub const Decompiler = struct {
             if (body.len == 0) {
                 body = try self.decompileHandlerBodyLinear(info.body_block, body_end, info.skip);
             }
+            body = self.trimExceptionCleanup(body);
             if (info.name) |handler_name| {
                 if (body.len > 0) {
                     const first = body[0];
@@ -10735,12 +10806,13 @@ pub const Decompiler = struct {
                 break :blk &[_]StackValue{ .{ .expr = e1 }, .{ .expr = e2 }, .{ .expr = e3 } };
             } else &.{};
 
-            const handler_body = try self.decompileBlockRangeWithStackAndSkip(
+            var handler_body = try self.decompileBlockRangeWithStackAndSkip(
                 body_block,
                 handler_end_block,
                 handler_seed,
                 body_skip,
             );
+            handler_body = self.trimExceptionCleanup(handler_body);
 
             try handlers.append(a, .{
                 .type = exc_type,
@@ -11330,7 +11402,10 @@ pub const Decompiler = struct {
         var i: usize = 0;
         while (i < head.instructions.len) : (i += 1) {
             const inst = head.instructions[i];
-            if (inst.opcode == .POP_EXCEPT) break;
+            if (inst.opcode == .POP_EXCEPT) {
+                try sim.simulate(inst);
+                continue;
+            }
             errdefer if (self.last_error_ctx == null) {
                 self.last_error_ctx = .{
                     .code_name = self.code.name,
@@ -14168,6 +14243,28 @@ pub const Decompiler = struct {
         const trimmed = try a.alloc(*Stmt, end);
         @memcpy(trimmed, items[0..end]);
         return trimmed;
+    }
+
+    fn trimExceptionCleanup(self: *Decompiler, items: []const *Stmt) []const *Stmt {
+        _ = self;
+        if (items.len < 2) return items;
+        var end = items.len;
+        while (end >= 2) {
+            const del_stmt = items[end - 1];
+            const assign_stmt = items[end - 2];
+            if (del_stmt.* != .delete) break;
+            if (assign_stmt.* != .assign) break;
+            if (del_stmt.delete.targets.len != 1) break;
+            if (assign_stmt.assign.targets.len != 1) break;
+            const del_target = del_stmt.delete.targets[0];
+            const assign_target = assign_stmt.assign.targets[0];
+            if (del_target.* != .name or assign_target.* != .name) break;
+            if (!std.mem.eql(u8, del_target.name.id, assign_target.name.id)) break;
+            const val = assign_stmt.assign.value;
+            if (val.* != .constant or val.constant != .none) break;
+            end -= 2;
+        }
+        return items[0..end];
     }
 
     fn takeDecorators(self: *Decompiler, decorators: *std.ArrayList(*Expr)) DecompileError![]const *Expr {
