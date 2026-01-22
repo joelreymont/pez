@@ -302,7 +302,7 @@ test "snapshot loop guard return 3.9" {
         \\            out.append(i)
         \\            return out
         \\        out.append(data[i])
-        \\        i = i + 1
+        \\        i += 1
         \\"
     );
 }
@@ -366,6 +366,15 @@ test "snapshot and or chain 3.9" {
     );
 }
 
+test "snapshot and or paren 3.9" {
+    try runSnapshot(@src(), "test/corpus/and_or_paren.3.9.pyc",
+        \\[]u8
+        \\  "def f(a, b, c):
+        \\    return a and (b or c)
+        \\"
+    );
+}
+
 test "snapshot if else tail 3.9" {
     try runSnapshot(@src(), "test/corpus/if_else_tail.3.9.pyc",
         \\[]u8
@@ -381,6 +390,15 @@ test "snapshot if else tail 3.9" {
         \\    else:
         \\        log = nolog
         \\    log(*args)
+        \\"
+    );
+}
+
+test "snapshot if exp binop 3.9" {
+    try runSnapshot(@src(), "test/corpus/if_exp_binop.3.9.pyc",
+        \\[]u8
+        \\  "def f(a, b, c):
+        \\    return a + (b if c else '')
         \\"
     );
 }
@@ -574,6 +592,18 @@ test "snapshot try import star 3.9" {
     );
 }
 
+test "snapshot try bool and 3.9" {
+    try runSnapshot(@src(), "test/corpus/try_bool_and.3.9.pyc",
+        \\[]u8
+        \\  "def f(a, b):
+        \\    try:
+        \\        return a and b
+        \\    except Exception:
+        \\        return False
+        \\"
+    );
+}
+
 test "snapshot try except return 3.9" {
     try runSnapshot(@src(), "test/corpus/try_except_return.3.9.pyc",
         \\[]u8
@@ -639,6 +669,28 @@ test "snapshot loop try 3.9" {
         \\        except Exception:
         \\            print('Bot polling error')
         \\            time.sleep(5)
+        \\"
+    );
+}
+
+test "snapshot try if after try 3.9" {
+    try runSnapshot(@src(), "test/corpus/try_if_after_try.3.9.pyc",
+        \\[]u8
+        \\  "def upload_file(file, url, retries, delay):
+        \\    for attempt in range(retries):
+        \\        try:
+        \\            files = {'file': file}
+        \\            response = requests.post(url, files=files)
+        \\            if response.status_code == 200:
+        \\                print('File uploaded successfully')
+        \\                return True
+        \\            else:
+        \\                print(f'Failed to upload file: {response.status_code} - {response.text}')
+        \\        except requests.RequestException as e:
+        \\            print(f'Request failed: {e}')
+        \\        time.sleep(delay)
+        \\    print('All attempts failed')
+        \\    return False
         \\"
     );
 }
