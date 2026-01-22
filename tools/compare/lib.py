@@ -1,9 +1,13 @@
 #!/usr/bin/env python3
+import re
 import shutil
 import subprocess
 import sys
 from pathlib import Path
 from typing import Optional, Tuple
+
+
+_CODE_ADDR_RE = re.compile(r"0x[0-9a-fA-F]+")
 
 
 def run_cmd(cmd, timeout: int) -> subprocess.CompletedProcess:
@@ -14,6 +18,14 @@ def run_cmd(cmd, timeout: int) -> subprocess.CompletedProcess:
         text=True,
         timeout=timeout,
     )
+
+
+def norm_argrepr(argrepr: str) -> str:
+    if not argrepr:
+        return argrepr
+    if argrepr.startswith("<code object"):
+        return _CODE_ADDR_RE.sub("0x?", argrepr)
+    return argrepr
 
 
 def check_xdis(python: str, timeout: int) -> bool:
@@ -115,3 +127,41 @@ def compile_source(py: str, src: Path, out_pyc: Path, timeout: int, dfile: Optio
     if proc.returncode != 0:
         sys.stderr.write(proc.stderr)
         raise SystemExit(proc.returncode)
+
+
+def collect_paths(code) -> list[str]:
+    paths: list[str] = []
+
+    def walk(obj, path: str) -> None:
+        paths.append(path)
+        for c in obj.co_consts:
+            if hasattr(c, "co_code"):
+                walk(c, path + "." + c.co_name)
+
+    walk(code, code.co_name)
+    return paths
+
+
+def find_code_by_path(code, target: str, index: Optional[int] = None):
+    matches = []
+
+    def walk(obj, path: str) -> None:
+        if path == target or path.endswith("." + target):
+            matches.append((path, obj))
+        for c in obj.co_consts:
+            if hasattr(c, "co_code"):
+                walk(c, path + "." + c.co_name)
+
+    walk(code, code.co_name)
+    if not matches:
+        return None, matches
+    if index is not None:
+        if index < 0 or index >= len(matches):
+            return None, matches
+        return matches[index], matches
+    if len(matches) == 1:
+        return matches[0], matches
+    exact = [m for m in matches if m[0] == target]
+    if len(exact) == 1:
+        return exact[0], matches
+    return None, matches

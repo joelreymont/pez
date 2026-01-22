@@ -46,13 +46,20 @@ def run_compare(
     ]
     if xdis_py:
         cmd.extend(["--xdis-python", xdis_py])
-    proc = subprocess.run(
-        cmd,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        text=True,
-        timeout=timeout,
-    )
+    try:
+        proc = subprocess.run(
+            cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            timeout=timeout,
+        )
+    except subprocess.TimeoutExpired:
+        return {
+            "verdict": "error",
+            "summary": {"error": f"timeout after {timeout}s"},
+            "rows": [],
+        }
     if proc.returncode != 0:
         return {
             "verdict": "error",

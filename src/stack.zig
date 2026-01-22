@@ -28,6 +28,7 @@ pub const SimError = Allocator.Error || error{
     InvalidLambdaBody,
     InvalidKeywordNames,
     InvalidStackDepth,
+    InvalidTernary,
     UnsupportedConstant,
     InvalidConstKeyMap,
 };
@@ -172,9 +173,8 @@ pub const StackValue = union(enum) {
 
     pub fn deinit(self: StackValue, ast_alloc: Allocator, stack_alloc: Allocator) void {
         switch (self) {
-            .expr => |e| {
-                e.deinit(ast_alloc);
-                ast_alloc.destroy(e);
+            .expr => {
+                // Expr nodes are arena-owned; avoid deep deinit to prevent shared-node corruption.
             },
             .comp_builder => |b| {
                 b.deinit(ast_alloc, stack_alloc);
@@ -236,6 +236,17 @@ pub fn stackValueEqual(a: StackValue, b: StackValue) bool {
             .unknown => true,
             else => false,
         },
+    };
+}
+
+fn isExcPh(val: StackValue) bool {
+    return switch (val) {
+        .unknown => true,
+        .expr => |e| switch (e.*) {
+            .name => |n| std.mem.eql(u8, n.id, "__exception__"),
+            else => false,
+        },
+        else => false,
     };
 }
 
@@ -539,6 +550,10 @@ pub const SimContext = struct {
     comp_unpack: ?PendingUnpack = null,
     /// Pending keyword argument names from KW_NAMES (3.11+).
     pending_kwnames: ?[]const []const u8 = null,
+    /// Pending conditional expressions (linear simulation).
+    pending_ifexp: std.ArrayList(PendingIfExp) = .{},
+    /// Enable conditional expression handling in linear simulation.
+    enable_ifexp: bool = false,
     /// GET_AWAITABLE was seen, next YIELD_FROM should be await.
     pending_await: bool = false,
     /// Relaxed stack simulation (used by stack-flow analysis).
@@ -556,6 +571,8 @@ pub const SimContext = struct {
             .iter_override = null,
             .comp_builder = null,
             .comp_unpack = null,
+            .pending_ifexp = .{},
+            .enable_ifexp = false,
             .lenient = false,
             .flow_mode = false,
             .class_name = null,
@@ -573,6 +590,13 @@ pub const SimContext = struct {
         }
         self.comp_unpack = null;
         self.pending_kwnames = null;
+        if (self.pending_ifexp.items.len > 0) {
+            for (self.pending_ifexp.items) |*item| {
+                item.deinit(self.allocator);
+            }
+            self.pending_ifexp.items.len = 0;
+        }
+        self.enable_ifexp = false;
         self.pending_await = false;
         self.lenient = false;
         self.flow_mode = false;
@@ -583,11 +607,18 @@ pub const SimContext = struct {
     pub fn deinit(self: *SimContext) void {
         if (self.flow_mode) {
             self.stack.deinitShallow();
+            self.pending_ifexp.deinit(self.stack_alloc);
             return;
         }
         self.stack.deinit();
         self.inplace_exprs.deinit(self.stack_alloc);
         self.empty_tuple_builds.deinit(self.stack_alloc);
+        if (self.pending_ifexp.items.len > 0) {
+            for (self.pending_ifexp.items) |*item| {
+                item.deinit(self.allocator);
+            }
+        }
+        self.pending_ifexp.deinit(self.stack_alloc);
         if (self.iter_override) |ov| {
             if (ov.expr) |expr| {
                 expr.deinit(self.allocator);
@@ -1048,7 +1079,7 @@ pub const SimContext = struct {
                 .expr => |e| e,
                 else => return error.NotAnExpression,
             };
-            const arg = if (std.mem.eql(u8, name, "<unknown>")) null else try self.allocator.dupe(u8, name);
+            const arg = try self.allocator.dupe(u8, name);
             keywords[i] = .{ .arg = arg, .value = value };
             kw_filled += 1;
         }
@@ -1551,7 +1582,7 @@ pub const SimContext = struct {
                         const name = if (name_expr.* == .constant and name_expr.constant == .string)
                             name_expr.constant.string
                         else
-                            "<unknown>";
+                            "__unknown__";
                         result[i] = .{ .name = name, .value = ann_expr };
                     }
                     return result;
@@ -1634,9 +1665,7 @@ pub const SimContext = struct {
         const keys = dict_expr.dict.keys;
         const values = dict_expr.dict.values;
 
-        const base_args: usize = @intCast(code.posonlyargcount + code.argcount);
-        const has_vararg = (code.flags & pyc.Code.CO_VARARGS) != 0;
-        const kw_start = base_args + @as(usize, @intFromBool(has_vararg));
+        const kw_start: usize = @intCast(code.argcount);
 
         for (keys, values) |maybe_key, value| {
             const key = maybe_key orelse continue;
@@ -1990,6 +2019,7 @@ pub const SimContext = struct {
     fn buildComprehensionFromCode(self: *SimContext, comp: CompObject, iter_expr: *Expr) SimError!*Expr {
         var nested = SimContext.init(self.allocator, self.allocator, comp.code, self.version);
         defer nested.deinit();
+        nested.enable_ifexp = true;
 
         const builder = try self.allocator.create(CompBuilder);
         builder.* = CompBuilder.init(comp.kind);
@@ -1998,10 +2028,43 @@ pub const SimContext = struct {
         nested.comp_builder = builder;
         nested.iter_override = .{ .index = 0, .expr = iter_expr };
 
+        var pending: std.ArrayList(PendingBoolOp) = .{};
+        defer pending.deinit(self.allocator);
+
         var iter = decoder.InstructionIterator.init(comp.code.code, self.version);
         while (iter.next()) |inst| {
+            _ = try resolveBoolOps(self.allocator, &nested.stack, &pending, inst.offset);
+            _ = try resolveIfExps(self.allocator, &nested.stack, &nested.pending_ifexp, inst.offset);
             switch (inst.opcode) {
                 .RETURN_VALUE, .RETURN_CONST => break,
+                .JUMP_IF_FALSE_OR_POP => {
+                    const left = try nested.stack.popExpr();
+                    var chain_compare = false;
+                    if (left.* == .compare and left.compare.comparators.len > 0) {
+                        if (nested.stack.peek()) |val| {
+                            if (val == .expr and ast.exprEqual(val.expr, left.compare.comparators[left.compare.comparators.len - 1])) {
+                                chain_compare = true;
+                            }
+                        }
+                    }
+                    try pending.append(self.allocator, .{
+                        .target = inst.arg,
+                        .op = .and_,
+                        .left = left,
+                        .chain_compare = chain_compare,
+                    });
+                    continue;
+                },
+                .JUMP_IF_TRUE_OR_POP => {
+                    const left = try nested.stack.popExpr();
+                    try pending.append(self.allocator, .{
+                        .target = inst.arg,
+                        .op = .or_,
+                        .left = left,
+                        .chain_compare = false,
+                    });
+                    continue;
+                },
                 else => try nested.simulate(inst),
             }
         }
@@ -2014,6 +2077,9 @@ pub const SimContext = struct {
 
     /// Simulate a single instruction.
     pub fn simulate(self: *SimContext, inst: Instruction) SimError!void {
+        if (self.enable_ifexp) {
+            _ = try resolveIfExps(self.allocator, &self.stack, &self.pending_ifexp, inst.offset);
+        }
         switch (inst.opcode) {
             .NOP,
             .RESUME,
@@ -2024,12 +2090,19 @@ pub const SimContext = struct {
             .SETUP_EXCEPT,
             .POP_BLOCK,
             .SET_LINENO,
-            .JUMP_FORWARD,
             .JUMP_BACKWARD,
             .JUMP_BACKWARD_NO_INTERRUPT,
             .JUMP_ABSOLUTE,
             .CONTINUE_LOOP,
             => {
+                // No stack effect
+            },
+
+            .JUMP_FORWARD => {
+                if (self.enable_ifexp) {
+                    const target = inst.jumpTarget(self.version) orelse inst.arg;
+                    if (try captureIfExpThen(&self.stack, &self.pending_ifexp, inst.offset, target)) return;
+                }
                 // No stack effect
             },
 
@@ -2060,6 +2133,20 @@ pub const SimContext = struct {
                             try self.stack.push(.{ .expr = expr });
                         },
                     }
+                } else {
+                    try self.stack.push(.unknown);
+                }
+            },
+
+            .LOAD_ASSERTION_ERROR => {
+                const expr = try self.makeName("AssertionError", .load);
+                try self.stack.push(.{ .expr = expr });
+            },
+
+            .LOAD_COMMON_CONSTANT => {
+                if (inst.arg == 0) {
+                    const expr = try self.makeName("AssertionError", .load);
+                    try self.stack.push(.{ .expr = expr });
                 } else {
                     try self.stack.push(.unknown);
                 }
@@ -2143,7 +2230,7 @@ pub const SimContext = struct {
                 // Pop the value and create assignment
                 // For now, just pop the value
                 if (self.stack.pop()) |v| {
-                    const name = self.getName(inst.arg) orelse "<unknown>";
+                    const name = self.getName(inst.arg) orelse "__unknown__";
                     if (!try self.consumeCompUnpackName(name)) {
                         try self.addCompTargetName(name);
                     }
@@ -2163,7 +2250,7 @@ pub const SimContext = struct {
             .STORE_FAST => {
                 // Pop the value
                 if (self.stack.pop()) |v| {
-                    const name = self.getLocal(inst.arg) orelse "<unknown>";
+                    const name = self.getLocal(inst.arg) orelse "__unknown__";
                     if (!try self.consumeCompUnpackName(name)) {
                         try self.addCompTargetName(name);
                     }
@@ -2529,7 +2616,7 @@ pub const SimContext = struct {
                             if (elem == .string) {
                                 names[i] = elem.string;
                             } else {
-                                names[i] = "<unknown>";
+                                names[i] = "__unknown__";
                             }
                         }
                         self.pending_kwnames = names;
@@ -2643,7 +2730,7 @@ pub const SimContext = struct {
                         if (elt.* == .constant and elt.constant == .string) {
                             names[i] = elt.constant.string;
                         } else {
-                            names[i] = "<unknown>";
+                            names[i] = "__unknown__";
                         }
                     }
                     kwnames = names;
@@ -3555,8 +3642,24 @@ pub const SimContext = struct {
                     return;
                 }
 
-                // Python 3.3+: pop code object
-                const code_val = self.stack.pop() orelse return error.StackUnderflow;
+                // Python 3.3+: pop code object and optional qualname (order varies in practice)
+                if (self.stack.items.items.len == 0) return error.StackUnderflow;
+                const top = self.stack.items.items[self.stack.items.items.len - 1];
+                var code_val: StackValue = .unknown;
+                if (top == .expr and top.expr.* == .constant and top.expr.constant == .string) {
+                    var q = self.stack.pop().?;
+                    q.deinit(self.allocator, self.stack_alloc);
+                    code_val = self.stack.pop() orelse return error.StackUnderflow;
+                } else {
+                    code_val = self.stack.pop() orelse return error.StackUnderflow;
+                    if (self.stack.items.items.len > 0) {
+                        const maybe_q = self.stack.items.items[self.stack.items.items.len - 1];
+                        if (maybe_q == .expr and maybe_q.expr.* == .constant and maybe_q.expr.constant == .string) {
+                            var q = self.stack.pop().?;
+                            q.deinit(self.allocator, self.stack_alloc);
+                        }
+                    }
+                }
                 const code_ptr: ?*const pyc.Code = switch (code_val) {
                     .code_obj => |code| code,
                     else => null,
@@ -3795,7 +3898,7 @@ pub const SimContext = struct {
             .STORE_DEREF => {
                 // STORE_DEREF i - stores value to a cell
                 if (self.stack.pop()) |v| {
-                    const name = self.getDeref(inst.arg) orelse "<unknown>";
+                    const name = self.getDeref(inst.arg) orelse "__unknown__";
                     if (!try self.consumeCompUnpackName(name)) {
                         try self.addCompTargetName(name);
                     }
@@ -3959,6 +4062,16 @@ pub const SimContext = struct {
             },
 
             // Unary operators
+            .UNARY_POSITIVE => {
+                const operand = try self.stack.popExpr();
+                errdefer {
+                    operand.deinit(self.allocator);
+                    self.allocator.destroy(operand);
+                }
+                const expr = try ast.makeUnaryOp(self.allocator, .uadd, operand);
+                try self.stack.push(.{ .expr = expr });
+            },
+
             .UNARY_NEGATIVE => {
                 const operand = try self.stack.popExpr();
                 errdefer {
@@ -4673,9 +4786,26 @@ pub const SimContext = struct {
             .POP_FINALLY,
             .WITH_CLEANUP_START,
             .WITH_CLEANUP_FINISH,
-            .POP_EXCEPT,
             => {
                 // These are control flow markers, no stack effect
+            },
+
+            .POP_EXCEPT => {
+                if (self.stack.items.items.len >= 3) {
+                    const len = self.stack.items.items.len;
+                    const a = self.stack.items.items[len - 1];
+                    const b = self.stack.items.items[len - 2];
+                    const c = self.stack.items.items[len - 3];
+                    if (isExcPh(a) and isExcPh(b) and isExcPh(c)) {
+                        var i: usize = 0;
+                        while (i < 3) : (i += 1) {
+                            if (self.stack.pop()) |v| {
+                                var val = v;
+                                val.deinit(self.allocator, self.stack_alloc);
+                            }
+                        }
+                    }
+                }
             },
 
             // Global/name deletion
@@ -4858,6 +4988,37 @@ pub const SimContext = struct {
             .POP_JUMP_BACKWARD_IF_NOT_NONE,
             => {
                 const cond = try self.stack.popExpr();
+                if (self.enable_ifexp) {
+                    const target = inst.jumpTarget(self.version) orelse inst.arg;
+                    if (target > inst.offset) {
+                        var final_cond = switch (inst.opcode) {
+                            .POP_JUMP_IF_TRUE,
+                            .POP_JUMP_FORWARD_IF_TRUE,
+                            .POP_JUMP_BACKWARD_IF_TRUE,
+                            => try ast.makeUnaryOp(self.allocator, .not_, cond),
+                            .POP_JUMP_IF_NONE,
+                            .POP_JUMP_FORWARD_IF_NONE,
+                            .POP_JUMP_BACKWARD_IF_NONE,
+                            => try self.makeIsNoneCompare(cond, true),
+                            .POP_JUMP_IF_NOT_NONE,
+                            .POP_JUMP_FORWARD_IF_NOT_NONE,
+                            .POP_JUMP_BACKWARD_IF_NOT_NONE,
+                            => try self.makeIsNoneCompare(cond, false),
+                            else => cond,
+                        };
+                        errdefer {
+                            final_cond.deinit(self.allocator);
+                            self.allocator.destroy(final_cond);
+                        }
+                        try self.pending_ifexp.append(self.stack_alloc, .{
+                            .false_target = target,
+                            .merge_target = null,
+                            .condition = final_cond,
+                            .then_expr = null,
+                        });
+                        return;
+                    }
+                }
                 if (self.findActiveCompBuilder()) |builder| {
                     const final_cond = switch (inst.opcode) {
                         .POP_JUMP_IF_TRUE,
@@ -5540,6 +5701,198 @@ pub const SimContext = struct {
     }
 };
 
+const PendingBoolOp = struct {
+    target: u32,
+    op: ast.BoolOp,
+    left: *Expr,
+    chain_compare: bool,
+};
+
+const PendingIfExp = struct {
+    false_target: u32,
+    merge_target: ?u32,
+    condition: *Expr,
+    then_expr: ?*Expr,
+
+    fn deinit(self: *PendingIfExp, allocator: Allocator) void {
+        self.condition.deinit(allocator);
+        allocator.destroy(self.condition);
+        if (self.then_expr) |expr| {
+            expr.deinit(allocator);
+            allocator.destroy(expr);
+        }
+    }
+};
+
+fn makeBoolPair(allocator: Allocator, left: *Expr, right: *Expr, op: ast.BoolOp) !*Expr {
+    const values = try allocator.alloc(*Expr, 2);
+    errdefer allocator.free(values);
+    values[0] = left;
+    values[1] = right;
+
+    const expr = try allocator.create(Expr);
+    errdefer allocator.destroy(expr);
+    expr.* = .{ .bool_op = .{ .op = op, .values = values } };
+    return expr;
+}
+
+fn tryMergeCompareChain(allocator: Allocator, left: *Expr, right: *Expr) !?*Expr {
+    if (left.* != .compare or right.* != .compare) return null;
+    const l = left.compare;
+    const r = right.compare;
+    if (l.comparators.len == 0 or r.comparators.len == 0) return null;
+    const last = l.comparators[l.comparators.len - 1];
+    if (!ast.exprEqual(last, r.left)) return null;
+
+    const ops = try allocator.alloc(ast.CmpOp, l.ops.len + r.ops.len);
+    errdefer allocator.free(ops);
+    const comps = try allocator.alloc(*Expr, l.comparators.len + r.comparators.len);
+    errdefer allocator.free(comps);
+    std.mem.copyForwards(ast.CmpOp, ops[0..l.ops.len], l.ops);
+    std.mem.copyForwards(ast.CmpOp, ops[l.ops.len..], r.ops);
+    std.mem.copyForwards(*Expr, comps[0..l.comparators.len], l.comparators);
+    std.mem.copyForwards(*Expr, comps[l.comparators.len..], r.comparators);
+
+    const expr = try allocator.create(Expr);
+    errdefer allocator.destroy(expr);
+    expr.* = .{ .compare = .{ .left = l.left, .ops = ops, .comparators = comps } };
+    return expr;
+}
+
+fn makeIfExp(allocator: Allocator, condition: *Expr, body: *Expr, else_body: *Expr) !*Expr {
+    const expr = try allocator.create(Expr);
+    errdefer allocator.destroy(expr);
+    expr.* = .{ .if_exp = .{
+        .condition = condition,
+        .body = body,
+        .else_body = else_body,
+    } };
+    return expr;
+}
+
+fn resolveIfExps(
+    allocator: Allocator,
+    stack: *Stack,
+    pending: *std.ArrayList(PendingIfExp),
+    offset: u32,
+) !bool {
+    if (pending.items.len == 0) return false;
+    var found = false;
+    var i: usize = pending.items.len;
+    while (i > 0) {
+        i -= 1;
+        if (pending.items[i].merge_target != null and pending.items[i].merge_target.? == offset) {
+            found = true;
+            break;
+        }
+    }
+    if (!found) return false;
+
+    var expr = try stack.popExpr();
+    var cleanup_expr: ?*Expr = expr;
+    errdefer {
+        if (cleanup_expr) |e| {
+            e.deinit(allocator);
+            allocator.destroy(e);
+        }
+    }
+
+    i = pending.items.len;
+    while (i > 0) {
+        i -= 1;
+        if (pending.items[i].merge_target == null or pending.items[i].merge_target.? != offset) continue;
+        const item = pending.items[i];
+        const then_expr = item.then_expr orelse return error.InvalidTernary;
+        const if_expr = try makeIfExp(allocator, item.condition, then_expr, expr);
+        expr = if_expr;
+        cleanup_expr = expr;
+
+        const len = pending.items.len;
+        if (i + 1 < len) {
+            std.mem.copyForwards(PendingIfExp, pending.items[i .. len - 1], pending.items[i + 1 .. len]);
+        }
+        pending.items.len -= 1;
+    }
+
+    try stack.push(.{ .expr = expr });
+    cleanup_expr = null;
+    return true;
+}
+
+fn captureIfExpThen(
+    stack: *Stack,
+    pending: *std.ArrayList(PendingIfExp),
+    offset: u32,
+    merge_target: u32,
+) !bool {
+    if (pending.items.len == 0) return false;
+    var idx: ?usize = null;
+    var i: usize = pending.items.len;
+    while (i > 0) {
+        i -= 1;
+        const item = pending.items[i];
+        if (item.merge_target == null and item.false_target > offset) {
+            idx = i;
+            break;
+        }
+    }
+    if (idx == null) return false;
+
+    const then_expr = try stack.popExpr();
+    errdefer {
+        then_expr.deinit(stack.ast_alloc);
+        stack.ast_alloc.destroy(then_expr);
+    }
+
+    pending.items[idx.?].then_expr = then_expr;
+    pending.items[idx.?].merge_target = merge_target;
+    return true;
+}
+
+fn resolveBoolOps(
+    allocator: Allocator,
+    stack: *Stack,
+    pending: *std.ArrayList(PendingBoolOp),
+    offset: u32,
+) !bool {
+    if (pending.items.len == 0) return false;
+    var found = false;
+    var i: usize = pending.items.len;
+    while (i > 0) {
+        i -= 1;
+        if (pending.items[i].target == offset) {
+            found = true;
+            break;
+        }
+    }
+    if (!found) return false;
+
+    var expr = try stack.popExpr();
+    i = pending.items.len;
+    while (i > 0) {
+        i -= 1;
+        if (pending.items[i].target != offset) continue;
+        const item = pending.items[i];
+        if (item.op == .and_ and item.chain_compare) {
+            if (try tryMergeCompareChain(allocator, item.left, expr)) |merged| {
+                expr = merged;
+            } else {
+                expr = try makeBoolPair(allocator, item.left, expr, item.op);
+            }
+        } else {
+            expr = try makeBoolPair(allocator, item.left, expr, item.op);
+        }
+        const len = pending.items.len;
+        if (i + 1 < len) {
+            std.mem.copyForwards(PendingBoolOp, pending.items[i .. len - 1], pending.items[i + 1 .. len]);
+        }
+        pending.items.len -= 1;
+    }
+
+    try stack.push(.{ .expr = expr });
+    return true;
+}
+
 fn compKindFromName(name: []const u8) ?CompKind {
     if (std.mem.eql(u8, name, "<listcomp>")) return .list;
     if (std.mem.eql(u8, name, "<setcomp>")) return .set;
@@ -5551,35 +5904,16 @@ fn compKindFromName(name: []const u8) ?CompKind {
 pub fn buildLambdaExpr(allocator: Allocator, code: *const pyc.Code, version: Version) SimError!*Expr {
     var ctx = SimContext.init(allocator, allocator, code, version);
     defer ctx.deinit();
+    ctx.enable_ifexp = true;
 
     var body_expr: ?*Expr = null;
-    const PendingBoolOp = struct {
-        target: u32,
-        op: ast.BoolOp,
-        left: *Expr,
-    };
     var pending: std.ArrayList(PendingBoolOp) = .{};
     defer pending.deinit(allocator);
 
     var iter = decoder.InstructionIterator.init(code.code, version);
     while (iter.next()) |inst| {
-        if (pending.items.len > 0) {
-            var j: usize = 0;
-            while (j < pending.items.len) {
-                if (pending.items[j].target == inst.offset) {
-                    const right = try ctx.stack.popExpr();
-                    const values = try allocator.alloc(*Expr, 2);
-                    values[0] = pending.items[j].left;
-                    values[1] = right;
-                    const bool_expr = try allocator.create(Expr);
-                    bool_expr.* = .{ .bool_op = .{ .op = pending.items[j].op, .values = values } };
-                    _ = pending.swapRemove(j);
-                    try ctx.stack.push(.{ .expr = bool_expr });
-                    continue;
-                }
-                j += 1;
-            }
-        }
+        _ = try resolveBoolOps(allocator, &ctx.stack, &pending, inst.offset);
+        _ = try resolveIfExps(allocator, &ctx.stack, &ctx.pending_ifexp, inst.offset);
         switch (inst.opcode) {
             .RETURN_VALUE => {
                 body_expr = try ctx.stack.popExpr();
@@ -5595,12 +5929,30 @@ pub fn buildLambdaExpr(allocator: Allocator, code: *const pyc.Code, version: Ver
             },
             .JUMP_IF_FALSE_OR_POP => {
                 const left = try ctx.stack.popExpr();
-                try pending.append(allocator, .{ .target = inst.arg, .op = .and_, .left = left });
+                var chain_compare = false;
+                if (left.* == .compare and left.compare.comparators.len > 0) {
+                    if (ctx.stack.peek()) |val| {
+                        if (val == .expr and ast.exprEqual(val.expr, left.compare.comparators[left.compare.comparators.len - 1])) {
+                            chain_compare = true;
+                        }
+                    }
+                }
+                try pending.append(allocator, .{
+                    .target = inst.arg,
+                    .op = .and_,
+                    .left = left,
+                    .chain_compare = chain_compare,
+                });
                 continue;
             },
             .JUMP_IF_TRUE_OR_POP => {
                 const left = try ctx.stack.popExpr();
-                try pending.append(allocator, .{ .target = inst.arg, .op = .or_, .left = left });
+                try pending.append(allocator, .{
+                    .target = inst.arg,
+                    .op = .or_,
+                    .left = left,
+                    .chain_compare = false,
+                });
                 continue;
             },
             else => try ctx.simulate(inst),
@@ -5775,6 +6127,51 @@ test "stack simulation dup top clones expr" {
     allocator.destroy(first.expr);
     second.expr.deinit(allocator);
     allocator.destroy(second.expr);
+}
+
+test "stack simulation pop except clears exception placeholders" {
+    const testing = std.testing;
+    const allocator = testing.allocator;
+
+    var consts: [0]pyc.Object = .{};
+    var code = pyc.Code{
+        .allocator = allocator,
+        .consts = &consts,
+    };
+    const version = Version.init(3, 12);
+
+    var ctx = SimContext.init(allocator, allocator, &code, version);
+    defer ctx.deinit();
+
+    const ret = try ast.makeName(allocator, "ret", .load);
+    const exc1 = try ast.makeName(allocator, "__exception__", .load);
+    const exc2 = try ast.makeName(allocator, "__exception__", .load);
+    const exc3 = try ast.makeName(allocator, "__exception__", .load);
+
+    try ctx.stack.push(.{ .expr = ret });
+    try ctx.stack.push(.{ .expr = exc1 });
+    try ctx.stack.push(.{ .expr = exc2 });
+    try ctx.stack.push(.{ .expr = exc3 });
+
+    const inst = Instruction{
+        .opcode = .POP_EXCEPT,
+        .arg = 0,
+        .offset = 0,
+        .size = 2,
+        .cache_entries = 0,
+    };
+    try ctx.simulate(inst);
+
+    try testing.expectEqual(@as(usize, 1), ctx.stack.len());
+    const val = ctx.stack.peek().?;
+    try testing.expect(val == .expr);
+    try testing.expect(std.mem.eql(u8, val.expr.name.id, "ret"));
+
+    const popped = ctx.stack.pop().?;
+    if (popped == .expr) {
+        popped.expr.deinit(allocator);
+        allocator.destroy(popped.expr);
+    }
 }
 
 test "stack simulation composite load const" {

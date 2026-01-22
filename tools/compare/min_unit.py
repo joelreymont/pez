@@ -14,6 +14,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--orig", required=True, help="Path to original .pyc")
     p.add_argument("--pez", required=True, help="Path to pez binary")
     p.add_argument("--path", required=True, help="Code object path to minimize")
+    p.add_argument("--index", type=int, default=-1, help="Path index if duplicates exist")
     p.add_argument("--py", default=sys.executable, help="Python interpreter to compile source")
     p.add_argument("--xdis-python", default="", help="Python interpreter with xdis installed")
     p.add_argument("--timeout", type=int, default=120, help="Timeout seconds")
@@ -53,6 +54,8 @@ def main() -> None:
             str(decompiled),
             "--path",
             args.path,
+            "--index",
+            str(args.index),
             "--py",
             args.py,
             "--xdis-python",

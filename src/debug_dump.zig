@@ -12,12 +12,13 @@ pub const Sections = struct {
     bytecode: bool = false,
     cfg: bool = false,
     dom: bool = false,
+    postdom: bool = false,
     loops: bool = false,
     patterns: bool = false,
     passes: bool = false,
 
     pub fn any(self: Sections) bool {
-        return self.bytecode or self.cfg or self.dom or self.loops or self.patterns or self.passes;
+        return self.bytecode or self.cfg or self.dom or self.postdom or self.loops or self.patterns or self.passes;
     }
 };
 
@@ -27,6 +28,7 @@ pub fn parseSections(raw: ?[]const u8) !Sections {
         sections.bytecode = true;
         sections.cfg = true;
         sections.dom = true;
+        sections.postdom = true;
         sections.loops = true;
         sections.patterns = true;
         sections.passes = true;
@@ -41,6 +43,7 @@ pub fn parseSections(raw: ?[]const u8) !Sections {
             sections.bytecode = true;
             sections.cfg = true;
             sections.dom = true;
+            sections.postdom = true;
             sections.loops = true;
             sections.patterns = true;
             sections.passes = true;
@@ -50,6 +53,8 @@ pub fn parseSections(raw: ?[]const u8) !Sections {
             sections.cfg = true;
         } else if (std.mem.eql(u8, name, "dom")) {
             sections.dom = true;
+        } else if (std.mem.eql(u8, name, "postdom")) {
+            sections.postdom = true;
         } else if (std.mem.eql(u8, name, "loops")) {
             sections.loops = true;
         } else if (std.mem.eql(u8, name, "patterns")) {
@@ -100,6 +105,7 @@ const CodeDump = struct {
     bytecode: ?[]const InstDump,
     cfg: ?CfgDump,
     dom: ?DomDump,
+    postdom: ?PostDomDump,
     patterns: ?[]const PatternDump,
     passes: ?PassDump,
     children: ?[]const CodeDump,
@@ -108,6 +114,7 @@ const CodeDump = struct {
         if (self.bytecode) |items| allocator.free(items);
         if (self.cfg) |*cfg| cfg.deinit(allocator);
         if (self.dom) |*dom| dom.deinit(allocator);
+        if (self.postdom) |*pd| pd.deinit(allocator);
         if (self.patterns) |items| allocator.free(items);
         if (self.passes) |*passes| passes.deinit(allocator);
         if (self.children) |items| {
@@ -176,6 +183,17 @@ const DomDump = struct {
     }
 };
 
+const PostDomDump = struct {
+    ipdom: []const ?u32,
+    depth: []const u32,
+    virtual_exit: ?u32,
+
+    fn deinit(self: *const PostDomDump, allocator: Allocator) void {
+        allocator.free(self.ipdom);
+        allocator.free(self.depth);
+    }
+};
+
 const PatternDump = struct {
     block: u32,
     kind: []const u8,
@@ -225,6 +243,7 @@ fn buildCodeDump(allocator: Allocator, code: *const pyc.Code, version: decoder.V
         .bytecode = null,
         .cfg = null,
         .dom = null,
+        .postdom = null,
         .patterns = null,
         .passes = null,
         .children = child_list,
@@ -243,7 +262,7 @@ fn buildCodeDump(allocator: Allocator, code: *const pyc.Code, version: decoder.V
         code_dump.bytecode = try collectInsts(allocator, code, version);
     }
 
-    if (sections.cfg or sections.dom or sections.loops or sections.patterns or sections.passes) {
+    if (sections.cfg or sections.dom or sections.postdom or sections.loops or sections.patterns or sections.passes) {
         cfg = if (version.gte(3, 11) and code.exceptiontable.len > 0)
             try cfg_mod.buildCFGWithExceptions(allocator, code.code, code.exceptiontable, version)
         else
@@ -252,6 +271,9 @@ fn buildCodeDump(allocator: Allocator, code: *const pyc.Code, version: decoder.V
         const cfg_ref = cfg.?;
         if (sections.cfg) {
             code_dump.cfg = try buildCfgDump(allocator, &cfg_ref, version);
+        }
+        if (sections.postdom) {
+            code_dump.postdom = try buildPostDomDump(allocator, &cfg_ref);
         }
 
         if (sections.dom or sections.loops or sections.patterns or sections.passes) {
@@ -402,6 +424,21 @@ fn buildDomDump(allocator: Allocator, dom: *const dom_mod.DomTree) !DomDump {
     return .{
         .idom = try allocator.dupe(u32, dom.idom),
         .loops = try loops.toOwnedSlice(allocator),
+    };
+}
+
+fn buildPostDomDump(allocator: Allocator, cfg: *const cfg_mod.CFG) !PostDomDump {
+    var pd = try cfg_mod.computePostDom(allocator, cfg, false);
+    defer pd.deinit();
+
+    const ipdom = try allocator.alloc(?u32, pd.ipdom.len);
+    std.mem.copyForwards(?u32, ipdom, pd.ipdom);
+    const depth = try allocator.alloc(u32, pd.depth.len);
+    std.mem.copyForwards(u32, depth, pd.depth);
+    return .{
+        .ipdom = ipdom,
+        .depth = depth,
+        .virtual_exit = pd.virtual_exit,
     };
 }
 

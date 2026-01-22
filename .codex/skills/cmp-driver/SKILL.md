@@ -15,3 +15,4 @@ tools/compare/compare_driver.py --orig <file.pyc> --pez ./zig-out/bin/pez --py p
 
 ## Notes
 - Add `--focus=<path>` only for quick text inspection; full compare needs full module.
+- Use `--index N` when the code path appears multiple times.

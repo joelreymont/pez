@@ -15,3 +15,4 @@ tools/compare/min_unit.py --orig <file.pyc> --pez ./zig-out/bin/pez --path <code
 
 ## Notes
 - Use `--out <path>` to keep minimized source.
+- Use `--index N` when the code path appears multiple times.

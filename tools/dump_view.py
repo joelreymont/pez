@@ -7,7 +7,7 @@ from pathlib import Path
 from typing import Optional
 
 
-SECTIONS = ("bytecode", "cfg", "dom", "patterns", "passes")
+SECTIONS = ("bytecode", "cfg", "dom", "postdom", "patterns", "passes")
 
 
 def parse_args() -> argparse.Namespace:
@@ -16,6 +16,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--pez", default="zig-out/bin/pez", help="Path to pez binary")
     p.add_argument("--section", choices=SECTIONS, default="bytecode", help="Section to dump")
     p.add_argument("--code-path", default="", help="Dot path to nested code object")
+    p.add_argument("--code-index", type=int, default=-1, help="Path index if duplicates exist")
     p.add_argument("--block", type=int, default=-1, help="Block id (cfg only)")
     p.add_argument("--out", default="", help="Write JSON to this path")
     return p.parse_args()
@@ -38,26 +39,27 @@ def run_dump(pez: str, pyc: str, section: str) -> dict:
             pass
 
 
-def find_code(root: dict, path: str) -> Optional[dict]:
+def find_codes(root: dict, path: str) -> list[dict]:
     if not path:
-        return root
+        return [root]
     parts = [p for p in path.split(".") if p]
     if not parts:
-        return root
+        return [root]
 
-    def walk(node: dict, idx: int) -> Optional[dict]:
+    matches: list[dict] = []
+
+    def walk(node: dict, idx: int) -> None:
         if idx >= len(parts):
-            return node
+            matches.append(node)
+            return
         for child in node.get("children") or []:
             name = child.get("name") or ""
             qual = child.get("qualname") or ""
             if parts[idx] == name or parts[idx] == qual:
-                found = walk(child, idx + 1)
-                if found:
-                    return found
-        return None
+                walk(child, idx + 1)
 
-    return walk(root, 0)
+    walk(root, 0)
+    return matches
 
 
 def dump_bytecode(code: dict) -> list:
@@ -96,9 +98,15 @@ def main() -> None:
     args = parse_args()
     data = run_dump(args.pez, args.pyc, args.section)
     root = data.get("code") or {}
-    code = find_code(root, args.code_path)
-    if code is None:
+    matches = find_codes(root, args.code_path)
+    if not matches:
         raise SystemExit("code path not found")
+    if args.code_index >= 0:
+        if args.code_index >= len(matches):
+            raise SystemExit(f"code index {args.code_index} out of range (count {len(matches)})")
+        code = matches[args.code_index]
+    else:
+        code = matches[0]
 
     if args.section == "bytecode":
         out = dump_bytecode(code)
@@ -108,6 +116,10 @@ def main() -> None:
         out = code.get("dom")
         if out is None:
             raise SystemExit("dom section missing")
+    elif args.section == "postdom":
+        out = code.get("postdom")
+        if out is None:
+            raise SystemExit("postdom section missing")
     elif args.section == "patterns":
         out = code.get("patterns")
         if out is None:

@@ -15,3 +15,4 @@ description: Minimize decompiled source while preserving a target code object.
 ## Options
 - `--stats-out <stats.json>` for removed count
 - `--max-iter N` to cap ddmin iterations
+- `--index N` if the code path appears multiple times

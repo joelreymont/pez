@@ -60,7 +60,7 @@ test "snapshot match guards 3.14" {
         \\            return 'unknown'
         \\class Point:
         \\    __firstlineno__ = 36
-        \\    <unknown> = locals()
+        \\    __unknown__ = locals()
         \\    def __init__(self, x, y):
         \\        self.x = x
         \\        self.y = y

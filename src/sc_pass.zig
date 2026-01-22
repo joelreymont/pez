@@ -19,12 +19,20 @@ pub fn Methods(comptime Self: type, comptime Err: type) type {
         pub const CondSim = struct {
             expr: *Expr,
             base_vals: []StackValue,
+            used_pending_store: bool = false,
         };
 
         pub const BoolOpResult = struct {
             expr: *Expr,
             merge_block: u32,
         };
+
+        fn popExprNoMatch(self: *Self, sim: *stack_mod.SimContext) DecompileError!?*Expr {
+            return self.popExprMatch(sim) catch |err| switch (err) {
+                error.PatternNoMatch => return null,
+                else => return err,
+            };
+        }
 
         pub fn simulateTernaryBranch(
             self: *Self,
@@ -49,7 +57,7 @@ pub fn Methods(comptime Self: type, comptime Err: type) type {
             }
 
             if (sim.stack.len() != base_vals.len + 1) return null;
-            return (try self.popExprOpt(&sim)) orelse null;
+            return (try popExprNoMatch(self, &sim)) orelse null;
         }
 
         pub fn simulateConditionExpr(
@@ -73,7 +81,7 @@ pub fn Methods(comptime Self: type, comptime Err: type) type {
                 if (!try self.simOpt(&sim, inst)) return null;
             }
 
-            const expr = (try self.popExprOpt(&sim)) orelse return null;
+            const expr = (try popExprNoMatch(self, &sim)) orelse return null;
             if (sim.stack.len() != base_vals.len) return null;
             return expr;
         }
@@ -103,7 +111,7 @@ pub fn Methods(comptime Self: type, comptime Err: type) type {
             }
 
             if (sim.stack.len() != base_vals.len + 1) return null;
-            return (try self.popExprOpt(&sim)) orelse null;
+            return (try popExprNoMatch(self, &sim)) orelse null;
         }
 
         pub fn simulateBoolOpCondExpr(
@@ -140,7 +148,7 @@ pub fn Methods(comptime Self: type, comptime Err: type) type {
                 if (!try self.simOpt(&sim, inst)) return null;
             }
 
-            const expr = (try self.popExprOpt(&sim)) orelse return null;
+            const expr = (try popExprNoMatch(self, &sim)) orelse return null;
             if (sim.stack.len() != base_vals.len) {
                 if (sim.stack.len() == base_vals.len + 1 and expr.* == .compare and boolOpHasChainCompare(block, skip)) {
                     if (sim.stack.pop()) |extra| {
@@ -182,11 +190,39 @@ pub fn Methods(comptime Self: type, comptime Err: type) type {
             return skip;
         }
 
+        fn blockHasLeadingStore(block: *const BasicBlock) bool {
+            for (block.instructions) |inst| {
+                if (inst.opcode == .NOT_TAKEN) continue;
+                const name = inst.opcode.name();
+                return std.mem.startsWith(u8, name, "STORE_");
+            }
+            return false;
+        }
+
         pub fn initCondSim(
             self: *Self,
             block_id: u32,
             stmts: *std.ArrayList(*Stmt),
             stmts_allocator: Allocator,
+        ) DecompileError!?CondSim {
+            return initCondSimInner(self, block_id, stmts, stmts_allocator, false);
+        }
+
+        pub fn initCondSimWithStore(
+            self: *Self,
+            block_id: u32,
+            stmts: *std.ArrayList(*Stmt),
+            stmts_allocator: Allocator,
+        ) DecompileError!?CondSim {
+            return initCondSimInner(self, block_id, stmts, stmts_allocator, true);
+        }
+
+        fn initCondSimInner(
+            self: *Self,
+            block_id: u32,
+            stmts: *std.ArrayList(*Stmt),
+            stmts_allocator: Allocator,
+            use_pending_store: bool,
         ) DecompileError!?CondSim {
             if (block_id >= self.cfg.blocks.len) return null;
             const cond_block = &self.cfg.blocks[block_id];
@@ -195,32 +231,74 @@ pub fn Methods(comptime Self: type, comptime Err: type) type {
             defer cond_sim.deinit();
             cond_sim.lenient = true;
 
-            if (self.pending_vals) |vals| {
+            const saved_pending_vals = self.pending_vals;
+            const saved_pending_store = self.pending_store_expr;
+            const saved_pending_ternary = self.pending_ternary_expr;
+            defer {
+                self.pending_vals = saved_pending_vals;
+                self.pending_store_expr = saved_pending_store;
+                self.pending_ternary_expr = null;
+            }
+            self.pending_vals = null;
+            self.pending_store_expr = null;
+            self.pending_ternary_expr = null;
+
+            if (saved_pending_vals) |vals| {
                 for (vals) |val| {
                     const cloned = try cond_sim.cloneStackValue(val);
                     try cond_sim.stack.push(cloned);
                 }
             }
-            if (self.pending_ternary_expr) |expr| {
+            if (saved_pending_ternary) |expr| {
                 try cond_sim.stack.push(.{ .expr = expr });
-                self.pending_ternary_expr = null;
             }
 
-            for (cond_block.instructions) |inst| {
-                if (ctrl.Analyzer.isConditionalJump(undefined, inst.opcode)) break;
-                if (Self.isStatementOpcode(inst.opcode)) {
-                    const stmt_opt = try self.tryEmitStatement(inst, &cond_sim);
-                    if (stmt_opt) |stmt| {
-                        try stmts.append(stmts_allocator, stmt);
+            var used_pending_store = false;
+            if (use_pending_store) {
+                if (saved_pending_store) |expr| {
+                    if (blockHasLeadingStore(cond_block)) {
+                        try cond_sim.stack.push(.{ .expr = expr });
+                        used_pending_store = true;
                     }
-                } else {
-                    if (!try self.simOpt(&cond_sim, inst)) return null;
                 }
             }
 
-            const expr = (try self.popExprOpt(&cond_sim)) orelse return null;
+            var stop_idx: usize = cond_block.instructions.len;
+            for (cond_block.instructions, 0..) |inst, i| {
+                if (ctrl.Analyzer.isConditionalJump(undefined, inst.opcode)) {
+                    stop_idx = i;
+                    break;
+                }
+            }
+            if (stop_idx >= cond_block.instructions.len) return null;
+
+            var partial = cond_block.*;
+            partial.instructions = cond_block.instructions[0..stop_idx];
+            try self.processBlockWithSim(&partial, &cond_sim, stmts, stmts_allocator);
+
+            const expr = (try popExprNoMatch(self, &cond_sim)) orelse return null;
             const base_vals = try self.cloneStackValues(cond_sim.stack.items.items);
-            return .{ .expr = expr, .base_vals = base_vals };
+            return .{ .expr = expr, .base_vals = base_vals, .used_pending_store = used_pending_store };
+        }
+
+        fn saveExpr(
+            self: *Self,
+            expr: *Expr,
+            base_vals: []StackValue,
+            base_owned: *bool,
+        ) DecompileError!void {
+            self.pending_ternary_expr = expr;
+            if (self.pending_vals) |vals| {
+                Self.deinitStackValuesSlice(self.allocator, self.allocator, vals);
+                self.pending_vals = null;
+            }
+            if (base_vals.len > 0) {
+                self.pending_vals = base_vals;
+                if (base_owned.*) base_owned.* = false;
+            } else if (base_owned.*) {
+                Self.deinitStackValuesSlice(self.allocator, self.allocator, base_vals);
+                base_owned.* = false;
+            }
         }
 
         pub fn saveTernary(
@@ -239,18 +317,74 @@ pub fn Methods(comptime Self: type, comptime Err: type) type {
                 .else_body = false_expr,
             } };
 
-            self.pending_ternary_expr = if_expr;
-            if (self.pending_vals) |vals| {
-                Self.deinitStackValuesSlice(self.allocator, self.allocator, vals);
-                self.pending_vals = null;
+            try saveExpr(self, if_expr, base_vals, base_owned);
+        }
+
+        fn tryFoldTernaryBoolOp(
+            self: *Self,
+            merge_block: u32,
+            if_expr: *Expr,
+            base_vals: []StackValue,
+            base_owned: *bool,
+            limit: u32,
+        ) DecompileError!?u32 {
+            if (merge_block >= self.cfg.blocks.len) return null;
+            const merge_blk = &self.cfg.blocks[merge_block];
+            const term = merge_blk.terminator() orelse return null;
+            const is_and = switch (term.opcode) {
+                .JUMP_IF_FALSE_OR_POP => true,
+                .JUMP_IF_TRUE_OR_POP => false,
+                else => return null,
+            };
+
+            var real_inst: ?decoder.Instruction = null;
+            for (merge_blk.instructions) |inst| {
+                if (inst.opcode == .NOT_TAKEN or inst.opcode == .CACHE) continue;
+                if (real_inst != null) return null;
+                real_inst = inst;
             }
-            if (base_vals.len > 0) {
-                self.pending_vals = base_vals;
-                if (base_owned.*) base_owned.* = false;
-            } else if (base_owned.*) {
-                Self.deinitStackValuesSlice(self.allocator, self.allocator, base_vals);
-                base_owned.* = false;
+            if (real_inst == null or real_inst.?.opcode != term.opcode) return null;
+
+            var short_id: ?u32 = null;
+            var second_id: ?u32 = null;
+            for (merge_blk.successors) |edge| {
+                switch (edge.edge_type) {
+                    .conditional_true, .normal => {
+                        if (is_and) {
+                            second_id = edge.target;
+                        } else {
+                            short_id = edge.target;
+                        }
+                    },
+                    .conditional_false => {
+                        if (is_and) {
+                            short_id = edge.target;
+                        } else {
+                            second_id = edge.target;
+                        }
+                    },
+                    else => {},
+                }
             }
+            const short = short_id orelse return null;
+            const second = second_id orelse return null;
+            if (short >= limit or second >= limit) return null;
+
+            const second_blk = &self.cfg.blocks[second];
+            const second_merge = blk: {
+                for (second_blk.successors) |edge| {
+                    if (edge.edge_type == .exception) continue;
+                    if (edge.edge_type == .normal) break :blk edge.target;
+                }
+                break :blk null;
+            };
+            if (second_merge == null or second_merge.? != short) return null;
+
+            const skip = boolOpBlockSkip(self, second_blk, .or_pop);
+            const second_expr = (try simulateValueExprSkip(self, second, base_vals, skip)) orelse return null;
+            const bool_expr = try self.makeBoolPair(if_expr, second_expr, if (is_and) .and_ else .or_);
+            try saveExpr(self, bool_expr, base_vals, base_owned);
+            return short;
         }
 
         pub fn findTernaryLeaf(
@@ -339,7 +473,17 @@ pub fn Methods(comptime Self: type, comptime Err: type) type {
                 return null;
             };
 
-            try saveTernary(self, condition, true_expr, false_expr, base_vals, &base_owned);
+            const a = self.arena.allocator();
+            const if_expr = try a.create(Expr);
+            if_expr.* = .{ .if_exp = .{
+                .condition = condition,
+                .body = true_expr,
+                .else_body = false_expr,
+            } };
+            if (try tryFoldTernaryBoolOp(self, pattern.merge_block, if_expr, base_vals, &base_owned, limit)) |next_block| {
+                return next_block;
+            }
+            try saveExpr(self, if_expr, base_vals, &base_owned);
             return pattern.merge_block;
         }
 
@@ -417,7 +561,17 @@ pub fn Methods(comptime Self: type, comptime Err: type) type {
                 }
                 false_expr = false_opt.?;
 
-                try saveTernary(self, condition, true_expr, false_expr, base_vals, &base_owned);
+                const a = self.arena.allocator();
+                const if_expr = try a.create(Expr);
+                if_expr.* = .{ .if_exp = .{
+                    .condition = condition,
+                    .body = true_expr,
+                    .else_body = false_expr,
+                } };
+                if (try tryFoldTernaryBoolOp(self, chain.merge_block, if_expr, base_vals, &base_owned, limit)) |next_block| {
+                    return next_block;
+                }
+                try saveExpr(self, if_expr, base_vals, &base_owned);
                 return chain.merge_block;
             }
 
@@ -465,7 +619,17 @@ pub fn Methods(comptime Self: type, comptime Err: type) type {
             }
             false_expr = false_opt.?;
 
-            try saveTernary(self, condition, true_expr, false_expr, base_vals, &base_owned);
+            const a = self.arena.allocator();
+            const if_expr = try a.create(Expr);
+            if_expr.* = .{ .if_exp = .{
+                .condition = condition,
+                .body = true_expr,
+                .else_body = false_expr,
+            } };
+            if (try tryFoldTernaryBoolOp(self, pattern.merge_block, if_expr, base_vals, &base_owned, limit)) |next_block| {
+                return next_block;
+            }
+            try saveExpr(self, if_expr, base_vals, &base_owned);
             return pattern.merge_block;
         }
 
@@ -476,8 +640,14 @@ pub fn Methods(comptime Self: type, comptime Err: type) type {
             stmts: *std.ArrayList(*Stmt),
             stmts_allocator: Allocator,
         ) DecompileError!?u32 {
-            if (self.pending_ternary_expr != null or self.pending_store_expr != null or self.pending_vals != null) {
+            if (self.pending_ternary_expr != null or self.pending_vals != null) {
                 return null;
+            }
+            var use_pending_store = false;
+            if (self.pending_store_expr != null) {
+                const cond_block = &self.cfg.blocks[block_id];
+                if (!blockHasLeadingStore(cond_block)) return null;
+                use_pending_store = true;
             }
             const pattern = self.analyzer.detectAndOr(block_id) orelse return null;
             if (pattern.true_block >= limit or pattern.false_block >= limit or pattern.merge_block >= limit) {
@@ -486,13 +656,18 @@ pub fn Methods(comptime Self: type, comptime Err: type) type {
             if (pattern.merge_block <= block_id) return null;
 
             const stmts_len = stmts.items.len;
-            const cond_res = (try initCondSim(self, pattern.condition_block, stmts, stmts_allocator)) orelse {
+            const cond_opt = if (use_pending_store)
+                (try initCondSimWithStore(self, pattern.condition_block, stmts, stmts_allocator))
+            else
+                (try initCondSim(self, pattern.condition_block, stmts, stmts_allocator));
+            const cond_res = cond_opt orelse {
                 stmts.items.len = stmts_len;
                 return null;
             };
             const base_vals = cond_res.base_vals;
             var base_owned = true;
             defer if (base_owned) Self.deinitStackValuesSlice(self.allocator, self.allocator, base_vals);
+            const used_pending_store = cond_res.used_pending_store;
 
             const true_blk = &self.cfg.blocks[pattern.true_block];
             const false_blk = &self.cfg.blocks[pattern.false_block];
@@ -503,10 +678,27 @@ pub fn Methods(comptime Self: type, comptime Err: type) type {
                 stmts.items.len = stmts_len;
                 return null;
             };
-            const false_expr = (try simulateValueExprSkip(self, pattern.false_block, base_vals, false_skip)) orelse {
-                stmts.items.len = stmts_len;
-                return null;
-            };
+            var false_expr: *Expr = undefined;
+            if (self.analyzer.detectBoolOp(pattern.false_block)) |bool_pat| {
+                if (bool_pat.merge_block == pattern.merge_block) {
+                    const first = (try simulateBoolOpCondExpr(self, pattern.false_block, base_vals, false_skip, bool_pat.kind)) orelse {
+                        stmts.items.len = stmts_len;
+                        return null;
+                    };
+                    const bool_res = try buildBoolOpExpr(self, first, bool_pat, base_vals);
+                    false_expr = bool_res.expr;
+                } else {
+                    false_expr = (try simulateValueExprSkip(self, pattern.false_block, base_vals, false_skip)) orelse {
+                        stmts.items.len = stmts_len;
+                        return null;
+                    };
+                }
+            } else {
+                false_expr = (try simulateValueExprSkip(self, pattern.false_block, base_vals, false_skip)) orelse {
+                    stmts.items.len = stmts_len;
+                    return null;
+                };
+            }
 
             const and_expr = try self.makeBoolPair(cond_res.expr, true_expr, .and_);
             const or_expr = try self.makeBoolPair(and_expr, false_expr, .or_);
@@ -514,6 +706,7 @@ pub fn Methods(comptime Self: type, comptime Err: type) type {
             const merge_block = &self.cfg.blocks[pattern.merge_block];
             if (merge_block.terminator()) |mt| {
                 if (ctrl.Analyzer.isConditionalJump(undefined, mt.opcode)) {
+                    if (used_pending_store) self.pending_store_expr = null;
                     if (self.pending_ternary_expr != null or self.pending_store_expr != null) return null;
                     self.pending_store_expr = or_expr;
                     if (base_vals.len > 0) {
@@ -527,6 +720,7 @@ pub fn Methods(comptime Self: type, comptime Err: type) type {
                 }
             }
 
+            if (used_pending_store) self.pending_store_expr = null;
             var merge_sim = self.initSim(self.arena.allocator(), self.arena.allocator(), self.code, self.version);
             defer merge_sim.deinit();
             if (base_vals.len > 0) {
@@ -540,7 +734,7 @@ pub fn Methods(comptime Self: type, comptime Err: type) type {
                 switch (err) {
                     error.StackUnderflow, error.NotAnExpression, error.InvalidBlock => {
                         stmts.items.len = stmts_len;
-                        return null;
+                        return error.PatternNoMatch;
                     },
                     else => return err,
                 }
@@ -561,6 +755,27 @@ pub fn Methods(comptime Self: type, comptime Err: type) type {
                 return null;
             }
 
+            const saved_pending_expr = self.pending_ternary_expr;
+            const saved_pending_vals = self.pending_vals;
+            var saved_pending_vals_copy: ?[]StackValue = null;
+            errdefer {
+                if (saved_pending_vals_copy) |vals| {
+                    Self.deinitStackValuesSlice(self.allocator, self.allocator, vals);
+                }
+            }
+            if (saved_pending_vals) |vals| {
+                saved_pending_vals_copy = try self.cloneStackValues(vals);
+            }
+            var success = false;
+            defer {
+                if (!success) {
+                    self.pending_ternary_expr = saved_pending_expr;
+                    self.pending_vals = saved_pending_vals_copy;
+                } else if (saved_pending_vals_copy) |vals| {
+                    Self.deinitStackValuesSlice(self.allocator, self.allocator, vals);
+                }
+            }
+
             const cond_block = &self.cfg.blocks[pattern.condition_block];
             const jump_idx = blk: {
                 var idx: ?usize = null;
@@ -576,13 +791,22 @@ pub fn Methods(comptime Self: type, comptime Err: type) type {
             try self.processPartialBlock(cond_block, stmts, stmts_allocator, &skip_first_store, jump_idx);
             var cond_sim = self.initSim(self.arena.allocator(), self.arena.allocator(), self.code, self.version);
             defer cond_sim.deinit();
-            if (pattern.condition_block < self.stack_in.len) {
+            if (saved_pending_vals_copy) |vals| {
+                for (vals) |val| {
+                    const cloned = try cond_sim.cloneStackValue(val);
+                    try cond_sim.stack.push(cloned);
+                }
+            } else if (pattern.condition_block < self.stack_in.len) {
                 if (self.stack_in[pattern.condition_block]) |entry| {
                     for (entry) |val| {
                         const cloned = try cond_sim.cloneStackValue(val);
                         try cond_sim.stack.push(cloned);
                     }
                 }
+            }
+            if (saved_pending_expr) |expr| {
+                try cond_sim.stack.push(.{ .expr = expr });
+                self.pending_ternary_expr = null;
             }
 
             if (pattern.kind == .pop_top) {
@@ -598,8 +822,8 @@ pub fn Methods(comptime Self: type, comptime Err: type) type {
                     }
                     if (ctrl.Analyzer.isConditionalJump(undefined, inst.opcode)) break;
                     cond_sim.simulate(inst) catch |err| {
-                        if (err == error.OutOfMemory) return err;
-                        return null;
+                        if (self.isSoftSimErr(err)) return error.PatternNoMatch;
+                        return err;
                     };
                 }
             } else {
@@ -607,16 +831,16 @@ pub fn Methods(comptime Self: type, comptime Err: type) type {
                 for (cond_block.instructions) |inst| {
                     if (ctrl.Analyzer.isConditionalJump(undefined, inst.opcode)) break;
                     cond_sim.simulate(inst) catch |err| {
-                        if (err == error.OutOfMemory) return err;
-                        return null;
+                        if (self.isSoftSimErr(err)) return error.PatternNoMatch;
+                        return err;
                     };
                 }
             }
 
             // First operand is on stack
             const first = cond_sim.stack.popExpr() catch |err| {
-                if (err == error.OutOfMemory) return err;
-                return null;
+                if (self.isSoftSimErr(err)) return error.PatternNoMatch;
+                return err;
             };
 
             const base_vals = try self.cloneStackValues(cond_sim.stack.items.items);
@@ -625,11 +849,13 @@ pub fn Methods(comptime Self: type, comptime Err: type) type {
 
             // Build potentially nested BoolOp expression
             const bool_result = buildBoolOpExpr(self, first, pattern, base_vals) catch |err| {
-                if (err == error.InvalidBlock) return null;
+                if (err == error.InvalidBlock or err == error.PatternNoMatch) return error.PatternNoMatch;
                 return err;
             };
             const bool_expr = bool_result.expr;
             const final_merge = bool_result.merge_block;
+            try self.markConsumed(pattern.condition_block);
+            try self.markConsumed(pattern.second_block);
 
             // Process merge block with the bool expression on stack
             const merge_block = &self.cfg.blocks[final_merge];
@@ -637,6 +863,8 @@ pub fn Methods(comptime Self: type, comptime Err: type) type {
                 if (ctrl.Analyzer.isConditionalJump(undefined, mt.opcode)) {
                     if (self.pending_ternary_expr != null or self.pending_store_expr != null) return error.InvalidBlock;
                     self.pending_store_expr = bool_expr;
+                    self.pending_vals = null;
+                    success = true;
                     return final_merge;
                 }
             }
@@ -653,13 +881,17 @@ pub fn Methods(comptime Self: type, comptime Err: type) type {
                 if (next) |next_block| {
                     if (self.pending_ternary_expr != null or self.pending_store_expr != null) return error.InvalidBlock;
                     self.pending_store_expr = bool_expr;
+                    try self.markConsumed(final_merge);
                     if (base_vals.len > 0) {
                         if (self.pending_vals) |vals| {
                             Self.deinitStackValuesSlice(self.allocator, self.allocator, vals);
                         }
                         self.pending_vals = base_vals;
                         base_owned = false;
+                    } else {
+                        self.pending_vals = null;
                     }
+                    success = true;
                     return next_block;
                 }
             }
@@ -675,11 +907,14 @@ pub fn Methods(comptime Self: type, comptime Err: type) type {
             try merge_sim.stack.push(.{ .expr = bool_expr });
             self.processBlockWithSim(merge_block, &merge_sim, stmts, stmts_allocator) catch |err| {
                 switch (err) {
-                    error.StackUnderflow, error.NotAnExpression, error.InvalidBlock => return null,
+                    error.StackUnderflow, error.NotAnExpression, error.InvalidBlock => return error.PatternNoMatch,
                     else => return err,
                 }
             };
+            try self.markConsumed(final_merge);
 
+            self.pending_vals = null;
+            success = true;
             return final_merge + 1;
         }
 
@@ -903,7 +1138,7 @@ pub fn Methods(comptime Self: type, comptime Err: type) type {
             for (block.instructions[0 .. stop_idx + 1]) |inst| {
                 if (!try self.simOpt(&sim, inst)) return null;
             }
-            const first_cmp = (try self.popExprOpt(&sim)) orelse return null;
+            const first_cmp = (try popExprNoMatch(self, &sim)) orelse return null;
             if (first_cmp.* != .compare or first_cmp.compare.ops.len != 1 or first_cmp.compare.comparators.len != 1) {
                 return null;
             }
@@ -927,7 +1162,7 @@ pub fn Methods(comptime Self: type, comptime Err: type) type {
             }
             if (cmp2_idx == null) return null;
             if (!try self.simOpt(&sim2, true_blk.instructions[cmp2_idx.?])) return null;
-            const second_cmp = (try self.popExprOpt(&sim2)) orelse return null;
+            const second_cmp = (try popExprNoMatch(self, &sim2)) orelse return null;
             if (second_cmp.* != .compare or second_cmp.compare.ops.len != 1 or second_cmp.compare.comparators.len != 1) {
                 return null;
             }

@@ -36,6 +36,8 @@ pub fn main() !void {
     var trace_loop_guards = false;
     var trace_sim_block: ?u32 = null;
     var trace_decisions = false;
+    var trace_stackflow = false;
+    var trace_blocks = false;
 
     for (args[1..]) |arg| {
         if (std.mem.eql(u8, arg, "-d") or std.mem.eql(u8, arg, "--disasm")) {
@@ -64,6 +66,10 @@ pub fn main() !void {
             trace_loop_guards = true;
         } else if (std.mem.eql(u8, arg, "--trace-decisions")) {
             trace_decisions = true;
+        } else if (std.mem.eql(u8, arg, "--trace-stackflow")) {
+            trace_stackflow = true;
+        } else if (std.mem.eql(u8, arg, "--trace-blocks")) {
+            trace_blocks = true;
         } else if (std.mem.startsWith(u8, arg, "--trace-sim=")) {
             const raw = arg["--trace-sim=".len..];
             trace_sim_block = std.fmt.parseInt(u32, raw, 10) catch {
@@ -99,14 +105,16 @@ pub fn main() !void {
     }
 
     if (filename == null) {
-        try stderr.print("Usage: {s} [-d|--disasm|--cfg|--dump|--test|--golden] [--focus=PATH] [--trace-loop-guards] [--trace-decisions] [--trace-sim=BLOCK] <file.pyc>\n", .{args[0]});
+        try stderr.print("Usage: {s} [-d|--disasm|--cfg|--dump|--test|--golden] [--focus=PATH] [--trace-loop-guards] [--trace-decisions] [--trace-stackflow] [--trace-blocks] [--trace-sim=BLOCK] <file.pyc>\n", .{args[0]});
         try stderr.print("  -d, --disasm  Disassemble only\n", .{});
         try stderr.print("  --cfg         Dump CFG analysis\n", .{});
-        try stderr.print("  --dump[=list] Dump JSON (bytecode,cfg,dom,loops,patterns,passes)\n", .{});
+        try stderr.print("  --dump[=list] Dump JSON (bytecode,cfg,dom,postdom,loops,patterns,passes)\n", .{});
         try stderr.print("  --dump-json=PATH  Write dump JSON to PATH\n", .{});
         try stderr.print("  --focus=PATH  Decompile only a code path\n", .{});
         try stderr.print("  --trace-loop-guards  JSONL loop-guard trace to stderr\n", .{});
         try stderr.print("  --trace-decisions  JSONL decision trace to stderr\n", .{});
+        try stderr.print("  --trace-stackflow  JSONL stack-flow trace to stderr\n", .{});
+        try stderr.print("  --trace-blocks  JSONL block-traversal trace to stderr\n", .{});
         try stderr.print("  --trace-sim=BLOCK  JSONL sim trace for block id to stderr\n", .{});
         try stderr.print("  --test        Run test suite (decompile check)\n", .{});
         try stderr.print("  --golden      Compare with golden .py files\n", .{});
@@ -140,7 +148,7 @@ pub fn main() !void {
         },
         .decompile => {
             if (module.code) |code| {
-                const trace_file: ?std.fs.File = if (trace_loop_guards or trace_sim_block != null or trace_decisions)
+                const trace_file: ?std.fs.File = if (trace_loop_guards or trace_sim_block != null or trace_decisions or trace_stackflow or trace_blocks)
                     std.fs.File.stderr()
                 else
                     null;
@@ -149,6 +157,8 @@ pub fn main() !void {
                     .trace_loop_guards = trace_loop_guards,
                     .trace_sim_block = trace_sim_block,
                     .trace_decisions = trace_decisions,
+                    .trace_stackflow = trace_stackflow,
+                    .trace_blocks = trace_blocks,
                     .trace_file = trace_file,
                 };
                 try decompile.decompileToSourceWithOptions(allocator, code, py_ver, stdout, std.fs.File.stderr(), opts);

@@ -15,3 +15,4 @@ description: Dump cfg+patterns (+bytecode) for a code path in one JSON.
 ## Options
 - `--sections bytecode,cfg,patterns`
 - `--pez <path>` to override pez binary
+- `--code-index N` if the code path appears multiple times

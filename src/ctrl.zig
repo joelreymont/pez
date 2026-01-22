@@ -248,13 +248,10 @@ pub const Analyzer = struct {
     enclosing_loops: []std.ArrayListUnmanaged(u32),
     /// Per-block cached flags for pattern detection.
     block_flags: []BlockFlags,
-    /// Merge-point scratch (generation-stamped visitation).
-    merge_then_seen: []u32,
-    merge_else_seen: []u32,
-    merge_gen: u32,
-    merge_queue: std.ArrayListUnmanaged(u32),
     /// Expanded loop regions per header.
     loop_regions: std.AutoHashMap(u32, std.DynamicBitSet),
+    /// Post-dominator tree for merge selection.
+    postdom: cfg_mod.PostDom,
 
     pub fn init(allocator: Allocator, cfg_ptr: *const CFG, dom: *const dom_mod.DomTree) !Analyzer {
         const processed = try std.DynamicBitSet.initEmpty(allocator, cfg_ptr.blocks.len);
@@ -270,15 +267,12 @@ pub const Analyzer = struct {
             allocator.free(enclosing_loops);
         }
 
-        const merge_then_seen = try allocator.alloc(u32, cfg_ptr.blocks.len);
-        errdefer allocator.free(merge_then_seen);
-        @memset(merge_then_seen, 0);
-        const merge_else_seen = try allocator.alloc(u32, cfg_ptr.blocks.len);
-        errdefer allocator.free(merge_else_seen);
-        @memset(merge_else_seen, 0);
         const block_flags = try allocator.alloc(BlockFlags, cfg_ptr.blocks.len);
         errdefer allocator.free(block_flags);
         @memset(block_flags, .{});
+
+        var postdom = try cfg_mod.computePostDom(allocator, cfg_ptr, false);
+        errdefer postdom.deinit();
 
         var analyzer = Analyzer{
             .cfg = cfg_ptr,
@@ -288,12 +282,9 @@ pub const Analyzer = struct {
             .try_cache = try_cache,
             .try_cache_checked = try_cache_checked,
             .enclosing_loops = enclosing_loops,
-            .merge_then_seen = merge_then_seen,
-            .merge_else_seen = merge_else_seen,
-            .merge_gen = 1,
-            .merge_queue = .{},
             .block_flags = block_flags,
             .loop_regions = std.AutoHashMap(u32, std.DynamicBitSet).init(allocator),
+            .postdom = postdom,
         };
         errdefer analyzer.deinit();
         try analyzer.populateEnclosingLoops();
@@ -303,6 +294,7 @@ pub const Analyzer = struct {
 
     pub fn deinit(self: *Analyzer) void {
         self.processed.deinit();
+        self.postdom.deinit();
         for (self.try_cache) |entry_opt| {
             if (entry_opt) |entry| {
                 if (entry.handlers.len > 0 and entry.handlers_owned == false) {
@@ -316,9 +308,6 @@ pub const Analyzer = struct {
             list.deinit(self.allocator);
         }
         if (self.enclosing_loops.len > 0) self.allocator.free(self.enclosing_loops);
-        if (self.merge_then_seen.len > 0) self.allocator.free(self.merge_then_seen);
-        if (self.merge_else_seen.len > 0) self.allocator.free(self.merge_else_seen);
-        self.merge_queue.deinit(self.allocator);
         if (self.block_flags.len > 0) self.allocator.free(self.block_flags);
         var it = self.loop_regions.valueIterator();
         while (it.next()) |bitset| {
@@ -389,18 +378,21 @@ pub const Analyzer = struct {
 
     fn loopRegion(self: *Analyzer, header: u32) ?*const std.DynamicBitSet {
         if (self.loop_regions.getPtr(header)) |ptr| return ptr;
-        var region = self.computeLoopRegion(header) catch return null;
-        self.loop_regions.put(header, region) catch {
-            region.deinit();
-            return null;
+        var region = if (self.computeLoopRegion(header)) |val| val else |err| {
+            if (err == error.NoLoopExit) return null;
+            std.debug.panic("loopRegion compute failed: {s}", .{@errorName(err)});
         };
+        if (self.loop_regions.put(header, region)) |_| {} else |err| {
+            region.deinit();
+            std.debug.panic("loopRegion cache failed: {s}", .{@errorName(err)});
+        }
         return self.loop_regions.getPtr(header);
     }
 
     fn computeLoopRegion(self: *Analyzer, header: u32) !std.DynamicBitSet {
         const exit_id = self.loopExitBlock(header) orelse return error.NoLoopExit;
         const body_id = self.loopBodySeed(header) orelse return error.NoLoopExit;
-        if (self.reachesHeader(exit_id, header)) return error.NoLoopExit;
+        if (try self.reachesHeader(exit_id, header)) return error.NoLoopExit;
         const header_block = &self.cfg.blocks[header];
         const exit_block = &self.cfg.blocks[exit_id];
         if (exit_block.start_offset <= header_block.start_offset) return error.NoLoopExit;
@@ -485,15 +477,6 @@ pub const Analyzer = struct {
         }
     }
 
-    fn nextMergeGen(self: *Analyzer) void {
-        self.merge_gen +%= 1;
-        if (self.merge_gen == 0) {
-            @memset(self.merge_then_seen, 0);
-            @memset(self.merge_else_seen, 0);
-            self.merge_gen = 1;
-        }
-    }
-
     /// Detect the control flow pattern starting at a block.
     pub fn detectPattern(self: *Analyzer, block_id: u32) !ControlFlowPattern {
         return self.detectPatternInner(block_id, false, false);
@@ -575,10 +558,12 @@ pub const Analyzer = struct {
             }
         }
 
-        // Check for try/except pattern (block with exception edge)
-        if (!skip_try and self.hasExceptionEdge(block)) {
-            if (try self.detectTryPattern(block_id)) |pattern| {
-                return .{ .try_stmt = pattern };
+        // Check for try/except pattern (block with exception edge or explicit setup)
+        if (!skip_try) {
+            if (self.hasExceptionEdge(block) or has_try_setup) {
+                if (try self.detectTryPattern(block_id)) |pattern| {
+                    return .{ .try_stmt = pattern };
+                }
             }
         }
 
@@ -759,17 +744,35 @@ pub const Analyzer = struct {
 
         const false_blk = &self.cfg.blocks[f_id];
         var false_merge: ?u32 = null;
+        var false_cont: ?u32 = null;
         for (false_blk.successors) |edge| {
             if (edge.edge_type == .normal) {
                 false_merge = edge.target;
                 break;
             }
         }
+        if (false_merge == null) {
+            if (false_blk.terminator()) |false_term| {
+                switch (false_term.opcode) {
+                    .JUMP_IF_FALSE_OR_POP, .JUMP_IF_TRUE_OR_POP => {
+                        for (false_blk.successors) |edge| {
+                            if (edge.edge_type == .exception) continue;
+                            if (edge.target == merge_id) {
+                                false_merge = merge_id;
+                            } else if (false_cont == null) {
+                                false_cont = edge.target;
+                            }
+                        }
+                    },
+                    else => {},
+                }
+            }
+        }
         if (false_merge == null or false_merge.? != merge_id) return null;
 
         const merge_blk = &self.cfg.blocks[merge_id];
         for (merge_blk.predecessors) |pred| {
-            if (pred != t_id and pred != f_id) return null;
+            if (pred != t_id and pred != f_id and (false_cont == null or pred != false_cont.?)) return null;
         }
 
         return .{
@@ -1261,8 +1264,26 @@ pub const Analyzer = struct {
         }
 
         if (!self.inLoop(body_id, block_id)) return null;
-        if (self.inLoop(exit_id, block_id)) return null;
-        if (self.exitLeadsToHeader(exit_id, block_id)) return null;
+        if (self.inLoop(exit_id, block_id)) {
+            const chain_blk = &self.cfg.blocks[exit_id];
+            const chain_term = chain_blk.terminator() orelse return null;
+            if (!self.isConditionalJump(chain_term.opcode)) return null;
+
+            var chain_in: ?u32 = null;
+            var chain_out: ?u32 = null;
+            for (chain_blk.successors) |edge| {
+                if (edge.edge_type == .exception) continue;
+                if (self.inLoop(edge.target, block_id)) {
+                    chain_in = edge.target;
+                } else {
+                    chain_out = edge.target;
+                }
+            }
+            if (chain_in == null or chain_out == null) return null;
+            if (chain_in.? != body_id) return null;
+            if (self.inLoop(chain_out.?, block_id)) return null;
+            exit_id = chain_out.?;
+        }
 
         return WhilePattern{
             .header_block = block_id,
@@ -1319,14 +1340,14 @@ pub const Analyzer = struct {
         return false;
     }
 
-    fn reachesHeader(self: *Analyzer, start: u32, header: u32) bool {
+    fn reachesHeader(self: *Analyzer, start: u32, header: u32) !bool {
         if (start >= self.cfg.blocks.len) return false;
         if (start == header) return true;
-        var seen = std.DynamicBitSet.initEmpty(self.allocator, self.cfg.blocks.len) catch return false;
+        var seen = try std.DynamicBitSet.initEmpty(self.allocator, self.cfg.blocks.len);
         defer seen.deinit();
         var queue: std.ArrayListUnmanaged(u32) = .{};
         defer queue.deinit(self.allocator);
-        queue.append(self.allocator, start) catch return false;
+        try queue.append(self.allocator, start);
         seen.set(start);
         while (queue.items.len > 0) {
             const cur = queue.items[queue.items.len - 1];
@@ -1339,7 +1360,7 @@ pub const Analyzer = struct {
                 if (tgt == header) return true;
                 if (seen.isSet(tgt)) continue;
                 seen.set(tgt);
-                queue.append(self.allocator, tgt) catch return false;
+                try queue.append(self.allocator, tgt);
             }
         }
         return false;
@@ -1374,6 +1395,14 @@ pub const Analyzer = struct {
         } else if (block.predecessors.len > 0) {
             for (block.predecessors) |pred_id| {
                 const pred = &self.cfg.blocks[pred_id];
+                var edge_type: ?cfg_mod.EdgeType = null;
+                for (pred.successors) |edge| {
+                    if (edge.target == block_id) {
+                        edge_type = edge.edge_type;
+                        break;
+                    }
+                }
+                if (edge_type == .loop_back) continue;
                 // Check if predecessor has GET_ITER
                 for (pred.instructions) |inst| {
                     if (inst.opcode == .GET_ITER) {
@@ -1384,7 +1413,23 @@ pub const Analyzer = struct {
             }
         }
 
-        const body_id = body_block orelse return null;
+        var setup_tail: ?u32 = null;
+        var body_id = body_block orelse return null;
+        if (body_id < self.cfg.blocks.len) {
+            const body_blk = &self.cfg.blocks[body_id];
+            if (body_blk.instructions.len == 1 and (body_blk.instructions[0].opcode == .SETUP_WITH or body_blk.instructions[0].opcode == .SETUP_ASYNC_WITH)) {
+                setup_tail = body_id;
+                var next_body: ?u32 = null;
+                for (body_blk.successors) |edge| {
+                    if (edge.edge_type == .normal) {
+                        next_body = edge.target;
+                        break;
+                    }
+                }
+                if (next_body == null) return null;
+                body_id = next_body.?;
+            }
+        }
         var exit_id = exit_block orelse return null;
         var else_id: ?u32 = null;
 
@@ -1467,6 +1512,41 @@ pub const Analyzer = struct {
 
         try self.collectExceptionTargets(block_id, &handler_targets);
         if (handler_targets.items.len == 0) return null;
+        if (!self.cfg.version.gte(3, 11)) {
+            var idx: usize = 0;
+            while (idx < handler_targets.items.len) : (idx += 1) {
+                const hid = handler_targets.items[idx];
+                if (hid >= self.cfg.blocks.len) continue;
+                const hblk = &self.cfg.blocks[hid];
+                const term = hblk.terminator() orelse continue;
+                if (term.opcode == .JUMP_IF_NOT_EXC_MATCH) {
+                    if (term.jumpTarget(self.cfg.version)) |target_off| {
+                        if (self.cfg.blockAtOffset(target_off)) |target_id| {
+                            var next_id = target_id;
+                            if (self.jumpOnlyTarget(next_id)) |jump_id| {
+                                next_id = jump_id;
+                            }
+                            if (next_id < self.cfg.blocks.len) {
+                                const next_blk = &self.cfg.blocks[next_id];
+                                if (self.hasExceptionTypeCheck(next_blk)) {
+                                    var seen = false;
+                                    for (handler_targets.items) |existing| {
+                                        if (existing == next_id) {
+                                            seen = true;
+                                            break;
+                                        }
+                                    }
+                                    if (!seen) {
+                                        try handler_targets.append(self.allocator, next_id);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            std.mem.sort(u32, handler_targets.items, {}, std.sort.asc(u32));
+        }
         if (!self.cfg.version.gte(3, 11) and handler_targets.items.len > 1) {
             const first_handler = handler_targets.items[0];
             var reachable = try std.DynamicBitSet.initEmpty(self.allocator, self.cfg.blocks.len);
@@ -1482,7 +1562,7 @@ pub const Analyzer = struct {
                 reachable.set(bid);
                 const blk = &self.cfg.blocks[bid];
                 for (blk.successors) |edge| {
-                    if (edge.edge_type != .normal) continue;
+                    if (edge.edge_type == .exception) continue;
                     if (edge.target >= self.cfg.blocks.len) continue;
                     if (!reachable.isSet(edge.target)) {
                         try queue.append(self.allocator, edge.target);
@@ -2183,6 +2263,25 @@ pub const Analyzer = struct {
 
         if (!has_before_with and legacy_setup == null) return null;
 
+        if (!has_before_with and legacy_setup != null) {
+            if (block.instructions.len == 1 and (block.instructions[0].opcode == .SETUP_WITH or block.instructions[0].opcode == .SETUP_ASYNC_WITH)) {
+                if (block.predecessors.len == 1) {
+                    const pred_id = block.predecessors[0];
+                    if (pred_id < self.cfg.blocks.len) {
+                        const pred = &self.cfg.blocks[pred_id];
+                        var pred_has_before = false;
+                        for (pred.instructions) |inst| {
+                            if (inst.opcode == .BEFORE_WITH or inst.opcode == .BEFORE_ASYNC_WITH or inst.opcode == .LOAD_SPECIAL) {
+                                pred_has_before = true;
+                                break;
+                            }
+                        }
+                        if (pred_has_before) return null;
+                    }
+                }
+            }
+        }
+
         // The body is the normal successor
         var body_block: ?u32 = null;
         var cleanup_block: ?u32 = null;
@@ -2206,9 +2305,44 @@ pub const Analyzer = struct {
             }
         }
 
-        const body_id = body_block orelse return null;
+        var setup_tail: ?u32 = null;
+        var body_id = body_block orelse return null;
+        if (body_id < self.cfg.blocks.len) {
+            const body_blk = &self.cfg.blocks[body_id];
+            if (body_blk.instructions.len == 1 and (body_blk.instructions[0].opcode == .SETUP_WITH or body_blk.instructions[0].opcode == .SETUP_ASYNC_WITH)) {
+                setup_tail = body_id;
+                var next_body: ?u32 = null;
+                for (body_blk.successors) |edge| {
+                    if (edge.edge_type == .normal) {
+                        next_body = edge.target;
+                        break;
+                    }
+                }
+                if (next_body == null) return null;
+                body_id = next_body.?;
+            }
+        }
 
         // If no exception edge from setup, check the body block for exception edge
+        if (cleanup_block == null) {
+            if (setup_tail) |tail_id| {
+                const tail_blk = &self.cfg.blocks[tail_id];
+                for (tail_blk.successors) |edge| {
+                    if (edge.edge_type == .exception) {
+                        if (edge.target < self.cfg.blocks.len) {
+                            const handler = &self.cfg.blocks[edge.target];
+                            for (handler.instructions) |inst| {
+                                if (inst.opcode == .WITH_EXCEPT_START) {
+                                    cleanup_block = edge.target;
+                                    break;
+                                }
+                            }
+                        }
+                        break;
+                    }
+                }
+            }
+        }
         if (cleanup_block == null and body_id < self.cfg.blocks.len) {
             const body_blk = &self.cfg.blocks[body_id];
             for (body_blk.successors) |edge| {
@@ -2478,366 +2612,43 @@ pub const Analyzer = struct {
     /// Find the merge point where two branches converge.
     fn findMergePoint(self: *Analyzer, cond_block: u32, then_block: u32, else_block: ?u32) !?u32 {
         const else_id = else_block orelse return null;
+        if (then_block >= self.cfg.blocks.len or else_id >= self.cfg.blocks.len) return null;
+        const merge = self.postdom.merge(then_block, else_id) orelse return null;
+        if (merge >= self.cfg.blocks.len) return null;
         const cond_off = if (cond_block < self.cfg.blocks.len)
             self.cfg.blocks[cond_block].start_offset
         else
             0;
+        if (self.cfg.blocks[merge].start_offset <= cond_off) return null;
+        if (self.cfg.blocks[merge].is_loop_header) return null;
+        return merge;
+    }
 
-        // If else block returns (no successors), merge is after the then branch (if any).
-        var else_terminal = false;
-        var cur_else = else_id;
-        var steps: u32 = 0;
-        while (cur_else < self.cfg.blocks.len) {
-            steps += 1;
-            if (steps > self.cfg.blocks.len) break;
-            const blk = &self.cfg.blocks[cur_else];
-            var next: ?u32 = null;
-            var count: u32 = 0;
-            for (blk.successors) |edge| {
-                if (edge.edge_type == .exception or edge.edge_type == .loop_back) continue;
-                count += 1;
-                if (count == 1) next = edge.target;
-            }
-            if (count == 0) {
-                else_terminal = true;
-                break;
-            }
-            if (count > 1 or next == null) break;
-            cur_else = next.?;
-        }
-        const term_else = cur_else;
-        if (else_terminal) {
-            // If then-branch reaches terminal else, treat it as merge.
-            var seen = try std.DynamicBitSet.initEmpty(self.allocator, self.cfg.blocks.len);
-            defer seen.deinit();
-            var stack: std.ArrayList(u32) = .{};
-            defer stack.deinit(self.allocator);
-            try stack.append(self.allocator, then_block);
-            var reaches_else = false;
-            var reaches_term = false;
-            while (stack.items.len > 0 and !reaches_else) {
-                const bid = stack.items[stack.items.len - 1];
-                stack.items.len -= 1;
-                if (bid >= self.cfg.blocks.len) continue;
-                if (seen.isSet(bid)) continue;
-                seen.set(bid);
-                if (bid == else_id) {
-                    reaches_else = true;
-                    break;
-                }
-                if (bid == term_else) {
-                    reaches_term = true;
-                    break;
-                }
-                const blk = &self.cfg.blocks[bid];
-                const term = blk.terminator();
-                const cond_only = if (term) |t|
-                    self.isConditionalJump(t.opcode) and !hasStmtPrelude(blk)
-                else
-                    false;
-                for (blk.successors) |edge| {
-                    if (edge.edge_type == .exception or edge.edge_type == .loop_back) continue;
-                    if (cond_only and edge.edge_type == .conditional_false and edge.target == else_id) continue;
-                    if (edge.target >= self.cfg.blocks.len) continue;
-                    if (self.cfg.blocks[edge.target].start_offset <= cond_off) continue;
-                    if (!seen.isSet(edge.target)) {
-                        try stack.append(self.allocator, edge.target);
-                    }
-                }
-            }
-            if (reaches_else) {
-                const else_blk = &self.cfg.blocks[else_id];
-                if (else_blk.predecessors.len <= 1) return else_id;
-                return null;
-            }
-            if (reaches_term) return term_else;
-
-            const cond_blk = &self.cfg.blocks[cond_block];
-            const term = cond_blk.terminator() orelse return null;
-            var else_edge: ?EdgeType = null;
-            for (cond_blk.successors) |edge| {
-                if (edge.target == else_id) {
-                    else_edge = edge.edge_type;
-                    break;
-                }
-            }
-            const jump_on_true = switch (term.opcode) {
-                .POP_JUMP_IF_TRUE,
-                .POP_JUMP_IF_NOT_NONE,
-                .POP_JUMP_FORWARD_IF_TRUE,
-                .POP_JUMP_FORWARD_IF_NOT_NONE,
-                .POP_JUMP_BACKWARD_IF_TRUE,
-                .POP_JUMP_BACKWARD_IF_NOT_NONE,
-                .JUMP_IF_TRUE,
-                .JUMP_IF_TRUE_OR_POP,
-                => true,
-                .POP_JUMP_IF_FALSE,
-                .POP_JUMP_IF_NONE,
-                .POP_JUMP_FORWARD_IF_FALSE,
-                .POP_JUMP_FORWARD_IF_NONE,
-                .POP_JUMP_BACKWARD_IF_FALSE,
-                .POP_JUMP_BACKWARD_IF_NONE,
-                .JUMP_IF_FALSE,
-                .JUMP_IF_FALSE_OR_POP,
-                .JUMP_IF_NOT_EXC_MATCH,
-                => false,
-                else => false,
-            };
-            if (else_edge != null) {
-                const else_is_jump_target = if (jump_on_true)
-                    else_edge.? == .conditional_true
-                else
-                    else_edge.? == .conditional_false;
-                if (!else_is_jump_target) {
-                    return then_block;
-                }
-            }
-            const then_blk = &self.cfg.blocks[then_block];
-            var then_candidate: ?u32 = null;
-            for (then_blk.successors) |edge| {
-                if (edge.edge_type == .exception or edge.edge_type == .loop_back) continue;
-                if (then_candidate != null) {
-                    then_candidate = null;
-                    break;
-                }
-                then_candidate = edge.target;
-            }
-            if (then_candidate) |candidate| {
-                if (candidate < self.cfg.blocks.len and self.cfg.blocks[candidate].is_loop_header) {
-                    return null;
-                }
-                return candidate;
-            }
-            // Else returns, then branch continues through a conditional chain.
-            var then_seen = try std.DynamicBitSet.initEmpty(self.allocator, self.cfg.blocks.len);
-            defer then_seen.deinit();
-            var stack2: std.ArrayList(u32) = .{};
-            defer stack2.deinit(self.allocator);
-            try stack2.append(self.allocator, then_block);
-            var merge_candidate: ?u32 = null;
-            var linear_candidate: ?u32 = null;
-            while (stack2.items.len > 0) {
-                const bid = stack2.items[stack2.items.len - 1];
-                stack2.items.len -= 1;
-                if (bid >= self.cfg.blocks.len) continue;
-                if (then_seen.isSet(bid)) continue;
-                then_seen.set(bid);
-                const blk = &self.cfg.blocks[bid];
-                if (blk.terminator()) |t| {
-                    switch (t.opcode) {
-                        .JUMP_FORWARD,
-                        .JUMP_BACKWARD,
-                        .JUMP_BACKWARD_NO_INTERRUPT,
-                        .JUMP_ABSOLUTE,
-                        => {
-                            if (t.jumpTarget(self.cfg.version)) |target_off| {
-                                if (self.cfg.blockAtOffset(target_off)) |target_id| {
-                                    if (target_id != else_id and target_id < self.cfg.blocks.len and
-                                        self.cfg.blocks[target_id].start_offset > cond_off)
-                                    {
-                                        var target_has_non_exc = false;
-                                        var target_single: ?u32 = null;
-                                        var target_multi = false;
-                                        for (self.cfg.blocks[target_id].successors) |edge| {
-                                            if (edge.edge_type == .exception or edge.edge_type == .loop_back) continue;
-                                            target_has_non_exc = true;
-                                            if (target_single != null) {
-                                                target_multi = true;
-                                            } else {
-                                                target_single = edge.target;
-                                            }
-                                        }
-                                        var target_terminal = !target_has_non_exc;
-                                        if (!target_terminal and !target_multi) {
-                                            if (target_single) |next_id| {
-                                                if (next_id < self.cfg.blocks.len) {
-                                                    var next_has_non_exc = false;
-                                                    for (self.cfg.blocks[next_id].successors) |edge| {
-                                                        if (edge.edge_type == .exception or edge.edge_type == .loop_back) continue;
-                                                        next_has_non_exc = true;
-                                                        break;
-                                                    }
-                                                    if (!next_has_non_exc) {
-                                                        target_terminal = true;
-                                                    }
-                                                }
-                                            }
-                                        }
-                                        var pred_count: u32 = 0;
-                                        for (self.cfg.blocks[target_id].predecessors) |pred_id| {
-                                            if (pred_id >= self.cfg.blocks.len) continue;
-                                            const pred_blk = &self.cfg.blocks[pred_id];
-                                            for (pred_blk.successors) |edge| {
-                                                if (edge.target == target_id and edge.edge_type != .exception) {
-                                                    pred_count += 1;
-                                                    break;
-                                                }
-                                            }
-                                        }
-                                        if (target_terminal) {
-                                            if (pred_count <= 1) continue;
-                                            var else_reaches_target = false;
-                                            var reach_seen = try std.DynamicBitSet.initEmpty(self.allocator, self.cfg.blocks.len);
-                                            defer reach_seen.deinit();
-                                            var reach_stack: std.ArrayList(u32) = .{};
-                                            defer reach_stack.deinit(self.allocator);
-                                            try reach_stack.append(self.allocator, else_id);
-                                            while (reach_stack.items.len > 0 and !else_reaches_target) {
-                                                const cur_id = reach_stack.items[reach_stack.items.len - 1];
-                                                reach_stack.items.len -= 1;
-                                                if (cur_id >= self.cfg.blocks.len) continue;
-                                                if (reach_seen.isSet(cur_id)) continue;
-                                                reach_seen.set(cur_id);
-                                                if (cur_id == target_id) {
-                                                    else_reaches_target = true;
-                                                    break;
-                                                }
-                                                const cur_blk = &self.cfg.blocks[cur_id];
-                                                for (cur_blk.successors) |edge| {
-                                                    if (edge.edge_type == .exception or edge.edge_type == .loop_back) continue;
-                                                    if (edge.target >= self.cfg.blocks.len) continue;
-                                                    if (self.cfg.blocks[edge.target].start_offset <= cond_off) continue;
-                                                    if (!reach_seen.isSet(edge.target)) {
-                                                        try reach_stack.append(self.allocator, edge.target);
-                                                    }
-                                                }
-                                            }
-                                            if (!else_reaches_target) continue;
-                                        }
-                                        if (pred_count > 1) {
-                                            if (merge_candidate == null or
-                                                self.cfg.blocks[target_id].start_offset <
-                                                    self.cfg.blocks[merge_candidate.?].start_offset)
-                                            {
-                                                merge_candidate = target_id;
-                                            }
-                                        } else if (!target_terminal) {
-                                            if (linear_candidate == null or
-                                                self.cfg.blocks[target_id].start_offset >
-                                                    self.cfg.blocks[linear_candidate.?].start_offset)
-                                            {
-                                                linear_candidate = target_id;
-                                            }
-                                        }
-                                    }
-                                }
-                            }
-                        },
-                        else => {},
-                    }
-                }
-                for (blk.successors) |edge| {
-                    if (edge.edge_type == .exception or edge.edge_type == .loop_back) continue;
-                    if (edge.target == else_id) continue;
-                    if (edge.target >= self.cfg.blocks.len) continue;
-                    if (self.cfg.blocks[edge.target].start_offset <= cond_off) continue;
-                    if (!then_seen.isSet(edge.target)) {
-                        try stack2.append(self.allocator, edge.target);
-                    }
-                }
-            }
-            if (merge_candidate) |candidate| {
-                if (candidate < self.cfg.blocks.len and self.cfg.blocks[candidate].is_loop_header) {
-                    return null;
-                }
-                return candidate;
-            }
-            if (linear_candidate) |candidate| {
-                if (candidate < self.cfg.blocks.len and self.cfg.blocks[candidate].is_loop_header) {
-                    return null;
-                }
-                return candidate;
-            }
-            return null;
-        }
-
-        const else_pred_non_exc = blk: {
-            var count: usize = 0;
-            for (self.cfg.blocks) |blk| {
-                for (blk.successors) |edge| {
-                    if (edge.target != else_id) continue;
-                    if (edge.edge_type == .exception) continue;
-                    count += 1;
-                }
-            }
-            break :blk count;
-        };
-
-        // Simple approach: follow each branch until we find a common successor
-        self.nextMergeGen();
-        const gen = self.merge_gen;
-
-        var queue = &self.merge_queue;
-        queue.clearRetainingCapacity();
-        try queue.append(self.allocator, then_block);
-
-        while (queue.items.len > 0) {
-            const bid = queue.items[queue.items.len - 1];
-            queue.items.len -= 1;
-            if (bid >= self.merge_then_seen.len) continue;
-            if (self.merge_then_seen[bid] == gen) continue;
-            self.merge_then_seen[bid] = gen;
-
-            const blk = &self.cfg.blocks[bid];
-            const term = blk.terminator();
-            const cond_only = if (term) |t|
-                self.isConditionalJump(t.opcode) and !hasStmtPrelude(blk)
-            else
-                false;
-            for (blk.successors) |edge| {
-                if (edge.edge_type == .exception or edge.edge_type == .loop_back) continue;
-                if (cond_only and edge.edge_type == .conditional_false and edge.target == else_id) continue;
-                if (edge.target >= self.cfg.blocks.len) continue;
-                if (self.cfg.blocks[edge.target].start_offset <= cond_off) continue;
-                if (edge.target < self.merge_then_seen.len and self.merge_then_seen[edge.target] != gen) {
-                    try queue.append(self.allocator, edge.target);
-                }
-            }
-        }
-
-        // Find first block reachable from else-branch that's also in then-visited
-        queue.clearRetainingCapacity();
-        try queue.append(self.allocator, else_id);
-
-        while (queue.items.len > 0) {
-            const bid = queue.items[queue.items.len - 1];
-            queue.items.len -= 1;
-            if (bid >= self.merge_else_seen.len) continue;
-            if (self.merge_else_seen[bid] == gen) continue;
-            self.merge_else_seen[bid] = gen;
-
-            if (bid < self.merge_then_seen.len and self.merge_then_seen[bid] == gen) {
-                if (bid == else_id) {
-                    const else_blk_local = &self.cfg.blocks[else_id];
-                    if (else_blk_local.terminator()) |else_term| {
-                        if (self.isConditionalJump(else_term.opcode) and !hasStmtPrelude(else_blk_local)) {
-                            if (else_pred_non_exc > 1) {
-                                return bid;
-                            }
-                            // Else block is part of a conditional chain (elif); skip as merge.
-                        } else {
-                            return bid;
-                        }
-                    } else {
-                        return bid;
-                    }
-                } else {
-                    return bid;
-                }
-            }
-
+    fn reachesBlock(self: *Analyzer, start: u32, target: u32, cond_off: u32) !bool {
+        if (start >= self.cfg.blocks.len or target >= self.cfg.blocks.len) return false;
+        var seen = try std.DynamicBitSet.initEmpty(self.allocator, self.cfg.blocks.len);
+        defer seen.deinit();
+        var stack: std.ArrayList(u32) = .{};
+        defer stack.deinit(self.allocator);
+        try stack.append(self.allocator, start);
+        while (stack.items.len > 0) {
+            const bid = stack.items[stack.items.len - 1];
+            stack.items.len -= 1;
+            if (bid >= self.cfg.blocks.len) continue;
+            if (seen.isSet(bid)) continue;
+            seen.set(bid);
+            if (bid == target) return true;
             const blk = &self.cfg.blocks[bid];
             for (blk.successors) |edge| {
                 if (edge.edge_type == .exception or edge.edge_type == .loop_back) continue;
                 if (edge.target >= self.cfg.blocks.len) continue;
                 if (self.cfg.blocks[edge.target].start_offset <= cond_off) continue;
-                if (edge.target < self.merge_else_seen.len and self.merge_else_seen[edge.target] != gen) {
-                    try queue.append(self.allocator, edge.target);
+                if (!seen.isSet(edge.target)) {
+                    try stack.append(self.allocator, edge.target);
                 }
             }
         }
-
-        return null;
+        return false;
     }
 
     /// Mark a range of blocks as processed.

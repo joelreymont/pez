@@ -7,7 +7,7 @@ import tempfile
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from lib import compile_source, pick_xdis_python, select_compile_python
+from lib import collect_paths, compile_source, find_code_by_path, pick_xdis_python, select_compile_python
 
 
 def parse_args() -> argparse.Namespace:
@@ -15,6 +15,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--orig", required=True, help="Path to original .pyc")
     p.add_argument("--src", required=True, help="Path to decompiled .py source")
     p.add_argument("--path", default="", help="Code object path (e.g. <module>.func)")
+    p.add_argument("--index", type=int, default=-1, help="Path index if duplicates exist")
     p.add_argument("--list", action="store_true", help="List available code paths")
     p.add_argument("--no-insts", action="store_true", help="Skip raw instruction dumps")
     p.add_argument("--py", default=sys.executable, help="Python interpreter to compile source")
@@ -33,34 +34,6 @@ def ensure_xdis(args: argparse.Namespace) -> None:
         if not xdis_py:
             raise SystemExit("xdis not found; set --xdis-python or install xdis")
         os.execv(xdis_py, [xdis_py, str(Path(__file__).resolve())] + sys.argv[1:])
-
-
-def collect_paths(code, path, out):
-    out.append(path)
-    for c in code.co_consts:
-        if hasattr(c, "co_code"):
-            collect_paths(c, path + "." + c.co_name, out)
-
-
-def find_code_by_path(code, target: str):
-    matches = []
-
-    def walk(obj, path):
-        if path == target or path.endswith("." + target):
-            matches.append((path, obj))
-        for c in obj.co_consts:
-            if hasattr(c, "co_code"):
-                walk(c, path + "." + c.co_name)
-
-    walk(code, code.co_name)
-    if not matches:
-        return None, []
-    if len(matches) == 1:
-        return matches[0], matches
-    exact = [m for m in matches if m[0] == target]
-    if len(exact) == 1:
-        return exact[0], matches
-    return None, matches
 
 
 def inst_dump(instrs):
@@ -89,8 +62,7 @@ def main() -> None:
     orig_ver_list = list(orig_ver)
 
     if args.list:
-        paths = []
-        collect_paths(orig_code, orig_code.co_name, paths)
+        paths = collect_paths(orig_code)
         if args.out:
             Path(args.out).write_text(json.dumps({"paths": paths}, indent=2))
         else:
@@ -101,7 +73,8 @@ def main() -> None:
     if not args.path:
         raise SystemExit("missing --path (use --list to see code paths)")
 
-    orig_match, orig_matches = find_code_by_path(orig_code, args.path)
+    idx = args.index if args.index >= 0 else None
+    orig_match, orig_matches = find_code_by_path(orig_code, args.path, idx)
     if not orig_match:
         raise SystemExit(f"ambiguous or missing path: {args.path}")
     orig_path, orig_unit = orig_match
@@ -113,7 +86,7 @@ def main() -> None:
 
     comp_ver, comp_code = ax.load_code(str(compiled_pyc))
     comp_ver_list = list(comp_ver)
-    comp_match, comp_matches = find_code_by_path(comp_code, orig_path)
+    comp_match, comp_matches = find_code_by_path(comp_code, orig_path, idx)
     if not comp_match:
         raise SystemExit(f"missing compiled path: {orig_path}")
     comp_path, comp_unit = comp_match
@@ -141,6 +114,7 @@ def main() -> None:
 
     out = {
         "path": orig_path,
+        "index": idx,
         "orig_version": orig_ver_list,
         "compiled_version": comp_ver_list,
         "orig_unit": orig_unit_dump,

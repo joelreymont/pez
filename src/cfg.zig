@@ -166,6 +166,272 @@ pub const CFG = struct {
     }
 };
 
+/// Post-dominator tree and sets for a CFG.
+pub const PostDom = struct {
+    allocator: Allocator,
+    sets: []std.DynamicBitSet,
+    ipdom: []?u32,
+    depth: []u32,
+    virtual_exit: ?u32,
+
+    pub fn deinit(self: *PostDom) void {
+        for (self.sets) |*set| {
+            set.deinit();
+        }
+        if (self.sets.len > 0) self.allocator.free(self.sets);
+        if (self.ipdom.len > 0) self.allocator.free(self.ipdom);
+        if (self.depth.len > 0) self.allocator.free(self.depth);
+    }
+
+    pub fn postdominates(self: *const PostDom, a: u32, b: u32) bool {
+        if (b >= self.sets.len or a >= self.sets.len) return false;
+        return self.sets[b].isSet(a);
+    }
+
+    pub fn merge(self: *const PostDom, a: u32, b: u32) ?u32 {
+        const m = self.lca(a, b) orelse return null;
+        if (self.virtual_exit) |ve| {
+            if (m == ve) return null;
+        }
+        return m;
+    }
+
+    fn lca(self: *const PostDom, a: u32, b: u32) ?u32 {
+        if (a >= self.depth.len or b >= self.depth.len) return null;
+        var x = a;
+        var y = b;
+        while (self.depth[x] > self.depth[y]) {
+            x = self.ipdom[x] orelse return null;
+        }
+        while (self.depth[y] > self.depth[x]) {
+            y = self.ipdom[y] orelse return null;
+        }
+        while (x != y) {
+            x = self.ipdom[x] orelse return null;
+            y = self.ipdom[y] orelse return null;
+        }
+        return x;
+    }
+};
+
+/// Compute post-dominator sets and tree.
+pub fn computePostDom(allocator: Allocator, cfg: *const CFG, include_exceptions: bool) !PostDom {
+    const n: u32 = @intCast(cfg.blocks.len);
+    var exits = try collectExitBlocks(allocator, cfg, include_exceptions);
+    defer exits.deinit(allocator);
+
+    var rev = try allocator.alloc(std.ArrayListUnmanaged(u32), @intCast(n));
+    errdefer {
+        for (rev) |*lst| lst.deinit(allocator);
+        allocator.free(rev);
+    }
+    for (rev) |*lst| {
+        lst.* = .{};
+    }
+    var src: u32 = 0;
+    while (src < n) : (src += 1) {
+        for (cfg.blocks[@intCast(src)].successors) |edge| {
+            if (!include_exceptions and edge.edge_type == .exception) continue;
+            const tgt = edge.target;
+            if (tgt >= n) continue;
+            try rev[@intCast(tgt)].append(allocator, src);
+        }
+    }
+    defer {
+        for (rev) |*lst| lst.deinit(allocator);
+        allocator.free(rev);
+    }
+
+    var reachable = try std.DynamicBitSet.initEmpty(allocator, @intCast(n));
+    defer reachable.deinit();
+    if (exits.items.len > 0) {
+        var queue: std.ArrayListUnmanaged(u32) = .{};
+        defer queue.deinit(allocator);
+        for (exits.items) |eid| {
+            if (eid >= n) continue;
+            if (!reachable.isSet(@intCast(eid))) {
+                reachable.set(@intCast(eid));
+                try queue.append(allocator, eid);
+            }
+        }
+        while (queue.items.len > 0) {
+            const cur = queue.items[queue.items.len - 1];
+            queue.items.len -= 1;
+            for (rev[@intCast(cur)].items) |pred| {
+                if (pred >= n) continue;
+                if (reachable.isSet(@intCast(pred))) continue;
+                reachable.set(@intCast(pred));
+                try queue.append(allocator, pred);
+            }
+        }
+    }
+    var any_unreach = exits.items.len == 0;
+    if (!any_unreach) {
+        var bid: u32 = 0;
+        while (bid < n) : (bid += 1) {
+            if (!reachable.isSet(@intCast(bid))) {
+                any_unreach = true;
+                break;
+            }
+        }
+    }
+
+    var virtual_exit: ?u32 = null;
+    var total: u32 = n;
+    if (exits.items.len > 1 or any_unreach) {
+        virtual_exit = n;
+        total = n + 1;
+    }
+
+    const total_usize: usize = @intCast(total);
+    var sets = try allocator.alloc(std.DynamicBitSet, total_usize);
+    errdefer {
+        for (sets) |*set| set.deinit();
+        allocator.free(sets);
+    }
+    var ipdom = try allocator.alloc(?u32, total_usize);
+    errdefer allocator.free(ipdom);
+    var depth = try allocator.alloc(u32, total_usize);
+    errdefer allocator.free(depth);
+
+    var is_exit = try std.DynamicBitSet.initEmpty(allocator, total_usize);
+    defer is_exit.deinit();
+    for (exits.items) |bid| {
+        if (bid < n) is_exit.set(@intCast(bid));
+    }
+
+    var i: usize = 0;
+    while (i < total_usize) : (i += 1) {
+        if (virtual_exit != null and i == @as(usize, @intCast(virtual_exit.?))) {
+            sets[i] = try std.DynamicBitSet.initEmpty(allocator, total_usize);
+            sets[i].set(i);
+        } else if (i < n and (!reachable.isSet(i) or (virtual_exit == null and is_exit.isSet(i)))) {
+            sets[i] = try std.DynamicBitSet.initEmpty(allocator, total_usize);
+            sets[i].set(i);
+        } else {
+            sets[i] = try std.DynamicBitSet.initFull(allocator, total_usize);
+        }
+    }
+
+    var scratch = try std.DynamicBitSet.initEmpty(allocator, total_usize);
+    defer scratch.deinit();
+
+    var changed = true;
+    while (changed) {
+        changed = false;
+        var bid: u32 = 0;
+        while (bid < n) : (bid += 1) {
+            if (!reachable.isSet(@intCast(bid))) continue;
+            if (virtual_exit == null and is_exit.isSet(@intCast(bid))) continue;
+            scratch.setRangeValue(.{ .start = 0, .end = total_usize }, false);
+            var has_succ = false;
+
+            for (cfg.blocks[@intCast(bid)].successors) |edge| {
+                if (!include_exceptions and edge.edge_type == .exception) continue;
+                const tid = edge.target;
+                if (tid >= n) continue;
+                if (!has_succ) {
+                    scratch.setUnion(sets[@intCast(tid)]);
+                    has_succ = true;
+                } else {
+                    scratch.setIntersection(sets[@intCast(tid)]);
+                }
+            }
+            if (!has_succ) {
+                if (virtual_exit) |ve| {
+                    scratch.setUnion(sets[@intCast(ve)]);
+                    has_succ = true;
+                }
+            }
+            scratch.set(@intCast(bid));
+
+            const idx: usize = @intCast(bid);
+            if (!scratch.eql(sets[idx])) {
+                sets[idx].setRangeValue(.{ .start = 0, .end = total_usize }, false);
+                sets[idx].setUnion(scratch);
+                changed = true;
+            }
+        }
+    }
+
+    // Compute immediate post-dominator.
+    i = 0;
+    while (i < total_usize) : (i += 1) {
+        if (virtual_exit != null and i == @as(usize, @intCast(virtual_exit.?))) {
+            ipdom[i] = null;
+            continue;
+        }
+        var best: ?u32 = null;
+        if (i >= n) {
+            ipdom[i] = null;
+            continue;
+        }
+        var it = sets[i].iterator(.{});
+        while (it.next()) |cand| {
+            if (cand == i) continue;
+            var ok = true;
+            var it2 = sets[i].iterator(.{});
+            while (it2.next()) |other| {
+                if (other == i or other == cand) continue;
+                if (!sets[cand].isSet(other)) {
+                    ok = false;
+                    break;
+                }
+            }
+            if (ok) {
+                best = @intCast(cand);
+                break;
+            }
+        }
+        ipdom[i] = best;
+    }
+
+    // Compute depth from postdom root.
+    i = 0;
+    while (i < total_usize) : (i += 1) {
+        var d: u32 = 0;
+        var cur: ?u32 = @intCast(i);
+        var steps: u32 = 0;
+        while (cur) |c| {
+            steps += 1;
+            if (steps > total) break;
+            const p = ipdom[@intCast(c)] orelse break;
+            d += 1;
+            cur = p;
+        }
+        depth[i] = d;
+    }
+
+    return PostDom{
+        .allocator = allocator,
+        .sets = sets,
+        .ipdom = ipdom,
+        .depth = depth,
+        .virtual_exit = virtual_exit,
+    };
+}
+
+fn collectExitBlocks(
+    allocator: Allocator,
+    cfg: *const CFG,
+    include_exceptions: bool,
+) !std.ArrayListUnmanaged(u32) {
+    var exits: std.ArrayListUnmanaged(u32) = .{};
+    var bid: u32 = 0;
+    while (bid < cfg.blocks.len) : (bid += 1) {
+        var has_succ = false;
+        for (cfg.blocks[@intCast(bid)].successors) |edge| {
+            if (!include_exceptions and edge.edge_type == .exception) continue;
+            has_succ = true;
+            break;
+        }
+        if (!has_succ) {
+            try exits.append(allocator, bid);
+        }
+    }
+    return exits;
+}
+
 /// Build a CFG from bytecode.
 pub fn buildCFG(allocator: Allocator, bytecode: []const u8, version: Version) !CFG {
     return buildCFGWithLeaders(allocator, bytecode, version, &.{});

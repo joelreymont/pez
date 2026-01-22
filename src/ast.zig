@@ -1459,6 +1459,7 @@ pub const Stmt = union(enum) {
         condition: *Expr,
         body: []const *Stmt,
         else_body: []const *Stmt,
+        no_merge: bool = false,
     },
 
     /// With statement

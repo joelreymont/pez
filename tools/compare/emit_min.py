@@ -8,7 +8,7 @@ import tempfile
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from lib import compile_source, pick_xdis_python, select_compile_python
+from lib import compile_source, find_code_by_path, norm_argrepr, pick_xdis_python, select_compile_python
 
 
 def parse_args() -> argparse.Namespace:
@@ -16,6 +16,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--orig", required=True, help="Path to original .pyc")
     p.add_argument("--src", required=True, help="Path to decompiled .py source")
     p.add_argument("--path", required=True, help="Code object path (e.g. <module>.func)")
+    p.add_argument("--index", type=int, default=-1, help="Path index if duplicates exist")
     p.add_argument("--py", default=sys.executable, help="Python interpreter to compile source")
     p.add_argument("--xdis-python", default="", help="Python interpreter with xdis installed")
     p.add_argument("--timeout", type=int, default=120, help="Timeout seconds")
@@ -36,29 +37,8 @@ def ensure_xdis(args: argparse.Namespace) -> None:
         os.execv(xdis_py, [xdis_py, str(Path(__file__).resolve())] + sys.argv[1:])
 
 
-def find_code_by_path(code, target: str):
-    matches = []
-
-    def walk(obj, path):
-        if path == target or path.endswith("." + target):
-            matches.append((path, obj))
-        for c in obj.co_consts:
-            if hasattr(c, "co_code"):
-                walk(c, path + "." + c.co_name)
-
-    walk(code, code.co_name)
-    if not matches:
-        return None, []
-    if len(matches) == 1:
-        return matches[0], matches
-    exact = [m for m in matches if m[0] == target]
-    if len(exact) == 1:
-        return exact[0], matches
-    return None, matches
-
-
 def inst_key(inst):
-    return inst.opname, inst.argrepr
+    return inst.opname, norm_argrepr(inst.argrepr)
 
 
 def target_parts(path: str) -> list[str]:
@@ -115,6 +95,7 @@ def same_unit(
     orig_opc,
     src_path: Path,
     path: str,
+    index,
     py: str,
     timeout: int,
 ) -> bool:
@@ -130,11 +111,11 @@ def same_unit(
         if list(comp_ver) != list(orig_ver):
             return False
         comp_opc = op_imports.get_opcode_module(comp_ver)
-        orig_match, _ = find_code_by_path(orig_code, path)
+        orig_match, _ = find_code_by_path(orig_code, path, index)
         if not orig_match:
             return False
         orig_path, orig_unit = orig_match
-        comp_match, _ = find_code_by_path(comp_code, orig_path)
+        comp_match, _ = find_code_by_path(comp_code, orig_path, index)
         if not comp_match:
             return False
         _, comp_unit = comp_match
@@ -163,6 +144,7 @@ def ddmin(
     keep_idx: set[int],
     removable: list[int],
     path: str,
+    index,
     py: str,
     timeout: int,
     max_iter: int,
@@ -189,7 +171,7 @@ def ddmin(
             tmp_src = Path(tempfile.mkstemp(prefix="pez-min-", suffix=".py")[1])
             try:
                 tmp_src.write_text(src_text)
-                if same_unit(orig_code, orig_ver, orig_opc, tmp_src, path, py, timeout):
+                if same_unit(orig_code, orig_ver, orig_opc, tmp_src, path, index, py, timeout):
                     removable = [i for i in removable if i not in subset]
                     removed = True
                     n = 2
@@ -224,6 +206,10 @@ def main() -> None:
     orig_opc = ax.op_imports.get_opcode_module(orig_ver)
     orig_ver_list = list(orig_ver)
     py = select_compile_python(args.py, tuple(orig_ver_list[:2]), args.timeout)
+    idx = args.index if args.index >= 0 else None
+    orig_match, _ = find_code_by_path(orig_code, args.path, idx)
+    if not orig_match:
+        raise SystemExit(f"ambiguous or missing path: {args.path}")
 
     text = src.read_text()
     module = ast.parse(text)
@@ -263,6 +249,7 @@ def main() -> None:
         keep_idx,
         removable,
         args.path,
+        idx,
         py,
         args.timeout,
         args.max_iter,

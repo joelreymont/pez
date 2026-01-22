@@ -131,6 +131,19 @@ test "snapshot for else break 3.9" {
     );
 }
 
+test "snapshot for prelude 3.9" {
+    try runSnapshot(@src(), "test/corpus/for_prelude.3.9.pyc",
+        \\[]u8
+        \\  "def xor_bytes(data, pad):
+        \\    xpad = pad
+        \\    xdata = data[0:2]
+        \\    for i in range(2, len(data)):
+        \\        xdata += bytes([data[i] ^ xpad[i - 2]])
+        \\    return xdata
+        \\"
+    );
+}
+
 test "snapshot try finally nested 3.9" {
     try runSnapshot(@src(), "test/corpus/try_finally_nested.3.9.pyc",
         \\[]u8
@@ -178,6 +191,28 @@ test "snapshot if attr prelude 3.9" {
         \\sys.prefix = sys._MEIPASS
         \\if sys.prefix:
         \\    pass
+        \\"
+    );
+}
+
+test "snapshot ternary attr prelude 3.9" {
+    try runSnapshot(@src(), "test/corpus/ternary_attr_prelude.3.9.pyc",
+        \\[]u8
+        \\  "import asyncio
+        \\RETRY_MAX = 3
+        \\
+        \\
+        \\
+        \\class Transaction:
+        \\    def __init__(self, request, addr, protocol, retransmissions = None):
+        \\        self.__addr = addr
+        \\        self.__future = asyncio.Future()
+        \\        self.__request = request
+        \\        self.__protocol = protocol
+        \\        self.__timeout_handle = None
+        \\        self.__tries = 0
+        \\        self.__timeout_delay = 1
+        \\        self.__tries_max = 1 + (retransmissions if retransmissions is not None else RETRY_MAX)
         \\"
     );
 }
@@ -261,6 +296,31 @@ test "snapshot if or chain 3.9" {
         \\        raise Exception('x')
         \\    else:
         \\        return None
+        \\"
+    );
+}
+
+test "snapshot if or term 3.9" {
+    try runSnapshot(@src(), "test/corpus/if_or_term.3.9.pyc",
+        \\[]u8
+        \\  "def f(a, b):
+        \\    if a or b:
+        \\        return 1
+        \\    x = 2
+        \\    return x
+        \\"
+    );
+}
+
+test "snapshot if elif else raise 3.9" {
+    try runSnapshot(@src(), "test/corpus/if_elif_else_raise.3.9.pyc",
+        \\[]u8
+        \\  "def f(protocol):
+        \\    if protocol == 4:
+        \\        return 'v4'
+        \\    if protocol == 6:
+        \\        return 'v6'
+        \\    raise ValueError('unknown protocol')
         \\"
     );
 }
@@ -759,6 +819,31 @@ test "snapshot guard or 3.9" {
     );
 }
 
+test "snapshot guard or return 3.9" {
+    try runSnapshot(@src(), "test/corpus/if_guard_or_return.3.9.pyc",
+        \\[]u8
+        \\  "import os
+        \\
+        \\
+        \\def f(importer):
+        \\    if importer.path is None or not os.path.isdir(importer.path):
+        \\        return None
+        \\    return 1
+        \\"
+    );
+}
+
+test "snapshot guard raise 3.9" {
+    try runSnapshot(@src(), "test/corpus/if_guard_raise.3.9.pyc",
+        \\[]u8
+        \\  "def f(x):
+        \\    if x is None:
+        \\        raise ValueError('x')
+        \\    return x
+        \\"
+    );
+}
+
 test "snapshot chained compare 3.9" {
     try runSnapshot(@src(), "test/corpus/chained_compare.3.9.pyc",
         \\[]u8
@@ -778,6 +863,112 @@ test "snapshot chained compare and 3.9" {
         \\    if limit is not None and 0 <= limit <= _read:
         \\        return True
         \\    return False
+        \\"
+    );
+}
+
+test "snapshot loop tail guard 3.9" {
+    try runSnapshot(@src(), "test/corpus/loop_tail_guard.3.9.pyc",
+        \\[]u8
+        \\  "from typing import List
+        \\
+        \\def scan(vals: List[int]) -> int:
+        \\    pos = 0
+        \\    while pos < len(vals):
+        \\        v = vals[pos]
+        \\        if v == 0:
+        \\            if v != vals[0]:
+        \\                raise ValueError('bad0')
+        \\        elif v == 1:
+        \\            if v != vals[1]:
+        \\                raise ValueError('bad1')
+        \\        pos += 1
+        \\    return pos
+        \\"
+    );
+}
+
+test "snapshot try if merge 3.9" {
+    try runSnapshot(@src(), "test/corpus/try_if_merge.3.9.pyc",
+        \\[]u8
+        \\  "def g():
+        \\    pass
+        \\
+        \\
+        \\def f(flag, other):
+        \\    if flag:
+        \\        x = 1
+        \\    elif other:
+        \\        try:
+        \\            g()
+        \\        except ValueError:
+        \\            return None
+        \\        else:
+        \\            x = 2
+        \\    return x
+        \\"
+    );
+}
+
+test "snapshot loop for prelude 3.9" {
+    try runSnapshot(@src(), "test/corpus/loop_for_prelude.3.9.pyc",
+        \\[]u8
+        \\  "import asyncio
+        \\
+        \\
+        \\async def loop_for_prelude(obj):
+        \\    while True:
+        \\        await asyncio.sleep(0.1)
+        \\        for item in obj.items():
+        \\            pass
+        \\"
+    );
+}
+
+test "snapshot kwonly defaults 3.9" {
+    try runSnapshot(@src(), "test/corpus/kwonly_defaults.3.9.pyc",
+        \\[]u8
+        \\  "class C:
+        \\    def __init__(self, *args, max_length = None, **kwargs):
+        \\        pass
+        \\"
+    );
+}
+
+test "snapshot loop try break 3.9" {
+    try runSnapshot(@src(), "test/corpus/loop_try_break.3.9.pyc",
+        \\[]u8
+        \\  "def read(fp, decomp, trailing_error):
+        \\    data = None
+        \\    while True:
+        \\        rawblock = fp.read(4)
+        \\        if not rawblock:
+        \\            break
+        \\        try:
+        \\            data = decomp.decompress(rawblock, 1)
+        \\        except trailing_error:
+        \\            break
+        \\        if data:
+        \\            break
+        \\    return data
+        \\"
+    );
+}
+
+test "snapshot loop break guard 3.9" {
+    try runSnapshot(@src(), "test/corpus/loop_break_guard.3.9.pyc",
+        \\[]u8
+        \\  "class _Base:
+        \\    pass
+        \\
+        \\class Generic:
+        \\    pass
+        \\
+        \\
+        \\def f(bases, i):
+        \\    for b in bases[i + 1:]:
+        \\        if isinstance(b, _Base) or issubclass(b, Generic):
+        \\            break
         \\"
     );
 }

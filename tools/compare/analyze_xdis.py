@@ -427,11 +427,12 @@ def analyze_code(code, opc, path):
 
     op_seq = []
     op_counts = Counter()
-    for ins in instrs:
-        arg_token = norm_arg(ins.opname, ins.argval, ins.argrepr, ins.arg or 0)
-        token = seq_token(ins.opname, arg_token)
-        op_seq.append(token)
-        op_counts[op_class(ins.opname)] += 1
+    for b in blocks:
+        for ins in b["instrs"]:
+            arg_token = norm_arg(ins.opname, ins.argval, ins.argrepr, ins.arg or 0)
+            token = seq_token(ins.opname, arg_token)
+            op_seq.append(token)
+            op_counts[op_class(ins.opname)] += 1
 
     loop_edges = 0
     starts = {b["id"]: b["start"] for b in blocks}

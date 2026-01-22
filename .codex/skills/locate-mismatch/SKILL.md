@@ -15,3 +15,4 @@ description: Locate first bytecode mismatch and map to CFG blocks.
 ## Options
 - `--context N` for wider window
 - `--code-path func` to override dump_view path
+- `--index N` if the code path appears multiple times

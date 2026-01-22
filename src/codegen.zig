@@ -69,8 +69,17 @@ pub const Writer = struct {
             try self.writeIndent(allocator);
             try self.write(allocator, "pass\n");
         } else {
+            var prev_def = false;
             for (body) |s| {
+                const cur_def = s.* == .function_def or s.* == .class_def;
+                if (cur_def and prev_def) {
+                    try self.writeByte(allocator, '\n');
+                    if (self.indent_level == 0) {
+                        try self.writeByte(allocator, '\n');
+                    }
+                }
                 try self.writeStmt(allocator, s);
+                prev_def = cur_def;
             }
         }
     }
@@ -233,13 +242,17 @@ pub const Writer = struct {
                 if (needs_parens) try self.writeByte(allocator, ')');
             },
             .compare => |c| {
-                try self.writeExprPrec(allocator, c.left, 0);
+                const prec: u8 = 5;
+                const needs_parens = prec < parent_prec;
+                if (needs_parens) try self.writeByte(allocator, '(');
+                try self.writeExprPrec(allocator, c.left, prec);
                 for (c.ops, c.comparators) |op, cmp| {
                     try self.write(allocator, " ");
                     try self.write(allocator, op.symbol());
                     try self.write(allocator, " ");
-                    try self.writeExprPrec(allocator, cmp, 0);
+                    try self.writeExprPrec(allocator, cmp, prec);
                 }
+                if (needs_parens) try self.writeByte(allocator, ')');
             },
             .named_expr => |n| {
                 const prec: u8 = 1;
@@ -456,25 +469,39 @@ pub const Writer = struct {
                 }
             },
             .string => |s| {
-                // Inside f-string expressions, use opposite quote from the f-string
-                const quote = if (self.fstring_quote) |fq|
-                    (if (fq == '\'') @as(u8, '"') else '\'')
-                else
-                    pickQuote(s);
-                try self.writeByte(allocator, quote);
-                try self.writeStringContents(allocator, s, quote, false);
-                try self.writeByte(allocator, quote);
+                const has_newline = std.mem.indexOfScalar(u8, s, '\n') != null;
+                if (has_newline) {
+                    try self.write(allocator, "\"\"\"");
+                    try self.writeStringContentsMultiline(allocator, s, '"', false);
+                    try self.write(allocator, "\"\"\"");
+                } else {
+                    // Inside f-string expressions, use opposite quote from the f-string
+                    const quote = if (self.fstring_quote) |fq|
+                        (if (fq == '\'') @as(u8, '"') else '\'')
+                    else
+                        pickQuote(s);
+                    try self.writeByte(allocator, quote);
+                    try self.writeStringContents(allocator, s, quote, false);
+                    try self.writeByte(allocator, quote);
+                }
             },
             .bytes => |b| {
-                // Inside f-string expressions, use opposite quote from the f-string
-                const quote = if (self.fstring_quote) |fq|
-                    (if (fq == '\'') @as(u8, '"') else '\'')
-                else
-                    pickQuote(b);
-                try self.writeByte(allocator, 'b');
-                try self.writeByte(allocator, quote);
-                try self.writeStringContents(allocator, b, quote, true);
-                try self.writeByte(allocator, quote);
+                const has_newline = std.mem.indexOfScalar(u8, b, '\n') != null;
+                if (has_newline) {
+                    try self.write(allocator, "b\"\"\"");
+                    try self.writeStringContentsMultiline(allocator, b, '"', true);
+                    try self.write(allocator, "\"\"\"");
+                } else {
+                    // Inside f-string expressions, use opposite quote from the f-string
+                    const quote = if (self.fstring_quote) |fq|
+                        (if (fq == '\'') @as(u8, '"') else '\'')
+                    else
+                        pickQuote(b);
+                    try self.writeByte(allocator, 'b');
+                    try self.writeByte(allocator, quote);
+                    try self.writeStringContents(allocator, b, quote, true);
+                    try self.writeByte(allocator, quote);
+                }
             },
             .tuple => |items| {
                 try self.writeByte(allocator, '(');
@@ -514,6 +541,86 @@ pub const Writer = struct {
 
     fn writeStringContents(self: *Writer, allocator: std.mem.Allocator, s: []const u8, quote: u8, is_bytes: bool) !void {
         try self.writeStringContentsEx(allocator, s, quote, false, is_bytes);
+    }
+
+    fn writeStringContentsMultiline(
+        self: *Writer,
+        allocator: std.mem.Allocator,
+        s: []const u8,
+        quote: u8,
+        is_bytes: bool,
+    ) !void {
+        if (!is_bytes) {
+            if (std.unicode.Utf8View.init(s)) |view| {
+                var it = std.unicode.Utf8View.iterator(view);
+                while (it.nextCodepoint()) |cp| {
+                    if (cp <= 0x7F) {
+                        const c: u8 = @intCast(cp);
+                        switch (c) {
+                            '\n' => try self.writeByte(allocator, '\n'),
+                            '\r' => try self.write(allocator, "\\r"),
+                            '\t' => try self.write(allocator, "\\t"),
+                            '\\' => try self.write(allocator, "\\\\"),
+                            '"' => if (quote == '"') {
+                                try self.write(allocator, "\\\"");
+                            } else {
+                                try self.writeByte(allocator, '"');
+                            },
+                            '\'' => if (quote == '\'') {
+                                try self.write(allocator, "\\'");
+                            } else {
+                                try self.writeByte(allocator, '\'');
+                            },
+                            '{', '}' => try self.writeByte(allocator, c),
+                            else => {
+                                if (c >= 0x20 and c < 0x7F) {
+                                    try self.writeByte(allocator, c);
+                                } else {
+                                    try self.writeFmt(allocator, "\\x{x:0>2}", .{c});
+                                }
+                            },
+                        }
+                        continue;
+                    }
+                    if (cp <= 0xFF) {
+                        try self.writeFmt(allocator, "\\x{x:0>2}", .{cp});
+                    } else if (cp <= 0xFFFF) {
+                        try self.writeFmt(allocator, "\\u{x:0>4}", .{cp});
+                    } else {
+                        try self.writeFmt(allocator, "\\U{x:0>8}", .{cp});
+                    }
+                }
+                return;
+            } else |_| {}
+        }
+
+        // Byte fallback (bytes literals or invalid UTF-8)
+        for (s) |c| {
+            switch (c) {
+                '\n' => try self.writeByte(allocator, '\n'),
+                '\r' => try self.write(allocator, "\\r"),
+                '\t' => try self.write(allocator, "\\t"),
+                '\\' => try self.write(allocator, "\\\\"),
+                '"' => if (quote == '"') {
+                    try self.write(allocator, "\\\"");
+                } else {
+                    try self.writeByte(allocator, '"');
+                },
+                '\'' => if (quote == '\'') {
+                    try self.write(allocator, "\\'");
+                } else {
+                    try self.writeByte(allocator, '\'');
+                },
+                '{', '}' => try self.writeByte(allocator, c),
+                else => {
+                    if (c >= 0x20 and c < 0x7F) {
+                        try self.writeByte(allocator, c);
+                    } else {
+                        try self.writeFmt(allocator, "\\x{x:0>2}", .{c});
+                    }
+                },
+            }
+        }
     }
 
     fn writeStringContentsEx(
@@ -816,6 +923,11 @@ pub const Writer = struct {
     fn writeArguments(self: *Writer, allocator: std.mem.Allocator, args: *const ast.Arguments) !void {
         var first = true;
 
+        const n_defaults = args.defaults.len;
+        const n_total_pos = args.posonlyargs.len + args.args.len;
+        const defaults_start = if (n_defaults > 0) n_total_pos - n_defaults else n_total_pos;
+        var pos_idx: usize = 0;
+
         // Write positional-only args
         for (args.posonlyargs) |arg| {
             if (!first) try self.write(allocator, ", ");
@@ -825,6 +937,12 @@ pub const Writer = struct {
                 try self.write(allocator, ": ");
                 try self.writeExpr(allocator, ann);
             }
+            if (n_defaults > 0 and pos_idx >= defaults_start) {
+                const default_idx = pos_idx - defaults_start;
+                try self.write(allocator, " = ");
+                try self.writeExpr(allocator, args.defaults[default_idx]);
+            }
+            pos_idx += 1;
         }
 
         if (args.posonlyargs.len > 0) {
@@ -832,9 +950,7 @@ pub const Writer = struct {
         }
 
         // Write regular args with defaults
-        const n_defaults = args.defaults.len;
-        const n_args = args.args.len;
-        for (args.args, 0..) |arg, i| {
+        for (args.args) |arg| {
             if (!first) try self.write(allocator, ", ");
             first = false;
             try self.write(allocator, arg.arg);
@@ -842,11 +958,12 @@ pub const Writer = struct {
                 try self.write(allocator, ": ");
                 try self.writeExpr(allocator, ann);
             }
-            if (n_defaults > 0 and i >= n_args - n_defaults) {
-                const default_idx = i - (n_args - n_defaults);
+            if (n_defaults > 0 and pos_idx >= defaults_start) {
+                const default_idx = pos_idx - defaults_start;
                 try self.write(allocator, " = ");
                 try self.writeExpr(allocator, args.defaults[default_idx]);
             }
+            pos_idx += 1;
         }
 
         // Write *args
@@ -1092,7 +1209,7 @@ pub const Writer = struct {
                             if (expr.* == .constant and expr.constant == .string) {
                                 try self.writeIndent(allocator);
                                 try self.write(allocator, "\"\"\"");
-                                try self.writeStringContents(allocator, expr.constant.string, '"', false);
+                                try self.writeStringContentsMultiline(allocator, expr.constant.string, '"', false);
                                 try self.write(allocator, "\"\"\"\n");
                                 continue;
                             }
@@ -1140,7 +1257,7 @@ pub const Writer = struct {
                             if (expr.* == .constant and expr.constant == .string) {
                                 try self.writeIndent(allocator);
                                 try self.write(allocator, "\"\"\"");
-                                try self.writeStringContents(allocator, expr.constant.string, '"', false);
+                                try self.writeStringContentsMultiline(allocator, expr.constant.string, '"', false);
                                 try self.write(allocator, "\"\"\"\n");
                                 continue;
                             }
@@ -2131,7 +2248,7 @@ pub fn extractFunctionName(code: *const pyc.Code) []const u8 {
     if (code.name.len > 0) {
         return code.name;
     }
-    return "<unknown>";
+    return "__unknown__";
 }
 
 /// Check if code object is a lambda (has name "<lambda>").

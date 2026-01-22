@@ -6,9 +6,10 @@ import subprocess
 import sys
 import tempfile
 from pathlib import Path
+from typing import Optional
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from lib import compile_source, pick_xdis_python, select_compile_python
+from lib import compile_source, find_code_by_path, norm_argrepr, pick_xdis_python, select_compile_python
 
 
 def parse_args() -> argparse.Namespace:
@@ -16,6 +17,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--orig", required=True, help="Path to original .pyc")
     p.add_argument("--src", required=True, help="Path to decompiled .py source")
     p.add_argument("--path", required=True, help="Code object path (e.g. <module>.func)")
+    p.add_argument("--index", type=int, default=-1, help="Path index if duplicates exist")
     p.add_argument("--py", default=sys.executable, help="Python interpreter to compile source")
     p.add_argument("--xdis-python", default="", help="Python interpreter with xdis installed")
     p.add_argument("--timeout", type=int, default=120, help="Timeout seconds")
@@ -37,27 +39,6 @@ def ensure_xdis(args: argparse.Namespace) -> None:
         os.execv(xdis_py, [xdis_py, str(Path(__file__).resolve())] + sys.argv[1:])
 
 
-def find_code_by_path(code, target: str):
-    matches = []
-
-    def walk(obj, path):
-        if path == target or path.endswith("." + target):
-            matches.append((path, obj))
-        for c in obj.co_consts:
-            if hasattr(c, "co_code"):
-                walk(c, path + "." + c.co_name)
-
-    walk(code, code.co_name)
-    if not matches:
-        return None, []
-    if len(matches) == 1:
-        return matches[0], matches
-    exact = [m for m in matches if m[0] == target]
-    if len(exact) == 1:
-        return exact[0], matches
-    return None, matches
-
-
 def inst_dump(instrs):
     out = []
     for ins in instrs:
@@ -66,7 +47,7 @@ def inst_dump(instrs):
                 "offset": ins.offset,
                 "op": ins.opname,
                 "arg": ins.arg or 0,
-                "argrepr": ins.argrepr,
+                "argrepr": norm_argrepr(ins.argrepr),
             }
         )
     return out
@@ -80,7 +61,7 @@ def strip_module(path: str) -> str:
     return path
 
 
-def run_dump_view(pyc: Path, code_path: str, timeout: int) -> list:
+def run_dump_view(pyc: Path, code_path: str, code_index: Optional[int], timeout: int) -> list:
     args = [
         sys.executable,
         str(Path(__file__).resolve().parent.parent / "dump_view.py"),
@@ -91,6 +72,8 @@ def run_dump_view(pyc: Path, code_path: str, timeout: int) -> list:
     ]
     if code_path:
         args += ["--code-path", code_path]
+    if code_index is not None:
+        args += ["--code-index", str(code_index)]
     proc = subprocess.run(args, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, timeout=timeout)
     if proc.returncode != 0:
         sys.stderr.write(proc.stderr)
@@ -127,7 +110,8 @@ def main() -> None:
     orig_ver, orig_code = ax.load_code(str(orig))
     orig_ver_list = list(orig_ver)
 
-    orig_match, _ = find_code_by_path(orig_code, args.path)
+    idx = args.index if args.index >= 0 else None
+    orig_match, _ = find_code_by_path(orig_code, args.path, idx)
     if not orig_match:
         raise SystemExit(f"ambiguous or missing path: {args.path}")
     orig_path, orig_unit = orig_match
@@ -139,7 +123,7 @@ def main() -> None:
 
     comp_ver, comp_code = ax.load_code(str(compiled_pyc))
     comp_ver_list = list(comp_ver)
-    comp_match, _ = find_code_by_path(comp_code, orig_path)
+    comp_match, _ = find_code_by_path(comp_code, orig_path, idx)
     if not comp_match:
         raise SystemExit(f"missing compiled path: {orig_path}")
     comp_path, comp_unit = comp_match
@@ -165,8 +149,8 @@ def main() -> None:
         mismatch = max_len
 
     code_path = args.code_path or strip_module(orig_path)
-    orig_cfg = run_dump_view(orig, code_path, args.timeout)
-    comp_cfg = run_dump_view(compiled_pyc, code_path, args.timeout)
+    orig_cfg = run_dump_view(orig, code_path, idx, args.timeout)
+    comp_cfg = run_dump_view(compiled_pyc, code_path, idx, args.timeout)
 
     def annotate(seq, blocks, idx):
         if idx < 0 or idx >= len(seq):
@@ -185,6 +169,7 @@ def main() -> None:
     payload = {
         "path": orig_path,
         "compiled_path": comp_path,
+        "index": idx,
         "orig_version": orig_ver_list,
         "compiled_version": comp_ver_list,
         "mismatch_index": mismatch,

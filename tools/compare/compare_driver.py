@@ -18,6 +18,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--timeout", type=int, default=120, help="Timeout seconds per step")
     p.add_argument("--focus", default="", help="Optional focus path for decompile")
     p.add_argument("--path", default="", help="Code object path for locate_mismatch")
+    p.add_argument("--index", type=int, default=-1, help="Path index if duplicates exist")
     p.add_argument("--out", default="", help="Write JSON report to this path")
     p.add_argument("--keep-temp", action="store_true", help="Keep temp files")
     return p.parse_args()
@@ -81,6 +82,8 @@ def main() -> None:
                 str(decompiled),
                 "--path",
                 args.path,
+                "--index",
+                str(args.index),
                 "--py",
                 args.py,
                 "--xdis-python",

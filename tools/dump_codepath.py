@@ -11,6 +11,7 @@ def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser()
     p.add_argument("--pyc", required=True, help="Path to .pyc")
     p.add_argument("--code-path", default="", help="Dot path to nested code object")
+    p.add_argument("--code-index", type=int, default=-1, help="Path index if duplicates exist")
     p.add_argument("--pez", default="", help="Path to pez binary")
     p.add_argument("--sections", default="bytecode,cfg,patterns", help="Comma-separated sections")
     p.add_argument("--out", default="", help="Write JSON to this path")
@@ -18,7 +19,7 @@ def parse_args() -> argparse.Namespace:
     return p.parse_args()
 
 
-def run_dump_view(pyc: Path, section: str, code_path: str, pez: str, timeout: int):
+def run_dump_view(pyc: Path, section: str, code_path: str, code_index: int, pez: str, timeout: int):
     args = [
         sys.executable,
         str(Path(__file__).resolve().parent / "dump_view.py"),
@@ -29,6 +30,8 @@ def run_dump_view(pyc: Path, section: str, code_path: str, pez: str, timeout: in
     ]
     if code_path:
         args += ["--code-path", code_path]
+    if code_index >= 0:
+        args += ["--code-index", str(code_index)]
     if pez:
         args += ["--pez", pez]
     proc = subprocess.run(args, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, timeout=timeout)
@@ -51,10 +54,18 @@ def main() -> None:
     out = {
         "pyc": str(pyc),
         "code_path": args.code_path,
+        "code_index": args.code_index if args.code_index >= 0 else None,
         "sections": {},
     }
     for section in sections:
-        out["sections"][section] = run_dump_view(pyc, section, args.code_path, args.pez, args.timeout)
+        out["sections"][section] = run_dump_view(
+            pyc,
+            section,
+            args.code_path,
+            args.code_index,
+            args.pez,
+            args.timeout,
+        )
 
     payload = json.dumps(out, indent=2)
     if args.out:
