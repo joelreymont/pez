@@ -526,7 +526,7 @@ pub const Analyzer = struct {
 
         // Check for loop header (while loop pattern) before generic if.
         if (block.is_loop_header) {
-            if (self.detectWhilePattern(block_id)) |pattern| {
+            if (self.detectWhilePattern(block_id, allow_loop_if)) |pattern| {
                 return .{ .while_loop = pattern };
             }
             // Loop headers that don't form a well-structured while shouldn't be treated as if.
@@ -1233,7 +1233,7 @@ pub const Analyzer = struct {
     }
 
     /// Detect while loop pattern.
-    fn detectWhilePattern(self: *Analyzer, block_id: u32) ?WhilePattern {
+    fn detectWhilePattern(self: *Analyzer, block_id: u32, in_loop_context: bool) ?WhilePattern {
         const block = &self.cfg.blocks[block_id];
         if (!block.is_loop_header) return null;
 
@@ -1267,22 +1267,69 @@ pub const Analyzer = struct {
         if (self.inLoop(exit_id, block_id)) {
             const chain_blk = &self.cfg.blocks[exit_id];
             const chain_term = chain_blk.terminator() orelse return null;
-            if (!self.isConditionalJump(chain_term.opcode)) return null;
 
-            var chain_in: ?u32 = null;
-            var chain_out: ?u32 = null;
-            for (chain_blk.successors) |edge| {
-                if (edge.edge_type == .exception) continue;
-                if (self.inLoop(edge.target, block_id)) {
-                    chain_in = edge.target;
+            // If exit has no conditional, it's not a chained condition
+            if (!self.isConditionalJump(chain_term.opcode)) {
+                // Check for nested loop: exit is structured code (outer loop body)
+                // that eventually loops back. Accept as valid exit.
+                var has_structure = false;
+                for (chain_blk.successors) |edge| {
+                    if (edge.edge_type == .exception) continue;
+                    if (edge.target != block_id and self.inLoop(edge.target, block_id)) {
+                        has_structure = true;
+                        break;
+                    }
+                }
+                if (!has_structure) return null;
+                // Accept exit_id as is - it's outer loop body
+            } else {
+                var chain_in: ?u32 = null;
+                var chain_out: ?u32 = null;
+                var any_direct_to_header = false;
+                for (chain_blk.successors) |edge| {
+                    if (edge.edge_type == .exception) continue;
+                    if (edge.target == block_id) any_direct_to_header = true;
+                    if (self.inLoop(edge.target, block_id)) {
+                        chain_in = edge.target;
+                    } else {
+                        chain_out = edge.target;
+                    }
+                }
+                // Nested loop case: exit_id is part of an outer loop that also
+                // targets this header. All successors are in the loop but none
+                // directly targets the header - this is outer loop body, not a
+                // chained condition. Accept exit_id as valid exit.
+                if (chain_out == null and !any_direct_to_header) {
+                    // This is a nested loop situation - accept exit_id as is
                 } else {
-                    chain_out = edge.target;
+                    if (chain_in == null or chain_out == null) return null;
+                    if (chain_in.? != body_id) return null;
+                    if (self.inLoop(chain_out.?, block_id)) return null;
+                    exit_id = chain_out.?;
                 }
             }
-            if (chain_in == null or chain_out == null) return null;
-            if (chain_in.? != body_id) return null;
-            if (self.inLoop(chain_out.?, block_id)) return null;
-            exit_id = chain_out.?;
+        }
+
+        // Check for nested loop: if there are back-edges to this header from
+        // blocks BEFORE the inner loop structure (not counting fallthrough),
+        // we have an outer loop with a separate header.
+        // Return null so decompileLoopHeader handles the outer while True:.
+        // Only do this when called from main decompile (not in_loop_context),
+        // so that the inner loop can be detected during loop body processing.
+        // Don't trigger for back-edges from blocks >= exit_id - those are
+        // continuation of the same loop body after the inner while.
+        if (!in_loop_context) {
+            const header_block = &self.cfg.blocks[block_id];
+            for (header_block.predecessors) |pred| {
+                if (pred == body_id) continue; // inner loop back-edge
+                if (pred + 1 == block_id) continue; // fallthrough from previous block
+                if (pred >= exit_id) continue; // back-edge from after inner while exit
+                // Check if pred is outside the inner loop body but in the outer loop
+                if (self.inLoop(pred, block_id) and pred != body_id) {
+                    // Additional back-edge from outside inner loop body - nested loop
+                    return null;
+                }
+            }
         }
 
         return WhilePattern{
@@ -2913,7 +2960,7 @@ test "detectWhilePattern rejects internal exit" {
     var analyzer = try Analyzer.init(allocator, &cfg, &dom);
     defer analyzer.deinit();
 
-    try testing.expect(analyzer.detectWhilePattern(0) == null);
+    try testing.expect(analyzer.detectWhilePattern(0, false) == null);
 }
 
 test "isConditionalJump" {

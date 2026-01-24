@@ -42163,3 +42163,1351 @@ Let me analyze the conversation chronologically:
 **Claude:** Let me investigate the remaining issue with for-loops containing if-statements.
 
 ---
+
+## Session - 2026-01-24 21:13:51
+
+### Active Work (bd)
+
+```
+(no in-progress items)
+```
+
+### Conversation
+
+**User:** Read your project guidelines (AGENTS.md).
+Check active dots: `dot ls --status active`
+If the dot description contains a plan file path, read it.
+Continue with the current task.
+
+**Claude:** I'll check the active dots and continue with the current task.
+
+**Claude:** No active dots. Ready for your task.
+
+**User:** keep going
+
+**Claude:** Plan complete: 190/190 pyc files decompile. All items finished. Match guards deferred (no test cases). Next: snapshot tests or new features.
+
+**User:** keep going
+
+**Claude:** No response requested.
+
+**User:** keep going
+
+**Claude:** Many dots in progress. Let me run fresh boat_main compare to check current state.
+
+**Claude:** Same as before: 140 exact, 43 close, 144 mismatch. Let me investigate worst offender `socket.pyc`.
+
+**Claude:** Found the bug: `UNARY_POSITIVE` opcode handler is missing. Let me add it.
+
+**Claude:** The string escaping test failure is pre-existing (unrelated to my change). Let me check by reverting and testing.
+
+**Claude:** The loop `while len(lines) == 4:` is being misidentified as `while True:`. Block 1 is a loop header but pattern detection says `kind: unknown`. Let me check the ctrl.zig loop detection.
+
+**Claude:** This is a complex control flow issue: the loop is actually `while True:` with complex conditionals inside, but `detectWhilePattern` expects a simpler while-with-exit pattern. When all paths lead back to the header, the detection fails.
+
+This is a pre-existing issue, not caused by UNARY_POSITIVE. Let me verify by checking if difflib was in the original mismatch list.
+
+**Claude:** Test failures are pre-existing (string escaping, py2 comprehension). My UNARY_POSITIVE fix is valid. Committing and starting new change.
+
+**Claude:** The issue is in `detectWhilePattern` at line 1287. It rejects patterns where the exit leads back to header, but `decompileWhile` already handles this case by converting to `while True:`.
+
+Let me fix this.
+
+**Claude:** Let me add debug output to understand what's happening.
+
+**Claude:** The function body is now decompiling. Let me run a full comparison.
+
+**Claude:** Good, back to baseline (143 exact). The UNARY_POSITIVE fix is working. The while True detection change broke other files so I reverted it.
+
+**User:** This session is being continued from a previous conversation that ran out of context. The summary below covers the earlier portion of the conversation.
+
+Analysis:
+Let me analyze the conversation chronologically:
+
+1. User asked to read project guidelines (AGENTS.md), check active dots, and continue with current task.
+
+2. I checked `dot ls --status active` - no active dots found.
+
+3. I read the plan file at `~/.claude/plans/composed-wishing-diffie.md` which contains a comprehensive plan for "100% Feature Parity with pycdc/uncompyle6". Key points:
+   - Current state: 209 total, 11 mismatches (3.14 corpus)
+   - pycdc test suite: 190/190 pass
+   - Boat_main: 329 total, 327 ok, 2 error
+   - Boat_main roundtrip compare: 140 exact, 43 close, 144 mismatch
+
+4. User said "keep going" twice.
+
+5. I ran tests and found 0 hard failures in pycdc test suite.
+
+6. I ran the boat_main compare - same results: 140 exact, 43 close, 144 mismatch.
+
+7. I investigated the worst offenders (socket.pyc at 0.266 min_seq_ratio).
+
+8. Found a bug: UNARY_POSITIVE opcode handler was missing in stack.zig. Added it:
+```zig
+.UNARY_POSITIVE => {
+    const operand = try self.stack.popExpr();
+    errdefer {
+        operand.deinit(self.allocator);
+        self.allocator.destroy(operand);
+    }
+    const expr = try ast.makeUnaryOp(self.allocator, .uadd, operand);
+    try self.stack.push(.{ .expr = expr });
+},
+```
+
+9. After fix: boat_main compare improved to 143 exact (from 140).
+
+10. I committed the fix with `jj describe`.
+
+11. Found difflib.pyc regressed to 0.100 min_seq_ratio. Investigated `_line_iterator` function - it was truncating output.
+
+12. Root cause: `detectWhilePattern` in ctrl.zig was returning null for block 1 (a loop header) because:
+    - The "exit" block eventually leads back to the header
+    - This is actually a `while True:` pattern with complex control flow inside
+
+13. I attempted to fix while True detection by modifying ctrl.zig:
+    - First attempt: Remove the `exitLeadsToHeader` check ...
+
+**Claude:** Looking at doctest.py's `__unknown__` occurrences to find missing opcode handlers.
+
+**Claude:** This is getting quite complex. Let me take a different approach - I'll remove the debug prints and focus on a simpler test case to verify the basic nested unpack works correctly without the if-statement complexity.
+
+**Claude:** Let me re-add the fixes for nested tuple unpacking.
+
+**Claude:** Summary of changes made:
+
+**Fixed nested tuple unpacking in for-loop targets:**
+
+1. **`collectUnpackTgts`**: Added recursive handling of nested `UNPACK_SEQUENCE` instructions, creating proper nested tuple targets like `(f, t)` instead of flat `f, t`.
+
+2. **`decompileFor`**: Added detection for Python 3.9's pattern where nested unpacking is done via `STORE_FAST var; LOAD_FAST var; UNPACK_SEQUENCE`.
+
+3. **`processPartialBlock`**: Added skip logic for nested `UNPACK_SEQUENCE` when processing for-loop body, so inner unpacking instructions don't generate spurious assignment statements.
+
+**Results:**
+- Boat_main corpus: 152 exact (up from 143 at session start)
+- Simple nested unpack like `for name, (f, t) in d.items():` now works correctly
+- Complex cases with conditionals inside the loop body still have issues (different code path)
+
+**User:** kep going
+
+**Claude:** Let me investigate the remaining issue with for-loops containing if-statements.
+
+**User:** This session is being continued from a previous conversation that ran out of context. The summary below covers the earlier portion of the conversation.
+
+Analysis:
+Let me analyze the conversation chronologically:
+
+1. **Session Start**: User asked to read AGENTS.md, check active dots, and continue with current task.
+
+2. **Initial State Check**: 
+   - No active dots found
+   - Read plan file at `~/.claude/plans/composed-wishing-diffie.md`
+   - Plan shows: 143 exact, 38 close, 147 mismatch for boat_main corpus
+
+3. **Main Work - Nested Tuple Unpacking Fix**:
+   - Investigated `__unknown__` occurrences in decompiled files
+   - Found 31 files with `__unknown__`, doctest.py having 6 occurrences
+   - Identified the pattern: `for name, (f, t) in dict.items():` was being decompiled incorrectly
+   
+4. **Bytecode Analysis**:
+   - Python 3.9 bytecode for nested unpacking:
+     ```
+     FOR_ITER
+     UNPACK_SEQUENCE 2   # outer tuple
+     STORE_FAST name
+     UNPACK_SEQUENCE 2   # inner tuple 
+     STORE_FAST f
+     STORE_FAST t
+     ```
+
+5. **Fix Implementation**:
+   - Added nested UNPACK_SEQUENCE handling in `collectUnpackTgts`
+   - Added pattern detection for STORE_FAST followed by LOAD_FAST and UNPACK_SEQUENCE in `decompileFor`
+   - Added skip logic for nested UNPACK_SEQUENCE in `processPartialBlock`
+   - Fixed tuple context (use `.load` for nested tuples to get parentheses)
+
+6. **Testing and Results**:
+   - Simple nested unpack works: `for name, (f, t) in d.items():`
+   - Boat_main: 152 exact (up from 143), 39 close, 150 mismatch
+   - Complex case with if-statement inside for-loop body still has issues
+
+7. **Remaining Issue**:
+   - When for-loop body contains an if-statement pattern, duplicate assignment statements appear
+   - Block 2 is both for-loop body AND if-statement condition block
+   - The body processing goes through a different code path that re-processes UNPACK_SEQUENCE
+
+8. **User Messages**:
+   - Initial: "Read your project guidelines... Continue with the current ...
+
+**Claude:** Let me examine the actual bytecode layout.
+
+**Claude:** Let me trace the flow more carefully. I'll add debug output to see what's happening.
+
+**Claude:** Found it. The issue is `tryDecompileBoolOpInto` calls `processPartialBlock` with `skip_first_store=false`, generating the bogus assignment. Then `stripLoopTargetAssigns` fails to clean it because it only handles ellipsis values, not `__unknown__`.
+
+The fix: pass skip_first_store to `tryDecompileBoolOpInto`.
+
+**Claude:** Let me add the skip_first_store handling to the ternary path as well.
+
+**Claude:** Let me add the skip_first_store handling to processBlockWithSimAndSkip and the chain of functions.
+
+**Claude:** Fixed the for-loop body decompilation issues. The changes:
+
+1. **Pass skip_first_store through boolop/ternary paths**: Added `tryDecompileBoolOpIntoWithSkip`, `tryDecompileTernaryIntoWithSkip`, `initCondSimWithSkipStore`, and `processBlockWithSimSkipStore` to properly propagate the skip flag through all code paths.
+
+2. **Handle nested UNPACK_SEQUENCE**: Added skip logic to both `processPartialBlock` and `processBlockWithSimAndSkipInner` for when `skip_store_count > 0` and we encounter another UNPACK_SEQUENCE (nested tuple unpacking).
+
+All test cases now work:
+- Simple for loops with tuple unpacking
+- For loops with enumerate
+- For loops with bool-op expressions in body
+- For loops with ternary expressions in body  
+- Nested tuple unpacking (e.g., `for name, (f, t) in d.items()`)
+- Combinations of the above
+
+**User:** keep going
+
+---
+
+## Session - 2026-01-24 21:44:45
+
+### Active Work (bd)
+
+```
+(no in-progress items)
+```
+
+### Conversation
+
+**User:** Read your project guidelines (AGENTS.md).
+Check active dots: `dot ls --status active`
+If the dot description contains a plan file path, read it.
+Continue with the current task.
+
+**Claude:** I'll check the active dots and continue with the current task.
+
+**Claude:** No active dots. Ready for your task.
+
+**User:** keep going
+
+**Claude:** Plan complete: 190/190 pyc files decompile. All items finished. Match guards deferred (no test cases). Next: snapshot tests or new features.
+
+**User:** keep going
+
+**Claude:** No response requested.
+
+**User:** keep going
+
+**Claude:** Many dots in progress. Let me run fresh boat_main compare to check current state.
+
+**Claude:** Same as before: 140 exact, 43 close, 144 mismatch. Let me investigate worst offender `socket.pyc`.
+
+**Claude:** Found the bug: `UNARY_POSITIVE` opcode handler is missing. Let me add it.
+
+**Claude:** The string escaping test failure is pre-existing (unrelated to my change). Let me check by reverting and testing.
+
+**Claude:** The loop `while len(lines) == 4:` is being misidentified as `while True:`. Block 1 is a loop header but pattern detection says `kind: unknown`. Let me check the ctrl.zig loop detection.
+
+**Claude:** This is a complex control flow issue: the loop is actually `while True:` with complex conditionals inside, but `detectWhilePattern` expects a simpler while-with-exit pattern. When all paths lead back to the header, the detection fails.
+
+This is a pre-existing issue, not caused by UNARY_POSITIVE. Let me verify by checking if difflib was in the original mismatch list.
+
+**Claude:** Test failures are pre-existing (string escaping, py2 comprehension). My UNARY_POSITIVE fix is valid. Committing and starting new change.
+
+**Claude:** The issue is in `detectWhilePattern` at line 1287. It rejects patterns where the exit leads back to header, but `decompileWhile` already handles this case by converting to `while True:`.
+
+Let me fix this.
+
+**Claude:** Let me add debug output to understand what's happening.
+
+**Claude:** The function body is now decompiling. Let me run a full comparison.
+
+**Claude:** Good, back to baseline (143 exact). The UNARY_POSITIVE fix is working. The while True detection change broke other files so I reverted it.
+
+**User:** This session is being continued from a previous conversation that ran out of context. The summary below covers the earlier portion of the conversation.
+
+Analysis:
+Let me analyze the conversation chronologically:
+
+1. User asked to read project guidelines (AGENTS.md), check active dots, and continue with current task.
+
+2. I checked `dot ls --status active` - no active dots found.
+
+3. I read the plan file at `~/.claude/plans/composed-wishing-diffie.md` which contains a comprehensive plan for "100% Feature Parity with pycdc/uncompyle6". Key points:
+   - Current state: 209 total, 11 mismatches (3.14 corpus)
+   - pycdc test suite: 190/190 pass
+   - Boat_main: 329 total, 327 ok, 2 error
+   - Boat_main roundtrip compare: 140 exact, 43 close, 144 mismatch
+
+4. User said "keep going" twice.
+
+5. I ran tests and found 0 hard failures in pycdc test suite.
+
+6. I ran the boat_main compare - same results: 140 exact, 43 close, 144 mismatch.
+
+7. I investigated the worst offenders (socket.pyc at 0.266 min_seq_ratio).
+
+8. Found a bug: UNARY_POSITIVE opcode handler was missing in stack.zig. Added it:
+```zig
+.UNARY_POSITIVE => {
+    const operand = try self.stack.popExpr();
+    errdefer {
+        operand.deinit(self.allocator);
+        self.allocator.destroy(operand);
+    }
+    const expr = try ast.makeUnaryOp(self.allocator, .uadd, operand);
+    try self.stack.push(.{ .expr = expr });
+},
+```
+
+9. After fix: boat_main compare improved to 143 exact (from 140).
+
+10. I committed the fix with `jj describe`.
+
+11. Found difflib.pyc regressed to 0.100 min_seq_ratio. Investigated `_line_iterator` function - it was truncating output.
+
+12. Root cause: `detectWhilePattern` in ctrl.zig was returning null for block 1 (a loop header) because:
+    - The "exit" block eventually leads back to the header
+    - This is actually a `while True:` pattern with complex control flow inside
+
+13. I attempted to fix while True detection by modifying ctrl.zig:
+    - First attempt: Remove the `exitLeadsToHeader` check ...
+
+**Claude:** Looking at doctest.py's `__unknown__` occurrences to find missing opcode handlers.
+
+**Claude:** This is getting quite complex. Let me take a different approach - I'll remove the debug prints and focus on a simpler test case to verify the basic nested unpack works correctly without the if-statement complexity.
+
+**Claude:** Let me re-add the fixes for nested tuple unpacking.
+
+**Claude:** Summary of changes made:
+
+**Fixed nested tuple unpacking in for-loop targets:**
+
+1. **`collectUnpackTgts`**: Added recursive handling of nested `UNPACK_SEQUENCE` instructions, creating proper nested tuple targets like `(f, t)` instead of flat `f, t`.
+
+2. **`decompileFor`**: Added detection for Python 3.9's pattern where nested unpacking is done via `STORE_FAST var; LOAD_FAST var; UNPACK_SEQUENCE`.
+
+3. **`processPartialBlock`**: Added skip logic for nested `UNPACK_SEQUENCE` when processing for-loop body, so inner unpacking instructions don't generate spurious assignment statements.
+
+**Results:**
+- Boat_main corpus: 152 exact (up from 143 at session start)
+- Simple nested unpack like `for name, (f, t) in d.items():` now works correctly
+- Complex cases with conditionals inside the loop body still have issues (different code path)
+
+**User:** kep going
+
+**Claude:** Let me investigate the remaining issue with for-loops containing if-statements.
+
+**User:** This session is being continued from a previous conversation that ran out of context. The summary below covers the earlier portion of the conversation.
+
+Analysis:
+Let me analyze the conversation chronologically:
+
+1. **Session Start**: User asked to read AGENTS.md, check active dots, and continue with current task.
+
+2. **Initial State Check**: 
+   - No active dots found
+   - Read plan file at `~/.claude/plans/composed-wishing-diffie.md`
+   - Plan shows: 143 exact, 38 close, 147 mismatch for boat_main corpus
+
+3. **Main Work - Nested Tuple Unpacking Fix**:
+   - Investigated `__unknown__` occurrences in decompiled files
+   - Found 31 files with `__unknown__`, doctest.py having 6 occurrences
+   - Identified the pattern: `for name, (f, t) in dict.items():` was being decompiled incorrectly
+   
+4. **Bytecode Analysis**:
+   - Python 3.9 bytecode for nested unpacking:
+     ```
+     FOR_ITER
+     UNPACK_SEQUENCE 2   # outer tuple
+     STORE_FAST name
+     UNPACK_SEQUENCE 2   # inner tuple 
+     STORE_FAST f
+     STORE_FAST t
+     ```
+
+5. **Fix Implementation**:
+   - Added nested UNPACK_SEQUENCE handling in `collectUnpackTgts`
+   - Added pattern detection for STORE_FAST followed by LOAD_FAST and UNPACK_SEQUENCE in `decompileFor`
+   - Added skip logic for nested UNPACK_SEQUENCE in `processPartialBlock`
+   - Fixed tuple context (use `.load` for nested tuples to get parentheses)
+
+6. **Testing and Results**:
+   - Simple nested unpack works: `for name, (f, t) in d.items():`
+   - Boat_main: 152 exact (up from 143), 39 close, 150 mismatch
+   - Complex case with if-statement inside for-loop body still has issues
+
+7. **Remaining Issue**:
+   - When for-loop body contains an if-statement pattern, duplicate assignment statements appear
+   - Block 2 is both for-loop body AND if-statement condition block
+   - The body processing goes through a different code path that re-processes UNPACK_SEQUENCE
+
+8. **User Messages**:
+   - Initial: "Read your project guidelines... Continue with the current ...
+
+**Claude:** Let me examine the actual bytecode layout.
+
+**Claude:** Let me trace the flow more carefully. I'll add debug output to see what's happening.
+
+**Claude:** Found it. The issue is `tryDecompileBoolOpInto` calls `processPartialBlock` with `skip_first_store=false`, generating the bogus assignment. Then `stripLoopTargetAssigns` fails to clean it because it only handles ellipsis values, not `__unknown__`.
+
+The fix: pass skip_first_store to `tryDecompileBoolOpInto`.
+
+**Claude:** Let me add the skip_first_store handling to the ternary path as well.
+
+**Claude:** Let me add the skip_first_store handling to processBlockWithSimAndSkip and the chain of functions.
+
+**Claude:** Fixed the for-loop body decompilation issues. The changes:
+
+1. **Pass skip_first_store through boolop/ternary paths**: Added `tryDecompileBoolOpIntoWithSkip`, `tryDecompileTernaryIntoWithSkip`, `initCondSimWithSkipStore`, and `processBlockWithSimSkipStore` to properly propagate the skip flag through all code paths.
+
+2. **Handle nested UNPACK_SEQUENCE**: Added skip logic to both `processPartialBlock` and `processBlockWithSimAndSkipInner` for when `skip_store_count > 0` and we encounter another UNPACK_SEQUENCE (nested tuple unpacking).
+
+All test cases now work:
+- Simple for loops with tuple unpacking
+- For loops with enumerate
+- For loops with bool-op expressions in body
+- For loops with ternary expressions in body  
+- Nested tuple unpacking (e.g., `for name, (f, t) in d.items()`)
+- Combinations of the above
+
+**User:** keep going
+
+**User:** This session is being continued from a previous conversation that ran out of context. The summary below covers the earlier portion of the conversation.
+
+Analysis:
+Let me analyze the conversation chronologically:
+
+1. **Session Start**: The user asked to continue with the current task. The context showed previous work on nested tuple unpacking in for-loops.
+
+2. **Initial State**: 
+   - Plan at `~/.claude/plans/composed-wishing-diffie.md`
+   - Previous commit: "Handle nested tuple unpacking in for-loop targets"
+   - Boat_main corpus: 152 exact (up from 143), 39 close, 150 mismatch
+   - Issue: Complex for-loops with if-statements inside generated duplicate assignment statements
+
+3. **Problem Investigation**:
+   - Test case `/tmp/complex_for.py` with `for idx, item in enumerate(items): quiet = flag & 1 and idx > 0`
+   - Output had spurious `idx, item = __unknown__` 
+   - Root cause: `tryDecompileBoolOpInto` called `processPartialBlock` with `skip_first_store=false`, causing UNPACK_SEQUENCE to generate bogus assignments
+   - `stripLoopTargetAssigns` failed to clean up because it looks for ellipsis values, not `__unknown__`
+
+4. **First Fix - BoolOp Path**:
+   - Added `tryDecompileBoolOpIntoWithSkip` to decompile.zig
+   - Added `tryDecompileBoolOpIntoWithSkip` to sc_pass.zig that takes `skip_first_store_param`
+   - Updated call sites in `decompileForBody` and `decompileLoopBody`
+
+5. **Second Fix - Nested UNPACK_SEQUENCE in processPartialBlock**:
+   - Added nested UNPACK_SEQUENCE handling when `skip_store_count > 0`
+   - Test case: `for name, (f, t) in d.items(): active = flag and name != ""`
+
+6. **Third Fix - Ternary Path**:
+   - Test case `/tmp/ternary_for.py` with `x = a if flag else b` showed same issue
+   - Added `tryDecompileTernaryIntoWithSkip` to decompile.zig
+   - Added `tryDecompileTernaryIntoWithSkip` to sc_pass.zig
+   - Added `initCondSimWithSkipStore` to sc_pass.zig
+   - Added `processBlockWithSimSkipStore` and `processBlockWithSimAndSkipInner` to decompile.zig
+...
+
+**Claude:** Improved: exact 140 → 145 (+5), close 43 → 37 (-6), mismatch 144 → 146 (+2).
+
+Let me check the worst file - difflib:
+
+**Claude:** Worst unit: `_mdiff._line_iterator` (seq_ratio=0.1, orig 285 ops vs comp 15). This is a generator that failed to decompile. Let me check:
+
+**Claude:** Let me see the decompiled source:
+
+**Claude:** The generator is truncated - only the first few lines emitted. Let me check the Python source:
+
+**Claude:** The generator body has complex control flow with many `yield` and `continue` statements. The decompiled output only has the first few lines before getting lost. Let me check the bytecode to understand the issue:
+
+**Claude:** The generator body is almost entirely missing. Let me see the bytecode dump:
+
+**Claude:** The issue: Block 1 is marked `is_loop_header=true` but pattern kind is `unknown`. The outer while loop isn't being detected. Let me look at block edges:
+
+**Claude:** Block 1 has 11 predecessors because many branches `continue` to it. The issue is:
+
+1. `while True:` starts after block 0 with no explicit condition
+2. Block 1 is the inner `while len(lines) < 4:` loop
+3. Block 2 is inner loop body
+4. The decompiler treats block 2's jump back to block 1 as the end of everything
+
+Let me look at which blocks jump to block 1:
+
+**Claude:** 10 jumps to offset 12 - these are `continue` statements within the outer `while True:`. The issue is nested loops where:
+- Inner loop: `while len(lines) < 4:` (block 1 header)
+- Outer loop: implicit `while True:` containing blocks 1-39
+
+The decompiler only processes the inner loop and stops. Let me look at the decompiler's loop handling:
+
+**Claude:** Let me check why block 1 doesn't get a loop pattern:
+
+**Claude:** This is a nested loop issue. Block 1 is the inner loop header, but `continue` statements from the outer `while True:` jump to block 1. This makes all blocks 3-39 appear to be "in the loop" of block 1, so `exit_id` (block 3) fails the "not in loop" check.
+
+Let me create a minimal test case:
+
+**Claude:** Inner `while` became an `if...continue`. Let me check patterns:
+
+**Claude:** The decompiler outputs `while True:` but turns the inner `while` into `if...continue`. The issue is the inner loop pattern detection fails.
+
+Let me check what happens when processing block 1:
+
+**Claude:** The issue: `inLoop(3, 1)` returns true because block 3 eventually leads back to block 1 through `continue` statements. But block 3 should be considered the EXIT of the inner loop, even though it's inside the outer loop.
+
+The fix needs to distinguish inner loop exit from outer loop body. Let me check if any of block 3's successors directly jump to block 1:
+
+**Claude:** I see the issue. Block 3's successors (blocks 4 and 6) don't directly target block 1 - they have more structure. This indicates block 3 is outer loop body, not a chained loop condition.
+
+Fix: If exit_id is "in loop" but none of its successors directly target the header, treat it as a valid exit (it's part of an outer loop, not a chained condition):
+
+**Claude:** Now the inner `while` is detected but outer `while True:` is gone. Let me check patterns:
+
+**Claude:** The fix made inner loop work but broke outer loop detection. The issue is more complex - we need BOTH loops detected. Let me revert and try a different approach:
+
+**Claude:** Let me check how the outer loop is detected. The issue might be in how `while True:` is handled:
+
+**Claude:** Let me trace what happens when decompiling:
+
+**Claude:** The `continue` after `items.append(1)` is from block 2's JUMP_ABSOLUTE back to block 1. Let me check how the inner loop is treated:
+
+**Claude:** The issue is that block 1 is both the inner loop header AND the outer loop body start. When decompiling the outer loop body, we should recognize block 1 as a nested loop.
+
+Let me check `decompileLoopBody`:
+
+**Claude:** Let me check how the while loop pattern is used:
+
+**Claude:** The issue is that block 1 represents BOTH loops. When the inner loop is detected, the outer loop context is lost. I need to check if there are additional back-edges indicating an outer loop:
+
+**Claude:** Let me re-apply the fix and test more carefully:
+
+**Claude:** The outer loop is lost. Let me check why - the blocks after inner loop should still be processed but `continue` is missing. Let me check the pattern detection:
+
+**Claude:** The issue is that the while_loop pattern is detected BEFORE `decompileLoopHeader` is called. The fix should be: if block 1 has additional back-edges beyond the inner loop, don't return the while pattern - let `decompileLoopHeader` handle it.
+
+**Claude:** I need to modify `detectWhilePattern` to check for additional back-edges indicating an outer loop:
+
+**Claude:** The outer loop is back but inner loop is still `if...continue`. I need to only return null when called from main loop, not from within loop body:
+
+**Claude:** The output is truncated - only inner while is shown. Let me check what's happening in the loop body processing:
+
+---
+
+## Session - 2026-01-25 11:06:39
+
+### Active Work (bd)
+
+```
+(no in-progress items)
+```
+
+### Conversation
+
+**User:** Read your project guidelines (AGENTS.md).
+Check active dots: `dot ls --status active`
+If the dot description contains a plan file path, read it.
+Continue with the current task.
+
+**Claude:** I'll check the active dots and continue with the current task.
+
+**Claude:** No active dots. Ready for your task.
+
+**User:** keep going
+
+**Claude:** Plan complete: 190/190 pyc files decompile. All items finished. Match guards deferred (no test cases). Next: snapshot tests or new features.
+
+**User:** keep going
+
+**Claude:** No response requested.
+
+**User:** keep going
+
+**Claude:** Many dots in progress. Let me run fresh boat_main compare to check current state.
+
+**Claude:** Same as before: 140 exact, 43 close, 144 mismatch. Let me investigate worst offender `socket.pyc`.
+
+**Claude:** Found the bug: `UNARY_POSITIVE` opcode handler is missing. Let me add it.
+
+**Claude:** The string escaping test failure is pre-existing (unrelated to my change). Let me check by reverting and testing.
+
+**Claude:** The loop `while len(lines) == 4:` is being misidentified as `while True:`. Block 1 is a loop header but pattern detection says `kind: unknown`. Let me check the ctrl.zig loop detection.
+
+**Claude:** This is a complex control flow issue: the loop is actually `while True:` with complex conditionals inside, but `detectWhilePattern` expects a simpler while-with-exit pattern. When all paths lead back to the header, the detection fails.
+
+This is a pre-existing issue, not caused by UNARY_POSITIVE. Let me verify by checking if difflib was in the original mismatch list.
+
+**Claude:** Test failures are pre-existing (string escaping, py2 comprehension). My UNARY_POSITIVE fix is valid. Committing and starting new change.
+
+**Claude:** The issue is in `detectWhilePattern` at line 1287. It rejects patterns where the exit leads back to header, but `decompileWhile` already handles this case by converting to `while True:`.
+
+Let me fix this.
+
+**Claude:** Let me add debug output to understand what's happening.
+
+**Claude:** The function body is now decompiling. Let me run a full comparison.
+
+**Claude:** Good, back to baseline (143 exact). The UNARY_POSITIVE fix is working. The while True detection change broke other files so I reverted it.
+
+**User:** This session is being continued from a previous conversation that ran out of context. The summary below covers the earlier portion of the conversation.
+
+Analysis:
+Let me analyze the conversation chronologically:
+
+1. User asked to read project guidelines (AGENTS.md), check active dots, and continue with current task.
+
+2. I checked `dot ls --status active` - no active dots found.
+
+3. I read the plan file at `~/.claude/plans/composed-wishing-diffie.md` which contains a comprehensive plan for "100% Feature Parity with pycdc/uncompyle6". Key points:
+   - Current state: 209 total, 11 mismatches (3.14 corpus)
+   - pycdc test suite: 190/190 pass
+   - Boat_main: 329 total, 327 ok, 2 error
+   - Boat_main roundtrip compare: 140 exact, 43 close, 144 mismatch
+
+4. User said "keep going" twice.
+
+5. I ran tests and found 0 hard failures in pycdc test suite.
+
+6. I ran the boat_main compare - same results: 140 exact, 43 close, 144 mismatch.
+
+7. I investigated the worst offenders (socket.pyc at 0.266 min_seq_ratio).
+
+8. Found a bug: UNARY_POSITIVE opcode handler was missing in stack.zig. Added it:
+```zig
+.UNARY_POSITIVE => {
+    const operand = try self.stack.popExpr();
+    errdefer {
+        operand.deinit(self.allocator);
+        self.allocator.destroy(operand);
+    }
+    const expr = try ast.makeUnaryOp(self.allocator, .uadd, operand);
+    try self.stack.push(.{ .expr = expr });
+},
+```
+
+9. After fix: boat_main compare improved to 143 exact (from 140).
+
+10. I committed the fix with `jj describe`.
+
+11. Found difflib.pyc regressed to 0.100 min_seq_ratio. Investigated `_line_iterator` function - it was truncating output.
+
+12. Root cause: `detectWhilePattern` in ctrl.zig was returning null for block 1 (a loop header) because:
+    - The "exit" block eventually leads back to the header
+    - This is actually a `while True:` pattern with complex control flow inside
+
+13. I attempted to fix while True detection by modifying ctrl.zig:
+    - First attempt: Remove the `exitLeadsToHeader` check ...
+
+**Claude:** Looking at doctest.py's `__unknown__` occurrences to find missing opcode handlers.
+
+**Claude:** This is getting quite complex. Let me take a different approach - I'll remove the debug prints and focus on a simpler test case to verify the basic nested unpack works correctly without the if-statement complexity.
+
+**Claude:** Let me re-add the fixes for nested tuple unpacking.
+
+**Claude:** Summary of changes made:
+
+**Fixed nested tuple unpacking in for-loop targets:**
+
+1. **`collectUnpackTgts`**: Added recursive handling of nested `UNPACK_SEQUENCE` instructions, creating proper nested tuple targets like `(f, t)` instead of flat `f, t`.
+
+2. **`decompileFor`**: Added detection for Python 3.9's pattern where nested unpacking is done via `STORE_FAST var; LOAD_FAST var; UNPACK_SEQUENCE`.
+
+3. **`processPartialBlock`**: Added skip logic for nested `UNPACK_SEQUENCE` when processing for-loop body, so inner unpacking instructions don't generate spurious assignment statements.
+
+**Results:**
+- Boat_main corpus: 152 exact (up from 143 at session start)
+- Simple nested unpack like `for name, (f, t) in d.items():` now works correctly
+- Complex cases with conditionals inside the loop body still have issues (different code path)
+
+**User:** kep going
+
+**Claude:** Let me investigate the remaining issue with for-loops containing if-statements.
+
+**User:** This session is being continued from a previous conversation that ran out of context. The summary below covers the earlier portion of the conversation.
+
+Analysis:
+Let me analyze the conversation chronologically:
+
+1. **Session Start**: User asked to read AGENTS.md, check active dots, and continue with current task.
+
+2. **Initial State Check**: 
+   - No active dots found
+   - Read plan file at `~/.claude/plans/composed-wishing-diffie.md`
+   - Plan shows: 143 exact, 38 close, 147 mismatch for boat_main corpus
+
+3. **Main Work - Nested Tuple Unpacking Fix**:
+   - Investigated `__unknown__` occurrences in decompiled files
+   - Found 31 files with `__unknown__`, doctest.py having 6 occurrences
+   - Identified the pattern: `for name, (f, t) in dict.items():` was being decompiled incorrectly
+   
+4. **Bytecode Analysis**:
+   - Python 3.9 bytecode for nested unpacking:
+     ```
+     FOR_ITER
+     UNPACK_SEQUENCE 2   # outer tuple
+     STORE_FAST name
+     UNPACK_SEQUENCE 2   # inner tuple 
+     STORE_FAST f
+     STORE_FAST t
+     ```
+
+5. **Fix Implementation**:
+   - Added nested UNPACK_SEQUENCE handling in `collectUnpackTgts`
+   - Added pattern detection for STORE_FAST followed by LOAD_FAST and UNPACK_SEQUENCE in `decompileFor`
+   - Added skip logic for nested UNPACK_SEQUENCE in `processPartialBlock`
+   - Fixed tuple context (use `.load` for nested tuples to get parentheses)
+
+6. **Testing and Results**:
+   - Simple nested unpack works: `for name, (f, t) in d.items():`
+   - Boat_main: 152 exact (up from 143), 39 close, 150 mismatch
+   - Complex case with if-statement inside for-loop body still has issues
+
+7. **Remaining Issue**:
+   - When for-loop body contains an if-statement pattern, duplicate assignment statements appear
+   - Block 2 is both for-loop body AND if-statement condition block
+   - The body processing goes through a different code path that re-processes UNPACK_SEQUENCE
+
+8. **User Messages**:
+   - Initial: "Read your project guidelines... Continue with the current ...
+
+**Claude:** Let me examine the actual bytecode layout.
+
+**Claude:** Let me trace the flow more carefully. I'll add debug output to see what's happening.
+
+**Claude:** Found it. The issue is `tryDecompileBoolOpInto` calls `processPartialBlock` with `skip_first_store=false`, generating the bogus assignment. Then `stripLoopTargetAssigns` fails to clean it because it only handles ellipsis values, not `__unknown__`.
+
+The fix: pass skip_first_store to `tryDecompileBoolOpInto`.
+
+**Claude:** Let me add the skip_first_store handling to the ternary path as well.
+
+**Claude:** Let me add the skip_first_store handling to processBlockWithSimAndSkip and the chain of functions.
+
+**Claude:** Fixed the for-loop body decompilation issues. The changes:
+
+1. **Pass skip_first_store through boolop/ternary paths**: Added `tryDecompileBoolOpIntoWithSkip`, `tryDecompileTernaryIntoWithSkip`, `initCondSimWithSkipStore`, and `processBlockWithSimSkipStore` to properly propagate the skip flag through all code paths.
+
+2. **Handle nested UNPACK_SEQUENCE**: Added skip logic to both `processPartialBlock` and `processBlockWithSimAndSkipInner` for when `skip_store_count > 0` and we encounter another UNPACK_SEQUENCE (nested tuple unpacking).
+
+All test cases now work:
+- Simple for loops with tuple unpacking
+- For loops with enumerate
+- For loops with bool-op expressions in body
+- For loops with ternary expressions in body  
+- Nested tuple unpacking (e.g., `for name, (f, t) in d.items()`)
+- Combinations of the above
+
+**User:** keep going
+
+**User:** This session is being continued from a previous conversation that ran out of context. The summary below covers the earlier portion of the conversation.
+
+Analysis:
+Let me analyze the conversation chronologically:
+
+1. **Session Start**: The user asked to continue with the current task. The context showed previous work on nested tuple unpacking in for-loops.
+
+2. **Initial State**: 
+   - Plan at `~/.claude/plans/composed-wishing-diffie.md`
+   - Previous commit: "Handle nested tuple unpacking in for-loop targets"
+   - Boat_main corpus: 152 exact (up from 143), 39 close, 150 mismatch
+   - Issue: Complex for-loops with if-statements inside generated duplicate assignment statements
+
+3. **Problem Investigation**:
+   - Test case `/tmp/complex_for.py` with `for idx, item in enumerate(items): quiet = flag & 1 and idx > 0`
+   - Output had spurious `idx, item = __unknown__` 
+   - Root cause: `tryDecompileBoolOpInto` called `processPartialBlock` with `skip_first_store=false`, causing UNPACK_SEQUENCE to generate bogus assignments
+   - `stripLoopTargetAssigns` failed to clean up because it looks for ellipsis values, not `__unknown__`
+
+4. **First Fix - BoolOp Path**:
+   - Added `tryDecompileBoolOpIntoWithSkip` to decompile.zig
+   - Added `tryDecompileBoolOpIntoWithSkip` to sc_pass.zig that takes `skip_first_store_param`
+   - Updated call sites in `decompileForBody` and `decompileLoopBody`
+
+5. **Second Fix - Nested UNPACK_SEQUENCE in processPartialBlock**:
+   - Added nested UNPACK_SEQUENCE handling when `skip_store_count > 0`
+   - Test case: `for name, (f, t) in d.items(): active = flag and name != ""`
+
+6. **Third Fix - Ternary Path**:
+   - Test case `/tmp/ternary_for.py` with `x = a if flag else b` showed same issue
+   - Added `tryDecompileTernaryIntoWithSkip` to decompile.zig
+   - Added `tryDecompileTernaryIntoWithSkip` to sc_pass.zig
+   - Added `initCondSimWithSkipStore` to sc_pass.zig
+   - Added `processBlockWithSimSkipStore` and `processBlockWithSimAndSkipInner` to decompile.zig
+...
+
+**Claude:** Improved: exact 140 → 145 (+5), close 43 → 37 (-6), mismatch 144 → 146 (+2).
+
+Let me check the worst file - difflib:
+
+**Claude:** Worst unit: `_mdiff._line_iterator` (seq_ratio=0.1, orig 285 ops vs comp 15). This is a generator that failed to decompile. Let me check:
+
+**Claude:** Let me see the decompiled source:
+
+**Claude:** The generator is truncated - only the first few lines emitted. Let me check the Python source:
+
+**Claude:** The generator body has complex control flow with many `yield` and `continue` statements. The decompiled output only has the first few lines before getting lost. Let me check the bytecode to understand the issue:
+
+**Claude:** The generator body is almost entirely missing. Let me see the bytecode dump:
+
+**Claude:** The issue: Block 1 is marked `is_loop_header=true` but pattern kind is `unknown`. The outer while loop isn't being detected. Let me look at block edges:
+
+**Claude:** Block 1 has 11 predecessors because many branches `continue` to it. The issue is:
+
+1. `while True:` starts after block 0 with no explicit condition
+2. Block 1 is the inner `while len(lines) < 4:` loop
+3. Block 2 is inner loop body
+4. The decompiler treats block 2's jump back to block 1 as the end of everything
+
+Let me look at which blocks jump to block 1:
+
+**Claude:** 10 jumps to offset 12 - these are `continue` statements within the outer `while True:`. The issue is nested loops where:
+- Inner loop: `while len(lines) < 4:` (block 1 header)
+- Outer loop: implicit `while True:` containing blocks 1-39
+
+The decompiler only processes the inner loop and stops. Let me look at the decompiler's loop handling:
+
+**Claude:** Let me check why block 1 doesn't get a loop pattern:
+
+**Claude:** This is a nested loop issue. Block 1 is the inner loop header, but `continue` statements from the outer `while True:` jump to block 1. This makes all blocks 3-39 appear to be "in the loop" of block 1, so `exit_id` (block 3) fails the "not in loop" check.
+
+Let me create a minimal test case:
+
+**Claude:** Inner `while` became an `if...continue`. Let me check patterns:
+
+**Claude:** The decompiler outputs `while True:` but turns the inner `while` into `if...continue`. The issue is the inner loop pattern detection fails.
+
+Let me check what happens when processing block 1:
+
+**Claude:** The issue: `inLoop(3, 1)` returns true because block 3 eventually leads back to block 1 through `continue` statements. But block 3 should be considered the EXIT of the inner loop, even though it's inside the outer loop.
+
+The fix needs to distinguish inner loop exit from outer loop body. Let me check if any of block 3's successors directly jump to block 1:
+
+**Claude:** I see the issue. Block 3's successors (blocks 4 and 6) don't directly target block 1 - they have more structure. This indicates block 3 is outer loop body, not a chained loop condition.
+
+Fix: If exit_id is "in loop" but none of its successors directly target the header, treat it as a valid exit (it's part of an outer loop, not a chained condition):
+
+**Claude:** Now the inner `while` is detected but outer `while True:` is gone. Let me check patterns:
+
+**Claude:** The fix made inner loop work but broke outer loop detection. The issue is more complex - we need BOTH loops detected. Let me revert and try a different approach:
+
+**Claude:** Let me check how the outer loop is detected. The issue might be in how `while True:` is handled:
+
+**Claude:** Let me trace what happens when decompiling:
+
+**Claude:** The `continue` after `items.append(1)` is from block 2's JUMP_ABSOLUTE back to block 1. Let me check how the inner loop is treated:
+
+**Claude:** The issue is that block 1 is both the inner loop header AND the outer loop body start. When decompiling the outer loop body, we should recognize block 1 as a nested loop.
+
+Let me check `decompileLoopBody`:
+
+**Claude:** Let me check how the while loop pattern is used:
+
+**Claude:** The issue is that block 1 represents BOTH loops. When the inner loop is detected, the outer loop context is lost. I need to check if there are additional back-edges indicating an outer loop:
+
+**Claude:** Let me re-apply the fix and test more carefully:
+
+**Claude:** The outer loop is lost. Let me check why - the blocks after inner loop should still be processed but `continue` is missing. Let me check the pattern detection:
+
+**Claude:** The issue is that the while_loop pattern is detected BEFORE `decompileLoopHeader` is called. The fix should be: if block 1 has additional back-edges beyond the inner loop, don't return the while pattern - let `decompileLoopHeader` handle it.
+
+**Claude:** I need to modify `detectWhilePattern` to check for additional back-edges indicating an outer loop:
+
+**Claude:** The outer loop is back but inner loop is still `if...continue`. I need to only return null when called from main loop, not from within loop body:
+
+**Claude:** The output is truncated - only inner while is shown. Let me check what's happening in the loop body processing:
+
+**User:** This session is being continued from a previous conversation that ran out of context. The summary below covers the earlier portion of the conversation.
+
+Analysis:
+Let me chronologically analyze the conversation:
+
+1. **Session Start**: Continuation from previous session about pez decompiler improvements. Previous work fixed for-loop body decompilation with bool-op, ternary, and nested unpack. Current session continues with boat_main corpus improvements.
+
+2. **Initial Work**: 
+   - Ran boat_main comparison: exact 140 → 145 (+5), close 43 → 37 (-6), mismatch 144 → 146 (+2)
+   - Identified worst file: difflib.pyc with min_seq_ratio=0.1
+   - Found worst unit: `_mdiff._line_iterator` (seq_ratio=0.1, orig 285 ops vs comp 15)
+
+3. **Root Cause Analysis**:
+   - The generator function `_line_iterator` has complex nested loops
+   - Outer `while True:` loop contains inner `while len(items) < 4:` loop
+   - The decompiler only outputs inner loop partially, loses outer loop structure
+   - Issue in `detectWhilePattern` in ctrl.zig: when exit block is "in loop" due to outer loop back-edges, pattern detection fails
+
+4. **First Fix Attempt** (reverted):
+   - Modified `detectWhilePattern` to accept exit_id when all successors are in loop but none directly targets header
+   - Result: Inner loop detected, but outer `while True:` lost
+
+5. **Second Fix Attempt**:
+   - Added `in_loop_context` parameter to `detectWhilePattern`
+   - Check for additional back-edges only when NOT in loop context
+   - Result: Both loops detected but body after inner loop is missing
+
+6. **Current State**:
+   - Modified files: `src/ctrl.zig`
+   - Output shows `while True:` containing `while len(items) < 4:` but blocks 3-8 (the if/elif/else with yields) are completely missing
+   - The decompilation stops after the inner while loop
+
+Key code changes made:
+
+In `detectWhilePattern`:
+1. Added `in_loop_context` parameter
+2. Added nested loop exit detection for non-conditional terminators
+3. Added check for additional bac...
+
+**Claude:** The nested loop is now decompiled correctly. Let me run the boat_main comparison.
+
+**Claude:** Let me check difflib specifically since that was the issue.
+
+**Claude:** The issue is in Python 3.9, the `while True:` and inner `while condition:` share the same header block. Let me examine the control flow more carefully.
+
+**Claude:** I see the issue now. My nested loop check at lines 1318-1328 is too aggressive for Python 3.9 where `while True:` and `while condition:` share the same header. The check returns null because there are back-edges from blocks after the inner while exit, but those are expected in the shared-header case.
+
+**Claude:** The fix significantly improved `_line_iterator` in difflib.pyc:
+- seq_ratio: 0.137 → 0.993
+- len_comp: 21 → 285 (matches original)
+
+Summary of fix: In `detectWhilePattern`, the nested loop check was too aggressive for Python 3.9 bytecode where `while True:` and `while condition:` share the same header block. Back-edges from blocks after the inner while's exit (>= exit_id) are expected continuation of the loop body, not indicators of a separate outer loop.
+
+**Claude:** Fixed nested loop pattern detection for shared headers.
+
+Key improvement: `_line_iterator` in difflib.pyc seq_ratio: 0.137 → 0.993 (len_comp: 21 → 285).
+
+The fix allows back-edges from blocks >= exit_id when detecting nested loops, as those represent continuation of the loop body after the inner while - not indicators of a separate outer loop with a different header.
+
+**User:** keep going
+
+---
+
+## Session - 2026-01-25 12:53:42
+
+### Active Work (bd)
+
+```
+(no in-progress items)
+```
+
+### Conversation
+
+**User:** Read your project guidelines (AGENTS.md).
+Check active dots: `dot ls --status active`
+If the dot description contains a plan file path, read it.
+Continue with the current task.
+
+**Claude:** I'll check the active dots and continue with the current task.
+
+**Claude:** No active dots. Ready for your task.
+
+**User:** keep going
+
+**Claude:** Plan complete: 190/190 pyc files decompile. All items finished. Match guards deferred (no test cases). Next: snapshot tests or new features.
+
+**User:** keep going
+
+**Claude:** No response requested.
+
+**User:** keep going
+
+**Claude:** Many dots in progress. Let me run fresh boat_main compare to check current state.
+
+**Claude:** Same as before: 140 exact, 43 close, 144 mismatch. Let me investigate worst offender `socket.pyc`.
+
+**Claude:** Found the bug: `UNARY_POSITIVE` opcode handler is missing. Let me add it.
+
+**Claude:** The string escaping test failure is pre-existing (unrelated to my change). Let me check by reverting and testing.
+
+**Claude:** The loop `while len(lines) == 4:` is being misidentified as `while True:`. Block 1 is a loop header but pattern detection says `kind: unknown`. Let me check the ctrl.zig loop detection.
+
+**Claude:** This is a complex control flow issue: the loop is actually `while True:` with complex conditionals inside, but `detectWhilePattern` expects a simpler while-with-exit pattern. When all paths lead back to the header, the detection fails.
+
+This is a pre-existing issue, not caused by UNARY_POSITIVE. Let me verify by checking if difflib was in the original mismatch list.
+
+**Claude:** Test failures are pre-existing (string escaping, py2 comprehension). My UNARY_POSITIVE fix is valid. Committing and starting new change.
+
+**Claude:** The issue is in `detectWhilePattern` at line 1287. It rejects patterns where the exit leads back to header, but `decompileWhile` already handles this case by converting to `while True:`.
+
+Let me fix this.
+
+**Claude:** Let me add debug output to understand what's happening.
+
+**Claude:** The function body is now decompiling. Let me run a full comparison.
+
+**Claude:** Good, back to baseline (143 exact). The UNARY_POSITIVE fix is working. The while True detection change broke other files so I reverted it.
+
+**User:** This session is being continued from a previous conversation that ran out of context. The summary below covers the earlier portion of the conversation.
+
+Analysis:
+Let me analyze the conversation chronologically:
+
+1. User asked to read project guidelines (AGENTS.md), check active dots, and continue with current task.
+
+2. I checked `dot ls --status active` - no active dots found.
+
+3. I read the plan file at `~/.claude/plans/composed-wishing-diffie.md` which contains a comprehensive plan for "100% Feature Parity with pycdc/uncompyle6". Key points:
+   - Current state: 209 total, 11 mismatches (3.14 corpus)
+   - pycdc test suite: 190/190 pass
+   - Boat_main: 329 total, 327 ok, 2 error
+   - Boat_main roundtrip compare: 140 exact, 43 close, 144 mismatch
+
+4. User said "keep going" twice.
+
+5. I ran tests and found 0 hard failures in pycdc test suite.
+
+6. I ran the boat_main compare - same results: 140 exact, 43 close, 144 mismatch.
+
+7. I investigated the worst offenders (socket.pyc at 0.266 min_seq_ratio).
+
+8. Found a bug: UNARY_POSITIVE opcode handler was missing in stack.zig. Added it:
+```zig
+.UNARY_POSITIVE => {
+    const operand = try self.stack.popExpr();
+    errdefer {
+        operand.deinit(self.allocator);
+        self.allocator.destroy(operand);
+    }
+    const expr = try ast.makeUnaryOp(self.allocator, .uadd, operand);
+    try self.stack.push(.{ .expr = expr });
+},
+```
+
+9. After fix: boat_main compare improved to 143 exact (from 140).
+
+10. I committed the fix with `jj describe`.
+
+11. Found difflib.pyc regressed to 0.100 min_seq_ratio. Investigated `_line_iterator` function - it was truncating output.
+
+12. Root cause: `detectWhilePattern` in ctrl.zig was returning null for block 1 (a loop header) because:
+    - The "exit" block eventually leads back to the header
+    - This is actually a `while True:` pattern with complex control flow inside
+
+13. I attempted to fix while True detection by modifying ctrl.zig:
+    - First attempt: Remove the `exitLeadsToHeader` check ...
+
+**Claude:** Looking at doctest.py's `__unknown__` occurrences to find missing opcode handlers.
+
+**Claude:** This is getting quite complex. Let me take a different approach - I'll remove the debug prints and focus on a simpler test case to verify the basic nested unpack works correctly without the if-statement complexity.
+
+**Claude:** Let me re-add the fixes for nested tuple unpacking.
+
+**Claude:** Summary of changes made:
+
+**Fixed nested tuple unpacking in for-loop targets:**
+
+1. **`collectUnpackTgts`**: Added recursive handling of nested `UNPACK_SEQUENCE` instructions, creating proper nested tuple targets like `(f, t)` instead of flat `f, t`.
+
+2. **`decompileFor`**: Added detection for Python 3.9's pattern where nested unpacking is done via `STORE_FAST var; LOAD_FAST var; UNPACK_SEQUENCE`.
+
+3. **`processPartialBlock`**: Added skip logic for nested `UNPACK_SEQUENCE` when processing for-loop body, so inner unpacking instructions don't generate spurious assignment statements.
+
+**Results:**
+- Boat_main corpus: 152 exact (up from 143 at session start)
+- Simple nested unpack like `for name, (f, t) in d.items():` now works correctly
+- Complex cases with conditionals inside the loop body still have issues (different code path)
+
+**User:** kep going
+
+**Claude:** Let me investigate the remaining issue with for-loops containing if-statements.
+
+**User:** This session is being continued from a previous conversation that ran out of context. The summary below covers the earlier portion of the conversation.
+
+Analysis:
+Let me analyze the conversation chronologically:
+
+1. **Session Start**: User asked to read AGENTS.md, check active dots, and continue with current task.
+
+2. **Initial State Check**: 
+   - No active dots found
+   - Read plan file at `~/.claude/plans/composed-wishing-diffie.md`
+   - Plan shows: 143 exact, 38 close, 147 mismatch for boat_main corpus
+
+3. **Main Work - Nested Tuple Unpacking Fix**:
+   - Investigated `__unknown__` occurrences in decompiled files
+   - Found 31 files with `__unknown__`, doctest.py having 6 occurrences
+   - Identified the pattern: `for name, (f, t) in dict.items():` was being decompiled incorrectly
+   
+4. **Bytecode Analysis**:
+   - Python 3.9 bytecode for nested unpacking:
+     ```
+     FOR_ITER
+     UNPACK_SEQUENCE 2   # outer tuple
+     STORE_FAST name
+     UNPACK_SEQUENCE 2   # inner tuple 
+     STORE_FAST f
+     STORE_FAST t
+     ```
+
+5. **Fix Implementation**:
+   - Added nested UNPACK_SEQUENCE handling in `collectUnpackTgts`
+   - Added pattern detection for STORE_FAST followed by LOAD_FAST and UNPACK_SEQUENCE in `decompileFor`
+   - Added skip logic for nested UNPACK_SEQUENCE in `processPartialBlock`
+   - Fixed tuple context (use `.load` for nested tuples to get parentheses)
+
+6. **Testing and Results**:
+   - Simple nested unpack works: `for name, (f, t) in d.items():`
+   - Boat_main: 152 exact (up from 143), 39 close, 150 mismatch
+   - Complex case with if-statement inside for-loop body still has issues
+
+7. **Remaining Issue**:
+   - When for-loop body contains an if-statement pattern, duplicate assignment statements appear
+   - Block 2 is both for-loop body AND if-statement condition block
+   - The body processing goes through a different code path that re-processes UNPACK_SEQUENCE
+
+8. **User Messages**:
+   - Initial: "Read your project guidelines... Continue with the current ...
+
+**Claude:** Let me examine the actual bytecode layout.
+
+**Claude:** Let me trace the flow more carefully. I'll add debug output to see what's happening.
+
+**Claude:** Found it. The issue is `tryDecompileBoolOpInto` calls `processPartialBlock` with `skip_first_store=false`, generating the bogus assignment. Then `stripLoopTargetAssigns` fails to clean it because it only handles ellipsis values, not `__unknown__`.
+
+The fix: pass skip_first_store to `tryDecompileBoolOpInto`.
+
+**Claude:** Let me add the skip_first_store handling to the ternary path as well.
+
+**Claude:** Let me add the skip_first_store handling to processBlockWithSimAndSkip and the chain of functions.
+
+**Claude:** Fixed the for-loop body decompilation issues. The changes:
+
+1. **Pass skip_first_store through boolop/ternary paths**: Added `tryDecompileBoolOpIntoWithSkip`, `tryDecompileTernaryIntoWithSkip`, `initCondSimWithSkipStore`, and `processBlockWithSimSkipStore` to properly propagate the skip flag through all code paths.
+
+2. **Handle nested UNPACK_SEQUENCE**: Added skip logic to both `processPartialBlock` and `processBlockWithSimAndSkipInner` for when `skip_store_count > 0` and we encounter another UNPACK_SEQUENCE (nested tuple unpacking).
+
+All test cases now work:
+- Simple for loops with tuple unpacking
+- For loops with enumerate
+- For loops with bool-op expressions in body
+- For loops with ternary expressions in body  
+- Nested tuple unpacking (e.g., `for name, (f, t) in d.items()`)
+- Combinations of the above
+
+**User:** keep going
+
+**User:** This session is being continued from a previous conversation that ran out of context. The summary below covers the earlier portion of the conversation.
+
+Analysis:
+Let me analyze the conversation chronologically:
+
+1. **Session Start**: The user asked to continue with the current task. The context showed previous work on nested tuple unpacking in for-loops.
+
+2. **Initial State**: 
+   - Plan at `~/.claude/plans/composed-wishing-diffie.md`
+   - Previous commit: "Handle nested tuple unpacking in for-loop targets"
+   - Boat_main corpus: 152 exact (up from 143), 39 close, 150 mismatch
+   - Issue: Complex for-loops with if-statements inside generated duplicate assignment statements
+
+3. **Problem Investigation**:
+   - Test case `/tmp/complex_for.py` with `for idx, item in enumerate(items): quiet = flag & 1 and idx > 0`
+   - Output had spurious `idx, item = __unknown__` 
+   - Root cause: `tryDecompileBoolOpInto` called `processPartialBlock` with `skip_first_store=false`, causing UNPACK_SEQUENCE to generate bogus assignments
+   - `stripLoopTargetAssigns` failed to clean up because it looks for ellipsis values, not `__unknown__`
+
+4. **First Fix - BoolOp Path**:
+   - Added `tryDecompileBoolOpIntoWithSkip` to decompile.zig
+   - Added `tryDecompileBoolOpIntoWithSkip` to sc_pass.zig that takes `skip_first_store_param`
+   - Updated call sites in `decompileForBody` and `decompileLoopBody`
+
+5. **Second Fix - Nested UNPACK_SEQUENCE in processPartialBlock**:
+   - Added nested UNPACK_SEQUENCE handling when `skip_store_count > 0`
+   - Test case: `for name, (f, t) in d.items(): active = flag and name != ""`
+
+6. **Third Fix - Ternary Path**:
+   - Test case `/tmp/ternary_for.py` with `x = a if flag else b` showed same issue
+   - Added `tryDecompileTernaryIntoWithSkip` to decompile.zig
+   - Added `tryDecompileTernaryIntoWithSkip` to sc_pass.zig
+   - Added `initCondSimWithSkipStore` to sc_pass.zig
+   - Added `processBlockWithSimSkipStore` and `processBlockWithSimAndSkipInner` to decompile.zig
+...
+
+**Claude:** Improved: exact 140 → 145 (+5), close 43 → 37 (-6), mismatch 144 → 146 (+2).
+
+Let me check the worst file - difflib:
+
+**Claude:** Worst unit: `_mdiff._line_iterator` (seq_ratio=0.1, orig 285 ops vs comp 15). This is a generator that failed to decompile. Let me check:
+
+**Claude:** Let me see the decompiled source:
+
+**Claude:** The generator is truncated - only the first few lines emitted. Let me check the Python source:
+
+**Claude:** The generator body has complex control flow with many `yield` and `continue` statements. The decompiled output only has the first few lines before getting lost. Let me check the bytecode to understand the issue:
+
+**Claude:** The generator body is almost entirely missing. Let me see the bytecode dump:
+
+**Claude:** The issue: Block 1 is marked `is_loop_header=true` but pattern kind is `unknown`. The outer while loop isn't being detected. Let me look at block edges:
+
+**Claude:** Block 1 has 11 predecessors because many branches `continue` to it. The issue is:
+
+1. `while True:` starts after block 0 with no explicit condition
+2. Block 1 is the inner `while len(lines) < 4:` loop
+3. Block 2 is inner loop body
+4. The decompiler treats block 2's jump back to block 1 as the end of everything
+
+Let me look at which blocks jump to block 1:
+
+**Claude:** 10 jumps to offset 12 - these are `continue` statements within the outer `while True:`. The issue is nested loops where:
+- Inner loop: `while len(lines) < 4:` (block 1 header)
+- Outer loop: implicit `while True:` containing blocks 1-39
+
+The decompiler only processes the inner loop and stops. Let me look at the decompiler's loop handling:
+
+**Claude:** Let me check why block 1 doesn't get a loop pattern:
+
+**Claude:** This is a nested loop issue. Block 1 is the inner loop header, but `continue` statements from the outer `while True:` jump to block 1. This makes all blocks 3-39 appear to be "in the loop" of block 1, so `exit_id` (block 3) fails the "not in loop" check.
+
+Let me create a minimal test case:
+
+**Claude:** Inner `while` became an `if...continue`. Let me check patterns:
+
+**Claude:** The decompiler outputs `while True:` but turns the inner `while` into `if...continue`. The issue is the inner loop pattern detection fails.
+
+Let me check what happens when processing block 1:
+
+**Claude:** The issue: `inLoop(3, 1)` returns true because block 3 eventually leads back to block 1 through `continue` statements. But block 3 should be considered the EXIT of the inner loop, even though it's inside the outer loop.
+
+The fix needs to distinguish inner loop exit from outer loop body. Let me check if any of block 3's successors directly jump to block 1:
+
+**Claude:** I see the issue. Block 3's successors (blocks 4 and 6) don't directly target block 1 - they have more structure. This indicates block 3 is outer loop body, not a chained loop condition.
+
+Fix: If exit_id is "in loop" but none of its successors directly target the header, treat it as a valid exit (it's part of an outer loop, not a chained condition):
+
+**Claude:** Now the inner `while` is detected but outer `while True:` is gone. Let me check patterns:
+
+**Claude:** The fix made inner loop work but broke outer loop detection. The issue is more complex - we need BOTH loops detected. Let me revert and try a different approach:
+
+**Claude:** Let me check how the outer loop is detected. The issue might be in how `while True:` is handled:
+
+**Claude:** Let me trace what happens when decompiling:
+
+**Claude:** The `continue` after `items.append(1)` is from block 2's JUMP_ABSOLUTE back to block 1. Let me check how the inner loop is treated:
+
+**Claude:** The issue is that block 1 is both the inner loop header AND the outer loop body start. When decompiling the outer loop body, we should recognize block 1 as a nested loop.
+
+Let me check `decompileLoopBody`:
+
+**Claude:** Let me check how the while loop pattern is used:
+
+**Claude:** The issue is that block 1 represents BOTH loops. When the inner loop is detected, the outer loop context is lost. I need to check if there are additional back-edges indicating an outer loop:
+
+**Claude:** Let me re-apply the fix and test more carefully:
+
+**Claude:** The outer loop is lost. Let me check why - the blocks after inner loop should still be processed but `continue` is missing. Let me check the pattern detection:
+
+**Claude:** The issue is that the while_loop pattern is detected BEFORE `decompileLoopHeader` is called. The fix should be: if block 1 has additional back-edges beyond the inner loop, don't return the while pattern - let `decompileLoopHeader` handle it.
+
+**Claude:** I need to modify `detectWhilePattern` to check for additional back-edges indicating an outer loop:
+
+**Claude:** The outer loop is back but inner loop is still `if...continue`. I need to only return null when called from main loop, not from within loop body:
+
+**Claude:** The output is truncated - only inner while is shown. Let me check what's happening in the loop body processing:
+
+**User:** This session is being continued from a previous conversation that ran out of context. The summary below covers the earlier portion of the conversation.
+
+Analysis:
+Let me chronologically analyze the conversation:
+
+1. **Session Start**: Continuation from previous session about pez decompiler improvements. Previous work fixed for-loop body decompilation with bool-op, ternary, and nested unpack. Current session continues with boat_main corpus improvements.
+
+2. **Initial Work**: 
+   - Ran boat_main comparison: exact 140 → 145 (+5), close 43 → 37 (-6), mismatch 144 → 146 (+2)
+   - Identified worst file: difflib.pyc with min_seq_ratio=0.1
+   - Found worst unit: `_mdiff._line_iterator` (seq_ratio=0.1, orig 285 ops vs comp 15)
+
+3. **Root Cause Analysis**:
+   - The generator function `_line_iterator` has complex nested loops
+   - Outer `while True:` loop contains inner `while len(items) < 4:` loop
+   - The decompiler only outputs inner loop partially, loses outer loop structure
+   - Issue in `detectWhilePattern` in ctrl.zig: when exit block is "in loop" due to outer loop back-edges, pattern detection fails
+
+4. **First Fix Attempt** (reverted):
+   - Modified `detectWhilePattern` to accept exit_id when all successors are in loop but none directly targets header
+   - Result: Inner loop detected, but outer `while True:` lost
+
+5. **Second Fix Attempt**:
+   - Added `in_loop_context` parameter to `detectWhilePattern`
+   - Check for additional back-edges only when NOT in loop context
+   - Result: Both loops detected but body after inner loop is missing
+
+6. **Current State**:
+   - Modified files: `src/ctrl.zig`
+   - Output shows `while True:` containing `while len(items) < 4:` but blocks 3-8 (the if/elif/else with yields) are completely missing
+   - The decompilation stops after the inner while loop
+
+Key code changes made:
+
+In `detectWhilePattern`:
+1. Added `in_loop_context` parameter
+2. Added nested loop exit detection for non-conditional terminators
+3. Added check for additional bac...
+
+**Claude:** The nested loop is now decompiled correctly. Let me run the boat_main comparison.
+
+**Claude:** Let me check difflib specifically since that was the issue.
+
+**Claude:** The issue is in Python 3.9, the `while True:` and inner `while condition:` share the same header block. Let me examine the control flow more carefully.
+
+**Claude:** I see the issue now. My nested loop check at lines 1318-1328 is too aggressive for Python 3.9 where `while True:` and `while condition:` share the same header. The check returns null because there are back-edges from blocks after the inner while exit, but those are expected in the shared-header case.
+
+**Claude:** The fix significantly improved `_line_iterator` in difflib.pyc:
+- seq_ratio: 0.137 → 0.993
+- len_comp: 21 → 285 (matches original)
+
+Summary of fix: In `detectWhilePattern`, the nested loop check was too aggressive for Python 3.9 bytecode where `while True:` and `while condition:` share the same header block. Back-edges from blocks after the inner while's exit (>= exit_id) are expected continuation of the loop body, not indicators of a separate outer loop.
+
+**Claude:** Fixed nested loop pattern detection for shared headers.
+
+Key improvement: `_line_iterator` in difflib.pyc seq_ratio: 0.137 → 0.993 (len_comp: 21 → 285).
+
+The fix allows back-edges from blocks >= exit_id when detecting nested loops, as those represent continuation of the loop body after the inner while - not indicators of a separate outer loop with a different header.
+
+**User:** keep going
+
+**User:** This session is being continued from a previous conversation that ran out of context. The summary below covers the earlier portion of the conversation.
+
+Analysis:
+Let me analyze the conversation chronologically:
+
+1. **Session Start**: This is a continuation from a previous conversation about pez decompiler improvements. The previous session worked on for-loop body decompilation with bool-op, ternary, and nested unpack.
+
+2. **Initial State**: The summary indicated work on boat_main corpus improvements, specifically targeting `_mdiff._line_iterator` in difflib.pyc which had seq_ratio=0.1 due to nested loop decompilation failures.
+
+3. **Previous Fix Attempt**: The summary mentioned modifications to `detectWhilePattern` in ctrl.zig to handle nested loops by adding an `in_loop_context` parameter.
+
+4. **Current Session Work**:
+   - First, I built and tested the simple nested loop case (`/tmp/nested_gen.py`) which worked correctly with Python 3.14
+   - Ran boat_main comparison showing exact=138, close=33, mismatch=157
+   - Found difflib `_line_iterator` still had issues (seq_ratio=0.137)
+   
+5. **Root Cause Analysis**: 
+   - Python 3.9 bytecode has `while True:` and `while condition:` sharing the same header block
+   - My nested loop check was too aggressive - it returned null when there were back-edges from blocks >= exit_id
+   - These back-edges are continuation of the loop body after the inner while, not indicators of a separate outer loop
+
+6. **Fix Applied**:
+   - Modified `detectWhilePattern` in ctrl.zig to add `if (pred >= exit_id) continue;` to skip back-edges from blocks after inner while exit
+   - Fixed a test that needed the new `in_loop_context` parameter
+
+7. **Results After Fix**:
+   - `_line_iterator` improved dramatically: seq_ratio 0.137 → 0.993, len_comp 21 → 285
+   - difflib no longer in worst 5 files
+   - Overall: close 33→35, mismatch 157→155
+
+8. **User Said "keep going"**: I started investigating the next worst file (socket.pyc) which has `socketpair` f...
+
+**Claude:** The fix is complete. I added an `in_elif_chain` parameter to prevent the `if_guard_terminal_else_direct` optimization from incorrectly transforming elif-else-raise patterns.
+
+The issue was that when processing an elif block where:
+- The then block (elif body) doesn't fall through to the else block  
+- The else block is a terminal raise
+
+The guard optimization was incorrectly inverting the condition and swapping branches, producing `elif not condition: raise` instead of `elif condition: body else: raise`.
+
+The fix passes `in_elif_chain=true` when recursively processing elif branches, which disables this guard optimization.
+
+**User:** keep going
+
+**Claude:** The elif-raise fix improved the boat_main corpus:
+- exact: 140 → 144 (+4)
+- close: 43 → 44 (+1)  
+- mismatch: 144 → 140 (-4)
+
+Let me investigate the worst file (pydoc.pyc, min_seq_ratio=0.28).
+
+---

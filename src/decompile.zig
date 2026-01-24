@@ -6640,11 +6640,20 @@ pub const Decompiler = struct {
 
     /// Decompile an if statement pattern.
     fn decompileIf(self: *Decompiler, pattern: ctrl.IfPattern) DecompileError!?*Stmt {
-        return self.decompileIfWithSkip(pattern, 0);
+        return self.decompileIfImpl(pattern, 0, false);
+    }
+
+    fn decompileIfWithSkip(self: *Decompiler, pattern: ctrl.IfPattern, skip_cond: usize) DecompileError!?*Stmt {
+        return self.decompileIfImpl(pattern, skip_cond, false);
+    }
+
+    fn decompileIfInElifChain(self: *Decompiler, pattern: ctrl.IfPattern, skip_cond: usize) DecompileError!?*Stmt {
+        return self.decompileIfImpl(pattern, skip_cond, true);
     }
 
     /// Decompile an if statement pattern, skipping first N instructions of condition block.
-    fn decompileIfWithSkip(self: *Decompiler, pattern: ctrl.IfPattern, skip_cond: usize) DecompileError!?*Stmt {
+    /// If in_elif_chain is true, this is a nested if inside an elif chain - skip guard optimizations.
+    fn decompileIfImpl(self: *Decompiler, pattern: ctrl.IfPattern, skip_cond: usize, in_elif_chain: bool) DecompileError!?*Stmt {
         if (self.if_in_progress) |*set| {
             if (set.isSet(pattern.condition_block)) return null;
             set.set(pattern.condition_block);
@@ -7239,7 +7248,37 @@ pub const Decompiler = struct {
                                         t_id = edge.target;
                                     }
                                 }
-                                if (t_id != null and f_id != null and self.resolveJumpOnlyBlock(t_id.?) == else_res) {
+                                // Check for `not A or not B` pattern:
+                                // Outer: POP_JUMP_IF_FALSE to body (A false -> body)
+                                // Inner: POP_JUMP_IF_TRUE to skip (B true -> skip)
+                                // Both inner false and outer else point to body
+                                if (t_id != null and f_id != null and self.resolveJumpOnlyBlock(f_id.?) == else_res) {
+                                    const true_res = self.resolveJumpOnlyBlock(t_id.?);
+                                    // Inner true target is the skip block, inner false is body
+                                    // Outer: POP_JUMP_IF_FALSE, Inner: POP_JUMP_IF_TRUE
+                                    const allow_or_not = self.isTerminalBlock(else_res) and
+                                        self.isFalseJump(term.?.opcode) and
+                                        self.isTrueJump(then_term.opcode);
+                                    if (allow_or_not) {
+                                        var then_sim = self.initSim(self.arena.allocator(), self.arena.allocator(), self.code, self.version);
+                                        defer then_sim.deinit();
+                                        then_sim.lenient = true;
+                                        then_sim.stack.allow_underflow = true;
+                                        if (try self.condExprFromBlock(then_block, &then_sim, t_id.?, f_id.?, 0)) |cond2| {
+                                            // not A or not B: invert A, invert B
+                                            const inv0 = try self.invertConditionExpr(condition);
+                                            const inv1 = try self.invertConditionExpr(cond2);
+                                            condition = try self.makeBoolPair(inv0, inv1, .or_);
+                                            then_block = else_res;
+                                            else_block = null;
+                                            cond_chain_then = true;
+                                            guard_or_applied = true;
+                                            deferred_if_next = true_res;
+                                            try self.emitDecisionTrace(pattern.condition_block, "if_chain_or_not", condition);
+                                        }
+                                    }
+                                }
+                                if (!guard_or_applied and t_id != null and f_id != null and self.resolveJumpOnlyBlock(t_id.?) == else_res) {
                                     const false_res = self.resolveJumpOnlyBlock(f_id.?);
                                     const allow_guard_or = (self.isTerminalBlock(false_res) and !self.isAssertRaiseBlock(false_res)) or
                                         (self.isTerminalBlock(else_res) and self.isRaiseBlock(else_res) and !self.isAssertRaiseBlock(else_res));
@@ -7649,7 +7688,8 @@ pub const Decompiler = struct {
         if (!inverted) {
             if (else_block) |else_id| {
                 const resolved_else = self.resolveJumpOnlyBlock(else_id);
-                if (resolved_else < self.cfg.blocks.len and
+                if (!in_elif_chain and
+                    resolved_else < self.cfg.blocks.len and
                     resolved_else == else_id and
                     self.isTerminalBlock(resolved_else) and
                     !self.isTerminalBlock(then_block) and
@@ -8000,7 +8040,9 @@ pub const Decompiler = struct {
             if (try self.tryDecompileAssertBlock(inv, then_block, skip)) |assert_stmt| {
                 deinitStackValuesSlice(self.allocator, self.allocator, base_vals_buf);
                 base_owned = false;
-                if (else_block) |else_id| {
+                if (deferred_if_next) |next| {
+                    self.if_next = next;
+                } else if (else_block) |else_id| {
                     if (self.if_next == null) {
                         self.if_next = else_id;
                     }
@@ -8025,7 +8067,7 @@ pub const Decompiler = struct {
                 // For legacy conditionals, elif block starts with POP_TOP to clean up previous condition
                 const else_pattern = try self.analyzer.detectPattern(else_id);
                 if (else_pattern == .if_stmt) {
-                    const elif_stmt = try self.decompileIfWithSkip(else_pattern.if_stmt, skip);
+                    const elif_stmt = try self.decompileIfInElifChain(else_pattern.if_stmt, skip);
                     if (elif_stmt) |s| {
                         const body = try a.alloc(*Stmt, 1);
                         body[0] = s;
