@@ -205,7 +205,7 @@ pub fn Methods(comptime Self: type, comptime Err: type) type {
             stmts: *std.ArrayList(*Stmt),
             stmts_allocator: Allocator,
         ) DecompileError!?CondSim {
-            return initCondSimInner(self, block_id, stmts, stmts_allocator, false);
+            return initCondSimInner(self, block_id, stmts, stmts_allocator, false, false);
         }
 
         pub fn initCondSimWithStore(
@@ -214,7 +214,17 @@ pub fn Methods(comptime Self: type, comptime Err: type) type {
             stmts: *std.ArrayList(*Stmt),
             stmts_allocator: Allocator,
         ) DecompileError!?CondSim {
-            return initCondSimInner(self, block_id, stmts, stmts_allocator, true);
+            return initCondSimInner(self, block_id, stmts, stmts_allocator, true, false);
+        }
+
+        pub fn initCondSimWithSkipStore(
+            self: *Self,
+            block_id: u32,
+            stmts: *std.ArrayList(*Stmt),
+            stmts_allocator: Allocator,
+            skip_first_store: bool,
+        ) DecompileError!?CondSim {
+            return initCondSimInner(self, block_id, stmts, stmts_allocator, false, skip_first_store);
         }
 
         fn initCondSimInner(
@@ -223,6 +233,7 @@ pub fn Methods(comptime Self: type, comptime Err: type) type {
             stmts: *std.ArrayList(*Stmt),
             stmts_allocator: Allocator,
             use_pending_store: bool,
+            skip_first_store: bool,
         ) DecompileError!?CondSim {
             if (block_id >= self.cfg.blocks.len) return null;
             const cond_block = &self.cfg.blocks[block_id];
@@ -274,7 +285,11 @@ pub fn Methods(comptime Self: type, comptime Err: type) type {
 
             var partial = cond_block.*;
             partial.instructions = cond_block.instructions[0..stop_idx];
-            try self.processBlockWithSim(&partial, &cond_sim, stmts, stmts_allocator);
+            if (skip_first_store) {
+                try self.processBlockWithSimSkipStore(&partial, &cond_sim, stmts, stmts_allocator, true);
+            } else {
+                try self.processBlockWithSim(&partial, &cond_sim, stmts, stmts_allocator);
+            }
 
             const expr = (try popExprNoMatch(self, &cond_sim)) orelse return null;
             const base_vals = try self.cloneStackValues(cond_sim.stack.items.items);
@@ -494,6 +509,17 @@ pub fn Methods(comptime Self: type, comptime Err: type) type {
             stmts: *std.ArrayList(*Stmt),
             stmts_allocator: Allocator,
         ) DecompileError!?u32 {
+            return self.tryDecompileTernaryIntoWithSkip(block_id, limit, stmts, stmts_allocator, false);
+        }
+
+        pub fn tryDecompileTernaryIntoWithSkip(
+            self: *Self,
+            block_id: u32,
+            limit: u32,
+            stmts: *std.ArrayList(*Stmt),
+            stmts_allocator: Allocator,
+            skip_first_store: bool,
+        ) DecompileError!?u32 {
             if (try self.analyzer.detectTernaryChain(block_id)) |chain| {
                 defer self.allocator.free(chain.condition_blocks);
                 if (chain.true_block >= limit or chain.false_block >= limit or chain.merge_block >= limit) {
@@ -516,7 +542,7 @@ pub fn Methods(comptime Self: type, comptime Err: type) type {
                 }
 
                 const stmts_len = stmts.items.len;
-                const cond_res = (try initCondSim(self, chain.condition_blocks[0], stmts, stmts_allocator)) orelse {
+                const cond_res = (try initCondSimWithSkipStore(self, chain.condition_blocks[0], stmts, stmts_allocator, skip_first_store)) orelse {
                     stmts.items.len = stmts_len;
                     return null;
                 };
@@ -597,7 +623,7 @@ pub fn Methods(comptime Self: type, comptime Err: type) type {
             }
 
             const stmts_len = stmts.items.len;
-            const cond_res = (try initCondSim(self, pattern.condition_block, stmts, stmts_allocator)) orelse {
+            const cond_res = (try initCondSimWithSkipStore(self, pattern.condition_block, stmts, stmts_allocator, skip_first_store)) orelse {
                 stmts.items.len = stmts_len;
                 return null;
             };
@@ -750,6 +776,17 @@ pub fn Methods(comptime Self: type, comptime Err: type) type {
             stmts: *std.ArrayList(*Stmt),
             stmts_allocator: Allocator,
         ) DecompileError!?u32 {
+            return self.tryDecompileBoolOpIntoWithSkip(block_id, limit, stmts, stmts_allocator, false);
+        }
+
+        pub fn tryDecompileBoolOpIntoWithSkip(
+            self: *Self,
+            block_id: u32,
+            limit: u32,
+            stmts: *std.ArrayList(*Stmt),
+            stmts_allocator: Allocator,
+            skip_first_store_param: bool,
+        ) DecompileError!?u32 {
             const pattern = self.analyzer.detectBoolOp(block_id) orelse return null;
             if (pattern.second_block >= limit or pattern.merge_block >= limit) {
                 return null;
@@ -787,7 +824,7 @@ pub fn Methods(comptime Self: type, comptime Err: type) type {
                 }
                 break :blk idx orelse return null;
             };
-            var skip_first_store = false;
+            var skip_first_store = skip_first_store_param;
             try self.processPartialBlock(cond_block, stmts, stmts_allocator, &skip_first_store, jump_idx);
             var cond_sim = self.initSim(self.arena.allocator(), self.arena.allocator(), self.code, self.version);
             defer cond_sim.deinit();

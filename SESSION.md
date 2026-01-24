@@ -41975,3 +41975,191 @@ ARGUMENTS: Review remaining complex dots: pez-detect-inline-comprehension-53eae5
 ### Conversation
 
 ---
+
+## Session - 2026-01-24 18:22:12
+
+### Active Work (bd)
+
+```
+(no in-progress items)
+```
+
+### Conversation
+
+**User:** Read your project guidelines (AGENTS.md).
+Check active dots: `dot ls --status active`
+If the dot description contains a plan file path, read it.
+Continue with the current task.
+
+**Claude:** I'll check the active dots and continue with the current task.
+
+**Claude:** No active dots. Ready for your task.
+
+**User:** keep going
+
+**Claude:** Plan complete: 190/190 pyc files decompile. All items finished. Match guards deferred (no test cases). Next: snapshot tests or new features.
+
+**User:** keep going
+
+**Claude:** No response requested.
+
+**User:** keep going
+
+**Claude:** Many dots in progress. Let me run fresh boat_main compare to check current state.
+
+**Claude:** Same as before: 140 exact, 43 close, 144 mismatch. Let me investigate worst offender `socket.pyc`.
+
+**Claude:** Found the bug: `UNARY_POSITIVE` opcode handler is missing. Let me add it.
+
+**Claude:** The string escaping test failure is pre-existing (unrelated to my change). Let me check by reverting and testing.
+
+**Claude:** The loop `while len(lines) == 4:` is being misidentified as `while True:`. Block 1 is a loop header but pattern detection says `kind: unknown`. Let me check the ctrl.zig loop detection.
+
+**Claude:** This is a complex control flow issue: the loop is actually `while True:` with complex conditionals inside, but `detectWhilePattern` expects a simpler while-with-exit pattern. When all paths lead back to the header, the detection fails.
+
+This is a pre-existing issue, not caused by UNARY_POSITIVE. Let me verify by checking if difflib was in the original mismatch list.
+
+**Claude:** Test failures are pre-existing (string escaping, py2 comprehension). My UNARY_POSITIVE fix is valid. Committing and starting new change.
+
+**Claude:** The issue is in `detectWhilePattern` at line 1287. It rejects patterns where the exit leads back to header, but `decompileWhile` already handles this case by converting to `while True:`.
+
+Let me fix this.
+
+**Claude:** Let me add debug output to understand what's happening.
+
+**Claude:** The function body is now decompiling. Let me run a full comparison.
+
+**Claude:** Good, back to baseline (143 exact). The UNARY_POSITIVE fix is working. The while True detection change broke other files so I reverted it.
+
+---
+
+## Session - 2026-01-24 19:04:19
+
+### Active Work (bd)
+
+```
+(no in-progress items)
+```
+
+### Conversation
+
+**User:** Read your project guidelines (AGENTS.md).
+Check active dots: `dot ls --status active`
+If the dot description contains a plan file path, read it.
+Continue with the current task.
+
+**Claude:** I'll check the active dots and continue with the current task.
+
+**Claude:** No active dots. Ready for your task.
+
+**User:** keep going
+
+**Claude:** Plan complete: 190/190 pyc files decompile. All items finished. Match guards deferred (no test cases). Next: snapshot tests or new features.
+
+**User:** keep going
+
+**Claude:** No response requested.
+
+**User:** keep going
+
+**Claude:** Many dots in progress. Let me run fresh boat_main compare to check current state.
+
+**Claude:** Same as before: 140 exact, 43 close, 144 mismatch. Let me investigate worst offender `socket.pyc`.
+
+**Claude:** Found the bug: `UNARY_POSITIVE` opcode handler is missing. Let me add it.
+
+**Claude:** The string escaping test failure is pre-existing (unrelated to my change). Let me check by reverting and testing.
+
+**Claude:** The loop `while len(lines) == 4:` is being misidentified as `while True:`. Block 1 is a loop header but pattern detection says `kind: unknown`. Let me check the ctrl.zig loop detection.
+
+**Claude:** This is a complex control flow issue: the loop is actually `while True:` with complex conditionals inside, but `detectWhilePattern` expects a simpler while-with-exit pattern. When all paths lead back to the header, the detection fails.
+
+This is a pre-existing issue, not caused by UNARY_POSITIVE. Let me verify by checking if difflib was in the original mismatch list.
+
+**Claude:** Test failures are pre-existing (string escaping, py2 comprehension). My UNARY_POSITIVE fix is valid. Committing and starting new change.
+
+**Claude:** The issue is in `detectWhilePattern` at line 1287. It rejects patterns where the exit leads back to header, but `decompileWhile` already handles this case by converting to `while True:`.
+
+Let me fix this.
+
+**Claude:** Let me add debug output to understand what's happening.
+
+**Claude:** The function body is now decompiling. Let me run a full comparison.
+
+**Claude:** Good, back to baseline (143 exact). The UNARY_POSITIVE fix is working. The while True detection change broke other files so I reverted it.
+
+**User:** This session is being continued from a previous conversation that ran out of context. The summary below covers the earlier portion of the conversation.
+
+Analysis:
+Let me analyze the conversation chronologically:
+
+1. User asked to read project guidelines (AGENTS.md), check active dots, and continue with current task.
+
+2. I checked `dot ls --status active` - no active dots found.
+
+3. I read the plan file at `~/.claude/plans/composed-wishing-diffie.md` which contains a comprehensive plan for "100% Feature Parity with pycdc/uncompyle6". Key points:
+   - Current state: 209 total, 11 mismatches (3.14 corpus)
+   - pycdc test suite: 190/190 pass
+   - Boat_main: 329 total, 327 ok, 2 error
+   - Boat_main roundtrip compare: 140 exact, 43 close, 144 mismatch
+
+4. User said "keep going" twice.
+
+5. I ran tests and found 0 hard failures in pycdc test suite.
+
+6. I ran the boat_main compare - same results: 140 exact, 43 close, 144 mismatch.
+
+7. I investigated the worst offenders (socket.pyc at 0.266 min_seq_ratio).
+
+8. Found a bug: UNARY_POSITIVE opcode handler was missing in stack.zig. Added it:
+```zig
+.UNARY_POSITIVE => {
+    const operand = try self.stack.popExpr();
+    errdefer {
+        operand.deinit(self.allocator);
+        self.allocator.destroy(operand);
+    }
+    const expr = try ast.makeUnaryOp(self.allocator, .uadd, operand);
+    try self.stack.push(.{ .expr = expr });
+},
+```
+
+9. After fix: boat_main compare improved to 143 exact (from 140).
+
+10. I committed the fix with `jj describe`.
+
+11. Found difflib.pyc regressed to 0.100 min_seq_ratio. Investigated `_line_iterator` function - it was truncating output.
+
+12. Root cause: `detectWhilePattern` in ctrl.zig was returning null for block 1 (a loop header) because:
+    - The "exit" block eventually leads back to the header
+    - This is actually a `while True:` pattern with complex control flow inside
+
+13. I attempted to fix while True detection by modifying ctrl.zig:
+    - First attempt: Remove the `exitLeadsToHeader` check ...
+
+**Claude:** Looking at doctest.py's `__unknown__` occurrences to find missing opcode handlers.
+
+**Claude:** This is getting quite complex. Let me take a different approach - I'll remove the debug prints and focus on a simpler test case to verify the basic nested unpack works correctly without the if-statement complexity.
+
+**Claude:** Let me re-add the fixes for nested tuple unpacking.
+
+**Claude:** Summary of changes made:
+
+**Fixed nested tuple unpacking in for-loop targets:**
+
+1. **`collectUnpackTgts`**: Added recursive handling of nested `UNPACK_SEQUENCE` instructions, creating proper nested tuple targets like `(f, t)` instead of flat `f, t`.
+
+2. **`decompileFor`**: Added detection for Python 3.9's pattern where nested unpacking is done via `STORE_FAST var; LOAD_FAST var; UNPACK_SEQUENCE`.
+
+3. **`processPartialBlock`**: Added skip logic for nested `UNPACK_SEQUENCE` when processing for-loop body, so inner unpacking instructions don't generate spurious assignment statements.
+
+**Results:**
+- Boat_main corpus: 152 exact (up from 143 at session start)
+- Simple nested unpack like `for name, (f, t) in d.items():` now works correctly
+- Complex cases with conditionals inside the loop body still have issues (different code path)
+
+**User:** kep going
+
+**Claude:** Let me investigate the remaining issue with for-loops containing if-statements.
+
+---

@@ -518,7 +518,18 @@ pub const Decompiler = struct {
         stmts: *std.ArrayList(*Stmt),
         stmts_allocator: Allocator,
     ) DecompileError!?u32 {
-        return ScPass.tryDecompileTernaryInto(self, block_id, limit, stmts, stmts_allocator) catch |err| switch (err) {
+        return self.tryDecompileTernaryIntoWithSkip(block_id, limit, stmts, stmts_allocator, false);
+    }
+
+    fn tryDecompileTernaryIntoWithSkip(
+        self: *Decompiler,
+        block_id: u32,
+        limit: u32,
+        stmts: *std.ArrayList(*Stmt),
+        stmts_allocator: Allocator,
+        skip_first_store: bool,
+    ) DecompileError!?u32 {
+        return ScPass.tryDecompileTernaryIntoWithSkip(self, block_id, limit, stmts, stmts_allocator, skip_first_store) catch |err| switch (err) {
             error.PatternNoMatch => return null,
             else => return err,
         };
@@ -544,7 +555,18 @@ pub const Decompiler = struct {
         stmts: *std.ArrayList(*Stmt),
         stmts_allocator: Allocator,
     ) DecompileError!?u32 {
-        return ScPass.tryDecompileBoolOpInto(self, block_id, limit, stmts, stmts_allocator) catch |err| switch (err) {
+        return self.tryDecompileBoolOpIntoWithSkip(block_id, limit, stmts, stmts_allocator, false);
+    }
+
+    fn tryDecompileBoolOpIntoWithSkip(
+        self: *Decompiler,
+        block_id: u32,
+        limit: u32,
+        stmts: *std.ArrayList(*Stmt),
+        stmts_allocator: Allocator,
+        skip_first_store: bool,
+    ) DecompileError!?u32 {
+        return ScPass.tryDecompileBoolOpIntoWithSkip(self, block_id, limit, stmts, stmts_allocator, skip_first_store) catch |err| switch (err) {
             error.PatternNoMatch => return null,
             else => return err,
         };
@@ -2237,7 +2259,18 @@ pub const Decompiler = struct {
         stmts: *std.ArrayList(*Stmt),
         stmts_allocator: Allocator,
     ) DecompileError!void {
-        return self.processBlockWithSimAndSkip(block, sim, stmts, stmts_allocator, 0);
+        return self.processBlockWithSimAndSkipInner(block, sim, stmts, stmts_allocator, 0, false);
+    }
+
+    pub fn processBlockWithSimSkipStore(
+        self: *Decompiler,
+        block: *const BasicBlock,
+        sim: *SimContext,
+        stmts: *std.ArrayList(*Stmt),
+        stmts_allocator: Allocator,
+        skip_first_store: bool,
+    ) DecompileError!void {
+        return self.processBlockWithSimAndSkipInner(block, sim, stmts, stmts_allocator, 0, skip_first_store);
     }
 
     fn tryHandleChainAssignStore(
@@ -2860,6 +2893,23 @@ pub const Decompiler = struct {
                     continue;
                 }
             }
+            // Handle nested UNPACK_SEQUENCE/UNPACK_EX for nested tuple targets
+            if (cur.opcode == .UNPACK_SEQUENCE or cur.opcode == .UNPACK_EX) {
+                if (try self.collectUnpackTgts(sim, instructions, inst_idx, arena)) |nested| {
+                    if (nested.ok) {
+                        const tuple_expr = try arena.create(Expr);
+                        // Use .load context for nested tuples to ensure parentheses are printed
+                        tuple_expr.* = .{ .tuple = .{ .elts = nested.tgts, .ctx = .load } };
+                        var t = tuple_expr;
+                        t = try self.starTgt(arena, t, found, star_pos);
+                        try tgts.append(arena, t);
+                        found += 1;
+                        skip += 1 + nested.skip;
+                        inst_idx += 1 + nested.skip;
+                        continue;
+                    }
+                }
+            }
             break;
         }
 
@@ -2938,6 +2988,18 @@ pub const Decompiler = struct {
         stmts_allocator: Allocator,
         skip_first: usize,
     ) DecompileError!void {
+        return self.processBlockWithSimAndSkipInner(block, sim, stmts, stmts_allocator, skip_first, false);
+    }
+
+    fn processBlockWithSimAndSkipInner(
+        self: *Decompiler,
+        block: *const BasicBlock,
+        sim: *SimContext,
+        stmts: *std.ArrayList(*Stmt),
+        stmts_allocator: Allocator,
+        skip_first: usize,
+        skip_first_store_param: bool,
+    ) DecompileError!void {
         // Check for pending ternary expression from tryDecompileTernaryInto
         // For inline comprehensions (Python 3.12+), we need to skip cleanup ops
         // before pushing the expression: END_FOR, POP_TOP, SWAP, STORE_FAST (loop var restore)
@@ -2993,6 +3055,8 @@ pub const Decompiler = struct {
 
         const instructions = block.instructions[skip_first + extra_skip ..];
         const inst_base = skip_first + extra_skip;
+        var skip_first_store = skip_first_store_param;
+        var skip_store_count: u32 = 0;
         var i: usize = 0;
         while (i < instructions.len) : (i += 1) {
             const inst = instructions[i];
@@ -3022,11 +3086,44 @@ pub const Decompiler = struct {
             }
             switch (inst.opcode) {
                 .UNPACK_SEQUENCE, .UNPACK_EX => {
+                    const count = if (inst.opcode == .UNPACK_EX) blk: {
+                        const before = inst.arg & 0xFF;
+                        const after = (inst.arg >> 8) & 0xFF;
+                        break :blk before + 1 + after;
+                    } else inst.arg;
+                    if (skip_first_store) {
+                        skip_first_store = false;
+                        if (count == 0) {
+                            _ = sim.stack.pop();
+                            continue;
+                        }
+                        skip_store_count = count;
+                        try sim.simulate(inst);
+                        continue;
+                    }
+                    // Handle nested UNPACK_SEQUENCE when skipping for-loop targets
+                    if (skip_store_count > 0) {
+                        skip_store_count = skip_store_count - 1 + count;
+                        try sim.simulate(inst);
+                        continue;
+                    }
                     const skip_count = try self.handleUnpack(sim, instructions, i, stmts, stmts_allocator);
                     i += skip_count;
                     continue;
                 },
                 .STORE_NAME, .STORE_FAST, .STORE_GLOBAL, .STORE_DEREF => {
+                    if (skip_store_count > 0) {
+                        skip_store_count -= 1;
+                        const val = sim.stack.pop() orelse StackValue.unknown;
+                        val.deinit(sim.allocator, sim.stack_alloc);
+                        continue;
+                    }
+                    if (skip_first_store) {
+                        skip_first_store = false;
+                        const val = sim.stack.pop() orelse StackValue.unknown;
+                        val.deinit(sim.allocator, sim.stack_alloc);
+                        continue;
+                    }
                     const abs_idx = inst_base + i;
                     const prev_was_dup = if (abs_idx > 0) blk: {
                         const prev = block.instructions[abs_idx - 1];
@@ -15544,6 +15641,25 @@ pub const Decompiler = struct {
         for (body.instructions, 0..) |inst, inst_idx| {
             switch (inst.opcode) {
                 .STORE_FAST => {
+                    // Check for pattern: STORE_FAST var, LOAD_FAST var, UNPACK_SEQUENCE
+                    // This is Python 3.9's way of doing nested tuple unpacking in for loops
+                    if (inst_idx + 2 < body.instructions.len) {
+                        const next = body.instructions[inst_idx + 1];
+                        const after = body.instructions[inst_idx + 2];
+                        if (next.opcode == .LOAD_FAST and next.arg == inst.arg and
+                            (after.opcode == .UNPACK_SEQUENCE or after.opcode == .UNPACK_EX))
+                        {
+                            // Use the UNPACK_SEQUENCE as the target
+                            const unpack = try self.collectUnpackTgts(&target_sim, body.instructions, inst_idx + 2, a);
+                            if (unpack != null and unpack.?.ok) {
+                                const tuple_expr = try a.create(Expr);
+                                tuple_expr.* = .{ .tuple = .{ .elts = unpack.?.tgts, .ctx = .store } };
+                                target = tuple_expr;
+                                found_target = true;
+                                break;
+                            }
+                        }
+                    }
                     const name = if (self.code.varnames.len > inst.arg)
                         self.code.varnames[inst.arg]
                     else
@@ -15761,19 +15877,13 @@ pub const Decompiler = struct {
                 }
             }
 
-            if (try self.tryDecompileBoolOpInto(block_idx, loop_limit, &stmts, a)) |next_block| {
-                if (has_loop_target) {
-                    self.stripLoopTargetAssigns(block, &stmts);
-                    skip_first_store = false;
-                }
+            if (try self.tryDecompileBoolOpIntoWithSkip(block_idx, loop_limit, &stmts, a, skip_first_store)) |next_block| {
+                skip_first_store = false;
                 block_idx = next_block;
                 continue;
             }
-            if (try self.tryDecompileTernaryInto(block_idx, loop_limit, &stmts, a)) |next_block| {
-                if (has_loop_target) {
-                    self.stripLoopTargetAssigns(block, &stmts);
-                    skip_first_store = false;
-                }
+            if (try self.tryDecompileTernaryIntoWithSkip(block_idx, loop_limit, &stmts, a, skip_first_store)) |next_block| {
+                skip_first_store = false;
                 block_idx = next_block;
                 continue;
             }
@@ -17244,6 +17354,14 @@ pub const Decompiler = struct {
                         try sim.simulate(inst);
                         continue;
                     }
+                    // Handle nested UNPACK_SEQUENCE when skipping for-loop targets
+                    if (skip_store_count > 0) {
+                        // This UNPACK_SEQUENCE is unpacking one of the elements from the outer unpack
+                        // Decrement for the one element consumed, add the inner count
+                        skip_store_count = skip_store_count - 1 + count;
+                        try sim.simulate(inst);
+                        continue;
+                    }
                     const skip_count = try self.handleUnpack(&sim, instructions, idx, stmts, a);
                     if (skip_count > 0) {
                         idx += skip_count;
@@ -17547,6 +17665,14 @@ pub const Decompiler = struct {
                             continue;
                         }
                         skip_store_count = count;
+                        try sim.simulate(inst);
+                        continue;
+                    }
+                    // Handle nested UNPACK_SEQUENCE when skipping for-loop targets
+                    if (skip_store_count > 0) {
+                        // This UNPACK_SEQUENCE is unpacking one of the elements from the outer unpack
+                        // Decrement for the one element consumed, add the inner count
+                        skip_store_count = skip_store_count - 1 + count;
                         try sim.simulate(inst);
                         continue;
                     }
@@ -18800,7 +18926,8 @@ pub const Decompiler = struct {
                 };
                 try self.writeTrace(ev);
             }
-            if (try self.tryDecompileBoolOpInto(block_idx, loop_limit, &stmts, a)) |next_block| {
+            if (try self.tryDecompileBoolOpIntoWithSkip(block_idx, loop_limit, &stmts, a, skip_first_store.*)) |next_block| {
+                skip_first_store.* = false;
                 block_idx = next_block;
                 continue;
             }
@@ -18814,7 +18941,8 @@ pub const Decompiler = struct {
                 };
                 try self.writeTrace(ev);
             }
-            if (try self.tryDecompileTernaryInto(block_idx, loop_limit, &stmts, a)) |next_block| {
+            if (try self.tryDecompileTernaryIntoWithSkip(block_idx, loop_limit, &stmts, a, skip_first_store.*)) |next_block| {
+                skip_first_store.* = false;
                 block_idx = next_block;
                 continue;
             }
