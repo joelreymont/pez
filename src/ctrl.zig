@@ -1264,6 +1264,25 @@ pub const Analyzer = struct {
         }
 
         if (!self.inLoop(body_id, block_id)) return null;
+
+        // If body block's only path forward goes through the exit block, this is
+        // a guard inside while True:, not a conditional while. E.g.:
+        //   while True:
+        //     if guard: os._exit()  # body goes to exit, not back to header
+        //     ...
+        // The body (os._exit) doesn't return, but bytecode still has successor.
+        // Detect this by checking if body's successor IS the exit block.
+        const body_blk = &self.cfg.blocks[body_id];
+        var body_goes_to_exit = false;
+        for (body_blk.successors) |edge| {
+            if (edge.edge_type == .exception) continue;
+            if (edge.target == exit_id) {
+                body_goes_to_exit = true;
+                break;
+            }
+        }
+        if (body_goes_to_exit) return null;
+
         if (self.inLoop(exit_id, block_id)) {
             const chain_blk = &self.cfg.blocks[exit_id];
             const chain_term = chain_blk.terminator() orelse return null;
