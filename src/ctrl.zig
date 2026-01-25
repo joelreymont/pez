@@ -1268,17 +1268,21 @@ pub const Analyzer = struct {
         //     if guard: os._exit()  # body goes to exit, not back to header
         //     ...
         // The body (os._exit) doesn't return, but bytecode still has successor.
-        // Detect this by checking if body's successor IS the exit block.
+        // Detect this by checking if body's ONLY non-exception successor IS the exit block.
+        // Note: for while A and B:, body (second condition) has exit as one branch but
+        // also has the real body as another branch - don't reject those.
         const body_blk = &self.cfg.blocks[body_id];
-        var body_goes_to_exit = false;
+        var body_only_to_exit = true;
+        var has_non_exc_succ = false;
         for (body_blk.successors) |edge| {
             if (edge.edge_type == .exception) continue;
-            if (edge.target == exit_id) {
-                body_goes_to_exit = true;
+            has_non_exc_succ = true;
+            if (edge.target != exit_id) {
+                body_only_to_exit = false;
                 break;
             }
         }
-        if (body_goes_to_exit) return null;
+        if (has_non_exc_succ and body_only_to_exit) return null;
 
         if (self.inLoop(exit_id, block_id)) {
             const chain_blk = &self.cfg.blocks[exit_id];
