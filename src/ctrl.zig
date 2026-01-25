@@ -1810,6 +1810,84 @@ pub const Analyzer = struct {
         return false;
     }
 
+    /// Check if all handlers end in terminal instructions (return/raise/break)
+    /// without falling through to continuation code.
+    fn allHandlersTerminal(self: *Analyzer, handlers: []const HandlerInfo, exit_block: ?u32) !bool {
+        if (handlers.len == 0) return false;
+
+        for (handlers) |h| {
+            if (!(try self.handlerIsTerminal(h.handler_block, exit_block))) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    /// Check if a handler block (and its normal successors) leads only to terminal blocks
+    fn handlerIsTerminal(self: *Analyzer, start: u32, exit_block: ?u32) !bool {
+        if (start >= self.cfg.blocks.len) return true;
+
+        var seen = try std.DynamicBitSet.initEmpty(self.allocator, self.cfg.blocks.len);
+        defer seen.deinit();
+        var queue: std.ArrayList(u32) = .{};
+        defer queue.deinit(self.allocator);
+        try queue.append(self.allocator, start);
+
+        while (queue.items.len > 0) {
+            const bid = queue.items[queue.items.len - 1];
+            queue.items.len -= 1;
+            if (bid >= self.cfg.blocks.len) continue;
+            if (seen.isSet(bid)) continue;
+            seen.set(bid);
+
+            const blk = &self.cfg.blocks[bid];
+            if (blk.instructions.len == 0) continue;
+
+            const last = blk.instructions[blk.instructions.len - 1];
+            // Terminal instructions - no fall-through
+            if (last.opcode == .RETURN_VALUE or last.opcode == .RETURN_CONST or
+                last.opcode == .RAISE_VARARGS or last.opcode == .RERAISE)
+            {
+                continue; // This path is terminal
+            }
+
+            // Check successors
+            var has_non_terminal_succ = false;
+            for (blk.successors) |edge| {
+                if (edge.edge_type == .exception) continue;
+                // Break to loop exit is terminal
+                if (exit_block) |exit| {
+                    if (edge.target == exit) continue;
+                }
+                // Loop back edges don't count as continuation
+                if (edge.edge_type == .loop_back) continue;
+
+                if (!seen.isSet(edge.target)) {
+                    try queue.append(self.allocator, edge.target);
+                    has_non_terminal_succ = true;
+                }
+            }
+
+            // If block has no successors and isn't terminal, it falls through
+            if (!has_non_terminal_succ and blk.successors.len == 0) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    /// Public version: check if all handler blocks are terminal (for decompiler)
+    pub fn allHandlerBlocksTerminal(self: *Analyzer, handler_blocks: []const u32, exit_block: ?u32) !bool {
+        if (handler_blocks.len == 0) return false;
+
+        for (handler_blocks) |hid| {
+            if (!(try self.handlerIsTerminal(hid, exit_block))) {
+                return false;
+            }
+        }
+        return true;
+    }
+
     fn collectReachableNormal(self: *Analyzer, start: u32, seen: *std.DynamicBitSet) !void {
         if (start >= self.cfg.blocks.len) return;
         var queue: std.ArrayList(u32) = .{};
@@ -2023,6 +2101,10 @@ pub const Analyzer = struct {
 
         // Verify candidate is not reachable from handlers
         if (try self.handlerReaches(handlers, cand)) return null;
+
+        // If all handlers are terminal (return/raise/break), no else needed -
+        // continuation code after try is not semantically an else clause
+        if (try self.allHandlersTerminal(handlers, exit_block)) return null;
 
         // Verify candidate comes before exit
         if (exit_block) |exit| {

@@ -9808,6 +9808,10 @@ pub const Decompiler = struct {
             if (post_try_entry) |entry| {
                 if (!handler_reach.isSet(entry)) {
                     if (join_block == null or entry != join_block.?) {
+                        // Don't infer else if all handlers are terminal (return/raise/break)
+                        if (try self.analyzer.allHandlerBlocksTerminal(handler_blocks.items, loop_exit)) {
+                            break :blk null;
+                        }
                         break :blk entry;
                     }
                 }
