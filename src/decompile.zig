@@ -8023,7 +8023,7 @@ pub const Decompiler = struct {
                 if (self.if_next == null) {
                     self.if_next = else_id;
                 }
-            } else if (!is_elif and else_id > pattern.condition_block and
+            } else if (!is_elif and !guard_or_else_applied and else_id > pattern.condition_block and
                 self.bodyEndsTerminal(then_body) and self.isTerminalBlock(else_id) and self.termSinglePred(else_id))
             {
                 else_block = null;
@@ -8424,6 +8424,8 @@ pub const Decompiler = struct {
             else_body = &[_]*Stmt{};
             self.if_tail = then_body;
             then_body = guard_body;
+            // Clear if_next since the following code is handled via if_tail
+            self.if_next = null;
         }
         if (else_block) |else_id| {
             if (self.if_next == null and else_id > pattern.condition_block and
@@ -9808,16 +9810,20 @@ pub const Decompiler = struct {
             if (post_try_entry) |entry| {
                 if (!handler_reach.isSet(entry)) {
                     if (join_block == null or entry != join_block.?) {
-                        // Don't infer else if all handlers are terminal (return/raise/break)
-                        if (try self.analyzer.allHandlerBlocksTerminal(handler_blocks.items, loop_exit)) {
-                            break :blk null;
-                        }
                         break :blk entry;
                     }
                 }
             }
             break :blk null;
         };
+
+        // Don't emit else if all handlers are truly terminal (return/raise in handler-owned
+        // blocks, or break to loop exit). Check even if pattern detected else_block.
+        if (else_start != null) {
+            if (try self.analyzer.allHandlerBlocksTerminal(handler_blocks.items, loop_exit)) {
+                else_start = null;
+            }
+        }
 
         if (has_finally and except_count == 0) {
             else_start = null;

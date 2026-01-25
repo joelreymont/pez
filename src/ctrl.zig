@@ -1824,7 +1824,9 @@ pub const Analyzer = struct {
         return true;
     }
 
-    /// Check if a handler block (and its normal successors) leads only to terminal blocks
+    /// Check if a handler block directly contains a terminal instruction (return/raise)
+    /// within its own block chain, not just eventually reaching a common return path.
+    /// Also treats jumps to loop exit block (break) as terminal.
     fn handlerIsTerminal(self: *Analyzer, start: u32, exit_block: ?u32) !bool {
         if (start >= self.cfg.blocks.len) return true;
 
@@ -1834,31 +1836,61 @@ pub const Analyzer = struct {
         defer queue.deinit(self.allocator);
         try queue.append(self.allocator, start);
 
+        // Collect handler-reachable blocks
+        var handler_blocks = try std.DynamicBitSet.initEmpty(self.allocator, self.cfg.blocks.len);
+        defer handler_blocks.deinit();
+
         while (queue.items.len > 0) {
             const bid = queue.items[queue.items.len - 1];
             queue.items.len -= 1;
             if (bid >= self.cfg.blocks.len) continue;
             if (seen.isSet(bid)) continue;
             seen.set(bid);
+            handler_blocks.set(bid);
 
             const blk = &self.cfg.blocks[bid];
             if (blk.instructions.len == 0) continue;
 
             const last = blk.instructions[blk.instructions.len - 1];
-            // Terminal instructions - no fall-through
+            // Terminal instructions - check if this block is handler-exclusive
             if (last.opcode == .RETURN_VALUE or last.opcode == .RETURN_CONST or
                 last.opcode == .RAISE_VARARGS or last.opcode == .RERAISE)
             {
-                continue; // This path is terminal
+                // Only count as terminal if this block has no predecessors from
+                // outside the handler chain (i.e., it's exclusively handler-owned)
+                var has_outside_pred = false;
+                for (blk.predecessors) |pred_id| {
+                    if (pred_id >= self.cfg.blocks.len) continue;
+                    // If predecessor is not in handler chain and not the start, it's outside
+                    if (!handler_blocks.isSet(pred_id) and pred_id != start) {
+                        has_outside_pred = true;
+                        break;
+                    }
+                }
+                if (!has_outside_pred) {
+                    continue; // This path is truly terminal (handler-owned)
+                }
+                // Terminal block is shared with non-handler path, don't count as terminal
+                return false;
             }
 
             // Check successors
             var has_non_terminal_succ = false;
             for (blk.successors) |edge| {
                 if (edge.edge_type == .exception) continue;
-                // Break to loop exit is terminal
+                // Break to loop exit is terminal - treat as handler-owned terminal
+                // Check both direct jump to exit and jump to where exit leads
                 if (exit_block) |exit| {
-                    if (edge.target == exit) continue;
+                    if (edge.target == exit) {
+                        // Direct jump to loop exit - handler IS terminal
+                        continue;
+                    }
+                    // Also check if handler jumps to same destination as loop exit
+                    // (e.g., both break paths go to same return block)
+                    const exit_dest = self.jumpOnlyTarget(exit);
+                    if (exit_dest != null and edge.target == exit_dest.?) {
+                        continue;
+                    }
                 }
                 // Loop back edges don't count as continuation
                 if (edge.edge_type == .loop_back) continue;
@@ -2103,9 +2135,8 @@ pub const Analyzer = struct {
         // Verify candidate is not reachable from handlers
         if (try self.handlerReaches(handlers, cand)) return null;
 
-        // If all handlers are terminal (return/raise/break), no else needed -
-        // continuation code after try is not semantically an else clause
-        if (try self.allHandlersTerminal(handlers, exit_block)) return null;
+        // Note: terminal handler check (allHandlersTerminal) is done in decompiler
+        // where we have loop context to properly detect breaks
 
         // Verify candidate comes before exit
         if (exit_block) |exit| {
