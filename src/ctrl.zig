@@ -2213,7 +2213,37 @@ pub const Analyzer = struct {
 
         const common = try self.commonReachableNormal(candidates.items);
         if (common == null) return null;
-        const candidate = common.?;
+        var candidate = common.?;
+
+        // Skip blocks ending with terminal instructions (inlined finally with return/raise)
+        // These are duplicated finally code before early returns, not the actual finally
+        while (candidate < self.cfg.blocks.len) {
+            const cand_blk = &self.cfg.blocks[candidate];
+            if (cand_blk.instructions.len > 0) {
+                const last = cand_blk.instructions[cand_blk.instructions.len - 1];
+                if (last.opcode == .RETURN_VALUE or last.opcode == .RETURN_CONST or
+                    last.opcode == .RAISE_VARARGS or last.opcode == .RERAISE)
+                {
+                    // Find next reachable block that's not terminal
+                    var next: ?u32 = null;
+                    for (cand_blk.successors) |edge| {
+                        if (edge.edge_type == .normal) {
+                            next = edge.target;
+                            break;
+                        }
+                    }
+                    if (next) |n| {
+                        candidate = n;
+                        continue;
+                    }
+                    // Try to find next block by offset
+                    candidate += 1;
+                    continue;
+                }
+            }
+            break;
+        }
+        if (candidate >= self.cfg.blocks.len) return null;
 
         // Verify not a handler
         for (handlers) |h| {

@@ -9581,6 +9581,15 @@ pub const Decompiler = struct {
                         continue;
                     }
                 }
+                // Skip blocks ending with terminal instructions (inlined finally with return/raise)
+                const cand_blk = &self.cfg.blocks[candidate];
+                if (cand_blk.terminator()) |term| {
+                    if (term.opcode == .RETURN_VALUE or term.opcode == .RETURN_CONST or
+                        term.opcode == .RAISE_VARARGS or term.opcode == .RERAISE)
+                    {
+                        continue;
+                    }
+                }
                 post_try_entry = if (post_try_entry) |prev|
                     @min(prev, candidate)
                 else
@@ -9610,6 +9619,17 @@ pub const Decompiler = struct {
             );
             for (scratch.normal_reach.list.items) |bid| {
                 if (handler_reach.isSet(bid)) {
+                    // Skip blocks ending with terminal instructions (return/raise)
+                    if (bid < self.cfg.blocks.len) {
+                        const blk = &self.cfg.blocks[bid];
+                        if (blk.terminator()) |term| {
+                            if (term.opcode == .RETURN_VALUE or term.opcode == .RETURN_CONST or
+                                term.opcode == .RAISE_VARARGS or term.opcode == .RERAISE)
+                            {
+                                continue;
+                            }
+                        }
+                    }
                     join_block = bid;
                     break;
                 }
@@ -9744,6 +9764,15 @@ pub const Decompiler = struct {
                         }
                     }
                     if (is_handler) continue;
+                    // Skip blocks ending with terminal instructions (inlined finally with return/raise)
+                    const target_blk = &self.cfg.blocks[normal_target.?];
+                    if (target_blk.terminator()) |term| {
+                        if (term.opcode == .RETURN_VALUE or term.opcode == .RETURN_CONST or
+                            term.opcode == .RAISE_VARARGS or term.opcode == .RERAISE)
+                        {
+                            continue;
+                        }
+                    }
                     if (cleanup_candidate == null or
                         self.cfg.blocks[normal_target.?].start_offset <
                             self.cfg.blocks[cleanup_candidate.?].start_offset)
@@ -9838,7 +9867,15 @@ pub const Decompiler = struct {
 
         const finally_start: ?u32 = effective_finally_block orelse blk: {
             if (has_finally) {
-                break :blk join_block orelse post_try_entry;
+                const candidate = join_block orelse post_try_entry;
+                // Validate that finally_start is not inside the protected try region
+                // (which would indicate an early return path, not the actual finally)
+                if (candidate) |cand| {
+                    if (cand < handler_start and protected_set.isSet(cand)) {
+                        break :blk null;
+                    }
+                }
+                break :blk candidate;
             }
             break :blk null;
         };
@@ -14596,7 +14633,15 @@ pub const Decompiler = struct {
                         }
                     }
                     if (next >= end or next >= self.cfg.blocks.len) {
-                        var scan = start + 1;
+                        // Calculate the minimum end of both if branches to avoid reprocessing
+                        const then_end = try self.branchEnd(if_pat.then_block, null);
+                        var min_next = @min(then_end, end);
+                        if (if_pat.else_block) |else_id| {
+                            const else_end = try self.branchEnd(else_id, null);
+                            min_next = @max(min_next, @min(else_end, end));
+                        }
+                        // Scan for unconsumed blocks starting from after the if branches
+                        var scan = @max(min_next, start + 1);
                         while (scan < end and scan < self.cfg.blocks.len) : (scan += 1) {
                             if (!self.consumed.isSet(scan)) {
                                 next = scan;
