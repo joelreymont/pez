@@ -1321,11 +1321,12 @@ pub const Analyzer = struct {
         if (!in_loop_context) {
             const header_block = &self.cfg.blocks[block_id];
             for (header_block.predecessors) |pred| {
-                if (pred == body_id) continue; // inner loop back-edge
                 if (pred + 1 == block_id) continue; // fallthrough from previous block
                 if (pred >= exit_id) continue; // back-edge from after inner while exit
+                // Allow back-edges from anywhere in the loop body (body_id to exit_id)
+                if (pred >= body_id and pred < exit_id) continue;
                 // Check if pred is outside the inner loop body but in the outer loop
-                if (self.inLoop(pred, block_id) and pred != body_id) {
+                if (self.inLoop(pred, block_id)) {
                     // Additional back-edge from outside inner loop body - nested loop
                     return null;
                 }

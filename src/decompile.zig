@@ -8603,8 +8603,9 @@ pub const Decompiler = struct {
                     const merge_is_then = guard.merge_block != null and
                         (guard.merge_block.? == guard.then_block or guard.merge_block.? == pattern.header_block);
                     const else_is_exit = else_id == pattern.exit_block;
+                    const merge_is_exit = guard.merge_block != null and guard.merge_block.? == pattern.exit_block;
                     const then_in_loop = self.analyzer.inLoop(guard.then_block, pattern.header_block);
-                    const can_merge = (merge_is_then or (guard.merge_block == null and else_is_exit)) and then_in_loop;
+                    const can_merge = (merge_is_then or merge_is_exit or (guard.merge_block == null and else_is_exit)) and then_in_loop;
                     if (can_merge and else_is_exit) {
                         var guard_sim = self.initSim(self.arena.allocator(), self.arena.allocator(), self.code, self.version);
                         defer guard_sim.deinit();
