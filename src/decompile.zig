@@ -8083,7 +8083,13 @@ pub const Decompiler = struct {
                 else
                     try self.branchEnd(else_id, null);
                 else_end = else_end_val;
-                break :blk try self.decompileBranchRange(else_id, else_end_val, &.{}, skip);
+                // Save if_next - nested if processing may clear it
+                const saved_if_next_elif = self.if_next;
+                const elif_result = try self.decompileBranchRange(else_id, else_end_val, &.{}, skip);
+                if (saved_if_next_elif != null and self.if_next == null) {
+                    self.if_next = saved_if_next_elif;
+                }
+                break :blk elif_result;
             }
             // Regular else with inherited stack
             var else_next: ?u32 = null;
@@ -8145,7 +8151,14 @@ pub const Decompiler = struct {
                 }
             }
             else_end = else_end_val;
-            break :blk try self.decompileBranchRange(else_start, else_end_val, else_vals, skip);
+            // Save if_next - nested if processing may clear it
+            const saved_if_next = self.if_next;
+            const result = try self.decompileBranchRange(else_start, else_end_val, else_vals, skip);
+            // Restore if_next if it was set by outer merge detection
+            if (saved_if_next != null and self.if_next == null) {
+                self.if_next = saved_if_next;
+            }
+            break :blk result;
         } else blk: {
             // No else block - clean up base_vals
             deinitStackValuesSlice(self.allocator, self.allocator, base_vals_buf);
