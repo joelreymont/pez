@@ -1499,7 +1499,7 @@ test "codegen string escaping" {
     const output = try writer.getOutput(allocator);
     defer allocator.free(output);
 
-    try testing.expectEqualStrings("'hello\\nworld'", output);
+    try testing.expectEqualStrings("\"\"\"hello\nworld\"\"\"", output);
 }
 
 test "codegen with statement" {
