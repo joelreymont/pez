@@ -839,6 +839,23 @@ pub const Decompiler = struct {
         return false;
     }
 
+    /// Check if a block has meaningful content beyond just a terminal instruction.
+    /// Returns true if there are statements before the terminator.
+    fn exitBlockHasContent(block: *const BasicBlock) bool {
+        var stmt_count: usize = 0;
+        for (block.instructions) |inst| {
+            if (inst.opcode == .NOT_TAKEN or inst.opcode == .CACHE) continue;
+            // Terminal instructions don't count as content
+            switch (inst.opcode) {
+                .RETURN_VALUE, .RETURN_CONST, .RAISE_VARARGS, .RERAISE => {},
+                else => {
+                    if (isStatementOpcode(inst.opcode)) stmt_count += 1;
+                },
+            }
+        }
+        return stmt_count > 0;
+    }
+
     fn condChainAllTrueJumps(self: *Decompiler, start: u32, stop: u32) DecompileError!bool {
         if (start >= self.cfg.blocks.len) return false;
         if (stop >= self.cfg.blocks.len) return false;
@@ -8680,9 +8697,11 @@ pub const Decompiler = struct {
 
         var guard_if: ?*Stmt = null;
         var guard_next: ?u32 = null;
-        if (condBlockHasPrelude(header) and pattern.exit_block < self.cfg.blocks.len) {
+        if (pattern.exit_block < self.cfg.blocks.len) {
             const exit_block = &self.cfg.blocks[pattern.exit_block];
-            if (exit_block.predecessors.len == 1 and exit_block.predecessors[0] == pattern.header_block) {
+            // Process exit block as guard if header has prelude OR exit block has content
+            const should_process = condBlockHasPrelude(header) or exitBlockHasContent(exit_block);
+            if (should_process and exit_block.predecessors.len == 1 and exit_block.predecessors[0] == pattern.header_block) {
                 var has_cond = false;
                 for (exit_block.instructions) |inst| {
                     if (ctrl.Analyzer.isConditionalJump(undefined, inst.opcode)) {
@@ -9584,12 +9603,15 @@ pub const Decompiler = struct {
                     }
                 }
                 // Skip blocks ending with terminal instructions (inlined finally with return/raise)
-                const cand_blk = &self.cfg.blocks[candidate];
-                if (cand_blk.terminator()) |term| {
-                    if (term.opcode == .RETURN_VALUE or term.opcode == .RETURN_CONST or
-                        term.opcode == .RAISE_VARARGS or term.opcode == .RERAISE)
-                    {
-                        continue;
+                // Only skip if there's actually a finally block that could have been inlined
+                if (has_finally) {
+                    const cand_blk = &self.cfg.blocks[candidate];
+                    if (cand_blk.terminator()) |term| {
+                        if (term.opcode == .RETURN_VALUE or term.opcode == .RETURN_CONST or
+                            term.opcode == .RAISE_VARARGS or term.opcode == .RERAISE)
+                        {
+                            continue;
+                        }
                     }
                 }
                 post_try_entry = if (post_try_entry) |prev|
@@ -10530,7 +10552,6 @@ pub const Decompiler = struct {
             },
         };
         try self.normalizeTryFinalbody(stmt);
-
         return .{ .stmt = stmt, .next_block = next_block };
     }
 

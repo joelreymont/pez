@@ -2634,8 +2634,16 @@ pub const Analyzer = struct {
             has_cond = self.isConditionalJump(term.opcode);
         }
 
-        for (block.instructions) |inst| {
-            if (inst.opcode == .COPY) has_copy = true;
+        for (block.instructions, 0..) |inst, i| {
+            // COPY followed by STORE is class cell pattern, not match
+            if (inst.opcode == .COPY) {
+                const next_is_store = if (i + 1 < block.instructions.len)
+                    block.instructions[i + 1].opcode == .STORE_NAME or
+                        block.instructions[i + 1].opcode == .STORE_FAST
+                else
+                    false;
+                if (!next_is_store) has_copy = true;
+            }
             if (inst.opcode == .MATCH_SEQUENCE or
                 inst.opcode == .MATCH_MAPPING or
                 inst.opcode == .MATCH_CLASS)
