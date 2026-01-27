@@ -59,14 +59,24 @@ pub fn dupeStrings(allocator: Allocator, items: []const []const u8) ![][]const u
     return out;
 }
 
-pub fn simulateExpr(allocator: Allocator, code: *pyc.Code, version: Version, insts: []const Instruction) !*stack.Expr {
-    var sim = stack.SimContext.init(allocator, allocator, code, version);
+pub const SimExpr = struct {
+    arena: std.heap.ArenaAllocator,
+    expr: *stack.Expr,
+};
+
+pub fn simulateExpr(allocator: Allocator, code: *pyc.Code, version: Version, insts: []const Instruction) !SimExpr {
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    errdefer arena.deinit();
+    const a = arena.allocator();
+
+    var sim = stack.SimContext.init(a, a, code, version);
     defer sim.deinit();
 
     for (insts) |item| {
         try sim.simulate(item);
     }
-    return sim.stack.popExpr();
+    const expr = try sim.stack.popExpr();
+    return .{ .arena = arena, .expr = expr };
 }
 
 pub fn opcodeByte(version: Version, op: Opcode) u8 {

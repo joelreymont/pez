@@ -53,11 +53,9 @@ test "snapshot list comprehension" {
         tu.inst(.STORE_FAST, 1),
     };
 
-    const expr = try tu.simulateExpr(allocator, &code, version, &insts);
-    defer {
-        expr.deinit(allocator);
-        allocator.destroy(expr);
-    }
+    var sim = try tu.simulateExpr(allocator, &code, version, &insts);
+    defer sim.arena.deinit();
+    const expr = sim.expr;
 
     const output = try tu.renderExprWithNewline(allocator, expr);
     defer allocator.free(output);
@@ -108,11 +106,9 @@ test "snapshot list comprehension with if" {
         tu.inst(.STORE_FAST, 1),
     };
 
-    const expr = try tu.simulateExpr(allocator, &code, version, &insts);
-    defer {
-        expr.deinit(allocator);
-        allocator.destroy(expr);
-    }
+    var sim = try tu.simulateExpr(allocator, &code, version, &insts);
+    defer sim.arena.deinit();
+    const expr = sim.expr;
 
     const output = try tu.renderExprWithNewline(allocator, expr);
     defer allocator.free(output);
@@ -162,11 +158,9 @@ test "snapshot list comprehension with is None" {
         tu.inst(.STORE_FAST, 1),
     };
 
-    const expr = try tu.simulateExpr(allocator, &code, version, &insts);
-    defer {
-        expr.deinit(allocator);
-        allocator.destroy(expr);
-    }
+    var sim = try tu.simulateExpr(allocator, &code, version, &insts);
+    defer sim.arena.deinit();
+    const expr = sim.expr;
 
     const output = try tu.renderExprWithNewline(allocator, expr);
     defer allocator.free(output);
@@ -266,11 +260,9 @@ test "snapshot set comprehension" {
         tu.inst(.STORE_FAST, 1),
     };
 
-    const expr = try tu.simulateExpr(allocator, &code, version, &insts);
-    defer {
-        expr.deinit(allocator);
-        allocator.destroy(expr);
-    }
+    var sim = try tu.simulateExpr(allocator, &code, version, &insts);
+    defer sim.arena.deinit();
+    const expr = sim.expr;
 
     const output = try tu.renderExprWithNewline(allocator, expr);
     defer allocator.free(output);
@@ -319,11 +311,9 @@ test "snapshot dict comprehension" {
         tu.inst(.STORE_FAST, 1),
     };
 
-    const expr = try tu.simulateExpr(allocator, &code, version, &insts);
-    defer {
-        expr.deinit(allocator);
-        allocator.destroy(expr);
-    }
+    var sim = try tu.simulateExpr(allocator, &code, version, &insts);
+    defer sim.arena.deinit();
+    const expr = sim.expr;
 
     const output = try tu.renderExprWithNewline(allocator, expr);
     defer allocator.free(output);
@@ -386,11 +376,9 @@ test "snapshot generator expression" {
         tu.inst(.CALL, 0),
     };
 
-    const expr = try tu.simulateExpr(allocator, &outer_code, version, &insts);
-    defer {
-        expr.deinit(allocator);
-        allocator.destroy(expr);
-    }
+    var sim = try tu.simulateExpr(allocator, &outer_code, version, &insts);
+    defer sim.arena.deinit();
+    const expr = sim.expr;
 
     const output = try tu.renderExprWithNewline(allocator, expr);
     defer allocator.free(output);
@@ -441,11 +429,9 @@ test "snapshot lambda expression" {
         tu.inst(.MAKE_FUNCTION, 0),
     };
 
-    const expr = try tu.simulateExpr(allocator, &outer_code, version, &insts);
-    defer {
-        expr.deinit(allocator);
-        allocator.destroy(expr);
-    }
+    var sim = try tu.simulateExpr(allocator, &outer_code, version, &insts);
+    defer sim.arena.deinit();
+    const expr = sim.expr;
 
     const output = try tu.renderExprWithNewline(allocator, expr);
     defer allocator.free(output);
@@ -483,11 +469,9 @@ test "snapshot list unpack" {
         tu.inst(.BUILD_LIST_UNPACK, 2),
     };
 
-    const expr = try tu.simulateExpr(allocator, &code, version, &insts);
-    defer {
-        expr.deinit(allocator);
-        allocator.destroy(expr);
-    }
+    var sim = try tu.simulateExpr(allocator, &code, version, &insts);
+    defer sim.arena.deinit();
+    const expr = sim.expr;
 
     const output = try tu.renderExprWithNewline(allocator, expr);
     defer allocator.free(output);
@@ -527,11 +511,9 @@ test "snapshot list extend const tuple" {
         tu.inst(.LIST_EXTEND, 1),
     };
 
-    const expr = try tu.simulateExpr(allocator, &code, version, &insts);
-    defer {
-        expr.deinit(allocator);
-        allocator.destroy(expr);
-    }
+    var sim = try tu.simulateExpr(allocator, &code, version, &insts);
+    defer sim.arena.deinit();
+    const expr = sim.expr;
 
     const output = try tu.renderExprWithNewline(allocator, expr);
     defer allocator.free(output);
@@ -583,11 +565,9 @@ test "snapshot call with keywords" {
         tu.inst(.CALL_FUNCTION_KW, 2),
     };
 
-    const expr = try tu.simulateExpr(allocator, &code, version, &insts);
-    defer {
-        expr.deinit(allocator);
-        allocator.destroy(expr);
-    }
+    var sim = try tu.simulateExpr(allocator, &code, version, &insts);
+    defer sim.arena.deinit();
+    const expr = sim.expr;
 
     const output = try tu.renderExprWithNewline(allocator, expr);
     defer allocator.free(output);
@@ -625,11 +605,9 @@ test "snapshot call method" {
         tu.inst(.CALL_METHOD, 0),
     };
 
-    const expr = try tu.simulateExpr(allocator, &code, version, &insts);
-    defer {
-        expr.deinit(allocator);
-        allocator.destroy(expr);
-    }
+    var sim = try tu.simulateExpr(allocator, &code, version, &insts);
+    defer sim.arena.deinit();
+    const expr = sim.expr;
 
     const output = try tu.renderExprWithNewline(allocator, expr);
     defer allocator.free(output);
