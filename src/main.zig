@@ -127,6 +127,14 @@ pub fn main() !void {
     defer module.deinit();
 
     module.loadFromFile(filename.?) catch |err| {
+        if (err == error.InvalidPyc) {
+            if (module.last_err) |d| {
+                try stderr.print("Invalid pyc at offset {d}: {s}\n", .{ d.pos, @errorName(d.err) });
+                if (d.note) |note| {
+                    try stderr.print("Note: {s}\n", .{note});
+                }
+            }
+        }
         try stderr.print("Error loading {s}: {}\n", .{ filename.?, err });
         try stderr.flush();
         std.process.exit(1);

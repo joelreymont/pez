@@ -737,6 +737,7 @@ pub const Module = struct {
     interns: std.ArrayList([]const u8) = .{},
     refs: std.ArrayList(Object) = .{},
     file_data: ?[]const u8 = null,
+    last_err: ?ParseDiag = null,
 
     pub fn init(allocator: Allocator) Module {
         return .{
@@ -767,6 +768,7 @@ pub const Module = struct {
     }
 
     pub fn loadFromFile(self: *Module, filename: []const u8) !void {
+        self.last_err = null;
         const file = try std.fs.cwd().openFile(filename, .{});
         defer file.close();
 
@@ -807,13 +809,28 @@ pub const Module = struct {
         }
 
         // Read marshalled code object
-        self.code = try self.readObject(&reader);
+        self.code = self.readObject(&reader) catch |err| switch (err) {
+            error.OutOfMemory => return err,
+            else => {
+                self.last_err = .{ .pos = reader.pos, .err = err, .note = null };
+                return error.InvalidPyc;
+            },
+        };
+        if (self.code == null) {
+            self.last_err = .{
+                .pos = reader.pos,
+                .err = error.InvalidObjectType,
+                .note = "top-level object is not code",
+            };
+            return error.InvalidPyc;
+        }
     }
 
     fn readObject(self: *Module, reader: *BufferReader) !?*Code {
         const type_byte = try reader.readByte();
         const obj_type = ObjectType.fromByte(type_byte);
         const add_ref = ObjectType.hasRef(type_byte);
+        if (obj_type == .TYPE_UNKNOWN) return error.InvalidObjectType;
 
         // Reserve slot in refs BEFORE parsing children (they may reference this object)
         const ref_idx: ?usize = if (add_ref and obj_type == .TYPE_CODE) blk: {
@@ -837,12 +854,20 @@ pub const Module = struct {
         return code;
     }
 
+    const ParseDiag = struct {
+        pos: usize,
+        err: anyerror,
+        note: ?[]const u8,
+    };
+
     const ParseError = error{
         UnexpectedEndOfFile,
         OutOfMemory,
         UnsupportedPythonVersion,
         InvalidRef,
         InvalidStringRef,
+        InvalidObjectType,
+        InvalidFloat,
     };
 
     fn readCode(self: *Module, reader: *BufferReader) ParseError!*Code {
@@ -909,11 +934,50 @@ pub const Module = struct {
         if (ver.gte(3, 11)) {
             // Python 3.11+ uses localsplusnames and localspluskinds
             // instead of varnames, freevars, cellvars
-            code.varnames = try self.readTupleStrings(reader); // localsplusnames
+            const localsplusnames = try self.readTupleStrings(reader);
             const localspluskinds = try self.readBytesAlloc(reader);
-            if (localspluskinds.len > 0) allocator.free(localspluskinds); // discard for now
-            code.freevars = &.{};
-            code.cellvars = &.{};
+            defer allocator.free(localspluskinds);
+
+            // Kind flags: CO_FAST_LOCAL=0x20, CO_FAST_CELL=0x40, CO_FAST_FREE=0x80
+            const CO_FAST_CELL: u8 = 0x40;
+            const CO_FAST_FREE: u8 = 0x80;
+
+            // Count cells and frees to allocate arrays
+            var cell_count: usize = 0;
+            var free_count: usize = 0;
+            for (localspluskinds) |kind| {
+                if (kind & CO_FAST_CELL != 0) cell_count += 1;
+                if (kind & CO_FAST_FREE != 0) free_count += 1;
+            }
+
+            // Build cellvars and freevars arrays
+            if (cell_count > 0) {
+                code.cellvars = try allocator.alloc([]const u8, cell_count);
+                var idx: usize = 0;
+                for (localspluskinds, 0..) |kind, i| {
+                    if (kind & CO_FAST_CELL != 0) {
+                        code.cellvars[idx] = try allocator.dupe(u8, localsplusnames[i]);
+                        idx += 1;
+                    }
+                }
+            } else {
+                code.cellvars = &.{};
+            }
+
+            if (free_count > 0) {
+                code.freevars = try allocator.alloc([]const u8, free_count);
+                var idx: usize = 0;
+                for (localspluskinds, 0..) |kind, i| {
+                    if (kind & CO_FAST_FREE != 0) {
+                        code.freevars[idx] = try allocator.dupe(u8, localsplusnames[i]);
+                        idx += 1;
+                    }
+                }
+            } else {
+                code.freevars = &.{};
+            }
+
+            code.varnames = localsplusnames;
         } else if (ver.gte(2, 1)) {
             // Python 2.1+: varnames, freevars, cellvars
             code.varnames = try self.readTupleStrings(reader);
@@ -963,6 +1027,7 @@ pub const Module = struct {
         const type_byte = try reader.readByte();
         const obj_type = ObjectType.fromByte(type_byte);
         const add_ref = ObjectType.hasRef(type_byte);
+        if (obj_type == .TYPE_UNKNOWN) return error.InvalidObjectType;
 
         // Handle TYPE_REF - lookup in refs table
         if (obj_type == .TYPE_REF) {
@@ -973,7 +1038,7 @@ pub const Module = struct {
                 .string => |s| try self.allocator.dupe(u8, s),
                 .bytes => |b| try self.allocator.dupe(u8, b),
                 .none => error.InvalidRef, // Placeholder - should not be referenced
-                else => &.{}, // Type mismatch - return empty
+                else => error.InvalidObjectType,
             };
         }
 
@@ -987,7 +1052,7 @@ pub const Module = struct {
         const len: usize = switch (obj_type) {
             .TYPE_STRING, .TYPE_ASCII, .TYPE_INTERNED, .TYPE_ASCII_INTERNED, .TYPE_UNICODE => try reader.readU32(),
             .TYPE_SHORT_ASCII, .TYPE_SHORT_ASCII_INTERNED => try reader.readByte(),
-            else => return &.{},
+            else => return error.InvalidObjectType,
         };
 
         const slice = try reader.readSlice(len);
@@ -1021,6 +1086,7 @@ pub const Module = struct {
         const type_byte = try reader.readByte();
         const obj_type = ObjectType.fromByte(type_byte);
         const add_ref = ObjectType.hasRef(type_byte);
+        if (obj_type == .TYPE_UNKNOWN) return error.InvalidObjectType;
 
         // Handle TYPE_REF - look up in refs table
         if (obj_type == .TYPE_REF) {
@@ -1028,16 +1094,19 @@ pub const Module = struct {
             if (ref_idx >= self.refs.items.len) return error.InvalidRef;
             const ref_obj = self.refs.items[ref_idx];
             if (ref_obj == .none) return error.InvalidRef; // Placeholder - should not be referenced
-            if (ref_obj != .tuple) return &.{}; // Type mismatch
+            if (ref_obj != .tuple) return error.InvalidObjectType;
             // Convert tuple of Objects to array of strings
             const tuple = ref_obj.tuple;
             const strings = try self.allocator.alloc([]const u8, tuple.len);
+            var initialized: usize = 0;
+            errdefer {
+                for (strings[0..initialized]) |s| self.allocator.free(s);
+                self.allocator.free(strings);
+            }
             for (tuple, 0..) |obj, i| {
-                if (obj == .string) {
-                    strings[i] = try self.allocator.dupe(u8, obj.string);
-                } else {
-                    strings[i] = &.{};
-                }
+                if (obj != .string) return error.InvalidObjectType;
+                strings[i] = try self.allocator.dupe(u8, obj.string);
+                initialized += 1;
             }
             return strings;
         }
@@ -1045,7 +1114,7 @@ pub const Module = struct {
         const count: usize = switch (obj_type) {
             .TYPE_TUPLE => try reader.readU32(),
             .TYPE_SMALL_TUPLE => try reader.readByte(),
-            else => return &.{},
+            else => return error.InvalidObjectType,
         };
 
         // Reserve slot in refs BEFORE parsing children (they may reference this tuple)
@@ -1056,13 +1125,15 @@ pub const Module = struct {
         } else null;
 
         const strings = try self.allocator.alloc([]const u8, count);
+        var initialized: usize = 0;
         errdefer {
-            for (strings) |s| self.allocator.free(s);
+            for (strings[0..initialized]) |s| self.allocator.free(s);
             self.allocator.free(strings);
         }
 
         for (strings) |*s| {
             s.* = try self.readStringAlloc(reader);
+            initialized += 1;
         }
 
         // If FLAG_REF is set, update placeholder with actual tuple
@@ -1081,6 +1152,7 @@ pub const Module = struct {
         const type_byte = try reader.readByte();
         const obj_type = ObjectType.fromByte(type_byte);
         const add_ref = ObjectType.hasRef(type_byte);
+        if (obj_type == .TYPE_UNKNOWN) return error.InvalidObjectType;
 
         // Handle TYPE_REF - look up in refs table
         if (obj_type == .TYPE_REF) {
@@ -1088,7 +1160,7 @@ pub const Module = struct {
             if (ref_idx >= self.refs.items.len) return error.InvalidRef;
             const ref_obj = self.refs.items[ref_idx];
             if (ref_obj == .none) return error.InvalidRef; // Placeholder - should not be referenced
-            if (ref_obj != .tuple) return &.{}; // Type mismatch
+            if (ref_obj != .tuple) return error.InvalidObjectType;
             // Clone the tuple
             const tuple = ref_obj.tuple;
             const objects = try self.allocator.alloc(Object, tuple.len);
@@ -1101,7 +1173,7 @@ pub const Module = struct {
         const count: usize = switch (obj_type) {
             .TYPE_TUPLE => try reader.readU32(),
             .TYPE_SMALL_TUPLE => try reader.readByte(),
-            else => return &.{},
+            else => return error.InvalidObjectType,
         };
 
         // Reserve slot in refs BEFORE parsing children (they may reference this tuple)
@@ -1139,6 +1211,7 @@ pub const Module = struct {
         const type_byte = try reader.readByte();
         const obj_type = ObjectType.fromByte(type_byte);
         const add_ref = ObjectType.hasRef(type_byte);
+        if (obj_type == .TYPE_UNKNOWN) return error.InvalidObjectType;
 
         // Handle TYPE_REF first - it returns a clone of a previously seen object
         if (obj_type == .TYPE_REF) {
@@ -1179,17 +1252,17 @@ pub const Module = struct {
                 // Text-based float: 1-byte length followed by ASCII decimal representation
                 const len = try reader.readByte();
                 const slice = try reader.readSlice(len);
-                const value = std.fmt.parseFloat(f64, slice) catch 0.0;
+                const value = std.fmt.parseFloat(f64, slice) catch return error.InvalidFloat;
                 break :blk .{ .float = value };
             },
             .TYPE_COMPLEX => blk: {
                 // Text-based complex: two text floats (real and imaginary)
                 const real_len = try reader.readByte();
                 const real_slice = try reader.readSlice(real_len);
-                const real = std.fmt.parseFloat(f64, real_slice) catch 0.0;
+                const real = std.fmt.parseFloat(f64, real_slice) catch return error.InvalidFloat;
                 const imag_len = try reader.readByte();
                 const imag_slice = try reader.readSlice(imag_len);
-                const imag = std.fmt.parseFloat(f64, imag_slice) catch 0.0;
+                const imag = std.fmt.parseFloat(f64, imag_slice) catch return error.InvalidFloat;
                 break :blk .{ .complex = .{ .real = real, .imag = imag } };
             },
             .TYPE_BINARY_COMPLEX => blk: {
@@ -1361,7 +1434,7 @@ pub const Module = struct {
                 } };
             },
             .TYPE_REF => unreachable, // Handled above
-            else => .none,
+            else => return error.InvalidObjectType,
         };
 
         // If FLAG_REF is set, add/update refs entry
@@ -1539,6 +1612,102 @@ test "object type parsing" {
     try testing.expectEqual(ObjectType.TYPE_CODE, ObjectType.fromByte('c' | 0x80));
     try testing.expect(ObjectType.hasRef('c' | 0x80));
     try testing.expect(!ObjectType.hasRef('c'));
+}
+
+test "invalid object type returns error" {
+    const testing = std.testing;
+    const allocator = testing.allocator;
+
+    const data = [_]u8{ 0x01 };
+    var reader = BufferReader{ .data = &data };
+
+    var module = Module.init(allocator);
+    defer module.deinit();
+
+    try testing.expectError(error.InvalidObjectType, module.readAnyObject(&reader));
+}
+
+test "invalid float returns error" {
+    const testing = std.testing;
+    const allocator = testing.allocator;
+
+    const data = [_]u8{ 'f', 1, 'x' };
+    var reader = BufferReader{ .data = &data };
+
+    var module = Module.init(allocator);
+    defer module.deinit();
+
+    try testing.expectError(error.InvalidFloat, module.readAnyObject(&reader));
+}
+
+test "readBytesAlloc rejects non-string type" {
+    const testing = std.testing;
+    const allocator = testing.allocator;
+
+    const data = [_]u8{ 'N' };
+    var reader = BufferReader{ .data = &data };
+
+    var module = Module.init(allocator);
+    defer module.deinit();
+
+    try testing.expectError(error.InvalidObjectType, module.readBytesAlloc(&reader));
+}
+
+test "readTupleStrings rejects non-tuple type" {
+    const testing = std.testing;
+    const allocator = testing.allocator;
+
+    const data = [_]u8{ 'N' };
+    var reader = BufferReader{ .data = &data };
+
+    var module = Module.init(allocator);
+    defer module.deinit();
+
+    try testing.expectError(error.InvalidObjectType, module.readTupleStrings(&reader));
+}
+
+test "readTupleObjects rejects non-tuple type" {
+    const testing = std.testing;
+    const allocator = testing.allocator;
+
+    const data = [_]u8{ 'N' };
+    var reader = BufferReader{ .data = &data };
+
+    var module = Module.init(allocator);
+    defer module.deinit();
+
+    try testing.expectError(error.InvalidObjectType, module.readTupleObjects(&reader));
+}
+
+test "loadFromFile invalid pyc hard-fails" {
+    const testing = std.testing;
+    const allocator = testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var data: [17]u8 = undefined;
+    std.mem.writeInt(u32, data[0..4], @intFromEnum(Magic.MAGIC_3_11), .little);
+    std.mem.writeInt(u32, data[4..8], 0, .little);
+    @memset(data[8..16], 0);
+    data[16] = 0x01; // invalid object type
+
+    const file = try tmp.dir.createFile("bad.pyc", .{});
+    defer file.close();
+    try file.writeAll(&data);
+
+    const path = try tmp.dir.realpathAlloc(allocator, "bad.pyc");
+    defer allocator.free(path);
+
+    var module = Module.init(allocator);
+    defer module.deinit();
+
+    try testing.expectError(error.InvalidPyc, module.loadFromFile(path));
+    try testing.expect(module.last_err != null);
+    const d = module.last_err.?;
+    try testing.expectEqual(@as(usize, 17), d.pos);
+    try testing.expectEqualStrings("InvalidObjectType", @errorName(d.err));
+    try testing.expect(d.note == null);
 }
 
 test "buffer reader" {
