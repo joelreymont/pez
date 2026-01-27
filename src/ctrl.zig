@@ -454,7 +454,7 @@ pub const Analyzer = struct {
                     .BEFORE_WITH, .BEFORE_ASYNC_WITH, .LOAD_SPECIAL, .SETUP_WITH, .SETUP_ASYNC_WITH => {
                         flags.has_with_setup = true;
                     },
-                    .CHECK_EXC_MATCH, .PUSH_EXC_INFO, .JUMP_IF_NOT_EXC_MATCH => {
+                    .CHECK_EXC_MATCH, .CHECK_EG_MATCH, .PUSH_EXC_INFO, .JUMP_IF_NOT_EXC_MATCH => {
                         flags.has_check_exc_match = true;
                     },
                     .DUP_TOP => has_dup = true,
@@ -1453,7 +1453,7 @@ pub const Analyzer = struct {
             }
         }
 
-        // Look backwards for GET_ITER in predecessor
+        // Look backwards for GET_ITER in predecessor chain
         var setup_block: u32 = block_id;
         if (term.opcode == .FOR_LOOP) {
             // FOR_LOOP (Python 1.x-2.2): predecessor has sequence + index setup
@@ -1461,21 +1461,75 @@ pub const Analyzer = struct {
                 setup_block = block.predecessors[0];
             }
         } else if (block.predecessors.len > 0) {
+            // Trace back through predecessors to find GET_ITER
+            // Python 3.14: GET_ITER may be multiple blocks back due to inline comprehension setup
+            var visited: [16]u32 = undefined;
+            var visited_count: usize = 0;
+            var work: [16]u32 = undefined;
+            var work_count: usize = 0;
+
+            // Start with direct predecessors (skip loop_back edges)
             for (block.predecessors) |pred_id| {
+                if (pred_id >= self.cfg.blocks.len) continue;
                 const pred = &self.cfg.blocks[pred_id];
-                var edge_type: ?cfg_mod.EdgeType = null;
+                var is_loop_back = false;
                 for (pred.successors) |edge| {
-                    if (edge.target == block_id) {
-                        edge_type = edge.edge_type;
+                    if (edge.target == block_id and edge.edge_type == .loop_back) {
+                        is_loop_back = true;
                         break;
                     }
                 }
-                if (edge_type == .loop_back) continue;
-                // Check if predecessor has GET_ITER
-                for (pred.instructions) |inst| {
-                    if (inst.opcode == .GET_ITER) {
-                        setup_block = pred_id;
+                if (is_loop_back) continue;
+                if (work_count < work.len) {
+                    work[work_count] = pred_id;
+                    work_count += 1;
+                }
+            }
+
+            outer: while (work_count > 0) {
+                work_count -= 1;
+                const cur_id = work[work_count];
+                if (cur_id >= self.cfg.blocks.len) continue;
+
+                // Check if visited
+                var already_visited = false;
+                for (visited[0..visited_count]) |v| {
+                    if (v == cur_id) {
+                        already_visited = true;
                         break;
+                    }
+                }
+                if (already_visited) continue;
+                if (visited_count < visited.len) {
+                    visited[visited_count] = cur_id;
+                    visited_count += 1;
+                }
+
+                const cur = &self.cfg.blocks[cur_id];
+
+                // Check if this block has GET_ITER
+                for (cur.instructions) |inst| {
+                    if (inst.opcode == .GET_ITER) {
+                        setup_block = cur_id;
+                        break :outer;
+                    }
+                }
+
+                // Add predecessors to worklist (only normal flow)
+                for (cur.predecessors) |pred_id| {
+                    if (pred_id >= self.cfg.blocks.len) continue;
+                    const pred = &self.cfg.blocks[pred_id];
+                    var is_loop_back = false;
+                    for (pred.successors) |edge| {
+                        if (edge.target == cur_id and edge.edge_type == .loop_back) {
+                            is_loop_back = true;
+                            break;
+                        }
+                    }
+                    if (is_loop_back) continue;
+                    if (work_count < work.len) {
+                        work[work_count] = pred_id;
+                        work_count += 1;
                     }
                 }
             }
@@ -2073,15 +2127,56 @@ pub const Analyzer = struct {
             if (h.handler_block < first_handler) first_handler = h.handler_block;
         }
 
-        // Walk normal edges through try body until just before first handler
-        var last_try_block = try_block;
-        var cur = try_block;
-        while (cur < first_handler) {
-            const blk = &self.cfg.blocks[cur];
-            var next: ?u32 = null;
+        // Walk normal edges through try body (bounded before first handler)
+        var try_body = try std.DynamicBitSet.initEmpty(self.allocator, self.cfg.blocks.len);
+        defer try_body.deinit();
+        var work: std.ArrayList(u32) = .{};
+        defer work.deinit(self.allocator);
+        if (try_block < first_handler) {
+            try work.append(self.allocator, try_block);
+        }
+        while (work.items.len > 0) {
+            const bid = work.pop().?;
+            if (bid >= self.cfg.blocks.len) continue;
+            if (bid >= first_handler) continue;
+            if (try_body.isSet(bid)) continue;
+            var is_handler = false;
+            for (handlers) |h| {
+                if (bid == h.handler_block) {
+                    is_handler = true;
+                    break;
+                }
+            }
+            if (is_handler) continue;
+            try_body.set(bid);
+            const blk = &self.cfg.blocks[bid];
             for (blk.successors) |edge| {
-                if (edge.edge_type != .normal) continue;
+                if (edge.edge_type != .normal and edge.edge_type != .loop_back) continue;
                 if (edge.target >= first_handler) continue;
+                var tgt_is_handler = false;
+                for (handlers) |h| {
+                    if (edge.target == h.handler_block) {
+                        tgt_is_handler = true;
+                        break;
+                    }
+                }
+                if (tgt_is_handler) continue;
+                if (!try_body.isSet(edge.target)) {
+                    try work.append(self.allocator, edge.target);
+                }
+            }
+        }
+
+        // Candidate else block is a normal successor leaving the try body
+        var candidate: ?u32 = null;
+        var best_off: u32 = std.math.maxInt(u32);
+        var bid: u32 = 0;
+        while (bid < self.cfg.blocks.len) : (bid += 1) {
+            if (!try_body.isSet(bid)) continue;
+            const blk = &self.cfg.blocks[bid];
+            for (blk.successors) |edge| {
+                if (edge.edge_type != .normal and edge.edge_type != .loop_back) continue;
+                if (edge.target <= first_handler) continue;
                 var is_handler = false;
                 for (handlers) |h| {
                     if (edge.target == h.handler_block) {
@@ -2090,33 +2185,12 @@ pub const Analyzer = struct {
                     }
                 }
                 if (is_handler) continue;
-                next = edge.target;
-                break;
-            }
-            if (next) |nxt| {
-                last_try_block = nxt;
-                cur = nxt;
-                continue;
-            }
-            break;
-        }
-
-        // Candidate else block is normal successor after the handlers
-        const last_blk = &self.cfg.blocks[last_try_block];
-        var candidate: ?u32 = null;
-        for (last_blk.successors) |edge| {
-            if (edge.edge_type != .normal) continue;
-            if (edge.target <= first_handler) continue;
-            var is_handler = false;
-            for (handlers) |h| {
-                if (edge.target == h.handler_block) {
-                    is_handler = true;
-                    break;
+                const off = self.cfg.blocks[edge.target].start_offset;
+                if (off < best_off) {
+                    best_off = off;
+                    candidate = edge.target;
                 }
             }
-            if (is_handler) continue;
-            candidate = edge.target;
-            break;
         }
         if (candidate == null) return null;
         var cand = candidate.?;

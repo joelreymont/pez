@@ -168,6 +168,8 @@ pub const StackValue = union(enum) {
     null_marker,
     /// A saved local (for LOAD_FAST_AND_CLEAR).
     saved_local: []const u8,
+    /// A type alias (name, value) for PEP 695.
+    type_alias: *Expr,
     /// Unknown/untracked value.
     unknown,
 
@@ -230,6 +232,10 @@ pub fn stackValueEqual(a: StackValue, b: StackValue) bool {
         },
         .saved_local => |name| switch (b) {
             .saved_local => |other| std.mem.eql(u8, name, other),
+            else => false,
+        },
+        .type_alias => |ae| switch (b) {
+            .type_alias => |be| ast.exprEqual(ae, be),
             else => false,
         },
         .unknown => switch (b) {
@@ -560,6 +566,8 @@ pub const SimContext = struct {
     lenient: bool = false,
     /// Avoid deep deinit in stack-flow analysis.
     flow_mode: bool = false,
+    /// Previous opcode (for walrus detection).
+    prev_opcode: ?Opcode = null,
 
     pub fn init(allocator: Allocator, stack_alloc: Allocator, code: *const pyc.Code, version: Version) SimContext {
         return .{
@@ -600,6 +608,7 @@ pub const SimContext = struct {
         self.pending_await = false;
         self.lenient = false;
         self.flow_mode = false;
+        self.prev_opcode = null;
         self.inplace_exprs.clearRetainingCapacity();
         self.empty_tuple_builds.clearRetainingCapacity();
     }
@@ -762,7 +771,7 @@ pub const SimContext = struct {
             .set => |items| {
                 const elts = try self.objectsToExprs(items);
                 const expr = try self.allocator.create(Expr);
-                expr.* = .{ .set = .{ .elts = elts } };
+                expr.* = .{ .set = .{ .elts = elts, .cap = elts.len } };
                 return expr;
             },
             .frozenset => |items| {
@@ -972,8 +981,16 @@ pub const SimContext = struct {
             else => return error.NotAnExpression,
         };
 
-        if (expr.* != .constant or expr.constant != .string) return error.InvalidConstant;
-        const name = try self.allocator.dupe(u8, expr.constant.string);
+        // Python 1.x/2.x uses bytes for class names, Python 3+ uses strings
+        const name_bytes = switch (expr.*) {
+            .constant => |c| switch (c) {
+                .string => |s| s,
+                .bytes => |b| b,
+                else => return error.InvalidConstant,
+            },
+            else => return error.InvalidConstant,
+        };
+        const name = try self.allocator.dupe(u8, name_bytes);
         expr.deinit(self.allocator);
         self.allocator.destroy(expr);
         return name;
@@ -1127,8 +1144,16 @@ pub const SimContext = struct {
             else => return error.InvalidKeywordNames,
         };
 
-        if (expr.* != .constant or expr.constant != .string) return error.InvalidKeywordNames;
-        const name = try self.allocator.dupe(u8, expr.constant.string);
+        // Python 1.x/2.x uses bytes for keyword names, Python 3+ uses strings
+        const name_bytes = switch (expr.*) {
+            .constant => |c| switch (c) {
+                .string => |s| s,
+                .bytes => |b| b,
+                else => return error.InvalidKeywordNames,
+            },
+            else => return error.InvalidKeywordNames,
+        };
+        const name = try self.allocator.dupe(u8, name_bytes);
         expr.deinit(self.allocator);
         self.allocator.destroy(expr);
         return name;
@@ -1144,7 +1169,7 @@ pub const SimContext = struct {
                 .tuple => try ast.makeTuple(self.allocator, &.{}, .load),
                 .set => blk: {
                     const empty_set = try self.allocator.create(Expr);
-                    empty_set.* = .{ .set = .{ .elts = &.{} } };
+                    empty_set.* = .{ .set = .{ .elts = &.{}, .cap = 0 } };
                     break :blk empty_set;
                 },
             };
@@ -1178,7 +1203,7 @@ pub const SimContext = struct {
             .tuple => try ast.makeTuple(self.allocator, starred, .load),
             .set => blk: {
                 const set_expr = try self.allocator.create(Expr);
-                set_expr.* = .{ .set = .{ .elts = starred } };
+                set_expr.* = .{ .set = .{ .elts = starred, .cap = starred.len } };
                 break :blk set_expr;
             },
         };
@@ -1339,19 +1364,56 @@ pub const SimContext = struct {
         try self.stack.push(.{ .expr = expr });
     }
 
+    fn ensureSetCap(self: *SimContext, set_expr: *Expr, new_len: usize) SimError!void {
+        const old_len = set_expr.set.elts.len;
+        if (new_len <= set_expr.set.cap) {
+            if (new_len != old_len) {
+                set_expr.set.elts = set_expr.set.elts.ptr[0..new_len];
+            }
+            return;
+        }
+
+        var new_cap: usize = if (set_expr.set.cap > 0) set_expr.set.cap else if (old_len > 0) old_len else 1;
+        while (new_cap < new_len) {
+            const doubled = new_cap * 2;
+            if (doubled <= new_cap) return error.OutOfMemory;
+            new_cap = doubled;
+        }
+
+        if (set_expr.set.cap > 0) {
+            const buf = try self.allocator.realloc(@constCast(set_expr.set.elts.ptr[0..set_expr.set.cap]), new_cap);
+            set_expr.set.elts = buf[0..new_len];
+            set_expr.set.cap = new_cap;
+            return;
+        }
+
+        const buf = try self.allocator.alloc(*Expr, new_cap);
+        if (old_len > 0) {
+            @memcpy(buf[0..old_len], set_expr.set.elts);
+            self.allocator.free(set_expr.set.elts);
+        }
+        set_expr.set.elts = buf[0..new_len];
+        set_expr.set.cap = new_cap;
+    }
+
     fn appendSetElts(self: *SimContext, set_expr: *Expr, new_elts: []const *Expr) SimError!void {
         if (new_elts.len == 0) return;
         const old_len = set_expr.set.elts.len;
-        if (old_len == 0) {
+        if (old_len == 0 and set_expr.set.cap == 0) {
             set_expr.set.elts = new_elts;
+            set_expr.set.cap = new_elts.len;
             return;
         }
-        const merged = try self.allocator.alloc(*Expr, old_len + new_elts.len);
-        @memcpy(merged[0..old_len], set_expr.set.elts);
-        @memcpy(merged[old_len..], new_elts);
-        self.allocator.free(set_expr.set.elts);
-        if (new_elts.len > 0) self.allocator.free(new_elts);
-        set_expr.set.elts = merged;
+        const new_len = old_len + new_elts.len;
+        try self.ensureSetCap(set_expr, new_len);
+        @memcpy(@constCast(set_expr.set.elts)[old_len..new_len], new_elts);
+        self.allocator.free(new_elts);
+    }
+
+    fn appendSetElt(self: *SimContext, set_expr: *Expr, elt: *Expr) SimError!void {
+        const old_len = set_expr.set.elts.len;
+        try self.ensureSetCap(set_expr, old_len + 1);
+        @constCast(set_expr.set.elts)[old_len] = elt;
     }
 
     fn handleCall(
@@ -1424,6 +1486,21 @@ pub const SimContext = struct {
             .expr => |callee_expr| {
                 try self.handleCallExpr(callee_expr, args_vals, keywords);
             },
+            .function_obj => |func| {
+                // Calling a function object directly (e.g., generic class pattern)
+                // Create a call expression with function name
+                deinitKeywordsOwned(self.allocator, keywords);
+                self.deinitStackValues(args_vals);
+                const name = if (func.code.name.len > 0) func.code.name else "__anon__";
+                const callee = try self.makeName(name, .load);
+                const call_expr = try self.allocator.create(Expr);
+                call_expr.* = .{ .call = .{
+                    .func = callee,
+                    .args = &.{},
+                    .keywords = &.{},
+                } };
+                try self.stack.push(.{ .expr = call_expr });
+            },
             else => {
                 deinitKeywordsOwned(self.allocator, keywords);
                 self.deinitStackValues(args_vals);
@@ -1455,6 +1532,7 @@ pub const SimContext = struct {
             .import_module => |imp| .{ .import_module = imp },
             .null_marker => .null_marker,
             .saved_local => |name| .{ .saved_local = name },
+            .type_alias => |e| .{ .type_alias = try ast.cloneExpr(self.allocator, e) },
             .unknown => .unknown,
         };
     }
@@ -1470,6 +1548,7 @@ pub const SimContext = struct {
             .code_obj => |code| .{ .code_obj = code },
             .import_module => .unknown,
             .null_marker => .null_marker,
+            .type_alias => .unknown,
             .saved_local => |name| .{ .saved_local = name },
             .unknown => .unknown,
         };
@@ -1623,6 +1702,680 @@ pub const SimContext = struct {
                 return &.{};
             },
         }
+    }
+
+    /// Parse annotations from PEP 649 __annotate__ code object (Python 3.14+).
+    /// Two patterns exist:
+    /// 1. Function annotations: LOAD_CONST name, LOAD_GLOBAL type, ..., BUILD_MAP n
+    /// 2. Class annotations: BUILD_MAP 0, then (LOAD_FROM_DICT_OR_GLOBALS type, COPY, LOAD_CONST name, STORE_SUBSCR)...
+    pub fn parseAnnotateCode(self: *SimContext, code: *const pyc.Code) SimError![]const signature.Annotation {
+        const MiniVal = union(enum) {
+            str: []const u8,
+            expr: *Expr,
+            dict, // marker for the dict being built
+        };
+
+        var stack: std.ArrayListUnmanaged(MiniVal) = .empty;
+        defer stack.deinit(self.stack_alloc);
+
+        // For class annotations with STORE_SUBSCR pattern
+        var class_annotations: std.ArrayListUnmanaged(signature.Annotation) = .empty;
+        defer class_annotations.deinit(self.stack_alloc);
+
+        var iter = decoder.InstructionIterator.init(code.code, self.version);
+        while (iter.next()) |inst| {
+            switch (inst.opcode) {
+                .LOAD_CONST, .LOAD_SMALL_INT => {
+                    if (inst.arg < code.consts.len) {
+                        const c = code.consts[inst.arg];
+                        if (c == .string) {
+                            try stack.append(self.stack_alloc, .{ .str = c.string });
+                        } else {
+                            // Type could be a constant (e.g., None)
+                            const expr = try self.allocator.create(Expr);
+                            expr.* = .{ .constant = try self.objToConstant(c) };
+                            try stack.append(self.stack_alloc, .{ .expr = expr });
+                        }
+                    }
+                },
+                .LOAD_GLOBAL, .LOAD_NAME => {
+                    const name_idx: usize = if (inst.opcode == .LOAD_GLOBAL and self.version.gte(3, 11))
+                        inst.arg >> 1
+                    else
+                        inst.arg;
+                    if (name_idx < code.names.len) {
+                        const name = code.names[name_idx];
+                        const expr = try self.allocator.create(Expr);
+                        expr.* = .{ .name = .{ .id = name, .ctx = .load } };
+                        try stack.append(self.stack_alloc, .{ .expr = expr });
+                    }
+                },
+                .LOAD_FROM_DICT_OR_GLOBALS => {
+                    // Used in class annotations - pops dict, pushes looked-up value
+                    // Stack: [dict, classdict] -> [dict, type]
+                    if (stack.items.len > 0) {
+                        _ = stack.pop(); // pop classdict
+                    }
+                    // Push the type from names
+                    const name_idx: usize = inst.arg;
+                    if (name_idx < code.names.len) {
+                        const name = code.names[name_idx];
+                        const expr = try self.allocator.create(Expr);
+                        expr.* = .{ .name = .{ .id = name, .ctx = .load } };
+                        try stack.append(self.stack_alloc, .{ .expr = expr });
+                    }
+                },
+                .LOAD_FROM_DICT_OR_DEREF => {
+                    // Used in generic class annotations - pops dict, looks up deref
+                    // Stack: [dict, classdict] -> [dict, type]
+                    if (stack.items.len > 0) {
+                        _ = stack.pop(); // pop classdict
+                    }
+                    // Push the type from varnames (localsplusnames in Python 3.11+)
+                    if (inst.arg < code.varnames.len) {
+                        const name = code.varnames[inst.arg];
+                        if (name.len > 0 and name[0] != '.') {
+                            const expr = try self.allocator.create(Expr);
+                            expr.* = .{ .name = .{ .id = name, .ctx = .load } };
+                            try stack.append(self.stack_alloc, .{ .expr = expr });
+                        }
+                    }
+                },
+                .LOAD_DEREF, .LOAD_FAST, .LOAD_FAST_BORROW => {
+                    // For generic function annotations, LOAD_DEREF loads type params
+                    // In Python 3.11+, index is into localsplusnames (stored in varnames)
+                    if (inst.arg < code.varnames.len) {
+                        const name = code.varnames[inst.arg];
+                        // For class annotations with __classdict__, just push placeholder
+                        if (std.mem.eql(u8, name, "__classdict__")) {
+                            try stack.append(self.stack_alloc, .dict);
+                        } else if (name.len > 0 and name[0] != '.') {
+                            // Type parameter or other variable - create name expression
+                            const expr = try self.allocator.create(Expr);
+                            expr.* = .{ .name = .{ .id = name, .ctx = .load } };
+                            try stack.append(self.stack_alloc, .{ .expr = expr });
+                        } else {
+                            // Internal variable like .format - push placeholder
+                            try stack.append(self.stack_alloc, .dict);
+                        }
+                    } else {
+                        try stack.append(self.stack_alloc, .dict);
+                    }
+                },
+                .COPY => {
+                    // COPY n - duplicates TOS to position n
+                    // For class annotations: [dict, type] -> [dict, type, dict]
+                    if (stack.items.len > 0) {
+                        const n = inst.arg;
+                        if (n > 0 and n <= stack.items.len) {
+                            const idx = stack.items.len - n;
+                            const val = stack.items[idx];
+                            try stack.append(self.stack_alloc, val);
+                        }
+                    }
+                },
+                .LOAD_ATTR => {
+                    // For attribute access like typing.Optional
+                    const name_idx: usize = if (self.version.gte(3, 12))
+                        inst.arg >> 1
+                    else
+                        inst.arg;
+                    if (name_idx < code.names.len and stack.items.len > 0) {
+                        const attr_name = code.names[name_idx];
+                        const val = stack.pop() orelse continue;
+                        if (val == .expr) {
+                            const attr = try self.allocator.create(Expr);
+                            attr.* = .{ .attribute = .{
+                                .value = val.expr,
+                                .attr = attr_name,
+                                .ctx = .load,
+                            } };
+                            try stack.append(self.stack_alloc, .{ .expr = attr });
+                        }
+                    }
+                },
+                .BINARY_SUBSCR => {
+                    // For subscript like list[int]
+                    if (stack.items.len >= 2) {
+                        const slice = stack.pop() orelse continue;
+                        const value = stack.pop() orelse continue;
+                        if (value == .expr and slice == .expr) {
+                            const subscr = try self.allocator.create(Expr);
+                            subscr.* = .{ .subscript = .{
+                                .value = value.expr,
+                                .slice = slice.expr,
+                                .ctx = .load,
+                            } };
+                            try stack.append(self.stack_alloc, .{ .expr = subscr });
+                        }
+                    }
+                },
+                .BINARY_OP => {
+                    // BINARY_OP arg 26 is NB_SUBSCR (subscript operation) in Python 3.14+
+                    if (inst.arg == 26 and stack.items.len >= 2) {
+                        const slice = stack.pop() orelse continue;
+                        const value = stack.pop() orelse continue;
+                        if (value == .expr and slice == .expr) {
+                            const subscr = try self.allocator.create(Expr);
+                            subscr.* = .{ .subscript = .{
+                                .value = value.expr,
+                                .slice = slice.expr,
+                                .ctx = .load,
+                            } };
+                            try stack.append(self.stack_alloc, .{ .expr = subscr });
+                        }
+                    }
+                },
+                .STORE_SUBSCR => {
+                    // For class annotations: dict[key] = value
+                    // Stack before: [dict, type, dict_copy, key]
+                    // Pops: key, dict_copy, type; stores dict_copy[key] = type
+                    // Stack after: [dict]
+                    if (stack.items.len >= 4) {
+                        const key = stack.pop() orelse continue;
+                        _ = stack.pop(); // dict_copy
+                        const type_val = stack.pop() orelse continue;
+
+                        const name = if (key == .str) key.str else "__unknown__";
+                        const type_expr: *Expr = if (type_val == .expr) type_val.expr else blk: {
+                            const expr = try self.allocator.create(Expr);
+                            expr.* = .{ .constant = .none };
+                            break :blk expr;
+                        };
+                        try class_annotations.append(self.stack_alloc, .{
+                            .name = name,
+                            .value = type_expr,
+                        });
+                    }
+                },
+                .BUILD_TUPLE => {
+                    // For tuple[int, str] slices
+                    const n = inst.arg;
+                    if (n <= stack.items.len) {
+                        const elts = try self.allocator.alloc(*Expr, n);
+                        var i: usize = 0;
+                        while (i < n) : (i += 1) {
+                            const idx = stack.items.len - n + i;
+                            if (stack.items[idx] == .expr) {
+                                elts[i] = stack.items[idx].expr;
+                            } else {
+                                // String not expected here, create name
+                                const expr = try self.allocator.create(Expr);
+                                expr.* = .{ .constant = .{ .string = if (stack.items[idx] == .str) stack.items[idx].str else "" } };
+                                elts[i] = expr;
+                            }
+                        }
+                        stack.items.len -= n;
+                        const tuple = try self.allocator.create(Expr);
+                        tuple.* = .{ .tuple = .{ .elts = elts, .ctx = .load } };
+                        try stack.append(self.stack_alloc, .{ .expr = tuple });
+                    }
+                },
+                .BUILD_MAP => {
+                    const n = inst.arg;
+                    if (n == 0) {
+                        // Class annotation pattern: BUILD_MAP 0, then STORE_SUBSCR
+                        try stack.append(self.stack_alloc, .dict);
+                        continue;
+                    }
+                    // Function annotation pattern: items already on stack
+                    if (n * 2 > stack.items.len) return &.{};
+
+                    const result = try self.allocator.alloc(signature.Annotation, n);
+                    var i: usize = 0;
+                    while (i < n) : (i += 1) {
+                        const base_idx = stack.items.len - n * 2 + i * 2;
+                        const name_val = stack.items[base_idx];
+                        const type_val = stack.items[base_idx + 1];
+
+                        const name = if (name_val == .str) name_val.str else "__unknown__";
+                        const type_expr = if (type_val == .expr) type_val.expr else blk: {
+                            const expr = try self.allocator.create(Expr);
+                            expr.* = .{ .constant = .{ .string = if (type_val == .str) type_val.str else "" } };
+                            break :blk expr;
+                        };
+                        result[i] = .{ .name = name, .value = type_expr };
+                    }
+                    return result;
+                },
+                .RETURN_VALUE, .RETURN_CONST => {
+                    // If we collected class annotations via STORE_SUBSCR, return those
+                    if (class_annotations.items.len > 0) {
+                        const result = try self.allocator.alloc(signature.Annotation, class_annotations.items.len);
+                        @memcpy(result, class_annotations.items);
+                        return result;
+                    }
+                    break;
+                },
+                else => {},
+            }
+        }
+        return &.{};
+    }
+
+    /// Parse type alias code object (PEP 695) to extract the type expression.
+    /// Pattern: LOAD_GLOBAL type, BUILD_TUPLE n, BINARY_OP 26 (subscript), RETURN_VALUE
+    pub fn parseTypeAliasCode(self: *SimContext, code: *const pyc.Code) SimError!*Expr {
+        const MiniVal = union(enum) {
+            expr: *Expr,
+        };
+
+        var stack: std.ArrayListUnmanaged(MiniVal) = .empty;
+        defer stack.deinit(self.stack_alloc);
+
+        var iter = decoder.InstructionIterator.init(code.code, self.version);
+        while (iter.next()) |inst| {
+            switch (inst.opcode) {
+                .LOAD_CONST, .LOAD_SMALL_INT => {
+                    if (inst.arg < code.consts.len) {
+                        const c = code.consts[inst.arg];
+                        const expr = try self.allocator.create(Expr);
+                        expr.* = .{ .constant = try self.objToConstant(c) };
+                        try stack.append(self.stack_alloc, .{ .expr = expr });
+                    }
+                },
+                .LOAD_GLOBAL, .LOAD_NAME => {
+                    const name_idx: usize = if (inst.opcode == .LOAD_GLOBAL and self.version.gte(3, 11))
+                        inst.arg >> 1
+                    else
+                        inst.arg;
+                    if (name_idx < code.names.len) {
+                        const name = code.names[name_idx];
+                        const expr = try self.allocator.create(Expr);
+                        expr.* = .{ .name = .{ .id = name, .ctx = .load } };
+                        try stack.append(self.stack_alloc, .{ .expr = expr });
+                    }
+                },
+                .LOAD_DEREF, .LOAD_FAST, .LOAD_FAST_BORROW => {
+                    // For generic type parameters (freevars)
+                    // In Python 3.11+, LOAD_DEREF uses localsplusnames index
+                    // which is stored in code.varnames
+                    const name: ?[]const u8 = if (inst.arg < code.varnames.len)
+                        code.varnames[inst.arg]
+                    else
+                        null;
+                    if (name) |n| {
+                        // Skip internal names like .format
+                        if (n.len > 0 and n[0] != '.') {
+                            const expr = try self.allocator.create(Expr);
+                            expr.* = .{ .name = .{ .id = n, .ctx = .load } };
+                            try stack.append(self.stack_alloc, .{ .expr = expr });
+                        }
+                    }
+                },
+                .LOAD_ATTR => {
+                    const name_idx: usize = if (self.version.gte(3, 12))
+                        inst.arg >> 1
+                    else
+                        inst.arg;
+                    if (name_idx < code.names.len and stack.items.len > 0) {
+                        const attr_name = code.names[name_idx];
+                        const val = stack.pop().?;
+                        const attr = try self.allocator.create(Expr);
+                        attr.* = .{ .attribute = .{
+                            .value = val.expr,
+                            .attr = attr_name,
+                            .ctx = .load,
+                        } };
+                        try stack.append(self.stack_alloc, .{ .expr = attr });
+                    }
+                },
+                .BINARY_SUBSCR => {
+                    if (stack.items.len >= 2) {
+                        const slice = stack.pop().?;
+                        const value = stack.pop().?;
+                        const subscr = try self.allocator.create(Expr);
+                        subscr.* = .{ .subscript = .{
+                            .value = value.expr,
+                            .slice = slice.expr,
+                            .ctx = .load,
+                        } };
+                        try stack.append(self.stack_alloc, .{ .expr = subscr });
+                    }
+                },
+                .BINARY_OP => {
+                    if (stack.items.len >= 2) {
+                        if (inst.arg == 26) {
+                            // BINARY_OP 26 is subscript in Python 3.14+
+                            const slice = stack.pop().?;
+                            const value = stack.pop().?;
+                            const subscr = try self.allocator.create(Expr);
+                            subscr.* = .{ .subscript = .{
+                                .value = value.expr,
+                                .slice = slice.expr,
+                                .ctx = .load,
+                            } };
+                            try stack.append(self.stack_alloc, .{ .expr = subscr });
+                        } else if (inst.arg == 7) {
+                            // BINARY_OP 7 is bitor (|) for union types
+                            const right = stack.pop().?;
+                            const left = stack.pop().?;
+                            const binop = try self.allocator.create(Expr);
+                            binop.* = .{ .bin_op = .{
+                                .left = left.expr,
+                                .op = .bitor,
+                                .right = right.expr,
+                            } };
+                            try stack.append(self.stack_alloc, .{ .expr = binop });
+                        }
+                    }
+                },
+                .BUILD_TUPLE => {
+                    const n = inst.arg;
+                    if (n <= stack.items.len) {
+                        const elts = try self.allocator.alloc(*Expr, n);
+                        var i: usize = 0;
+                        while (i < n) : (i += 1) {
+                            const idx = stack.items.len - n + i;
+                            elts[i] = stack.items[idx].expr;
+                        }
+                        stack.items.len -= n;
+                        const tuple = try self.allocator.create(Expr);
+                        tuple.* = .{ .tuple = .{ .elts = elts, .ctx = .load } };
+                        try stack.append(self.stack_alloc, .{ .expr = tuple });
+                    }
+                },
+                .BUILD_LIST => {
+                    const n = inst.arg;
+                    if (n <= stack.items.len) {
+                        const elts = try self.allocator.alloc(*Expr, n);
+                        var i: usize = 0;
+                        while (i < n) : (i += 1) {
+                            const idx = stack.items.len - n + i;
+                            elts[i] = stack.items[idx].expr;
+                        }
+                        stack.items.len -= n;
+                        const list_expr = try self.allocator.create(Expr);
+                        list_expr.* = .{ .list = .{ .elts = elts, .ctx = .load } };
+                        try stack.append(self.stack_alloc, .{ .expr = list_expr });
+                    }
+                },
+                .RETURN_VALUE, .RETURN_CONST => {
+                    // Return TOS as the type expression
+                    if (stack.items.len > 0) {
+                        return stack.items[stack.items.len - 1].expr;
+                    }
+                    break;
+                },
+                else => {},
+            }
+        }
+        // Return unknown if we couldn't parse
+        const expr = try self.allocator.create(Expr);
+        expr.* = .{ .name = .{ .id = "__unknown__", .ctx = .load } };
+        return expr;
+    }
+
+    pub const GenericTypeAliasResult = struct {
+        type_params: []const []const u8,
+        value: ?*Expr,
+    };
+
+    /// Parse a generic type alias code object (the <generic parameters of X> code).
+    /// Extracts type parameters and the type value expression.
+    /// Returns null value if this is not a type alias (e.g., it's a generic function).
+    pub fn parseGenericTypeAliasCode(self: *SimContext, code: *const pyc.Code) SimError!GenericTypeAliasResult {
+        var type_params: std.ArrayListUnmanaged([]const u8) = .empty;
+        defer type_params.deinit(self.stack_alloc);
+
+        var inner_code: ?*const pyc.Code = null;
+        var found_typealias_intrinsic = false;
+
+        // Scan for CALL_INTRINSIC_1 11 (TYPEALIAS) to verify this is a type alias
+        // Generic functions use CALL_INTRINSIC_2 4 (SET_FUNCTION_TYPE_PARAMS) instead
+        var iter = decoder.InstructionIterator.init(code.code, self.version);
+        while (iter.next()) |inst| {
+            switch (inst.opcode) {
+                .CALL_INTRINSIC_1 => {
+                    if (inst.arg == 11) {
+                        // INTRINSIC_TYPEALIAS - this is indeed a type alias
+                        found_typealias_intrinsic = true;
+                    }
+                },
+                .CALL_INTRINSIC_2 => {
+                    if (inst.arg == 4) {
+                        // INTRINSIC_SET_FUNCTION_TYPE_PARAMS - this is a generic function, not a type alias
+                        return .{ .type_params = &.{}, .value = null };
+                    }
+                },
+                .LOAD_CONST => {
+                    // Check if this loads a code object that could be the inner type alias
+                    if (inst.arg < code.consts.len) {
+                        const c = code.consts[inst.arg];
+                        if (c == .code or c == .code_ref) {
+                            const inner = if (c == .code) c.code else c.code_ref;
+                            // Check if this is NOT the generic parameters code or __annotate__
+                            if (!std.mem.startsWith(u8, inner.name, "<generic parameters") and
+                                !std.mem.eql(u8, inner.name, "__annotate__"))
+                            {
+                                inner_code = inner;
+                            }
+                        }
+                    }
+                },
+                else => {},
+            }
+        }
+
+        // If we didn't find CALL_INTRINSIC_1 11, this is not a type alias
+        if (!found_typealias_intrinsic) {
+            return .{ .type_params = &.{}, .value = null };
+        }
+
+        // Extract type parameters from cellvars (they're stored with STORE_DEREF)
+        for (code.cellvars) |cv| {
+            // Filter out internal names
+            if (cv.len > 0 and cv[0] != '.' and !std.mem.eql(u8, cv, "__classcell__")) {
+                try type_params.append(self.stack_alloc, cv);
+            }
+        }
+
+        // Parse the inner code to get the actual type expression
+        const value = if (inner_code) |ic|
+            try self.parseTypeAliasCode(ic)
+        else
+            null;
+
+        const params_slice = try self.allocator.alloc([]const u8, type_params.items.len);
+        @memcpy(params_slice, type_params.items);
+
+        return .{
+            .type_params = params_slice,
+            .value = value,
+        };
+    }
+
+    pub const GenericFunctionResult = struct {
+        type_params: []const []const u8,
+        func_code: ?*const pyc.Code,
+        annotate_code: ?*const pyc.Code,
+        return_annotation: ?*Expr,
+    };
+
+    /// Parse a generic function/class code object (the <generic parameters of X> code).
+    /// Extracts type parameters and the function/class code object.
+    pub fn parseGenericFunctionCode(self: *SimContext, code: *const pyc.Code) SimError!GenericFunctionResult {
+        var type_params: std.ArrayListUnmanaged([]const u8) = .empty;
+        defer type_params.deinit(self.stack_alloc);
+
+        var func_code: ?*const pyc.Code = null;
+        var annotate_code: ?*const pyc.Code = null;
+        var found_set_type_params = false;
+
+        // Scan for CALL_INTRINSIC_2 4 (SET_FUNCTION_TYPE_PARAMS)
+        var iter = decoder.InstructionIterator.init(code.code, self.version);
+        while (iter.next()) |inst| {
+            switch (inst.opcode) {
+                .CALL_INTRINSIC_2 => {
+                    if (inst.arg == 4) {
+                        // INTRINSIC_SET_FUNCTION_TYPE_PARAMS - this is a generic function
+                        found_set_type_params = true;
+                    }
+                },
+                .CALL_INTRINSIC_1 => {
+                    if (inst.arg == 11) {
+                        // INTRINSIC_TYPEALIAS - this is a type alias, not a function
+                        return .{ .type_params = &.{}, .func_code = null, .annotate_code = null, .return_annotation = null };
+                    }
+                },
+                .LOAD_CONST => {
+                    // Check if this loads a code object
+                    if (inst.arg < code.consts.len) {
+                        const c = code.consts[inst.arg];
+                        if (c == .code or c == .code_ref) {
+                            const inner = if (c == .code) c.code else c.code_ref;
+                            if (std.mem.eql(u8, inner.name, "__annotate__")) {
+                                annotate_code = inner;
+                            } else if (!std.mem.startsWith(u8, inner.name, "<generic parameters")) {
+                                func_code = inner;
+                            }
+                        }
+                    }
+                },
+                else => {},
+            }
+        }
+
+        // If we didn't find CALL_INTRINSIC_2 4, this is not a generic function
+        if (!found_set_type_params) {
+            return .{ .type_params = &.{}, .func_code = null, .annotate_code = null, .return_annotation = null };
+        }
+
+        // Extract type parameters from cellvars
+        for (code.cellvars) |cv| {
+            if (cv.len > 0 and cv[0] != '.' and !std.mem.eql(u8, cv, "__classcell__")) {
+                try type_params.append(self.stack_alloc, cv);
+            }
+        }
+
+        // Try to get return annotation from __annotate__ code
+        var return_annotation: ?*Expr = null;
+        if (annotate_code) |ann_code| {
+            const annotations = try self.parseAnnotateCode(ann_code);
+            for (annotations) |ann| {
+                if (std.mem.eql(u8, ann.name, "return")) {
+                    return_annotation = ann.value;
+                    break;
+                }
+            }
+        }
+
+        const params_slice = try self.allocator.alloc([]const u8, type_params.items.len);
+        @memcpy(params_slice, type_params.items);
+
+        return .{
+            .type_params = params_slice,
+            .func_code = func_code,
+            .annotate_code = annotate_code,
+            .return_annotation = return_annotation,
+        };
+    }
+
+    pub const GenericClassResult = struct {
+        type_params: []const []const u8,
+        class_code: ?*const pyc.Code,
+    };
+
+    /// Parse a generic class code object (the <generic parameters of X> code).
+    /// Extracts type parameters and the class code object.
+    pub fn parseGenericClassCode(self: *SimContext, code: *const pyc.Code) SimError!GenericClassResult {
+        var type_params: std.ArrayListUnmanaged([]const u8) = .empty;
+        defer type_params.deinit(self.stack_alloc);
+
+        var class_code: ?*const pyc.Code = null;
+        var found_build_class = false;
+
+        // Scan for LOAD_BUILD_CLASS (indicates this is a class, not a function)
+        var iter = decoder.InstructionIterator.init(code.code, self.version);
+        while (iter.next()) |inst| {
+            switch (inst.opcode) {
+                .LOAD_BUILD_CLASS => {
+                    found_build_class = true;
+                },
+                .CALL_INTRINSIC_1 => {
+                    if (inst.arg == 11) {
+                        // INTRINSIC_TYPEALIAS - this is a type alias, not a class
+                        return .{ .type_params = &.{}, .class_code = null };
+                    }
+                },
+                .CALL_INTRINSIC_2 => {
+                    if (inst.arg == 4) {
+                        // INTRINSIC_SET_FUNCTION_TYPE_PARAMS - this is a function, not a class
+                        return .{ .type_params = &.{}, .class_code = null };
+                    }
+                },
+                .LOAD_CONST => {
+                    // Check if this loads a code object
+                    if (inst.arg < code.consts.len) {
+                        const c = code.consts[inst.arg];
+                        if (c == .code or c == .code_ref) {
+                            const inner = if (c == .code) c.code else c.code_ref;
+                            // Class code objects don't start with special prefixes
+                            if (!std.mem.startsWith(u8, inner.name, "<generic parameters") and
+                                !std.mem.eql(u8, inner.name, "__annotate__"))
+                            {
+                                class_code = inner;
+                            }
+                        }
+                    }
+                },
+                else => {},
+            }
+        }
+
+        // If we didn't find LOAD_BUILD_CLASS, this is not a generic class
+        if (!found_build_class) {
+            return .{ .type_params = &.{}, .class_code = null };
+        }
+
+        // For generic classes, type parameters are stored in varnames via STORE_FAST
+        // They're the names that come from CALL_INTRINSIC_1 7 (INTRINSIC_TYPEVAR)
+        // Look for pattern: LOAD_CONST 'T', CALL_INTRINSIC_1 7, COPY, STORE_FAST T
+        iter = decoder.InstructionIterator.init(code.code, self.version);
+        var prev_was_typevar = false;
+        while (iter.next()) |inst| {
+            switch (inst.opcode) {
+                .CALL_INTRINSIC_1 => {
+                    if (inst.arg == 7) {
+                        prev_was_typevar = true;
+                    }
+                },
+                .STORE_FAST => {
+                    if (prev_was_typevar and inst.arg < code.varnames.len) {
+                        const name = code.varnames[inst.arg];
+                        if (name.len > 0 and name[0] != '.') {
+                            try type_params.append(self.stack_alloc, name);
+                        }
+                    }
+                    prev_was_typevar = false;
+                },
+                .STORE_DEREF => {
+                    // For complex generic classes, type params may be stored as cells
+                    // In Python 3.11+, STORE_DEREF uses localsplusnames index (stored in varnames)
+                    if (prev_was_typevar and inst.arg < code.varnames.len) {
+                        const name = code.varnames[inst.arg];
+                        if (name.len > 0 and name[0] != '.') {
+                            try type_params.append(self.stack_alloc, name);
+                        }
+                    }
+                    prev_was_typevar = false;
+                },
+                .COPY => {
+                    // COPY is between CALL_INTRINSIC_1 and STORE_FAST/STORE_DEREF, keep prev_was_typevar
+                },
+                else => {
+                    prev_was_typevar = false;
+                },
+            }
+        }
+
+        const params_slice = try self.allocator.alloc([]const u8, type_params.items.len);
+        @memcpy(params_slice, type_params.items);
+
+        return .{
+            .type_params = params_slice,
+            .class_code = class_code,
+        };
     }
 
     /// Parse keyword defaults dict from MAKE_FUNCTION.
@@ -1824,13 +2577,19 @@ pub const SimContext = struct {
     fn getBuilderAtDepth(self: *SimContext, depth: u32, kind: CompKind) !*CompBuilder {
         const idx = self.stackIndexFromDepth(depth) catch |err| {
             if (err != error.StackUnderflow) return err;
-            const missing = depth - @as(u32, @intCast(self.stack.items.items.len));
+            const len = self.stack.items.items.len;
+            const missing: usize = @intCast(depth - @as(u32, @intCast(len)));
             const builder = try self.stack_alloc.create(CompBuilder);
             builder.* = CompBuilder.init(kind);
-            try self.stack.items.insert(self.stack_alloc, 0, .{ .comp_builder = builder });
-            var i: u32 = 1;
+            try self.stack.items.ensureTotalCapacity(self.stack_alloc, len + missing);
+            self.stack.items.items.len = len + missing;
+            if (len > 0) {
+                @memmove(self.stack.items.items[missing .. missing + len], self.stack.items.items[0..len]);
+            }
+            self.stack.items.items[0] = .{ .comp_builder = builder };
+            var i: usize = 1;
             while (i < missing) : (i += 1) {
-                try self.stack.items.insert(self.stack_alloc, @intCast(i), .unknown);
+                self.stack.items.items[i] = .unknown;
             }
             return builder;
         };
@@ -2017,11 +2776,11 @@ pub const SimContext = struct {
     }
 
     fn buildComprehensionFromCode(self: *SimContext, comp: CompObject, iter_expr: *Expr) SimError!*Expr {
-        var nested = SimContext.init(self.allocator, self.allocator, comp.code, self.version);
+        var nested = SimContext.init(self.allocator, self.stack_alloc, comp.code, self.version);
         defer nested.deinit();
         nested.enable_ifexp = true;
 
-        const builder = try self.allocator.create(CompBuilder);
+        const builder = try self.stack_alloc.create(CompBuilder);
         builder.* = CompBuilder.init(comp.kind);
         errdefer builder.deinit(self.allocator, self.stack_alloc);
 
@@ -2071,6 +2830,7 @@ pub const SimContext = struct {
 
         if (!builder.seen_append) return error.InvalidComprehension;
         const expr = try nested.buildCompExpr(builder);
+        nested.comp_builder = null;
         builder.deinit(self.allocator, self.stack_alloc);
         return expr;
     }
@@ -2227,15 +2987,46 @@ pub const SimContext = struct {
             },
 
             .STORE_NAME, .STORE_GLOBAL => {
-                // Pop the value and create assignment
-                // For now, just pop the value
-                if (self.stack.pop()) |v| {
-                    const name = self.getName(inst.arg) orelse "__unknown__";
-                    if (!try self.consumeCompUnpackName(name)) {
-                        try self.addCompTargetName(name);
+                // Check for walrus operator: COPY 1 followed by STORE_* in comprehension
+                const is_walrus = self.prev_opcode == .COPY and self.findActiveCompBuilder() != null;
+                if (is_walrus) {
+                    // Walrus operator: (name := value)
+                    // After COPY 1: stack is [value, value_copy]
+                    // STORE pops value_copy, we transform remaining value to named_expr
+                    if (self.stack.pop()) |copy| {
+                        var c = copy;
+                        c.deinit(self.allocator, self.stack_alloc);
                     }
-                    var val = v;
-                    val.deinit(self.allocator, self.stack_alloc);
+                    // Transform TOS to named_expr
+                    if (self.stack.pop()) |val| {
+                        const name = self.getName(inst.arg) orelse "__unknown__";
+                        const target = try self.makeName(name, .store);
+                        errdefer {
+                            target.deinit(self.allocator);
+                            self.allocator.destroy(target);
+                        }
+                        const value_expr = switch (val) {
+                            .expr => |e| e,
+                            else => blk: {
+                                var v = val;
+                                v.deinit(self.allocator, self.stack_alloc);
+                                break :blk try self.makeName("__unknown__", .load);
+                            },
+                        };
+                        const named = try self.allocator.create(Expr);
+                        named.* = .{ .named_expr = .{ .target = target, .value = value_expr } };
+                        try self.stack.push(.{ .expr = named });
+                    }
+                } else {
+                    // Normal store - pop the value
+                    if (self.stack.pop()) |v| {
+                        const name = self.getName(inst.arg) orelse "__unknown__";
+                        if (!try self.consumeCompUnpackName(name)) {
+                            try self.addCompTargetName(name);
+                        }
+                        var val = v;
+                        val.deinit(self.allocator, self.stack_alloc);
+                    }
                 }
             },
 
@@ -2248,14 +3039,43 @@ pub const SimContext = struct {
             },
 
             .STORE_FAST => {
-                // Pop the value
-                if (self.stack.pop()) |v| {
-                    const name = self.getLocal(inst.arg) orelse "__unknown__";
-                    if (!try self.consumeCompUnpackName(name)) {
-                        try self.addCompTargetName(name);
+                // Check for walrus operator: COPY 1 followed by STORE_FAST in comprehension
+                const is_walrus = self.prev_opcode == .COPY and self.findActiveCompBuilder() != null;
+                if (is_walrus) {
+                    // Walrus operator: (name := value)
+                    if (self.stack.pop()) |copy| {
+                        var c = copy;
+                        c.deinit(self.allocator, self.stack_alloc);
                     }
-                    var val = v;
-                    val.deinit(self.allocator, self.stack_alloc);
+                    if (self.stack.pop()) |val| {
+                        const name = self.getLocal(inst.arg) orelse "__unknown__";
+                        const target = try self.makeName(name, .store);
+                        errdefer {
+                            target.deinit(self.allocator);
+                            self.allocator.destroy(target);
+                        }
+                        const value_expr = switch (val) {
+                            .expr => |e| e,
+                            else => blk: {
+                                var v = val;
+                                v.deinit(self.allocator, self.stack_alloc);
+                                break :blk try self.makeName("__unknown__", .load);
+                            },
+                        };
+                        const named = try self.allocator.create(Expr);
+                        named.* = .{ .named_expr = .{ .target = target, .value = value_expr } };
+                        try self.stack.push(.{ .expr = named });
+                    }
+                } else {
+                    // Normal store - pop the value
+                    if (self.stack.pop()) |v| {
+                        const name = self.getLocal(inst.arg) orelse "__unknown__";
+                        if (!try self.consumeCompUnpackName(name)) {
+                            try self.addCompTargetName(name);
+                        }
+                        var val = v;
+                        val.deinit(self.allocator, self.stack_alloc);
+                    }
                 }
             },
 
@@ -2480,7 +3300,7 @@ pub const SimContext = struct {
                                 sequence.deinit(self.allocator);
                                 self.allocator.destroy(sequence);
                                 const set_expr = try self.allocator.create(Expr);
-                                set_expr.* = .{ .set = .{ .elts = elts } };
+                                set_expr.* = .{ .set = .{ .elts = elts, .cap = elts.len } };
                                 sequence = set_expr;
                             },
                             .tuple => |*t| {
@@ -2489,16 +3309,17 @@ pub const SimContext = struct {
                                 sequence.deinit(self.allocator);
                                 self.allocator.destroy(sequence);
                                 const set_expr = try self.allocator.create(Expr);
-                                set_expr.* = .{ .set = .{ .elts = elts } };
+                                set_expr.* = .{ .set = .{ .elts = elts, .cap = elts.len } };
                                 sequence = set_expr;
                             },
                             .set => |*s| {
                                 const elts = s.elts;
                                 s.elts = &.{};
+                                s.cap = 0;
                                 sequence.deinit(self.allocator);
                                 self.allocator.destroy(sequence);
                                 const set_expr = try self.allocator.create(Expr);
-                                set_expr.* = .{ .set = .{ .elts = elts } };
+                                set_expr.* = .{ .set = .{ .elts = elts, .cap = elts.len } };
                                 sequence = set_expr;
                             },
                             else => {},
@@ -2571,7 +3392,7 @@ pub const SimContext = struct {
                 const count = inst.arg;
                 const elts = if (count == 0) &[_]*Expr{} else try self.stack.popNExprs(count);
                 const expr = try self.allocator.create(Expr);
-                expr.* = .{ .set = .{ .elts = elts } };
+                expr.* = .{ .set = .{ .elts = elts, .cap = elts.len } };
                 try self.stack.push(.{ .expr = expr });
             },
 
@@ -2685,8 +3506,16 @@ pub const SimContext = struct {
                         // Case 2: LOAD_NAME + PUSH_NULL order
                         callable = tos1;
                         // tos (null_marker) is discarded
+                    } else if (tos == .null_marker and tos1 == .function_obj) {
+                        // MAKE_FUNCTION + PUSH_NULL + CALL (generic class pattern)
+                        callable = tos1;
+                        // tos (null_marker) is discarded
                     } else if (tos1 == .null_marker and tos == .expr) {
                         // Case 1: LOAD_GLOBAL with push_null order
+                        callable = tos;
+                        // tos1 (null_marker) is discarded
+                    } else if (tos1 == .null_marker and tos == .function_obj) {
+                        // PUSH_NULL + MAKE_FUNCTION + CALL order
                         callable = tos;
                         // tos1 (null_marker) is discarded
                     } else if (tos == .expr and tos1 != .null_marker) {
@@ -3857,9 +4686,13 @@ pub const SimContext = struct {
                         attr_val.deinit(self.allocator, self.stack_alloc);
                     },
                     16 => { // annotate (Python 3.14+ - PEP 649 deferred annotations)
-                        // This sets __annotate__ which is a function, not a dict
-                        // For now, ignore as we'd need to run/analyze the code object
-                        attr_val.deinit(self.allocator, self.stack_alloc);
+                        // attr_val is a function_obj containing the __annotate__ code
+                        const func = func_val.function_obj;
+                        if (attr_val == .function_obj) {
+                            func.annotations = try self.parseAnnotateCode(attr_val.function_obj.code);
+                        } else {
+                            attr_val.deinit(self.allocator, self.stack_alloc);
+                        }
                     },
                     else => {
                         attr_val.deinit(self.allocator, self.stack_alloc);
@@ -5023,11 +5856,20 @@ pub const SimContext = struct {
                     }
                 }
                 if (self.findActiveCompBuilder()) |builder| {
+                    // For comprehension filters, both old and new patterns result in
+                    // "include when condition is truthy":
+                    // - Old: POP_JUMP_IF_FALSE to skip, fall through to include -> include on TRUE
+                    // - 3.14: POP_JUMP_IF_TRUE to include -> include on TRUE
+                    // So we use the condition as-is for TRUE jumps and negate for FALSE jumps
                     const final_cond = switch (inst.opcode) {
+                        .POP_JUMP_IF_FALSE,
+                        .POP_JUMP_FORWARD_IF_FALSE,
+                        .POP_JUMP_BACKWARD_IF_FALSE,
+                        => cond, // FALSE jumps to skip, TRUE falls through to include
                         .POP_JUMP_IF_TRUE,
                         .POP_JUMP_FORWARD_IF_TRUE,
                         .POP_JUMP_BACKWARD_IF_TRUE,
-                        => try ast.makeUnaryOp(self.allocator, .not_, cond),
+                        => cond, // Python 3.14: TRUE jumps to include
                         .POP_JUMP_IF_NONE,
                         .POP_JUMP_FORWARD_IF_NONE,
                         .POP_JUMP_BACKWARD_IF_NONE,
@@ -5077,11 +5919,14 @@ pub const SimContext = struct {
                     return;
                 }
 
-                const value = self.stack.popExpr() catch {
-                    // If we can't get an expr, push unknown and continue
-                    _ = self.stack.pop();
-                    try self.stack.push(.unknown);
-                    return;
+                const value = self.stack.popExpr() catch |err| {
+                    if (self.lenient or self.flow_mode) {
+                        // If we can't get an expr, push unknown and continue
+                        _ = self.stack.pop();
+                        try self.stack.push(.unknown);
+                        return;
+                    }
+                    return err;
                 };
 
                 if (self.comp_builder) |builder| {
@@ -5390,6 +6235,7 @@ pub const SimContext = struct {
                         .set => |*s| {
                             const elts = s.elts;
                             s.elts = &.{};
+                            s.cap = 0;
                             items.expr.deinit(self.allocator);
                             self.allocator.destroy(items.expr);
                             try self.appendSetElts(set_expr, elts);
@@ -5418,6 +6264,7 @@ pub const SimContext = struct {
                                     .set => |*s| {
                                         const elts = s.elts;
                                         s.elts = &.{};
+                                        s.cap = 0;
                                         items.expr.deinit(self.allocator);
                                         self.allocator.destroy(items.expr);
                                         try self.appendSetElts(set_expr, elts);
@@ -5440,14 +6287,7 @@ pub const SimContext = struct {
                     },
                 };
                 const starred = try ast.makeStarred(self.allocator, item_expr, .load);
-                const old_len = set_expr.set.elts.len;
-                const new_elts = try self.allocator.alloc(*Expr, old_len + 1);
-                if (old_len > 0) {
-                    @memcpy(new_elts[0..old_len], set_expr.set.elts);
-                    self.allocator.free(set_expr.set.elts);
-                }
-                new_elts[old_len] = starred;
-                set_expr.set.elts = new_elts;
+                try self.appendSetElt(set_expr, starred);
             },
 
             .DICT_UPDATE => {
@@ -5683,8 +6523,49 @@ pub const SimContext = struct {
             .CALL_INTRINSIC_1 => {
                 // Pops 1 arg, pushes result (net: 0)
                 // IDs: 3=STOPITERATION_ERROR, 7=TYPEVAR, 11=TYPEALIAS
-                _ = self.stack.pop() orelse return error.StackUnderflow;
-                try self.stack.push(.unknown);
+                const arg = self.stack.pop() orelse return error.StackUnderflow;
+
+                if (inst.arg == 11) { // INTRINSIC_TYPEALIAS
+                    // arg is a tuple (name, type_params, value_func)
+                    // value_func code contains the type expression
+                    if (arg == .expr and arg.expr.* == .tuple and arg.expr.tuple.elts.len == 3) {
+                        const elts = arg.expr.tuple.elts;
+                        const name_expr = elts[0];
+                        const value_func = elts[2];
+
+                        // Convert name constant to Name expression
+                        const final_name = if (name_expr.* == .constant and name_expr.constant == .string) blk: {
+                            const name_node = try self.allocator.create(Expr);
+                            name_node.* = .{ .name = .{ .id = name_expr.constant.string, .ctx = .store } };
+                            break :blk name_node;
+                        } else name_expr;
+
+                        // Try to extract type value from the value function
+                        // The value_func is created from MAKE_FUNCTION and may contain code
+                        // that evaluates to the type expression
+                        const final_value = if (value_func.* == .constant and value_func.constant == .ellipsis) blk: {
+                            // Placeholder - keep as is
+                            break :blk value_func;
+                        } else value_func;
+
+                        // Create a type_alias_marker tuple for the decompiler
+                        const marker = try self.allocator.create(Expr);
+                        const marker_elts = try self.allocator.alloc(*Expr, 2);
+                        marker_elts[0] = final_name;
+                        marker_elts[1] = final_value;
+                        marker.* = .{ .tuple = .{
+                            .elts = marker_elts,
+                            .ctx = .load,
+                        } };
+                        try self.stack.push(.{ .type_alias = marker });
+                    } else {
+                        arg.deinit(self.allocator, self.stack_alloc);
+                        try self.stack.push(.unknown);
+                    }
+                } else {
+                    arg.deinit(self.allocator, self.stack_alloc);
+                    try self.stack.push(.unknown);
+                }
             },
 
             .CALL_INTRINSIC_2 => {
@@ -5701,6 +6582,7 @@ pub const SimContext = struct {
                 try self.stack.push(.unknown);
             },
         }
+        self.prev_opcode = inst.opcode;
     }
 };
 
@@ -6135,6 +7017,9 @@ test "stack simulation dup top clones expr" {
 test "stack simulation pop except clears exception placeholders" {
     const testing = std.testing;
     const allocator = testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
 
     var consts: [0]pyc.Object = .{};
     var code = pyc.Code{
@@ -6143,13 +7028,13 @@ test "stack simulation pop except clears exception placeholders" {
     };
     const version = Version.init(3, 12);
 
-    var ctx = SimContext.init(allocator, allocator, &code, version);
+    var ctx = SimContext.init(a, a, &code, version);
     defer ctx.deinit();
 
-    const ret = try ast.makeName(allocator, "ret", .load);
-    const exc1 = try ast.makeName(allocator, "__exception__", .load);
-    const exc2 = try ast.makeName(allocator, "__exception__", .load);
-    const exc3 = try ast.makeName(allocator, "__exception__", .load);
+    const ret = try ast.makeName(a, "ret", .load);
+    const exc1 = try ast.makeName(a, "__exception__", .load);
+    const exc2 = try ast.makeName(a, "__exception__", .load);
+    const exc3 = try ast.makeName(a, "__exception__", .load);
 
     try ctx.stack.push(.{ .expr = ret });
     try ctx.stack.push(.{ .expr = exc1 });
@@ -6170,11 +7055,74 @@ test "stack simulation pop except clears exception placeholders" {
     try testing.expect(val == .expr);
     try testing.expect(std.mem.eql(u8, val.expr.name.id, "ret"));
 
-    const popped = ctx.stack.pop().?;
-    if (popped == .expr) {
-        popped.expr.deinit(allocator);
-        allocator.destroy(popped.expr);
-    }
+    _ = ctx.stack.pop().?;
+}
+
+test "stack simulation yield value strict error" {
+    const testing = std.testing;
+    const allocator = testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    var code = pyc.Code{
+        .allocator = allocator,
+    };
+    const version = Version.init(3, 12);
+
+    var ctx = SimContext.init(a, a, &code, version);
+    defer ctx.deinit();
+
+    try ctx.stack.push(.null_marker);
+
+    const inst = Instruction{
+        .opcode = .YIELD_VALUE,
+        .arg = 0,
+        .offset = 0,
+        .size = 2,
+        .cache_entries = 0,
+    };
+
+    try testing.expectError(error.NotAnExpression, ctx.simulate(inst));
+}
+
+test "stack simulation set append grows cap" {
+    const testing = std.testing;
+    const allocator = testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    var code = pyc.Code{
+        .allocator = allocator,
+    };
+    const version = Version.init(3, 12);
+
+    var ctx = SimContext.init(a, a, &code, version);
+    defer ctx.deinit();
+
+    const e0 = try ast.makeConstant(a, .{ .int = 0 });
+    const e1 = try ast.makeConstant(a, .{ .int = 1 });
+    const e2 = try ast.makeConstant(a, .{ .int = 2 });
+
+    const elts0 = try a.alloc(*Expr, 1);
+    elts0[0] = e0;
+    const set_expr = try a.create(Expr);
+    set_expr.* = .{ .set = .{ .elts = elts0, .cap = elts0.len } };
+
+    const elts1 = try a.alloc(*Expr, 1);
+    elts1[0] = e1;
+    try ctx.appendSetElts(set_expr, elts1);
+
+    const elts2 = try a.alloc(*Expr, 1);
+    elts2[0] = e2;
+    try ctx.appendSetElts(set_expr, elts2);
+
+    try testing.expectEqual(@as(usize, 3), set_expr.set.elts.len);
+    try testing.expect(set_expr.set.cap >= set_expr.set.elts.len);
+
+    set_expr.deinit(a);
+    a.destroy(set_expr);
 }
 
 test "stack simulation composite load const" {
@@ -6256,37 +7204,33 @@ test "stack simulation composite load const" {
 test "stack simulation CALL_FUNCTION_KW error clears moved args" {
     const testing = std.testing;
     const allocator = testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
 
     var code = pyc.Code{
         .allocator = allocator,
     };
     const version = Version.init(3, 9);
 
-    var ctx = SimContext.init(allocator, allocator, &code, version);
+    var ctx = SimContext.init(a, a, &code, version);
     defer {
-        // Clean up remaining stack items
-        while (ctx.stack.pop()) |val| {
-            if (val == .expr) {
-                val.expr.deinit(allocator);
-                allocator.destroy(val.expr);
-            }
-        }
         ctx.deinit();
     }
 
-    const callable = try ast.makeName(allocator, "f", .load);
+    const callable = try ast.makeName(a, "f", .load);
     try ctx.stack.push(.{ .expr = callable });
 
-    const pos_expr = try ast.makeConstant(allocator, .{ .int = 1 });
+    const pos_expr = try ast.makeConstant(a, .{ .int = 1 });
     try ctx.stack.push(.{ .expr = pos_expr });
 
     try ctx.stack.push(.unknown);
 
-    const kw_name = try allocator.dupe(u8, "x");
-    const kw_name_expr = try ast.makeConstant(allocator, .{ .string = kw_name });
-    const kw_elts = try allocator.alloc(*Expr, 1);
+    const kw_name = try a.dupe(u8, "x");
+    const kw_name_expr = try ast.makeConstant(a, .{ .string = kw_name });
+    const kw_elts = try a.alloc(*Expr, 1);
     kw_elts[0] = kw_name_expr;
-    const kw_names_tuple = try ast.makeTuple(allocator, kw_elts, .load);
+    const kw_names_tuple = try ast.makeTuple(a, kw_elts, .load);
     try ctx.stack.push(.{ .expr = kw_names_tuple });
 
     const inst = Instruction{

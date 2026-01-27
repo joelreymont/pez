@@ -345,7 +345,8 @@ const GenSet = struct {
 /// Decompiler state for a single code object.
 pub const Decompiler = struct {
     allocator: Allocator,
-    arena: std.heap.ArenaAllocator,
+    base_alloc: Allocator,
+    arena: *std.heap.ArenaAllocator,
     clone_arena: *std.heap.ArenaAllocator,
     code: *const pyc.Code,
     version: Version,
@@ -362,6 +363,8 @@ pub const Decompiler = struct {
     chained_cmp_next_block: ?u32 = null,
     /// Pending ternary expression to be consumed by next STORE instruction.
     pending_ternary_expr: ?*Expr = null,
+    /// Pending inline comprehension expressions keyed by exit block.
+    inline_pend: std.ArrayListUnmanaged(InlinePend) = .{},
     /// Pending expression for next STORE (boolop merge with conditional).
     pending_store_expr: ?*Expr = null,
     /// Pending stack values to prepend before next pending expr.
@@ -591,63 +594,32 @@ pub const Decompiler = struct {
         version: Version,
         opts: DecompileOptions,
     ) DecompileError!Decompiler {
-        var arena = std.heap.ArenaAllocator.init(allocator);
+        const arena = try allocator.create(std.heap.ArenaAllocator);
+        errdefer allocator.destroy(arena);
+        arena.* = std.heap.ArenaAllocator.init(allocator);
         errdefer arena.deinit();
 
-        const a = arena.allocator();
-
-        const clone_arena = try allocator.create(std.heap.ArenaAllocator);
-        errdefer allocator.destroy(clone_arena);
-        clone_arena.* = std.heap.ArenaAllocator.init(allocator);
-        errdefer clone_arena.deinit();
-
-        // Allocate CFG on heap so pointer stays valid
-        const cfg = try a.create(CFG);
-
-        cfg.* = if (version.gte(3, 11) and code.exceptiontable.len > 0)
-            try cfg_mod.buildCFGWithExceptions(a, code.code, code.exceptiontable, version)
-        else
-            try cfg_mod.buildCFG(a, code.code, version);
-        errdefer cfg.deinit();
-
-        const dom = try allocator.create(dom_mod.DomTree);
-        errdefer allocator.destroy(dom);
-        dom.* = try dom_mod.DomTree.init(allocator, cfg);
-        errdefer dom.deinit();
-
-        var analyzer = try Analyzer.init(allocator, cfg, dom);
-        errdefer analyzer.deinit();
-
-        var cond_seen = try GenSet.init(allocator, cfg.blocks.len);
-        errdefer cond_seen.deinit(allocator);
-        var consumed = try GenSet.init(allocator, cfg.blocks.len);
-        errdefer consumed.deinit(allocator);
-        var cond_stack: std.ArrayListUnmanaged(u32) = .{};
-        errdefer cond_stack.deinit(allocator);
-        if (cfg.blocks.len > 0) {
-            try cond_stack.ensureTotalCapacity(allocator, cfg.blocks.len);
-        }
-
         var decomp = Decompiler{
-            .allocator = allocator,
+            .allocator = undefined,
+            .base_alloc = allocator,
             .arena = arena,
-            .clone_arena = clone_arena,
+            .clone_arena = undefined,
             .code = code,
             .version = version,
-            .cfg = cfg,
-            .analyzer = analyzer,
-            .dom = dom,
+            .cfg = undefined,
+            .analyzer = undefined,
+            .dom = undefined,
             .postdom_idom = null,
             .statements = .{},
             .nested_decompilers = .{},
             .print_items = .{},
             .pending_chain_targets = .{},
             .stack_in = &.{},
-            .range_in_progress = std.AutoHashMap(u64, void).init(allocator),
-            .cond_seen = cond_seen,
-            .cond_stack = cond_stack,
-            .consumed = consumed,
-            .clone_sim = SimContext.init(clone_arena.allocator(), clone_arena.allocator(), code, version),
+            .range_in_progress = undefined,
+            .cond_seen = undefined,
+            .cond_stack = .{},
+            .consumed = undefined,
+            .clone_sim = undefined,
             .class_name = null,
             .trace_loop_guards = opts.trace_loop_guards,
             .trace_sim_block = opts.trace_sim_block,
@@ -656,17 +628,60 @@ pub const Decompiler = struct {
             .trace_blocks = opts.trace_blocks,
             .trace_file = opts.trace_file,
         };
+        decomp.allocator = decomp.arena.allocator();
+        const a = decomp.allocator;
+
+        const clone_arena = try a.create(std.heap.ArenaAllocator);
+        errdefer a.destroy(clone_arena);
+        clone_arena.* = std.heap.ArenaAllocator.init(allocator);
+        errdefer clone_arena.deinit();
+        decomp.clone_arena = clone_arena;
+        decomp.clone_sim = SimContext.init(clone_arena.allocator(), clone_arena.allocator(), code, version);
+
+        // Allocate CFG on heap so pointer stays valid
+        const cfg = try a.create(CFG);
+        cfg.* = if (version.gte(3, 11) and code.exceptiontable.len > 0)
+            try cfg_mod.buildCFGWithExceptions(a, code.code, code.exceptiontable, version)
+        else
+            try cfg_mod.buildCFG(a, code.code, version);
+        errdefer cfg.deinit();
+        decomp.cfg = cfg;
+
+        const dom = try a.create(dom_mod.DomTree);
+        errdefer a.destroy(dom);
+        dom.* = try dom_mod.DomTree.init(a, cfg);
+        errdefer dom.deinit();
+        decomp.dom = dom;
+
+        var analyzer = try Analyzer.init(a, cfg, dom);
+        errdefer analyzer.deinit();
+        decomp.analyzer = analyzer;
+
+        decomp.range_in_progress = std.AutoHashMap(u64, void).init(a);
+
+        var cond_seen = try GenSet.init(a, cfg.blocks.len);
+        errdefer cond_seen.deinit(a);
+        decomp.cond_seen = cond_seen;
+
+        var consumed = try GenSet.init(a, cfg.blocks.len);
+        errdefer consumed.deinit(a);
+        decomp.consumed = consumed;
+
+        var cond_stack: std.ArrayListUnmanaged(u32) = .{};
+        errdefer cond_stack.deinit(a);
+        if (cfg.blocks.len > 0) {
+            try cond_stack.ensureTotalCapacity(a, cfg.blocks.len);
+        }
+        decomp.cond_stack = cond_stack;
 
         try decomp.initStackFlow();
-        decomp.if_in_progress = try std.DynamicBitSet.initEmpty(allocator, cfg.blocks.len);
-        decomp.loop_in_progress = try std.DynamicBitSet.initEmpty(allocator, cfg.blocks.len);
+        decomp.if_in_progress = try std.DynamicBitSet.initEmpty(a, cfg.blocks.len);
+        decomp.loop_in_progress = try std.DynamicBitSet.initEmpty(a, cfg.blocks.len);
         return decomp;
     }
 
     pub fn deinit(self: *Decompiler) void {
         self.clone_sim.deinit();
-        self.clone_arena.deinit();
-        self.allocator.destroy(self.clone_arena);
         for (self.nested_decompilers.items) |nested| {
             nested.deinit();
             self.allocator.destroy(nested);
@@ -674,10 +689,13 @@ pub const Decompiler = struct {
         self.nested_decompilers.deinit(self.allocator);
         self.print_items.deinit(self.allocator);
         self.pending_chain_targets.deinit(self.allocator);
+        self.inline_pend.deinit(self.allocator);
         if (self.pending_vals) |vals| {
-            deinitStackValuesSlice(self.allocator, self.allocator, vals);
+            self.deinitStackValues(vals);
             self.pending_vals = null;
         }
+        self.clone_arena.deinit();
+        self.allocator.destroy(self.clone_arena);
         for (self.stack_in) |entry_opt| {
             if (entry_opt) |entry| {
                 if (entry.len > 0) self.allocator.free(entry);
@@ -699,8 +717,9 @@ pub const Decompiler = struct {
         self.cond_seen.deinit(self.allocator);
         self.cond_stack.deinit(self.allocator);
         self.consumed.deinit(self.allocator);
-        self.arena.deinit();
         self.statements.deinit(self.allocator);
+        self.arena.deinit();
+        self.base_alloc.destroy(self.arena);
     }
 
     const TryScratch = struct {
@@ -951,12 +970,15 @@ pub const Decompiler = struct {
     ) DecompileError!?*Stmt {
         switch (inst.opcode) {
             .STORE_NAME, .STORE_FAST, .STORE_GLOBAL, .STORE_DEREF => {
-                const name = switch (inst.opcode) {
+                var name = switch (inst.opcode) {
                     .STORE_NAME, .STORE_GLOBAL => sim.getName(inst.arg) orelse "__unknown__",
                     .STORE_FAST => sim.getLocal(inst.arg) orelse "__unknown__",
                     .STORE_DEREF => sim.getDeref(inst.arg) orelse "__unknown__",
                     else => "__unknown__",
                 };
+                if (inst.opcode == .STORE_DEREF and self.version.gte(3, 14) and std.mem.eql(u8, name, "__classdict__")) {
+                    name = "__unknown__";
+                }
                 var value = sim.stack.pop() orelse {
                     if (sim.lenient) return null;
                     return error.StackUnderflow;
@@ -1190,7 +1212,7 @@ pub const Decompiler = struct {
         if (!pred_match) return null;
 
         const cond_res = (try self.loopCondExpr(cond_block, true_id, false_id, 0)) orelse return null;
-        defer deinitStackValuesSlice(self.allocator, self.allocator, cond_res.base_vals);
+        defer self.deinitStackValues(cond_res.base_vals);
 
         const true_expr = (try self.simulateTernaryBranch(true_id, cond_res.base_vals)) orelse return null;
         const false_expr = (try self.simulateTernaryBranch(false_id, cond_res.base_vals)) orelse return null;
@@ -1308,7 +1330,7 @@ pub const Decompiler = struct {
             return err;
         };
         const base_vals = try self.cloneStackValues(cond_sim.stack.items.items);
-        defer deinitStackValuesSlice(self.allocator, self.allocator, base_vals);
+        defer self.deinitStackValues(base_vals);
 
         const bool_res = ScPass.buildBoolOpExpr(self, first, pattern, base_vals) catch |err| {
             if (err == error.InvalidBlock or err == error.PatternNoMatch) return error.PatternNoMatch;
@@ -1423,13 +1445,22 @@ pub const Decompiler = struct {
         return null;
     }
 
-    pub fn deinitStackValuesSlice(ast_alloc: Allocator, stack_alloc: Allocator, values: []const StackValue) void {
+    pub fn deinitStackValuesSlice(
+        ast_alloc: Allocator,
+        stack_alloc: Allocator,
+        slice_alloc: Allocator,
+        values: []const StackValue,
+    ) void {
         for (values) |val| {
             if (val != .expr) {
                 val.deinit(ast_alloc, stack_alloc);
             }
         }
-        if (values.len > 0) stack_alloc.free(@constCast(values));
+        if (values.len > 0) slice_alloc.free(@constCast(values));
+    }
+
+    fn deinitStackValues(self: *Decompiler, values: []const StackValue) void {
+        deinitStackValuesSlice(self.clone_sim.allocator, self.clone_sim.stack_alloc, self.allocator, values);
     }
 
     fn returnCleanupSkip(instructions: []const decoder.Instruction, idx: usize) ?usize {
@@ -3021,6 +3052,48 @@ pub const Decompiler = struct {
         return self.processBlockWithSimAndSkipInner(block, sim, stmts, stmts_allocator, skip_first, false);
     }
 
+    fn inlineCleanupSkip(block: *const BasicBlock, start: usize) usize {
+        const cleanup_insts = block.instructions[start..];
+        var extra_skip: usize = 0;
+        for (cleanup_insts, 0..) |inst, j| {
+            switch (inst.opcode) {
+                .END_FOR, .POP_TOP, .POP_ITER, .SWAP => {
+                    extra_skip += 1;
+                },
+                .STORE_FAST => {
+                    if (j > 0 and cleanup_insts[j - 1].opcode == .SWAP) {
+                        extra_skip += 1;
+                    } else {
+                        break;
+                    }
+                },
+                else => break,
+            }
+        }
+        return extra_skip;
+    }
+
+    fn hasInlinePend(self: *const Decompiler, block_id: u32) bool {
+        for (self.inline_pend.items) |item| {
+            if (item.block == block_id) return true;
+        }
+        return false;
+    }
+
+    fn pushInlinePend(self: *Decompiler, block_id: u32, sim: *SimContext) DecompileError!void {
+        if (self.inline_pend.items.len == 0) return;
+        var write: usize = 0;
+        for (self.inline_pend.items) |item| {
+            if (item.block == block_id) {
+                try sim.stack.push(.{ .expr = item.expr });
+            } else {
+                self.inline_pend.items[write] = item;
+                write += 1;
+            }
+        }
+        self.inline_pend.items.len = write;
+    }
+
     fn processBlockWithSimAndSkipInner(
         self: *Decompiler,
         block: *const BasicBlock,
@@ -3047,32 +3120,19 @@ pub const Decompiler = struct {
                 const cloned = try sim.cloneStackValue(val);
                 try sim.stack.push(cloned);
             }
-            deinitStackValuesSlice(self.allocator, self.allocator, vals);
+            self.deinitStackValues(vals);
             self.pending_vals = null;
         }
         if (self.pending_store_expr) |expr| {
             try sim.stack.push(.{ .expr = expr });
             self.pending_store_expr = null;
         }
-        if (self.pending_ternary_expr != null) {
-            // Skip cleanup ops at start of block
-            const cleanup_insts = block.instructions[skip_first..];
-            for (cleanup_insts, 0..) |cleanup_inst, j| {
-                switch (cleanup_inst.opcode) {
-                    .END_FOR, .POP_TOP, .POP_ITER, .SWAP => {
-                        extra_skip += 1;
-                    },
-                    .STORE_FAST => {
-                        // STORE_FAST after SWAP is loop variable restore - skip it
-                        if (j > 0 and cleanup_insts[j - 1].opcode == .SWAP) {
-                            extra_skip += 1;
-                        } else {
-                            break;
-                        }
-                    },
-                    else => break,
-                }
-            }
+        const has_inline = self.hasInlinePend(block.id);
+        if (has_inline or self.pending_ternary_expr != null) {
+            extra_skip = inlineCleanupSkip(block, skip_first);
+        }
+        if (has_inline) {
+            try self.pushInlinePend(block.id, sim);
         }
         if (self.pending_ternary_expr) |expr| {
             try sim.stack.push(.{ .expr = expr });
@@ -3160,12 +3220,15 @@ pub const Decompiler = struct {
                         break :blk prev.opcode == .DUP_TOP or prev.opcode == .COPY;
                     } else false;
 
-                    const name = switch (inst.opcode) {
+                    var name = switch (inst.opcode) {
                         .STORE_NAME, .STORE_GLOBAL => sim.getName(inst.arg) orelse "__unknown__",
                         .STORE_FAST => sim.getLocal(inst.arg) orelse "__unknown__",
                         .STORE_DEREF => sim.getDeref(inst.arg) orelse "__unknown__",
                         else => "__unknown__",
                     };
+                    if (inst.opcode == .STORE_DEREF and self.version.gte(3, 14) and std.mem.eql(u8, name, "__classdict__")) {
+                        name = "__unknown__";
+                    }
 
                     const is_classcell = inst.opcode == .STORE_NAME and std.mem.eql(u8, name, "__classcell__");
 
@@ -3173,6 +3236,77 @@ pub const Decompiler = struct {
                         _ = sim.stack.pop() orelse return error.StackUnderflow;
                         self.saw_classcell = true;
                         continue;
+                    }
+
+                    // __annotate_func__ contains class annotations
+                    if (inst.opcode == .STORE_NAME and self.version.gte(3, 14) and std.mem.eql(u8, name, "__annotate_func__")) {
+                        const val = sim.stack.pop() orelse return error.StackUnderflow;
+                        if (val == .function_obj) {
+                            const annotations = try sim.parseAnnotateCode(val.function_obj.code);
+                            const arena = self.arena.allocator();
+                            // Insert annotations after docstring (if present) at the beginning of class body
+                            var insert_idx: usize = 0;
+                            // Check if first statement is a docstring assignment (__doc__ = "...")
+                            if (stmts.items.len > 0) {
+                                const first = stmts.items[0];
+                                if (first.* == .assign and first.assign.targets.len == 1) {
+                                    const target = first.assign.targets[0];
+                                    if (target.* == .name and std.mem.eql(u8, target.name.id, "__doc__") and
+                                        first.assign.value.* == .constant and
+                                        first.assign.value.constant == .string)
+                                    {
+                                        insert_idx = 1; // Insert after docstring
+                                    }
+                                }
+                            }
+                            for (annotations) |ann| {
+                                const target = try self.makeName(ann.name, .store);
+                                const stmt = try arena.create(Stmt);
+                                stmt.* = .{ .ann_assign = .{
+                                    .target = target,
+                                    .annotation = ann.value,
+                                    .value = null,
+                                    .simple = true,
+                                } };
+                                try stmts.insert(stmts_allocator, insert_idx, stmt);
+                                insert_idx += 1;
+                            }
+                        } else {
+                            val.deinit(sim.allocator, sim.stack_alloc);
+                        }
+                        continue;
+                    }
+
+                    // Try to recover type alias (PEP 695)
+                    if (self.version.gte(3, 12)) {
+                        // Try simple type alias first
+                        if (try self.tryRecoverTypeAlias(sim, instructions, i, name)) |type_stmt| {
+                            try stmts.append(stmts_allocator, type_stmt);
+                            const val = sim.stack.pop() orelse return error.StackUnderflow;
+                            val.deinit(sim.allocator, sim.stack_alloc);
+                            continue;
+                        }
+                        // Try generic type alias
+                        if (try self.tryRecoverGenericTypeAlias(sim, instructions, i, name)) |type_stmt| {
+                            try stmts.append(stmts_allocator, type_stmt);
+                            const val = sim.stack.pop() orelse return error.StackUnderflow;
+                            val.deinit(sim.allocator, sim.stack_alloc);
+                            continue;
+                        }
+                        // Try generic function
+                        if (try self.tryRecoverGenericFunction(sim, instructions, i, name)) |func_stmt| {
+                            try stmts.append(stmts_allocator, func_stmt);
+                            const val = sim.stack.pop() orelse return error.StackUnderflow;
+                            val.deinit(sim.allocator, sim.stack_alloc);
+                            continue;
+                        }
+                        // Try generic class
+                        if (try self.tryRecoverGenericClass(sim, instructions, i, name)) |class_stmt| {
+                            try stmts.append(stmts_allocator, class_stmt);
+                            const val = sim.stack.pop() orelse return error.StackUnderflow;
+                            val.deinit(sim.allocator, sim.stack_alloc);
+                            continue;
+                        }
                     }
 
                     if (!prev_was_dup and i > 0 and instructions[i - 1].opcode == .ROT_TWO and
@@ -3217,6 +3351,63 @@ pub const Decompiler = struct {
                     }
 
                     if (prev_was_dup) {
+                        // Check for walrus operator FIRST: COPY 1 followed by STORE_* with value used later
+                        // Pattern: expr on stack, COPY 1 duplicates it, STORE_* stores the copy
+                        // The original expr remains and is used in comparison/condition
+                        const prev_inst: ?decoder.Instruction = if (abs_idx > 0) block.instructions[abs_idx - 1] else null;
+                        const is_copy_1 = if (prev_inst) |pi| pi.opcode == .COPY and pi.arg == 1 else false;
+                        if (is_copy_1) {
+                            // Check if next instruction uses the stack value (not another DUP/STORE)
+                            const next_idx = i + 1;
+                            var is_walrus = false;
+                            if (next_idx < instructions.len) {
+                                const next_op = instructions[next_idx].opcode;
+                                // Walrus if next instruction consumes the value for comparison, bool conversion, etc.
+                                // NOT walrus if next is DUP/COPY/STORE (that's chain assignment)
+                                is_walrus = switch (next_op) {
+                                    .DUP_TOP, .COPY, .STORE_NAME, .STORE_FAST, .STORE_GLOBAL, .STORE_DEREF => false,
+                                    .COMPARE_OP, .CONTAINS_OP, .IS_OP,
+                                    .TO_BOOL, .POP_JUMP_IF_TRUE, .POP_JUMP_IF_FALSE,
+                                    .POP_JUMP_IF_NONE, .POP_JUMP_IF_NOT_NONE,
+                                    .POP_JUMP_FORWARD_IF_TRUE, .POP_JUMP_FORWARD_IF_FALSE,
+                                    .POP_JUMP_FORWARD_IF_NONE, .POP_JUMP_FORWARD_IF_NOT_NONE,
+                                    .LOAD_SMALL_INT, .LOAD_CONST, .LOAD_FAST, .LOAD_FAST_BORROW,
+                                    .LOAD_NAME, .LOAD_GLOBAL, .BINARY_OP,
+                                    => true,
+                                    else => false,
+                                };
+                            }
+
+                            if (is_walrus) {
+                                // Pop the copied value (what STORE_* would consume)
+                                const copied = sim.stack.pop() orelse StackValue.unknown;
+                                const val_expr = switch (copied) {
+                                    .expr => |e| e,
+                                    else => blk: {
+                                        copied.deinit(sim.allocator, sim.stack_alloc);
+                                        break :blk null;
+                                    },
+                                };
+
+                                if (val_expr) |expr| {
+                                    // Create named_expr: (name := expr)
+                                    const arena = self.arena.allocator();
+                                    const target = try self.makeName(name, .store);
+                                    const named = try arena.create(Expr);
+                                    named.* = .{ .named_expr = .{ .target = target, .value = expr } };
+
+                                    // Replace the original on stack with the named_expr
+                                    // Pop the original (which is now TOS after we popped the copy)
+                                    if (sim.stack.pop()) |orig| {
+                                        orig.deinit(sim.allocator, sim.stack_alloc);
+                                    }
+                                    try sim.stack.push(.{ .expr = named });
+                                    continue;
+                                }
+                            }
+                        }
+
+                        // Not walrus - try chain assignment
                         var chain_idx = abs_idx;
                         if (try self.tryHandleChainAssignStore(sim, block.instructions, &chain_idx, name, stmts, stmts_allocator)) {
                             i = chain_idx - inst_base;
@@ -5294,6 +5485,11 @@ pub const Decompiler = struct {
         stack: []const StackValue,
     };
 
+    const InlinePend = struct {
+        block: u32,
+        expr: *Expr,
+    };
+
     fn tryDecompileInlineListComp(
         self: *Decompiler,
         pattern: ctrl.ForPattern,
@@ -5358,6 +5554,33 @@ pub const Decompiler = struct {
                     break;
                 }
                 if (inst.opcode == .FOR_ITER) break;
+            }
+        }
+
+        // Python 3.14: BUILD_LIST may be in an intermediate block between setup and header
+        // Check direct predecessors of header block that are not the setup block
+        if (comp_start == null) {
+            for (header.predecessors) |pred_id| {
+                if (pred_id == pattern.setup_block) continue;
+                if (pred_id >= self.cfg.blocks.len) continue;
+                const pred = &self.cfg.blocks[pred_id];
+                // Skip loop_back edges
+                var is_loop_back = false;
+                for (pred.successors) |edge| {
+                    if (edge.target == pattern.header_block and edge.edge_type == .loop_back) {
+                        is_loop_back = true;
+                        break;
+                    }
+                }
+                if (is_loop_back) continue;
+
+                for (pred.instructions) |inst| {
+                    if (isBuildComp(inst.opcode, inst.arg)) {
+                        comp_start = inst.offset;
+                        break;
+                    }
+                }
+                if (comp_start != null) break;
             }
         }
 
@@ -5433,11 +5656,43 @@ pub const Decompiler = struct {
             return err;
         } orelse return null;
 
-        if (self.pending_ternary_expr != null) return error.InvalidBlock;
-        self.pending_ternary_expr = expr;
+        if (self.version.gte(3, 14)) {
+            // Python 3.14+ inline comprehensions with LOAD_FAST_AND_CLEAR / POP_ITER
+            // Build stack for exit processing:
+            // Exit block has: END_FOR, POP_ITER
+            // Cleanup block has: SWAP N, STORE_FAST..., STORE_NAME
+            // Stack entering exit: [saved_locals..., comp_result, iterator]
+            // Nested comprehensions may have multiple saved_locals (one per loop var)
+            var saved_count: usize = 0;
+            for (sim.stack.items.items) |val| {
+                if (val == .saved_local) saved_count += 1;
+            }
+            const stack_len: usize = 2 + saved_count;
+            const clean_stack = try self.arena.allocator().alloc(StackValue, stack_len);
+            var idx: usize = 0;
+            // Add all saved_locals in order
+            for (sim.stack.items.items) |val| {
+                if (val == .saved_local) {
+                    clean_stack[idx] = val;
+                    idx += 1;
+                }
+            }
+            clean_stack[idx] = .{ .expr = expr };
+            idx += 1;
+            clean_stack[idx] = .unknown; // iterator placeholder for POP_ITER
 
-        const stack_copy = try self.cloneStackValues(sim.stack.items.items);
-        return .{ .exit_block = pattern.exit_block, .stack = stack_copy };
+            const stack_copy = try self.cloneStackValues(clean_stack);
+            return .{ .exit_block = pattern.exit_block, .stack = stack_copy };
+        } else {
+            // Pre-3.14: stash inline comp expr for exit block cleanup handling
+            try self.inline_pend.append(self.allocator, .{
+                .block = pattern.exit_block,
+                .expr = expr,
+            });
+
+            const stack_copy = try self.cloneStackValues(sim.stack.items.items);
+            return .{ .exit_block = pattern.exit_block, .stack = stack_copy };
+        }
     }
 
     /// Try to decompile a try pattern as an inline comprehension.
@@ -5537,9 +5792,9 @@ pub const Decompiler = struct {
 
         // Try to decompile as inline comprehension
         if (try self.tryDecompileInlineListComp(for_pattern)) |result| {
-            // Comprehension is now in pending_ternary_expr
+            // Comprehension is now in inline_pend for the exit block
             // Process the exit block to pick it up
-            defer deinitStackValuesSlice(self.allocator, self.allocator, result.stack);
+            defer self.deinitStackValues(result.stack);
             const exit_id = exit_block_id.?;
             if (exit_id < self.cfg.blocks.len) {
                 const exit_stmts = try self.decompileBlockRangeWithStack(exit_id, handler_id, result.stack);
@@ -5947,9 +6202,53 @@ pub const Decompiler = struct {
                 },
                 .for_loop => |p| {
                     if (try self.tryDecompileInlineListComp(p)) |result| {
-                        deinitStackValuesSlice(self.allocator, self.allocator, result.stack);
-                        block_idx = result.exit_block;
-                        continue;
+                        // Python 3.14+ inline comprehensions need special stack handling
+                        // because of LOAD_FAST_AND_CLEAR / POP_ITER cleanup
+                        if (self.version.gte(3, 14)) {
+                            // Set stack_in for exit block so subsequent processing uses it
+                            if (result.exit_block < self.stack_in.len) {
+                                // Free old entry if any
+                                if (self.stack_in[result.exit_block]) |old| {
+                                    if (old.len > 0) self.allocator.free(old);
+                                }
+                                self.stack_in[result.exit_block] = @constCast(result.stack);
+
+                                // Also set stack for successor block (after POP_ITER consumes iterator)
+                                // Exit block has END_FOR + POP_ITER, which consumes one stack value
+                                const exit_blk = &self.cfg.blocks[result.exit_block];
+                                for (exit_blk.successors) |edge| {
+                                    if (edge.edge_type == .exception) continue;
+                                    const succ = edge.target;
+                                    if (succ >= self.stack_in.len) continue;
+                                    // Stack after POP_ITER: one less element
+                                    if (result.stack.len >= 1) {
+                                        const succ_stack = try self.allocator.alloc(StackValue, result.stack.len - 1);
+                                        for (result.stack[0 .. result.stack.len - 1], 0..) |val, i| {
+                                            succ_stack[i] = val;
+                                        }
+                                        if (self.stack_in[succ]) |old| {
+                                            if (old.len > 0) self.allocator.free(old);
+                                        }
+                                        self.stack_in[succ] = succ_stack;
+                                    }
+                                }
+                            } else {
+                                self.deinitStackValues(result.stack);
+                            }
+                            // Mark comprehension blocks as consumed
+                            try self.consumed.set(self.allocator, p.setup_block);
+                            try self.consumed.set(self.allocator, p.header_block);
+                            try self.consumed.set(self.allocator, p.body_block);
+                            // Continue from exit block - normal processing will use stack_in
+                            block_idx = result.exit_block;
+                            continue;
+                        } else {
+                            // Pre-3.14: comprehension expr is stashed in inline_pend
+                            // Just free the stack and continue from exit block
+                            self.deinitStackValues(result.stack);
+                            block_idx = result.exit_block;
+                            continue;
+                        }
                     }
                     try self.emitForPrelude(p, &self.statements, self.allocator);
                     const stmt = try self.decompileFor(p);
@@ -6721,8 +7020,62 @@ pub const Decompiler = struct {
         const legacy_cond = if (term) |t| t.opcode == .JUMP_IF_FALSE or t.opcode == .JUMP_IF_TRUE else false;
 
         // Simulate up to but not including the conditional jump, skipping first N instructions
-        for (cond_block.instructions[skip_cond..]) |inst| {
+        const insts = cond_block.instructions[skip_cond..];
+        var inst_idx: usize = 0;
+        while (inst_idx < insts.len) : (inst_idx += 1) {
+            const inst = insts[inst_idx];
             if (ctrl.Analyzer.isConditionalJump(undefined, inst.opcode)) break;
+
+            // Detect walrus operator: COPY 1 followed by STORE_*
+            if (inst.opcode == .STORE_NAME or inst.opcode == .STORE_FAST or
+                inst.opcode == .STORE_GLOBAL or inst.opcode == .STORE_DEREF)
+            {
+                if (inst_idx > 0 and insts[inst_idx - 1].opcode == .COPY and insts[inst_idx - 1].arg == 1) {
+                    const next_idx = inst_idx + 1;
+                    var is_walrus = false;
+                    if (next_idx < insts.len) {
+                        const next_op = insts[next_idx].opcode;
+                        is_walrus = switch (next_op) {
+                            .DUP_TOP, .COPY, .STORE_NAME, .STORE_FAST, .STORE_GLOBAL, .STORE_DEREF => false,
+                            .COMPARE_OP, .CONTAINS_OP, .IS_OP,
+                            .TO_BOOL, .POP_JUMP_IF_TRUE, .POP_JUMP_IF_FALSE,
+                            .POP_JUMP_IF_NONE, .POP_JUMP_IF_NOT_NONE,
+                            .POP_JUMP_FORWARD_IF_TRUE, .POP_JUMP_FORWARD_IF_FALSE,
+                            .POP_JUMP_FORWARD_IF_NONE, .POP_JUMP_FORWARD_IF_NOT_NONE,
+                            .LOAD_SMALL_INT, .LOAD_CONST, .LOAD_FAST, .LOAD_FAST_BORROW,
+                            .LOAD_NAME, .LOAD_GLOBAL, .BINARY_OP,
+                            => true,
+                            else => false,
+                        };
+                    }
+
+                    if (is_walrus) {
+                        const copied = sim.stack.pop() orelse StackValue.unknown;
+                        if (copied == .expr) {
+                            const expr = copied.expr;
+                            const name = switch (inst.opcode) {
+                                .STORE_FAST => sim.getLocal(inst.arg) orelse "__unknown__",
+                                .STORE_NAME, .STORE_GLOBAL => sim.getName(inst.arg) orelse "__unknown__",
+                                .STORE_DEREF => sim.getDeref(inst.arg) orelse "__unknown__",
+                                else => "__unknown__",
+                            };
+                            const arena = self.arena.allocator();
+                            const target = try self.makeName(name, .store);
+                            const named = try arena.create(Expr);
+                            named.* = .{ .named_expr = .{ .target = target, .value = expr } };
+
+                            if (sim.stack.pop()) |orig| {
+                                orig.deinit(sim.allocator, sim.stack_alloc);
+                            }
+                            try sim.stack.push(.{ .expr = named });
+                            continue;
+                        } else {
+                            copied.deinit(sim.allocator, sim.stack_alloc);
+                        }
+                    }
+                }
+            }
+
             try sim.simulate(inst);
         }
 
@@ -7120,10 +7473,10 @@ pub const Decompiler = struct {
         var base_vals = base_vals_buf;
         var base_owned = true;
         errdefer if (base_owned) {
-            deinitStackValuesSlice(self.allocator, self.allocator, base_vals_buf);
+            self.deinitStackValues(base_vals_buf);
         };
         defer if (base_owned) {
-            deinitStackValuesSlice(self.allocator, self.allocator, base_vals_buf);
+            self.deinitStackValues(base_vals_buf);
         };
 
         // Collapse chained condition blocks on the then-path (x and y and z).
@@ -7914,8 +8267,8 @@ pub const Decompiler = struct {
             },
             else => {},
         };
-        defer if (then_owned) deinitStackValuesSlice(self.allocator, self.allocator, then_vals);
-        defer if (else_owned) deinitStackValuesSlice(self.allocator, self.allocator, else_vals);
+        defer if (then_owned) self.deinitStackValues(then_vals);
+        defer if (else_owned) self.deinitStackValues(else_vals);
 
         if (else_block) |else_id| {
             const resolved_else = self.resolveJumpOnlyBlock(else_id);
@@ -7924,7 +8277,7 @@ pub const Decompiler = struct {
             const assert_ok = self.isAssertRaiseBlock(resolved_else);
             if (merge_ok or assert_ok) {
                 if (try self.tryDecompileAssertBlock(condition, else_id, skip)) |assert_stmt| {
-                    deinitStackValuesSlice(self.allocator, self.allocator, base_vals_buf);
+                    self.deinitStackValues(base_vals_buf);
                     base_owned = false;
                     self.if_next = then_block;
                     return assert_stmt;
@@ -8048,7 +8401,7 @@ pub const Decompiler = struct {
         // Check for assert pattern: if cond: pass else: raise AssertionError
         if (else_block) |else_id| {
             if (try self.tryDecompileAssert(pattern, condition, else_id, then_body, base_vals, skip)) |assert_stmt| {
-                deinitStackValuesSlice(self.allocator, self.allocator, base_vals_buf);
+                self.deinitStackValues(base_vals_buf);
                 base_owned = false;
                 return assert_stmt;
             }
@@ -8079,7 +8432,7 @@ pub const Decompiler = struct {
         if (!is_elif and self.isAssertRaiseBlock(then_block)) {
             const inv = try self.invertConditionExpr(condition);
             if (try self.tryDecompileAssertBlock(inv, then_block, skip)) |assert_stmt| {
-                deinitStackValuesSlice(self.allocator, self.allocator, base_vals_buf);
+                self.deinitStackValues(base_vals_buf);
                 base_owned = false;
                 if (deferred_if_next) |next| {
                     self.if_next = next;
@@ -8098,7 +8451,7 @@ pub const Decompiler = struct {
             // Check if else is an elif
             if (is_elif) {
                 // Elif needs to start with fresh stack
-                deinitStackValuesSlice(self.allocator, self.allocator, base_vals_buf);
+                self.deinitStackValues(base_vals_buf);
                 base_owned = false;
                 if (else_id <= pattern.condition_block) {
                     break :blk &[_]*Stmt{};
@@ -8202,7 +8555,7 @@ pub const Decompiler = struct {
             break :blk result;
         } else blk: {
             // No else block - clean up base_vals
-            deinitStackValuesSlice(self.allocator, self.allocator, base_vals_buf);
+            self.deinitStackValues(base_vals_buf);
             base_owned = false;
             break :blk &[_]*Stmt{};
         };
@@ -8580,10 +8933,65 @@ pub const Decompiler = struct {
         defer sim.deinit();
 
         var cond_idx: usize = header.instructions.len;
-        for (header.instructions, 0..) |inst, idx| {
+        const insts = header.instructions;
+        var inst_idx: usize = 0;
+        while (inst_idx < insts.len) : (inst_idx += 1) {
+            const inst = insts[inst_idx];
             if (ctrl.Analyzer.isConditionalJump(undefined, inst.opcode)) break;
+
+            // Detect walrus operator: COPY 1 followed by STORE_*
+            if (inst.opcode == .STORE_NAME or inst.opcode == .STORE_FAST or
+                inst.opcode == .STORE_GLOBAL or inst.opcode == .STORE_DEREF)
+            {
+                if (inst_idx > 0 and insts[inst_idx - 1].opcode == .COPY and insts[inst_idx - 1].arg == 1) {
+                    const next_idx = inst_idx + 1;
+                    var is_walrus = false;
+                    if (next_idx < insts.len) {
+                        const next_op = insts[next_idx].opcode;
+                        is_walrus = switch (next_op) {
+                            .DUP_TOP, .COPY, .STORE_NAME, .STORE_FAST, .STORE_GLOBAL, .STORE_DEREF => false,
+                            .COMPARE_OP, .CONTAINS_OP, .IS_OP,
+                            .TO_BOOL, .POP_JUMP_IF_TRUE, .POP_JUMP_IF_FALSE,
+                            .POP_JUMP_IF_NONE, .POP_JUMP_IF_NOT_NONE,
+                            .POP_JUMP_FORWARD_IF_TRUE, .POP_JUMP_FORWARD_IF_FALSE,
+                            .POP_JUMP_FORWARD_IF_NONE, .POP_JUMP_FORWARD_IF_NOT_NONE,
+                            .LOAD_SMALL_INT, .LOAD_CONST, .LOAD_FAST, .LOAD_FAST_BORROW,
+                            .LOAD_NAME, .LOAD_GLOBAL, .BINARY_OP,
+                            => true,
+                            else => false,
+                        };
+                    }
+
+                    if (is_walrus) {
+                        const copied = sim.stack.pop() orelse StackValue.unknown;
+                        if (copied == .expr) {
+                            const expr = copied.expr;
+                            const name = switch (inst.opcode) {
+                                .STORE_FAST => sim.getLocal(inst.arg) orelse "__unknown__",
+                                .STORE_NAME, .STORE_GLOBAL => sim.getName(inst.arg) orelse "__unknown__",
+                                .STORE_DEREF => sim.getDeref(inst.arg) orelse "__unknown__",
+                                else => "__unknown__",
+                            };
+                            const arena = self.arena.allocator();
+                            const target = try self.makeName(name, .store);
+                            const named = try arena.create(Expr);
+                            named.* = .{ .named_expr = .{ .target = target, .value = expr } };
+
+                            if (sim.stack.pop()) |orig| {
+                                orig.deinit(sim.allocator, sim.stack_alloc);
+                            }
+                            try sim.stack.push(.{ .expr = named });
+                            cond_idx = inst_idx + 1;
+                            continue;
+                        } else {
+                            copied.deinit(sim.allocator, sim.stack_alloc);
+                        }
+                    }
+                }
+            }
+
             try sim.simulate(inst);
-            cond_idx = idx + 1;
+            cond_idx = inst_idx + 1;
         }
 
         var condition = try sim.stack.popExpr();
@@ -10842,6 +11250,16 @@ pub const Decompiler = struct {
         const a = self.arena.allocator();
         var sim = self.initSim(a, a, self.code, self.version);
         defer sim.deinit();
+
+        // Check if this is a class pattern (has MATCH_CLASS)
+        var has_match_class = false;
+        for (subj_block.instructions) |inst| {
+            if (inst.opcode == .MATCH_CLASS) {
+                has_match_class = true;
+                break;
+            }
+        }
+
         var prev_was_load = false;
         for (subj_block.instructions) |inst| {
             // Stop before MATCH_* opcodes or COPY
@@ -10858,7 +11276,15 @@ pub const Decompiler = struct {
             if (inst.opcode == .STORE_FAST_LOAD_FAST) {
                 break;
             }
-            prev_was_load = inst.opcode == .LOAD_NAME or inst.opcode == .LOAD_FAST;
+            // For class patterns, stop after first load (the subject)
+            // because subsequent loads are for class and attrs
+            if (has_match_class and prev_was_load and
+                (inst.opcode == .LOAD_GLOBAL or inst.opcode == .LOAD_NAME or inst.opcode == .LOAD_CONST))
+            {
+                break;
+            }
+            prev_was_load = inst.opcode == .LOAD_NAME or inst.opcode == .LOAD_FAST or
+                inst.opcode == .LOAD_FAST_BORROW;
             try sim.simulate(inst);
         }
 
@@ -11239,8 +11665,10 @@ pub const Decompiler = struct {
                 if (!seen_match) continue;
                 var preload: ?*Expr = null;
                 var j = i + 1;
+                var seen_literal = false;
                 while (j < block.instructions.len) : (j += 1) {
                     const op = block.instructions[j].opcode;
+                    if (op == .NOT_TAKEN or op == .CACHE) continue;
                     if (op == .STORE_FAST_LOAD_FAST) {
                         const load_idx = block.instructions[j].arg & 0xF;
                         if (load_idx < self.code.varnames.len) {
@@ -11249,10 +11677,23 @@ pub const Decompiler = struct {
                         }
                         continue;
                     }
+                    // LOAD_CONST before LOAD_FAST suggests f-string body, not guard
+                    if (op == .LOAD_CONST or op == .LOAD_SMALL_INT) {
+                        seen_literal = true;
+                        continue;
+                    }
+                    // Body ops - this isn't a guard, it's case body code
+                    if (op == .FORMAT_SIMPLE or op == .BUILD_STRING or
+                        op == .BINARY_SUBSCR or op == .RETURN_VALUE or op == .RETURN_CONST)
+                    {
+                        break;
+                    }
                     if (op == .LOAD_GLOBAL or op == .LOAD_NAME or op == .LOAD_FAST or
                         op == .LOAD_FAST_BORROW or op == .LOAD_FAST_LOAD_FAST or
                         op == .LOAD_FAST_BORROW_LOAD_FAST_BORROW)
                     {
+                        // If we saw a literal before the load, it's likely f-string body
+                        if (seen_literal) break;
                         return .{ .idx = j, .preload = preload };
                     }
                     if (ctrl.Analyzer.isConditionalJump(undefined, op)) break;
@@ -11265,6 +11706,19 @@ pub const Decompiler = struct {
                 var j = i + 1;
                 while (j < block.instructions.len) : (j += 1) {
                     const op = block.instructions[j].opcode;
+                    if (op == .NOT_TAKEN or op == .CACHE) continue;
+                    // Body ops - this isn't a guard, it's case body code
+                    if (op == .FORMAT_SIMPLE or op == .BUILD_STRING or
+                        op == .BINARY_OP or op == .BINARY_SUBSCR or
+                        op == .RETURN_VALUE or op == .RETURN_CONST)
+                    {
+                        break;
+                    }
+                    // Guard starts at first load - could be LOAD_GLOBAL for function call
+                    // e.g., `case str() as s if len(s) > 5` starts guard at LOAD_GLOBAL len
+                    if (op == .LOAD_GLOBAL or op == .LOAD_NAME) {
+                        return .{ .idx = j, .preload = null };
+                    }
                     if (inst.opcode == .STORE_FAST and (op == .LOAD_FAST or op == .LOAD_FAST_BORROW) and block.instructions[j].arg == store_idx) {
                         return .{ .idx = j, .preload = null };
                     }
@@ -11507,7 +11961,7 @@ pub const Decompiler = struct {
                         }
                         continue;
                     },
-                    .STORE_FAST_STORE_FAST, .MATCH_SEQUENCE, .MATCH_MAPPING, .MATCH_CLASS, .MATCH_KEYS, .UNPACK_SEQUENCE, .GET_LEN, .STORE_FAST, .STORE_NAME => continue,
+                    .STORE_FAST_STORE_FAST, .MATCH_SEQUENCE, .MATCH_MAPPING, .MATCH_CLASS, .MATCH_KEYS, .UNPACK_SEQUENCE, .UNPACK_EX, .GET_LEN, .STORE_FAST, .STORE_NAME => continue,
                     .POP_TOP => {
                         if (sim.stack.len() > 0) {
                             _ = sim.stack.pop();
@@ -12035,6 +12489,56 @@ pub const Decompiler = struct {
         };
     }
 
+    /// Returns how many instructions at the start of `block` are pattern-related
+    /// (UNPACK_SEQUENCE + stores + POP_TOPs) for map/class pattern bindings.
+    fn patternSkipCount(self: *Decompiler, block: *const cfg_mod.BasicBlock) usize {
+        _ = self;
+        var skip: usize = 0;
+        var found_unpack = false;
+        var unpack_count: usize = 0;
+        var stores_done: usize = 0;
+
+        for (block.instructions) |inst| {
+            if (inst.opcode == .NOT_TAKEN or inst.opcode == .CACHE) {
+                skip += 1;
+                continue;
+            }
+            if (!found_unpack) {
+                if (inst.opcode == .UNPACK_SEQUENCE) {
+                    found_unpack = true;
+                    unpack_count = @intCast(inst.arg);
+                    skip += 1;
+                    continue;
+                }
+                // No unpack at start - no pattern ops to skip
+                return 0;
+            }
+            // After UNPACK_SEQUENCE, expect stores
+            if (stores_done < unpack_count) {
+                if (inst.opcode == .STORE_FAST or inst.opcode == .STORE_NAME or inst.opcode == .STORE_DEREF) {
+                    stores_done += 1;
+                    skip += 1;
+                    continue;
+                }
+                if (inst.opcode == .STORE_FAST_STORE_FAST) {
+                    stores_done += 2;
+                    skip += 1;
+                    continue;
+                }
+                // Unexpected op - stop
+                break;
+            }
+            // After stores, expect POP_TOPs (cleanup)
+            if (inst.opcode == .POP_TOP) {
+                skip += 1;
+                continue;
+            }
+            // Reached actual body
+            break;
+        }
+        return skip;
+    }
+
     fn mapPatternFromBlocks(self: *Decompiler, blocks: []const u32) DecompileError!?*ast.Pattern {
         const a = self.arena.allocator();
         var keys: ?[]const *Expr = null;
@@ -12161,8 +12665,10 @@ pub const Decompiler = struct {
             for (blk.instructions, 0..) |inst, i| {
                 switch (inst.opcode) {
                     .LOAD_GLOBAL => {
-                        if (inst.arg < self.code.names.len) {
-                            const name = self.code.names[inst.arg];
+                        // Python 3.11+ encodes name_idx in upper bits
+                        const name_idx: usize = if (self.version.gte(3, 11)) inst.arg >> 1 else inst.arg;
+                        if (name_idx < self.code.names.len) {
+                            const name = self.code.names[name_idx];
                             last_cls = try self.makeName(name, .load);
                         }
                     },
@@ -12205,9 +12711,108 @@ pub const Decompiler = struct {
             if (cls_expr != null and attrs != null and val_block != null) break;
         }
 
-        if (cls_expr == null or attrs == null or val_block == null) return null;
+        if (cls_expr == null or attrs == null) return null;
         const attr_list = attrs.?;
-        if (attr_list.len == 0) return null;
+
+        // For empty keyword attrs, check for positional captures via UNPACK_SEQUENCE
+        if (attr_list.len == 0) {
+            if (val_block) |vb| {
+                const vblk = &self.cfg.blocks[vb];
+                var unpack_count: usize = 0;
+                var unpack_idx: ?usize = null;
+                for (vblk.instructions, 0..) |inst, idx| {
+                    if (inst.opcode == .UNPACK_SEQUENCE) {
+                        unpack_count = @intCast(inst.arg);
+                        unpack_idx = idx;
+                        break;
+                    }
+                }
+                if (unpack_count > 0 and unpack_idx != null) {
+                    // Positional capture pattern like case int(x):
+                    const pats = try a.alloc(*ast.Pattern, unpack_count);
+                    var filled: usize = 0;
+                    var i = unpack_idx.? + 1;
+                    while (i < vblk.instructions.len and filled < unpack_count) : (i += 1) {
+                        const op = vblk.instructions[i].opcode;
+                        if (op == .NOT_TAKEN or op == .CACHE) continue;
+                        if (op == .STORE_FAST or op == .STORE_NAME) {
+                            const name = if (op == .STORE_NAME)
+                                self.code.names[vblk.instructions[i].arg]
+                            else
+                                self.code.varnames[vblk.instructions[i].arg];
+                            const unmangled = try self.unmangleClassName(name);
+                            const p = try a.create(ast.Pattern);
+                            p.* = .{ .match_as = .{ .pattern = null, .name = unmangled } };
+                            pats[filled] = p;
+                            filled += 1;
+                            continue;
+                        }
+                        // STORE_FAST_LOAD_FAST used with guards - store index is in high nibble
+                        if (op == .STORE_FAST_LOAD_FAST) {
+                            const store_idx = (vblk.instructions[i].arg >> 4) & 0xF;
+                            if (store_idx < self.code.varnames.len) {
+                                const name = self.code.varnames[store_idx];
+                                const unmangled = try self.unmangleClassName(name);
+                                const p = try a.create(ast.Pattern);
+                                p.* = .{ .match_as = .{ .pattern = null, .name = unmangled } };
+                                pats[filled] = p;
+                                filled += 1;
+                                continue;
+                            }
+                        }
+                        break;
+                    }
+                    if (filled == unpack_count) {
+                        const pat = try a.create(ast.Pattern);
+                        pat.* = .{ .match_class = .{
+                            .cls = cls_expr.?,
+                            .patterns = pats,
+                            .kwd_attrs = &.{},
+                            .kwd_patterns = &.{},
+                        } };
+                        return pat;
+                    }
+                } else if (unpack_count == 0 and unpack_idx != null) {
+                    // Check for as binding: case int() as n
+                    // UNPACK_SEQUENCE 0 followed by STORE_FAST is the as binding
+                    var i = unpack_idx.? + 1;
+                    while (i < vblk.instructions.len) : (i += 1) {
+                        const op = vblk.instructions[i].opcode;
+                        if (op == .NOT_TAKEN or op == .CACHE or op == .POP_TOP) continue;
+                        if (op == .STORE_FAST or op == .STORE_NAME) {
+                            const name = if (op == .STORE_NAME)
+                                self.code.names[vblk.instructions[i].arg]
+                            else
+                                self.code.varnames[vblk.instructions[i].arg];
+                            const unmangled = try self.unmangleClassName(name);
+                            // Create inner class pattern
+                            const cls_pat = try a.create(ast.Pattern);
+                            cls_pat.* = .{ .match_class = .{
+                                .cls = cls_expr.?,
+                                .patterns = &.{},
+                                .kwd_attrs = &.{},
+                                .kwd_patterns = &.{},
+                            } };
+                            // Wrap in match_as
+                            const as_pat = try a.create(ast.Pattern);
+                            as_pat.* = .{ .match_as = .{ .pattern = cls_pat, .name = unmangled } };
+                            return as_pat;
+                        }
+                        break;
+                    }
+                }
+            }
+            // Empty pattern (case int():)
+            const pat = try a.create(ast.Pattern);
+            pat.* = .{ .match_class = .{
+                .cls = cls_expr.?,
+                .patterns = &.{},
+                .kwd_attrs = &.{},
+                .kwd_patterns = &.{},
+            } };
+            return pat;
+        }
+        if (val_block == null) return null;
 
         const vblk = &self.cfg.blocks[val_block.?];
         var unpack_idx: ?usize = null;
@@ -12254,6 +12859,19 @@ pub const Decompiler = struct {
                 pats[filled + 1] = p2;
                 filled += 2;
                 continue;
+            }
+            // STORE_FAST_LOAD_FAST used with guards - store index in high nibble
+            if (op == .STORE_FAST_LOAD_FAST) {
+                const store_idx = (vblk.instructions[i].arg >> 4) & 0xF;
+                if (store_idx < self.code.varnames.len) {
+                    const name = self.code.varnames[store_idx];
+                    const unmangled = try self.unmangleClassName(name);
+                    const p = try a.create(ast.Pattern);
+                    p.* = .{ .match_as = .{ .pattern = null, .name = unmangled } };
+                    pats[filled] = p;
+                    filled += 1;
+                    continue;
+                }
             }
             if (op == .LOAD_SMALL_INT or op == .LOAD_CONST) {
                 const next_op = nextOp(vblk.instructions, i);
@@ -12444,13 +13062,14 @@ pub const Decompiler = struct {
             var has_pattern = false;
             var has_guard_ops = false;
             var has_literal_load = false;
+            var has_body_ops = false;
             for (blk.instructions) |inst| {
                 if (inst.opcode == .LOAD_SMALL_INT or inst.opcode == .LOAD_CONST) {
                     has_literal_load = true;
                 }
                 if (inst.opcode == .MATCH_SEQUENCE or inst.opcode == .MATCH_MAPPING or
                     inst.opcode == .MATCH_CLASS or inst.opcode == .MATCH_KEYS or
-                    inst.opcode == .UNPACK_SEQUENCE or
+                    inst.opcode == .UNPACK_SEQUENCE or inst.opcode == .UNPACK_EX or
                     inst.opcode == .STORE_FAST_STORE_FAST or inst.opcode == .STORE_FAST_LOAD_FAST or
                     inst.opcode == .STORE_FAST or inst.opcode == .STORE_NAME or
                     inst.opcode == .POP_JUMP_IF_NONE or inst.opcode == .POP_JUMP_FORWARD_IF_NONE or
@@ -12467,13 +13086,36 @@ pub const Decompiler = struct {
                 {
                     has_guard_ops = true;
                 }
+                // Body ops: f-string formatting, string building, calls
+                if (inst.opcode == .FORMAT_SIMPLE or inst.opcode == .FORMAT_WITH_SPEC or
+                    inst.opcode == .BUILD_STRING or inst.opcode == .CALL or
+                    inst.opcode == .CALL_FUNCTION or inst.opcode == .CALL_KW)
+                {
+                    has_body_ops = true;
+                }
             }
 
             var has_cond_term = false;
+            var has_return = false;
             if (blk.terminator()) |term| {
                 has_cond_term = ctrl.Analyzer.isConditionalJump(undefined, term.opcode);
+                if (term.opcode == .RETURN_VALUE or term.opcode == .RETURN_CONST) {
+                    has_return = true;
+                }
             }
             has_cond = has_cond or has_cond_term;
+
+            // Body block: has guard-like ops (LOAD_FAST) but ends with return, no conditional
+            if (has_guard_ops and has_return and !has_cond_term and !has_pattern) break;
+
+            // Body block: has f-string/call ops (even if also has pattern cleanup like UNPACK)
+            // Still add to pattern_blocks for binding extraction, but not test_blocks
+            if (has_body_ops and !has_cond_term) {
+                if (has_pattern) {
+                    try pattern_blocks.append(self.allocator, current_block_id);
+                }
+                break;
+            }
 
             if (!has_pattern and !has_guard_ops and !has_cond) break;
 
@@ -12851,9 +13493,11 @@ pub const Decompiler = struct {
             // No guard: body in true branch or inline
             var inline_body = false;
             var seen_jump = false;
+            var has_cond_jump = false;
             for (final_block.instructions) |inst| {
                 if (ctrl.Analyzer.isConditionalJump(undefined, inst.opcode)) {
                     seen_jump = true;
+                    has_cond_jump = true;
                     continue;
                 }
                 if (!seen_jump) continue;
@@ -12868,6 +13512,10 @@ pub const Decompiler = struct {
                     break;
                 }
                 break;
+            }
+            // If no conditional jump in block, the entire block is the body (success path)
+            if (!has_cond_jump) {
+                inline_body = true;
             }
 
             var body_block: ?u32 = null;
@@ -12885,7 +13533,6 @@ pub const Decompiler = struct {
                     body_block = null;
                 }
             }
-
             if (body_block) |bid| {
                 var body_end: u32 = last_test + 1;
                 const body_blk = &self.cfg.blocks[bid];
@@ -12901,19 +13548,56 @@ pub const Decompiler = struct {
                     }
                 }
                 if (bid < body_end) {
-                    const pop_need = self.maxLeadPop(bid, body_end);
-                    if (pop_need > 0) {
-                        if (pop_need == 1) {
-                            var init_stack = [_]StackValue{.unknown};
-                            body = try self.decompileStructuredRangeWithStack(bid, body_end, init_stack[0..]);
-                        } else {
-                            const init_stack = try self.allocator.alloc(StackValue, pop_need);
-                            defer self.allocator.free(init_stack);
-                            for (init_stack) |*sv| sv.* = .unknown;
-                            body = try self.decompileStructuredRangeWithStack(bid, body_end, init_stack);
+                    // Check if body block starts with pattern ops that need skipping
+                    const skip = self.patternSkipCount(body_blk);
+                    if (skip > 0 and skip < body_blk.instructions.len) {
+                        // Decompile body inline, skipping pattern instructions
+                        const a = self.arena.allocator();
+                        var stmts: std.ArrayList(*Stmt) = .{};
+                        defer stmts.deinit(a);
+
+                        var sim = self.initSim(a, a, self.code, self.version);
+                        defer sim.deinit();
+
+                        for (body_blk.instructions[skip..]) |inst| {
+                            if (inst.opcode == .NOT_TAKEN or inst.opcode == .CACHE or inst.opcode == .POP_TOP) continue;
+                            if (inst.opcode == .RETURN_VALUE or inst.opcode == .RETURN_CONST) {
+                                const val = if (inst.opcode == .RETURN_CONST)
+                                    try self.constExprFromObj(self.code.consts[inst.arg])
+                                else if (sim.stack.popExpr()) |expr|
+                                    expr
+                                else |err| switch (err) {
+                                    error.StackUnderflow => blk: {
+                                        const none_expr = try a.create(Expr);
+                                        none_expr.* = .{ .constant = .{ .none = {} } };
+                                        break :blk none_expr;
+                                    },
+                                    else => return err,
+                                };
+                                const stmt = try a.create(Stmt);
+                                stmt.* = .{ .return_stmt = .{ .value = val } };
+                                try stmts.append(a, stmt);
+                                break;
+                            } else {
+                                try sim.simulate(inst);
+                            }
                         }
+                        body = try stmts.toOwnedSlice(a);
                     } else {
-                        body = try self.decompileStructuredRange(bid, body_end);
+                        const pop_need = self.maxLeadPop(bid, body_end);
+                        if (pop_need > 0) {
+                            if (pop_need == 1) {
+                                var init_stack = [_]StackValue{.unknown};
+                                body = try self.decompileStructuredRangeWithStack(bid, body_end, init_stack[0..]);
+                            } else {
+                                const init_stack = try self.allocator.alloc(StackValue, pop_need);
+                                defer self.allocator.free(init_stack);
+                                for (init_stack) |*sv| sv.* = .unknown;
+                                body = try self.decompileStructuredRangeWithStack(bid, body_end, init_stack);
+                            }
+                        } else {
+                            body = try self.decompileStructuredRange(bid, body_end);
+                        }
                     }
                 }
             } else {
@@ -12931,18 +13615,19 @@ pub const Decompiler = struct {
                     if (!found_jump) continue;
                     if (inst.opcode == .NOT_TAKEN or inst.opcode == .CACHE) continue;
                     if (inst.opcode == .STORE_FAST or inst.opcode == .STORE_NAME or inst.opcode == .STORE_DEREF or
-                        inst.opcode == .STORE_FAST_STORE_FAST or inst.opcode == .STORE_FAST_LOAD_FAST)
+                        inst.opcode == .STORE_FAST_STORE_FAST or inst.opcode == .STORE_FAST_LOAD_FAST or
+                        inst.opcode == .UNPACK_SEQUENCE or inst.opcode == .UNPACK_EX)
                     {
                         continue;
                     }
-                    if (inst.opcode == .POP_TOP) {
+                    if (inst.opcode == .POP_TOP or inst.opcode == .NOP) {
+                        // Skip POP_TOP/NOP and start body after
                         start_idx = idx + 1;
                         break;
                     }
-                    if (inst.opcode == .NOP) {
-                        start_idx = idx + 1;
-                        break;
-                    }
+                    // First non-pattern instruction is body start
+                    start_idx = idx;
+                    break;
                 }
                 if (jump_idx) |pj| {
                     const jinst = final_block.instructions[pj];
@@ -12959,9 +13644,18 @@ pub const Decompiler = struct {
                     }
                 }
                 if (start_idx == null and !found_jump) {
+                    // No conditional jump - skip pattern opcodes to find actual body
                     for (final_block.instructions, 0..) |inst, idx| {
                         if (inst.opcode == .NOT_TAKEN or inst.opcode == .CACHE) continue;
-                        if (inst.opcode == .NOP) {
+                        // Skip pattern matching opcodes (UNPACK_SEQUENCE, STORE_FAST, etc.)
+                        if (inst.opcode == .UNPACK_SEQUENCE or inst.opcode == .UNPACK_EX or
+                            inst.opcode == .STORE_FAST or inst.opcode == .STORE_NAME or
+                            inst.opcode == .STORE_FAST_STORE_FAST or inst.opcode == .STORE_FAST_LOAD_FAST or
+                            inst.opcode == .STORE_DEREF)
+                        {
+                            continue;
+                        }
+                        if (inst.opcode == .NOP or inst.opcode == .POP_TOP) {
                             start_idx = idx + 1;
                             break;
                         }
@@ -13850,7 +14544,7 @@ pub const Decompiler = struct {
                 },
                 .for_loop => |p| {
                     if (try self.tryDecompileInlineListComp(p)) |result| {
-                        deinitStackValuesSlice(self.allocator, self.allocator, result.stack);
+                        self.deinitStackValues(result.stack);
                         block_idx = result.exit_block;
                         continue;
                     }
@@ -14096,14 +14790,33 @@ pub const Decompiler = struct {
             var seen_check_match = false;
             var seen_cond_jump = false;
 
+            var is_star = false; // except* vs except
+
             for (handler_block.instructions, 0..) |inst, i| {
                 switch (inst.opcode) {
                     .PUSH_EXC_INFO => {
                         seen_push_exc = true;
+                        // Push placeholder for exception info (needed for COPY 2 in except*)
+                        try sim.stack.push(.unknown);
                         body_skip = i + 1;
                     },
                     .NOT_TAKEN => {
                         // NOT_TAKEN is just a marker, skip and continue
+                        body_skip = i + 1;
+                    },
+                    .BUILD_LIST => {
+                        // except* uses BUILD_LIST 0 at start to collect exceptions
+                        if (inst.arg == 0 and !seen_check_match) {
+                            is_star = true;
+                            try sim.simulate(inst);
+                            body_skip = i + 1;
+                        } else {
+                            try sim.simulate(inst);
+                        }
+                    },
+                    .COPY => {
+                        // except* uses COPY to duplicate exception group
+                        try sim.simulate(inst);
                         body_skip = i + 1;
                     },
                     .POP_TOP => {
@@ -14134,7 +14847,20 @@ pub const Decompiler = struct {
                         // Don't pop - let simulation handle it (it pushes bool)
                         body_skip = i + 1;
                     },
-                    .POP_JUMP_IF_FALSE, .POP_JUMP_IF_TRUE => {
+                    .CHECK_EG_MATCH => {
+                        // except* exception group matching (PEP 654)
+                        is_star = true;
+                        seen_check_match = true;
+                        if (sim.stack.peek()) |val| {
+                            switch (val) {
+                                .expr => |e| exc_type = e,
+                                else => {},
+                            }
+                        }
+                        try sim.simulate(inst);
+                        body_skip = i + 1;
+                    },
+                    .POP_JUMP_IF_FALSE, .POP_JUMP_IF_TRUE, .POP_JUMP_IF_NONE, .POP_JUMP_IF_NOT_NONE => {
                         seen_cond_jump = true;
                         body_skip = i + 1;
                     },
@@ -14157,6 +14883,7 @@ pub const Decompiler = struct {
                     },
                 }
             }
+
 
             // For typed except, body is in fall-through successor after cond jump
             // Also track next handler (conditional_false = exception didn't match)
@@ -14266,6 +14993,7 @@ pub const Decompiler = struct {
                 .type = exc_type,
                 .name = exc_name,
                 .body = handler_body,
+                .is_star = is_star,
             });
 
             // Track the actual end of processed blocks
@@ -16238,7 +16966,7 @@ pub const Decompiler = struct {
                 },
                 .for_loop => |p| {
                     if (try self.tryDecompileInlineListComp(p)) |result| {
-                        deinitStackValuesSlice(self.allocator, self.allocator, result.stack);
+                        self.deinitStackValues(result.stack);
                         block_idx = result.exit_block;
                         continue;
                     }
@@ -16978,6 +17706,7 @@ pub const Decompiler = struct {
             .import_module => |m| .{ .tag = "import", .text = m.module },
             .null_marker => .{ .tag = "null", .text = null },
             .saved_local => |name| .{ .tag = "saved_local", .text = name },
+            .type_alias => .{ .tag = "type_alias", .text = null },
             .unknown => .{ .tag = "unknown", .text = null },
         };
     }
@@ -17379,6 +18108,10 @@ pub const Decompiler = struct {
             try sim.stack.push(.unknown);
             seed_pop.* = false;
         }
+        const has_inline = self.hasInlinePend(block_id);
+        if (has_inline) {
+            try self.pushInlinePend(block_id, &sim);
+        }
         if (self.pending_ternary_expr) |expr| {
             try sim.stack.push(.{ .expr = expr });
             self.pending_ternary_expr = null;
@@ -17419,6 +18152,7 @@ pub const Decompiler = struct {
         }
 
         var skip_store_count: u32 = 0;
+        const extra_skip = if (has_inline) inlineCleanupSkip(block, skip_first) else 0;
         const instructions = block.instructions;
         var idx: usize = 0;
         if (skip_first > 0) {
@@ -17435,6 +18169,10 @@ pub const Decompiler = struct {
                 };
                 try sim.simulate(inst);
             }
+        }
+        if (extra_skip > 0) {
+            const next_idx = idx + extra_skip;
+            idx = if (next_idx > instructions.len) instructions.len else next_idx;
         }
         while (idx < instructions.len) : (idx += 1) {
             const inst = instructions[idx];
@@ -17538,11 +18276,14 @@ pub const Decompiler = struct {
                         val.deinit(sim.allocator, sim.stack_alloc);
                         continue;
                     }
-                    const name = switch (inst.opcode) {
+                    var name = switch (inst.opcode) {
                         .STORE_FAST => sim.getLocal(inst.arg) orelse "__unknown__",
                         .STORE_DEREF => sim.getDeref(inst.arg) orelse "__unknown__",
                         else => sim.getName(inst.arg) orelse "__unknown__",
                     };
+                    if (inst.opcode == .STORE_DEREF and self.version.gte(3, 14) and std.mem.eql(u8, name, "__classdict__")) {
+                        name = "__unknown__";
+                    }
                     var chain_idx = idx;
                     if (try self.tryHandleChainAssignStore(&sim, instructions, &chain_idx, name, stmts, a)) {
                         idx = chain_idx;
@@ -17777,7 +18518,7 @@ pub const Decompiler = struct {
                 const cloned = try sim.cloneStackValue(val);
                 try sim.stack.push(cloned);
             }
-            deinitStackValuesSlice(self.allocator, self.allocator, vals);
+            self.deinitStackValues(vals);
             self.pending_vals = null;
         }
         if (self.pending_store_expr) |expr| {
@@ -17893,6 +18634,91 @@ pub const Decompiler = struct {
                             }
                         }
                     }
+                    // Check for walrus operator: COPY 1 followed by STORE_* with value used later
+                    const prev_was_copy_1 = idx > 0 and instructions[idx - 1].opcode == .COPY and instructions[idx - 1].arg == 1;
+                    if (prev_was_copy_1) {
+                        const next_idx = idx + 1;
+                        var is_walrus = false;
+                        if (next_idx < instructions.len) {
+                            const next_op = instructions[next_idx].opcode;
+                            is_walrus = switch (next_op) {
+                                .DUP_TOP, .COPY, .STORE_NAME, .STORE_FAST, .STORE_GLOBAL, .STORE_DEREF => false,
+                                .COMPARE_OP, .CONTAINS_OP, .IS_OP,
+                                .TO_BOOL, .POP_JUMP_IF_TRUE, .POP_JUMP_IF_FALSE,
+                                .POP_JUMP_IF_NONE, .POP_JUMP_IF_NOT_NONE,
+                                .POP_JUMP_FORWARD_IF_TRUE, .POP_JUMP_FORWARD_IF_FALSE,
+                                .POP_JUMP_FORWARD_IF_NONE, .POP_JUMP_FORWARD_IF_NOT_NONE,
+                                .LOAD_SMALL_INT, .LOAD_CONST, .LOAD_FAST, .LOAD_FAST_BORROW,
+                                .LOAD_NAME, .LOAD_GLOBAL, .BINARY_OP,
+                                => true,
+                                else => false,
+                            };
+                        }
+
+                        if (is_walrus) {
+                            const copied = sim.stack.pop() orelse StackValue.unknown;
+                            const val_expr = switch (copied) {
+                                .expr => |e| e,
+                                else => blk: {
+                                    copied.deinit(sim.allocator, sim.stack_alloc);
+                                    break :blk null;
+                                },
+                            };
+
+                            if (val_expr) |expr| {
+                                const arena = self.arena.allocator();
+                                const target = try self.makeName(name, .store);
+                                const named = try arena.create(Expr);
+                                named.* = .{ .named_expr = .{ .target = target, .value = expr } };
+
+                                if (sim.stack.pop()) |orig| {
+                                    orig.deinit(sim.allocator, sim.stack_alloc);
+                                }
+                                try sim.stack.push(.{ .expr = named });
+                                continue;
+                            }
+                        }
+                    }
+
+                    // Skip Python 3.14+ internal names (PEP 649)
+                    if (self.version.gte(3, 14) and inst.opcode == .STORE_NAME) {
+                        const is_internal = std.mem.eql(u8, name, "__annotate__") or
+                            std.mem.eql(u8, name, "__conditional_annotations__");
+                        if (is_internal) {
+                            const val = sim.stack.pop() orelse return error.StackUnderflow;
+                            val.deinit(sim.allocator, sim.stack_alloc);
+                            continue;
+                        }
+                    }
+
+                    // Try to recover PEP 695 constructs (type aliases, generic funcs/classes)
+                    if (self.version.gte(3, 12)) {
+                        if (try self.tryRecoverTypeAlias(&sim, instructions, idx, name)) |type_stmt| {
+                            try stmts.append(stmts_allocator, type_stmt);
+                            const val = sim.stack.pop() orelse return error.StackUnderflow;
+                            val.deinit(sim.allocator, sim.stack_alloc);
+                            continue;
+                        }
+                        if (try self.tryRecoverGenericTypeAlias(&sim, instructions, idx, name)) |type_stmt| {
+                            try stmts.append(stmts_allocator, type_stmt);
+                            const val = sim.stack.pop() orelse return error.StackUnderflow;
+                            val.deinit(sim.allocator, sim.stack_alloc);
+                            continue;
+                        }
+                        if (try self.tryRecoverGenericFunction(&sim, instructions, idx, name)) |func_stmt| {
+                            try stmts.append(stmts_allocator, func_stmt);
+                            const val = sim.stack.pop() orelse return error.StackUnderflow;
+                            val.deinit(sim.allocator, sim.stack_alloc);
+                            continue;
+                        }
+                        if (try self.tryRecoverGenericClass(&sim, instructions, idx, name)) |class_stmt| {
+                            try stmts.append(stmts_allocator, class_stmt);
+                            const val = sim.stack.pop() orelse return error.StackUnderflow;
+                            val.deinit(sim.allocator, sim.stack_alloc);
+                            continue;
+                        }
+                    }
+
                     var chain_idx = idx;
                     if (try self.tryHandleChainAssignStore(&sim, instructions, &chain_idx, name, stmts, stmts_allocator)) {
                         idx = chain_idx;
@@ -18192,7 +19018,7 @@ pub const Decompiler = struct {
         )) orelse return null;
         var condition = cond_res.expr;
         const base_vals = cond_res.base_vals;
-        defer deinitStackValuesSlice(self.allocator, self.allocator, base_vals);
+        defer self.deinitStackValues(base_vals);
         var then_block = pattern.then_block;
         var else_block = pattern.else_block;
         var is_elif = pattern.is_elif;
@@ -18238,7 +19064,7 @@ pub const Decompiler = struct {
                         }
                         const elif_skip = elif_last orelse 0;
                         if (try self.loopCondExpr(elif_pat.condition_block, elif_pat.then_block, elif_pat.else_block, elif_skip)) |elif_res| {
-                            defer deinitStackValuesSlice(self.allocator, self.allocator, elif_res.base_vals);
+                            defer self.deinitStackValues(elif_res.base_vals);
                             condition = try self.makeBoolPair(condition, elif_res.expr, .or_);
                             if (self.cfg.blocks[elif_pat.condition_block].terminator()) |elif_term| {
                                 cond_op = elif_term.opcode;
@@ -19371,7 +20197,7 @@ pub const Decompiler = struct {
                 },
                 .for_loop => |p| {
                     if (try self.tryDecompileInlineListComp(p)) |result| {
-                        deinitStackValuesSlice(self.allocator, self.allocator, result.stack);
+                        self.deinitStackValues(result.stack);
                         block_idx = result.exit_block;
                         continue;
                     }
@@ -20095,21 +20921,53 @@ pub const Decompiler = struct {
             body = new_body;
         }
 
-        // Extract docstring from consts[0] if it's a string
+        // Extract docstring from consts[0] if it's a string AND is a valid docstring
+        // Python 3.12+: docstring is in co_consts[0] but NOT loaded by bytecode
+        // Older Python: docstring pattern is LOAD_CONST 0, POP_TOP
         if (func.code.consts.len > 0) {
             const first_const = &func.code.consts[0];
             if (first_const.* == .string) {
-                const docstring = first_const.string;
-                const doc_const = ast.Constant{ .string = docstring };
-                const doc_expr = try ast.makeConstant(a, doc_const);
-                const doc_stmt = try a.create(ast.Stmt);
-                doc_stmt.* = .{ .expr_stmt = .{ .value = doc_expr } };
+                var is_docstring = false;
+                var has_load_const_0 = false;
 
-                // Prepend docstring to body
-                const new_body = try a.alloc(*ast.Stmt, body.len + 1);
-                new_body[0] = doc_stmt;
-                @memcpy(new_body[1..], body);
-                body = new_body;
+                var it = decoder.InstructionIterator.init(func.code.code, self.version);
+                var prev_op: ?Opcode = null;
+                var prev_arg: u32 = 0;
+                while (it.next()) |inst| {
+                    if (inst.opcode == .LOAD_CONST and inst.arg == 0) {
+                        has_load_const_0 = true;
+                        // Check for old-style docstring: LOAD_CONST 0, POP_TOP
+                        prev_op = inst.opcode;
+                        prev_arg = inst.arg;
+                        continue;
+                    }
+                    if (prev_op == .LOAD_CONST and prev_arg == 0 and inst.opcode == .POP_TOP) {
+                        // Old-style docstring pattern
+                        is_docstring = true;
+                        break;
+                    }
+                    prev_op = inst.opcode;
+                    prev_arg = inst.arg;
+                }
+
+                // Python 3.12+: if consts[0] is string but never loaded, it's the docstring
+                if (!has_load_const_0 and self.version.gte(3, 11)) {
+                    is_docstring = true;
+                }
+
+                if (is_docstring) {
+                    const docstring = first_const.string;
+                    const doc_const = ast.Constant{ .string = docstring };
+                    const doc_expr = try ast.makeConstant(a, doc_const);
+                    const doc_stmt = try a.create(ast.Stmt);
+                    doc_stmt.* = .{ .expr_stmt = .{ .value = doc_expr } };
+
+                    // Prepend docstring to body
+                    const new_body = try a.alloc(*ast.Stmt, body.len + 1);
+                    new_body[0] = doc_stmt;
+                    @memcpy(new_body[1..], body);
+                    body = new_body;
+                }
             }
         }
 
@@ -20134,6 +20992,7 @@ pub const Decompiler = struct {
 
         stmt.* = .{ .function_def = .{
             .name = name_copy,
+            .type_params = &.{},
             .args = args,
             .body = body,
             .decorator_list = decorator_list,
@@ -20204,6 +21063,7 @@ pub const Decompiler = struct {
         const stmt = try a.create(Stmt);
         stmt.* = .{ .class_def = .{
             .name = class_name,
+            .type_params = &.{},
             .bases = bases,
             .keywords = keywords,
             .body = body,
@@ -20245,6 +21105,24 @@ pub const Decompiler = struct {
             .function_obj => |func| try self.makeFunctionDef(out_name, func),
             .class_obj => |cls| try self.makeClassDef(out_name, cls),
             .import_module => |imp| try self.makeImport(out_name, imp),
+            .type_alias => |ta| blk: {
+                // ta is a tuple (name_expr, value_expr)
+                if (ta.* == .tuple and ta.tuple.elts.len >= 2) {
+                    const name_expr = ta.tuple.elts[0];
+                    const value_expr = ta.tuple.elts[1];
+                    const stmt = try a.create(Stmt);
+                    stmt.* = .{ .type_alias = .{
+                        .name = name_expr,
+                        .type_params = &.{},
+                        .value = value_expr,
+                    } };
+                    break :blk stmt;
+                }
+                // Fallback
+                const placeholder = try ast.makeConstant(a, .ellipsis);
+                const target = try self.makeName(out_name, .store);
+                break :blk try self.makeAssign(target, placeholder);
+            },
             .saved_local => null,
             .code_obj, .comp_obj, .comp_builder, .null_marker, .unknown => blk: {
                 // Fallback for unhandled stack values - emit a valid placeholder
@@ -20304,6 +21182,339 @@ pub const Decompiler = struct {
         };
 
         return try self.makeFunctionDef(name, func);
+    }
+
+    fn tryRecoverTypeAlias(
+        self: *Decompiler,
+        sim: *SimContext,
+        instructions: []const decoder.Instruction,
+        inst_idx: usize,
+        name: []const u8,
+    ) DecompileError!?*Stmt {
+        // Type alias pattern (Python 3.12+):
+        // LOAD_CONST name        # n-6
+        // LOAD_CONST type_params # n-5
+        // LOAD_CONST defaults    # n-4
+        // LOAD_CONST code_obj    # n-3
+        // MAKE_FUNCTION          # n-2
+        // SET_FUNCTION_ATTRIBUTE # n-1 (optional, depends on defaults)
+        // BUILD_TUPLE 3          # inst_idx-2
+        // CALL_INTRINSIC_1 11    # inst_idx-1
+        // STORE_NAME             # inst_idx
+
+        if (inst_idx < 2) return null;
+        const intrinsic = instructions[inst_idx - 1];
+        if (intrinsic.opcode != .CALL_INTRINSIC_1 or intrinsic.arg != 11) return null;
+
+        const build_tuple = instructions[inst_idx - 2];
+        if (build_tuple.opcode != .BUILD_TUPLE or build_tuple.arg != 3) return null;
+
+        // Search backwards for MAKE_FUNCTION and LOAD_CONST instructions
+        var make_func_idx: ?usize = null;
+        const min_idx = if (inst_idx > 10) inst_idx - 10 else 0;
+        var search_idx: usize = inst_idx -| 3;
+        while (search_idx > min_idx) : (search_idx -= 1) {
+            const inst = instructions[search_idx];
+            if (inst.opcode == .MAKE_FUNCTION) {
+                make_func_idx = search_idx;
+                break;
+            }
+        }
+        if (make_func_idx == null) return null;
+        const mf_idx = make_func_idx.?;
+
+        // Code object is loaded before MAKE_FUNCTION
+        if (mf_idx < 1) return null;
+        const code_load = instructions[mf_idx - 1];
+        if (code_load.opcode != .LOAD_CONST) return null;
+
+        const code_obj = sim.getConst(code_load.arg) orelse return null;
+        const code = switch (code_obj) {
+            .code, .code_ref => |c| c,
+            else => return null,
+        };
+
+        // Parse the code object to get the type expression
+        // The code returns the type value when called
+        const type_value = try sim.parseTypeAliasCode(code);
+
+        const a = self.arena.allocator();
+        const name_expr = try self.makeName(name, .store);
+        const stmt = try a.create(Stmt);
+        stmt.* = .{ .type_alias = .{
+            .name = name_expr,
+            .type_params = &.{},
+            .value = type_value,
+        } };
+        return stmt;
+    }
+
+    /// Recover generic type aliases (PEP 695) like `type Matrix[T] = list[list[T]]`
+    /// Pattern: MAKE_FUNCTION (code=<generic parameters of X>), PUSH_NULL, CALL 0, STORE_NAME
+    fn tryRecoverGenericTypeAlias(
+        self: *Decompiler,
+        sim: *SimContext,
+        instructions: []const decoder.Instruction,
+        inst_idx: usize,
+        name: []const u8,
+    ) DecompileError!?*Stmt {
+        // Check for CALL 0 before STORE_NAME
+        if (inst_idx < 2) return null;
+        const call = instructions[inst_idx - 1];
+        if (call.opcode != .CALL or call.arg != 0) return null;
+
+        // Check for PUSH_NULL before CALL
+        const push_null = instructions[inst_idx - 2];
+        if (push_null.opcode != .PUSH_NULL) return null;
+
+        // Search backwards for MAKE_FUNCTION
+        var mf_idx: ?usize = null;
+        const min_idx = if (inst_idx > 6) inst_idx - 6 else 0;
+        var search_idx: usize = inst_idx -| 3;
+        while (search_idx > min_idx) : (search_idx -= 1) {
+            if (instructions[search_idx].opcode == .MAKE_FUNCTION) {
+                mf_idx = search_idx;
+                break;
+            }
+        }
+        const make_func_idx = mf_idx orelse return null;
+
+        // Get the code object before MAKE_FUNCTION
+        if (make_func_idx < 1) return null;
+        const code_load = instructions[make_func_idx - 1];
+        if (code_load.opcode != .LOAD_CONST) return null;
+
+        const code_obj = sim.getConst(code_load.arg) orelse return null;
+        const outer_code = switch (code_obj) {
+            .code, .code_ref => |c| c,
+            else => return null,
+        };
+
+        // Check if this is a generic parameters code object
+        const prefix = "<generic parameters of ";
+        if (!std.mem.startsWith(u8, outer_code.name, prefix)) return null;
+
+        // Parse the outer code to find:
+        // 1. Type parameters (from CALL_INTRINSIC_1 7 = INTRINSIC_TYPEVAR)
+        // 2. The inner type alias code object (from CALL_INTRINSIC_1 11 = INTRINSIC_TYPEALIAS)
+        const result = try sim.parseGenericTypeAliasCode(outer_code);
+        if (result.value == null) return null;
+
+        const a = self.arena.allocator();
+        const name_expr = try self.makeName(name, .store);
+        const stmt = try a.create(Stmt);
+        stmt.* = .{ .type_alias = .{
+            .name = name_expr,
+            .type_params = result.type_params,
+            .value = result.value.?,
+        } };
+        return stmt;
+    }
+
+    /// Recover generic functions (PEP 695) like `def identity[T](x: T) -> T: ...`
+    /// Pattern: MAKE_FUNCTION (code=<generic parameters of X>), PUSH_NULL, CALL 0, STORE_NAME
+    fn tryRecoverGenericFunction(
+        self: *Decompiler,
+        sim: *SimContext,
+        instructions: []const decoder.Instruction,
+        inst_idx: usize,
+        name: []const u8,
+    ) DecompileError!?*Stmt {
+        // Check for CALL 0 before STORE_NAME
+        if (inst_idx < 2) return null;
+        const call = instructions[inst_idx - 1];
+        if (call.opcode != .CALL or call.arg != 0) return null;
+
+        // Check for PUSH_NULL before CALL
+        const push_null = instructions[inst_idx - 2];
+        if (push_null.opcode != .PUSH_NULL) return null;
+
+        // Search backwards for MAKE_FUNCTION
+        var mf_idx: ?usize = null;
+        const min_idx = if (inst_idx > 6) inst_idx - 6 else 0;
+        var search_idx: usize = inst_idx -| 3;
+        while (search_idx > min_idx) : (search_idx -= 1) {
+            if (instructions[search_idx].opcode == .MAKE_FUNCTION) {
+                mf_idx = search_idx;
+                break;
+            }
+        }
+        const make_func_idx = mf_idx orelse return null;
+
+        // Get the code object before MAKE_FUNCTION
+        if (make_func_idx < 1) return null;
+        const code_load = instructions[make_func_idx - 1];
+        if (code_load.opcode != .LOAD_CONST) return null;
+
+        const code_obj = sim.getConst(code_load.arg) orelse return null;
+        const outer_code = switch (code_obj) {
+            .code, .code_ref => |c| c,
+            else => return null,
+        };
+
+        // Check if this is a generic parameters code object
+        const prefix = "<generic parameters of ";
+        if (!std.mem.startsWith(u8, outer_code.name, prefix)) return null;
+
+        // Parse the outer code to find type parameters and function/class code
+        const result = try sim.parseGenericFunctionCode(outer_code);
+        if (result.func_code == null) return null;
+
+        const func_code = result.func_code.?;
+
+        const a = self.arena.allocator();
+
+        // Parse annotations from __annotate__ code if present
+        var annotations: []const signature.Annotation = &.{};
+        if (result.annotate_code) |ann_code| {
+            annotations = try sim.parseAnnotateCode(ann_code);
+        }
+
+        // Create the function_def directly with type_params
+        const returns = result.return_annotation;
+        const args = try signature.extractFunctionSignature(a, func_code, self.class_name, &.{}, &.{}, annotations);
+        var body = try self.decompileNestedBody(func_code);
+
+        // Extract docstring (same logic as makeFunctionDef)
+        if (func_code.consts.len > 0) {
+            const first_const = &func_code.consts[0];
+            if (first_const.* == .string) {
+                var is_docstring = false;
+                var has_load_const_0 = false;
+
+                var it = decoder.InstructionIterator.init(func_code.code, self.version);
+                while (it.next()) |inst| {
+                    if (inst.opcode == .LOAD_CONST and inst.arg == 0) {
+                        has_load_const_0 = true;
+                        break;
+                    }
+                }
+
+                // Python 3.11+: if consts[0] is string but never loaded, it's the docstring
+                if (!has_load_const_0 and self.version.gte(3, 11)) {
+                    is_docstring = true;
+                }
+
+                if (is_docstring) {
+                    const docstring = first_const.string;
+                    const doc_const = ast.Constant{ .string = docstring };
+                    const doc_expr = try ast.makeConstant(a, doc_const);
+                    const doc_stmt = try a.create(ast.Stmt);
+                    doc_stmt.* = .{ .expr_stmt = .{ .value = doc_expr } };
+
+                    // Prepend docstring to body
+                    const new_body = try a.alloc(*ast.Stmt, body.len + 1);
+                    new_body[0] = doc_stmt;
+                    @memcpy(new_body[1..], body);
+                    body = new_body;
+                }
+            }
+        }
+
+        const stmt = try a.create(Stmt);
+        stmt.* = .{ .function_def = .{
+            .name = try a.dupe(u8, name),
+            .type_params = result.type_params,
+            .args = args,
+            .body = body,
+            .decorator_list = &.{},
+            .returns = returns,
+            .type_comment = null,
+            .is_async = codegen.isCoroutine(func_code) or codegen.isAsyncGenerator(func_code),
+        } };
+        return stmt;
+    }
+
+    /// Recover generic classes (PEP 695) like `class Box[T]: ...`
+    /// Pattern: MAKE_FUNCTION (code=<generic parameters of X>), PUSH_NULL, CALL 0, STORE_NAME
+    fn tryRecoverGenericClass(
+        self: *Decompiler,
+        sim: *SimContext,
+        instructions: []const decoder.Instruction,
+        inst_idx: usize,
+        name: []const u8,
+    ) DecompileError!?*Stmt {
+        // Check for CALL 0 before STORE_NAME
+        if (inst_idx < 2) return null;
+        const call = instructions[inst_idx - 1];
+        if (call.opcode != .CALL or call.arg != 0) return null;
+
+        // Check for PUSH_NULL before CALL
+        const push_null = instructions[inst_idx - 2];
+        if (push_null.opcode != .PUSH_NULL) return null;
+
+        // Search backwards for MAKE_FUNCTION
+        var mf_idx: ?usize = null;
+        const min_idx = if (inst_idx > 6) inst_idx - 6 else 0;
+        var search_idx: usize = inst_idx -| 3;
+        while (search_idx > min_idx) : (search_idx -= 1) {
+            if (instructions[search_idx].opcode == .MAKE_FUNCTION) {
+                mf_idx = search_idx;
+                break;
+            }
+        }
+        const make_func_idx = mf_idx orelse return null;
+
+        // Get the code object before MAKE_FUNCTION
+        if (make_func_idx < 1) return null;
+        const code_load = instructions[make_func_idx - 1];
+        if (code_load.opcode != .LOAD_CONST) return null;
+
+        const code_obj = sim.getConst(code_load.arg) orelse return null;
+        const outer_code = switch (code_obj) {
+            .code, .code_ref => |c| c,
+            else => return null,
+        };
+
+        // Check if this is a generic parameters code object
+        const prefix = "<generic parameters of ";
+        if (!std.mem.startsWith(u8, outer_code.name, prefix)) return null;
+
+        // Parse the outer code to find type parameters and class code
+        const result = try sim.parseGenericClassCode(outer_code);
+        if (result.class_code == null) return null;
+
+        const class_code = result.class_code.?;
+        const a = self.arena.allocator();
+
+        // Decompile the class body
+        var body = try self.decompileNestedBodyWithClass(class_code, name);
+        body = try self.trimTrailingReturnNone(body);
+        body = self.trimClassPrelude(body, name);
+
+        // Convert __doc__ = "..." to proper docstring (same logic as makeClassDef)
+        if (body.len > 0 and body[0].* == .assign) {
+            const assign = body[0].assign;
+            if (assign.targets.len == 1) {
+                const target = assign.targets[0];
+                if (target.* == .name and std.mem.eql(u8, target.name.id, "__doc__") and
+                    assign.value.* == .constant and assign.value.constant == .string)
+                {
+                    const doc_const = ast.Constant{ .string = assign.value.constant.string };
+                    const doc_expr = try ast.makeConstant(a, doc_const);
+                    const doc_stmt = try a.create(ast.Stmt);
+                    doc_stmt.* = .{ .expr_stmt = .{ .value = doc_expr } };
+
+                    const new_body = try a.alloc(*ast.Stmt, body.len);
+                    new_body[0] = doc_stmt;
+                    if (body.len > 1) {
+                        @memcpy(new_body[1..], body[1..]);
+                    }
+                    body = new_body;
+                }
+            }
+        }
+
+        const stmt = try a.create(Stmt);
+        stmt.* = .{ .class_def = .{
+            .name = try a.dupe(u8, name),
+            .type_params = result.type_params,
+            .bases = &.{},
+            .keywords = &.{},
+            .body = body,
+            .decorator_list = &.{},
+        } };
+        return stmt;
     }
 
     fn tryDecompileImportFromGroup(
@@ -20639,6 +21850,12 @@ pub const Decompiler = struct {
             if (std.mem.eql(u8, value.name.id, "__exception__") or std.mem.eql(u8, value.name.id, "__unknown__") or std.mem.eql(u8, value.name.id, "_")) {
                 return error.SkipStatement;
             }
+            // Skip Python 3.14+ internal names (PEP 649)
+            if (self.version.gte(3, 14) and (std.mem.eql(u8, value.name.id, "__conditional_annotations__") or
+                std.mem.eql(u8, value.name.id, "__annotate__")))
+            {
+                return error.SkipStatement;
+            }
         }
         if (value.* == .call) {
             const func = value.call.func;
@@ -20790,6 +22007,7 @@ pub const Decompiler = struct {
     fn isModuleLevel(self: *const Decompiler) bool {
         return std.mem.eql(u8, self.code.name, "<module>");
     }
+
 };
 
 pub fn computeStackDepthsForTest(
@@ -20885,9 +22103,7 @@ pub fn decompileToSourceWithOptions(
 
         const output = try cg.getOutput(allocator);
         defer allocator.free(output);
-        const aligned = try alignDefLines(allocator, target, output);
-        defer allocator.free(aligned);
-        try writer.writeAll(aligned);
+        try writer.writeAll(output);
         return;
     }
     try decompileFunctionToSource(allocator, target, version, writer, 0, use_opts);

@@ -304,14 +304,14 @@ pub fn Methods(comptime Self: type, comptime Err: type) type {
         ) DecompileError!void {
             self.pending_ternary_expr = expr;
             if (self.pending_vals) |vals| {
-                Self.deinitStackValuesSlice(self.allocator, self.allocator, vals);
+                Self.deinitStackValuesSlice(self.clone_sim.allocator, self.clone_sim.stack_alloc, self.allocator, vals);
                 self.pending_vals = null;
             }
             if (base_vals.len > 0) {
                 self.pending_vals = base_vals;
                 if (base_owned.*) base_owned.* = false;
             } else if (base_owned.*) {
-                Self.deinitStackValuesSlice(self.allocator, self.allocator, base_vals);
+                Self.deinitStackValuesSlice(self.clone_sim.allocator, self.clone_sim.stack_alloc, self.allocator, base_vals);
                 base_owned.* = false;
             }
         }
@@ -455,7 +455,7 @@ pub fn Methods(comptime Self: type, comptime Err: type) type {
             };
             const base_vals = cond_res.base_vals;
             var base_owned = true;
-            defer if (base_owned) Self.deinitStackValuesSlice(self.allocator, self.allocator, base_vals);
+            defer if (base_owned) Self.deinitStackValuesSlice(self.clone_sim.allocator, self.clone_sim.stack_alloc, self.allocator, base_vals);
 
             var in_stack = try std.DynamicBitSet.initEmpty(self.allocator, self.cfg.blocks.len);
             defer in_stack.deinit();
@@ -537,7 +537,7 @@ pub fn Methods(comptime Self: type, comptime Err: type) type {
 
                 defer {
                     if (base_owned) {
-                        Self.deinitStackValuesSlice(self.allocator, self.allocator, base_vals);
+                        Self.deinitStackValuesSlice(self.clone_sim.allocator, self.clone_sim.stack_alloc, self.allocator, base_vals);
                     }
                 }
 
@@ -618,7 +618,7 @@ pub fn Methods(comptime Self: type, comptime Err: type) type {
 
             defer {
                 if (base_owned) {
-                    Self.deinitStackValuesSlice(self.allocator, self.allocator, base_vals);
+                    Self.deinitStackValuesSlice(self.clone_sim.allocator, self.clone_sim.stack_alloc, self.allocator, base_vals);
                 }
             }
 
@@ -692,7 +692,7 @@ pub fn Methods(comptime Self: type, comptime Err: type) type {
             };
             const base_vals = cond_res.base_vals;
             var base_owned = true;
-            defer if (base_owned) Self.deinitStackValuesSlice(self.allocator, self.allocator, base_vals);
+            defer if (base_owned) Self.deinitStackValuesSlice(self.clone_sim.allocator, self.clone_sim.stack_alloc, self.allocator, base_vals);
             const used_pending_store = cond_res.used_pending_store;
 
             const true_blk = &self.cfg.blocks[pattern.true_block];
@@ -737,7 +737,7 @@ pub fn Methods(comptime Self: type, comptime Err: type) type {
                     self.pending_store_expr = or_expr;
                     if (base_vals.len > 0) {
                         if (self.pending_vals) |vals| {
-                            Self.deinitStackValuesSlice(self.allocator, self.allocator, vals);
+                            Self.deinitStackValuesSlice(self.clone_sim.allocator, self.clone_sim.stack_alloc, self.allocator, vals);
                         }
                         self.pending_vals = base_vals;
                         base_owned = false;
@@ -797,7 +797,7 @@ pub fn Methods(comptime Self: type, comptime Err: type) type {
             var saved_pending_vals_copy: ?[]StackValue = null;
             errdefer {
                 if (saved_pending_vals_copy) |vals| {
-                    Self.deinitStackValuesSlice(self.allocator, self.allocator, vals);
+                    Self.deinitStackValuesSlice(self.clone_sim.allocator, self.clone_sim.stack_alloc, self.allocator, vals);
                 }
             }
             if (saved_pending_vals) |vals| {
@@ -809,7 +809,7 @@ pub fn Methods(comptime Self: type, comptime Err: type) type {
                     self.pending_ternary_expr = saved_pending_expr;
                     self.pending_vals = saved_pending_vals_copy;
                 } else if (saved_pending_vals_copy) |vals| {
-                    Self.deinitStackValuesSlice(self.allocator, self.allocator, vals);
+                    Self.deinitStackValuesSlice(self.clone_sim.allocator, self.clone_sim.stack_alloc, self.allocator, vals);
                 }
             }
 
@@ -882,7 +882,7 @@ pub fn Methods(comptime Self: type, comptime Err: type) type {
 
             const base_vals = try self.cloneStackValues(cond_sim.stack.items.items);
             var base_owned = true;
-            defer if (base_owned) Self.deinitStackValuesSlice(self.allocator, self.allocator, base_vals);
+            defer if (base_owned) Self.deinitStackValuesSlice(self.clone_sim.allocator, self.clone_sim.stack_alloc, self.allocator, base_vals);
 
             // Build potentially nested BoolOp expression
             const bool_result = buildBoolOpExpr(self, first, pattern, base_vals) catch |err| {
@@ -921,7 +921,7 @@ pub fn Methods(comptime Self: type, comptime Err: type) type {
                     try self.markConsumed(final_merge);
                     if (base_vals.len > 0) {
                         if (self.pending_vals) |vals| {
-                            Self.deinitStackValuesSlice(self.allocator, self.allocator, vals);
+                            Self.deinitStackValuesSlice(self.clone_sim.allocator, self.clone_sim.stack_alloc, self.allocator, vals);
                         }
                         self.pending_vals = base_vals;
                         base_owned = false;

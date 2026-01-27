@@ -1091,6 +1091,21 @@ pub const Writer = struct {
                 }
                 try self.writeByte(allocator, '\n');
             },
+            .type_alias => |t| {
+                try self.write(allocator, "type ");
+                try self.writeExpr(allocator, t.name);
+                if (t.type_params.len > 0) {
+                    try self.writeByte(allocator, '[');
+                    for (t.type_params, 0..) |param, i| {
+                        if (i > 0) try self.write(allocator, ", ");
+                        try self.write(allocator, param);
+                    }
+                    try self.writeByte(allocator, ']');
+                }
+                try self.write(allocator, " = ");
+                try self.writeExpr(allocator, t.value);
+                try self.writeByte(allocator, '\n');
+            },
             .if_stmt => |i| {
                 try self.writeIfStmt(allocator, i, false);
             },
@@ -1189,6 +1204,14 @@ pub const Writer = struct {
                 if (f.is_async) try self.write(allocator, "async ");
                 try self.write(allocator, "def ");
                 try self.write(allocator, f.name);
+                if (f.type_params.len > 0) {
+                    try self.writeByte(allocator, '[');
+                    for (f.type_params, 0..) |param, pi| {
+                        if (pi > 0) try self.write(allocator, ", ");
+                        try self.write(allocator, param);
+                    }
+                    try self.writeByte(allocator, ']');
+                }
                 try self.writeByte(allocator, '(');
                 try self.writeArguments(allocator, f.args);
                 try self.writeByte(allocator, ')');
@@ -1228,6 +1251,14 @@ pub const Writer = struct {
                 }
                 try self.write(allocator, "class ");
                 try self.write(allocator, c.name);
+                if (c.type_params.len > 0) {
+                    try self.writeByte(allocator, '[');
+                    for (c.type_params, 0..) |param, pi| {
+                        if (pi > 0) try self.write(allocator, ", ");
+                        try self.write(allocator, param);
+                    }
+                    try self.writeByte(allocator, ']');
+                }
                 if (c.bases.len > 0 or c.keywords.len > 0) {
                     try self.writeByte(allocator, '(');
                     for (c.bases, 0..) |b, i| {
@@ -1347,7 +1378,11 @@ pub const Writer = struct {
                 for (t.handlers) |h| {
                     if (h.type == null) continue;
                     try self.writeIndent(allocator);
-                    try self.write(allocator, "except");
+                    if (h.is_star) {
+                        try self.write(allocator, "except*");
+                    } else {
+                        try self.write(allocator, "except");
+                    }
                     if (h.type) |exc| {
                         try self.writeByte(allocator, ' ');
                         try self.writeExpr(allocator, exc);

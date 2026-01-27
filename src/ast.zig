@@ -224,6 +224,7 @@ pub const Expr = union(enum) {
     /// Set: {a, b, c}
     set: struct {
         elts: []const *Expr,
+        cap: usize,
     },
 
     /// List comprehension: [x for x in xs]
@@ -394,7 +395,16 @@ pub const Expr = union(enum) {
                 deinitExprSlice(allocator, v.elts);
             },
             .set => |v| {
-                deinitExprSlice(allocator, v.elts);
+                std.debug.assert(v.cap >= v.elts.len);
+                for (v.elts) |item| {
+                    @constCast(item).deinit(allocator);
+                    allocator.destroy(item);
+                }
+                if (v.cap > 0) {
+                    allocator.free(v.elts.ptr[0..v.cap]);
+                } else if (v.elts.len > 0) {
+                    allocator.free(v.elts);
+                }
             },
             .dict => |v| {
                 for (v.keys, v.values) |maybe_key, value| {
@@ -981,7 +991,10 @@ pub fn cloneExpr(allocator: Allocator, expr: *const Expr) CloneError!*Expr {
             const values = try cloneExprSlice(allocator, v.values);
             break :blk .{ .dict = .{ .keys = keys, .values = values } };
         },
-        .set => |v| .{ .set = .{ .elts = try cloneExprSlice(allocator, v.elts) } },
+        .set => |v| blk: {
+            const elts = try cloneExprSlice(allocator, v.elts);
+            break :blk .{ .set = .{ .elts = elts, .cap = elts.len } };
+        },
         .list_comp => |v| blk: {
             const elt = try cloneExpr(allocator, v.elt);
             errdefer {
@@ -1388,6 +1401,7 @@ pub const Stmt = union(enum) {
     /// Function definition
     function_def: struct {
         name: []const u8,
+        type_params: []const []const u8, // PEP 695 generic type parameters [T, U, ...]
         args: *Arguments,
         body: []const *Stmt,
         decorator_list: []const *Expr,
@@ -1399,6 +1413,7 @@ pub const Stmt = union(enum) {
     /// Class definition
     class_def: struct {
         name: []const u8,
+        type_params: []const []const u8, // PEP 695 generic type parameters [T, U, ...]
         bases: []const *Expr,
         keywords: []const Keyword,
         body: []const *Stmt,
@@ -1435,6 +1450,13 @@ pub const Stmt = union(enum) {
         annotation: *Expr,
         value: ?*Expr,
         simple: bool,
+    },
+
+    /// Type alias (PEP 695)
+    type_alias: struct {
+        name: *Expr,
+        type_params: []const []const u8, // Generic type parameters [T, U, ...]
+        value: *Expr,
     },
 
     /// For loop
@@ -1588,6 +1610,12 @@ pub const Stmt = union(enum) {
                     allocator.destroy(val);
                 }
             },
+            .type_alias => |v| {
+                v.name.deinit(allocator);
+                allocator.destroy(v.name);
+                v.value.deinit(allocator);
+                allocator.destroy(v.value);
+            },
             .for_stmt => |v| {
                 v.target.deinit(allocator);
                 allocator.destroy(v.target);
@@ -1715,6 +1743,7 @@ pub const ExceptHandler = struct {
     type: ?*Expr,
     name: ?[]const u8,
     body: []const *Stmt,
+    is_star: bool = false, // except* (PEP 654)
 };
 
 /// Import alias: name as asname
