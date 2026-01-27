@@ -1575,6 +1575,7 @@ pub const Analyzer = struct {
             if (!has_setup) return null;
         }
 
+
         var handler_targets: std.ArrayList(u32) = .{};
         defer handler_targets.deinit(self.allocator);
 
@@ -1660,6 +1661,8 @@ pub const Analyzer = struct {
             if (self.isWithCleanupHandler(handler_block)) continue;
             // Skip generator StopIteration handlers (CALL_INTRINSIC_1 + RERAISE)
             if (self.isStopIterHandler(handler_block)) continue;
+            // Skip comprehension cleanup handlers (SWAP/POP_TOP/STORE_FAST/RERAISE)
+            if (self.isComprehensionCleanupHandler(handler_block)) continue;
             const is_bare = !self.hasExceptionTypeCheck(handler_block);
             try handler_list.append(self.allocator, .{
                 .handler_block = hid,
@@ -2441,6 +2444,38 @@ pub const Analyzer = struct {
             if (inst.opcode == .RERAISE) has_reraise = true;
         }
         return has_intrinsic and has_reraise;
+    }
+
+    /// Check if handler is a comprehension cleanup handler (Python 3.12+).
+    /// Pattern: SWAP, POP_TOP, SWAP, STORE_FAST+, RERAISE
+    fn isComprehensionCleanupHandler(self: *const Analyzer, block: *const BasicBlock) bool {
+        if (!self.cfg.version.gte(3, 12)) return false;
+        const insts = block.instructions;
+        if (insts.len < 3) return false;
+
+        // Must end with RERAISE
+        if (insts[insts.len - 1].opcode != .RERAISE) return false;
+
+        // Must have STORE_FAST before RERAISE (restoring saved variable)
+        var has_store = false;
+        var i = insts.len - 2;
+        while (i > 0) : (i -= 1) {
+            if (insts[i].opcode == .STORE_FAST) {
+                has_store = true;
+            } else if (has_store) {
+                // After seeing STORE_FAST, rest should be SWAP/POP_TOP
+                if (insts[i].opcode != .SWAP and insts[i].opcode != .POP_TOP) {
+                    return false;
+                }
+            }
+        }
+        if (i == 0 and has_store) {
+            if (insts[0].opcode != .SWAP and insts[0].opcode != .POP_TOP) {
+                return false;
+            }
+        }
+
+        return has_store;
     }
 
     /// Check if handler block has exception type check (CHECK_EXC_MATCH).

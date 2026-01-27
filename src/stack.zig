@@ -4038,7 +4038,10 @@ pub const SimContext = struct {
                 // SWAP i - swap TOS with stack item at position i
                 if (inst.arg < 2) return error.InvalidSwapArg;
                 const pos = inst.arg - 1;
-                if (pos >= self.stack.items.items.len) return error.StackUnderflow;
+                if (pos >= self.stack.items.items.len) {
+                    if (self.stack.allow_underflow or self.lenient) return;
+                    return error.StackUnderflow;
+                }
                 const top_idx = self.stack.items.items.len - 1;
                 const swap_idx = self.stack.items.items.len - 1 - pos;
                 const tmp = self.stack.items.items[top_idx];

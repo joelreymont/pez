@@ -2049,7 +2049,12 @@ pub const Decompiler = struct {
         clone_sim.stack.allow_underflow = true;
         defer clone_sim.deinit();
 
+        var iterations: usize = 0;
+        const max_iterations: usize = block_count * 100; // Limit iterations to prevent infinite loops
         while (worklist.items.len > 0) {
+            iterations += 1;
+            if (iterations > max_iterations) break;
+
             const bid = worklist.items[worklist.items.len - 1];
             worklist.items.len -= 1;
 
@@ -2106,8 +2111,12 @@ pub const Decompiler = struct {
                 if (term) |t| switch (t.opcode) {
                     .FOR_ITER => {
                         if (edge.edge_type == .conditional_false) {
-                            const false_len = if (incoming.len >= 2) incoming.len - 2 else 0;
-                            incoming = incoming[0..false_len];
+                            // Python 3.12+: iterator stays on stack, END_FOR/POP_ITER will pop it
+                            // Python <3.12: FOR_ITER pops iterator on exhaustion, adjust by -2
+                            if (!self.version.gte(3, 12)) {
+                                const false_len = if (incoming.len >= 2) incoming.len - 2 else 0;
+                                incoming = incoming[0..false_len];
+                            }
                         }
                     },
                     .JUMP_IF_TRUE_OR_POP => {
@@ -2235,8 +2244,12 @@ pub const Decompiler = struct {
                 if (term) |t| switch (t.opcode) {
                     .FOR_ITER => {
                         if (edge.edge_type == .conditional_false) {
-                            const false_len = if (incoming.len >= 2) incoming.len - 2 else 0;
-                            incoming = incoming[0..false_len];
+                            // Python 3.12+: iterator stays on stack, END_FOR/POP_ITER will pop it
+                            // Python <3.12: FOR_ITER pops iterator on exhaustion, adjust by -2
+                            if (!self.version.gte(3, 12)) {
+                                const false_len = if (incoming.len >= 2) incoming.len - 2 else 0;
+                                incoming = incoming[0..false_len];
+                            }
                         }
                     },
                     .JUMP_IF_TRUE_OR_POP => {
@@ -5436,6 +5449,17 @@ pub const Decompiler = struct {
     ) DecompileError!?u32 {
         if (!self.version.gte(3, 12)) return null;
         if (pattern.handlers.len == 0) return null;
+
+        // Check if try block has LOAD_FAST_AND_CLEAR (inline comprehension marker)
+        const try_block = &self.cfg.blocks[pattern.try_block];
+        var has_load_fast_and_clear = false;
+        for (try_block.instructions) |inst| {
+            if (inst.opcode == .LOAD_FAST_AND_CLEAR) {
+                has_load_fast_and_clear = true;
+                break;
+            }
+        }
+
 
         const handler_id = pattern.handlers[0].handler_block;
         if (handler_id >= self.cfg.blocks.len) return null;

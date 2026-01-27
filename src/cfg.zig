@@ -984,23 +984,20 @@ pub fn parseExceptionTable(table: []const u8, allocator: Allocator) ![]Exception
 
 /// Read a 7-bit varint from the exception table.
 /// Format: SXdddddd where S=start marker, X=extend, d=data bits.
+/// Uses big-endian encoding: first byte contributes most significant bits.
 fn readVarint7(data: []const u8, start_pos: usize) struct { value: u32, new_pos: usize } {
     var result: u32 = 0;
-    var shift: u5 = 0;
     var pos = start_pos;
 
     while (pos < data.len) {
         const byte = data[pos];
         pos += 1;
 
-        // 6 data bits per byte
-        result |= @as(u32, byte & 0x3F) << shift;
+        // Shift existing result and add new 6 data bits (big-endian)
+        result = (result << 6) | @as(u32, byte & 0x3F);
 
         // X bit (bit 6) not set = last byte of this value
         if ((byte & 0x40) == 0) break;
-
-        shift +|= 6;
-        if (shift > 30) break;
     }
 
     return .{ .value = result, .new_pos = pos };
@@ -1180,19 +1177,12 @@ test "exception table parsing" {
 test "exception table varint" {
     const testing = std.testing;
 
-    // Test varint with extend bit
-    // Value 100 (0x64) needs two bytes in 6-bit encoding:
-    // 100 = 0b1100100 = 0b100 (6 bits) + 0b1 (1 bit)
-    // First byte: S=1, X=1, d=100 & 0x3F = 36 -> 0x80 | 0x40 | 36 = 0xE4
-    // Second byte: S=0, X=0, d=100 >> 6 = 1 -> 0x01
-    // Hmm, let me recalculate. 100 in binary is 1100100.
-    // We take 6 bits at a time LSB first: bits 0-5 = 100100 = 36, bits 6+ = 1
-    // First byte: S=1, X=1 (more data), d=36 -> 1 1 100100 = 0xE4
-    // Second byte: S=0, X=0 (no more), d=1 -> 0 0 000001 = 0x01
-
-    // Actually for 100:
-    // 100 in 6-bit chunks: 100 & 0x3F = 36, 100 >> 6 = 1
-    const result = readVarint7(&[_]u8{ 0xE4, 0x01 }, 0);
+    // Test varint with extend bit (big-endian: high bits first)
+    // Value 100 = 1 * 64 + 36 = (1 << 6) | 36
+    // First byte: d=1, X=1 (extend) -> 0x41
+    // Second byte: d=36, X=0 -> 0x24
+    // Decoding: (1 << 6) | 36 = 100
+    const result = readVarint7(&[_]u8{ 0x41, 0x24 }, 0);
     try testing.expectEqual(@as(u32, 100), result.value);
     try testing.expectEqual(@as(usize, 2), result.new_pos);
 }

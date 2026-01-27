@@ -8,7 +8,7 @@ Pez parses `.pyc` files (Python's compiled bytecode format), disassembles byteco
 
 - **Multi-version support**: Parses `.pyc` files from Python 1.0 through 3.14
 - **Bytecode disassembly**: Human-readable opcode output with argument annotations
-- **Symbol annotation**: Shows constant values, variable names, and attribute names
+- **Source reconstruction**: Generates readable Python source from bytecode
 - **Nested code objects**: Recursively processes closures and nested functions
 
 ## Build
@@ -27,10 +27,36 @@ zig build test         # run tests
 ./zig-out/bin/pez example.pyc
 ```
 
-Output includes:
-- Python version (detected from magic number)
-- Code object metadata (argcount, stacksize, flags, etc.)
-- Disassembled bytecode with symbolic annotations
+## Verification
+
+Batch decompile and validate syntax:
+
+```bash
+# Decompile all .pyc files in a directory
+for f in /path/to/*.pyc; do
+  ./zig-out/bin/pez "$f" > "/tmp/out/$(basename "$f" .pyc).py" 2>/dev/null
+done
+
+# Verify all outputs are valid Python
+for f in /tmp/out/*.py; do
+  python3 -m py_compile "$f" || echo "FAIL: $f"
+done
+```
+
+Roundtrip comparison (requires xdis):
+
+```bash
+python3 tools/compare/compare_dir.py \
+  --orig-dir /path/to/pyc/files \
+  --src-dir /path/to/decompiled \
+  --out /tmp/compare.json
+```
+
+## Test Corpora
+
+- **Local corpus** (`test/corpus/`): 93 files, 88 pass (94.6%)
+- **pycdc corpus** (`refs/pycdc/tests/compiled/`): 190 files, 108 pass (56.8%)
+- **boat_main**: 118/118 files decompile to valid Python
 
 ## Project Structure
 
@@ -41,26 +67,22 @@ src/
 ├── opcodes.zig       # Opcode definitions by Python version
 ├── decoder.zig       # Instruction decoding & line table parsing
 ├── cfg.zig           # Control flow graph construction
+├── ctrl.zig          # Control flow pattern detection
 ├── ast.zig           # AST node definitions
 ├── stack.zig         # Stack simulation for expression reconstruction
+├── decompile.zig     # Main decompilation logic
 ├── codegen.zig       # Python source code generation
-└── property_tests.zig # Property-based tests (zcheck)
-docs/
-├── python-bytecode.md   # Technical reference
-└── zig-0.15-io-api.md   # Zig API patterns
+tools/
+├── compare/          # Roundtrip comparison tools
+└── dump_view.py      # Bytecode/CFG visualization
 ```
 
-## Status
+## Known Limitations
 
-- [x] Magic number detection (all Python versions)
-- [x] Marshal format parsing
-- [x] Code object extraction
-- [x] Bytecode disassembly
-- [x] Control flow graph construction
-- [x] Exception table parsing (3.11+)
-- [x] Line number table parsing (all versions)
-- [ ] AST reconstruction
-- [ ] Source code generation
+- Python 3.14 inline comprehensions (PEP 709)
+- Python 3.14 match statement optimizations
+- except* (PEP 654)
+- Some Python 2.x edge cases
 
 ## License
 
