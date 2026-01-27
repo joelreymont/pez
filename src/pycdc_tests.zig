@@ -9,22 +9,26 @@ const opcodes = @import("opcodes.zig");
 const Version = opcodes.Version;
 
 fn parsePycVersion(filename: []const u8) !Version {
-    var idx = std.mem.lastIndexOf(u8, filename, ".") orelse return error.InvalidFilename;
-    if (idx == 0) return error.InvalidFilename;
-    idx -= 1;
+    var it = std.mem.splitScalar(u8, filename, '.');
+    var third_last: ?[]const u8 = null;
+    var second_last: ?[]const u8 = null;
+    var last: ?[]const u8 = null;
+    while (it.next()) |seg| {
+        third_last = second_last;
+        second_last = last;
+        last = seg;
+    }
 
-    var end = idx;
-    while (end > 0 and (std.ascii.isDigit(filename[end]) or filename[end] == '.')) : (end -= 1) {}
-    end += 1;
+    const ext = last orelse return error.InvalidFilename;
+    const minor_str = second_last orelse return error.InvalidFilename;
+    const major_str = third_last orelse return error.InvalidFilename;
+    if (!std.mem.eql(u8, ext, "pyc")) return error.InvalidFilename;
+    if (major_str.len == 0 or minor_str.len == 0) return error.InvalidFilename;
+    for (major_str) |c| if (!std.ascii.isDigit(c)) return error.InvalidFilename;
+    for (minor_str) |c| if (!std.ascii.isDigit(c)) return error.InvalidFilename;
 
-    const ver_str = filename[end .. idx + 1];
-    var it = std.mem.splitScalar(u8, ver_str, '.');
-    const major_str = it.next() orelse return error.InvalidFilename;
-    const minor_str = it.next() orelse return error.InvalidFilename;
-
-    const major = if (std.fmt.parseInt(u8, major_str, 10)) |value| value else |_| return error.InvalidFilename;
-    const minor = if (std.fmt.parseInt(u8, minor_str, 10)) |value| value else |_| return error.InvalidFilename;
-
+    const major = std.fmt.parseInt(u8, major_str, 10) catch return error.InvalidFilename;
+    const minor = std.fmt.parseInt(u8, minor_str, 10) catch return error.InvalidFilename;
     return Version.init(major, minor);
 }
 
@@ -45,18 +49,16 @@ test "parse pyc version from filename" {
 }
 
 fn decompilePycFile(allocator: std.mem.Allocator, path: []const u8) ![]const u8 {
-    const version = try parsePycVersion(path);
-
-    const file = try std.fs.cwd().openFile(path, .{});
-    defer file.close();
-
-    var module = try pyc.Module.fromFile(allocator, file.reader());
+    var module = pyc.Module.init(allocator);
     defer module.deinit();
+    try module.loadFromFile(path);
+    const version = module.version();
+    const code = module.code orelse return error.InvalidPyc;
 
     var out: std.ArrayList(u8) = .{};
     errdefer out.deinit(allocator);
 
-    try decompile.decompileToSource(allocator, module.code, version, out.writer(allocator));
+    try decompile.decompileToSource(allocator, code, version, out.writer(allocator));
     return out.toOwnedSlice(allocator);
 }
 
@@ -71,6 +73,22 @@ test "pycdc test_global 2.5" {
 test "pycdc swap 3.11" {
     const allocator = testing.allocator;
     const output = try decompilePycFile(allocator, "refs/pycdc/tests/compiled/swap.3.11.pyc");
+    defer allocator.free(output);
+
+    try testing.expect(output.len > 0);
+}
+
+test "pycdc test_loops2 2.2" {
+    const allocator = testing.allocator;
+    const output = try decompilePycFile(allocator, "refs/pycdc/tests/compiled/test_loops2.2.2.pyc");
+    defer allocator.free(output);
+
+    try testing.expect(output.len > 0);
+}
+
+test "pycdc test_listComprehensions 2.7" {
+    const allocator = testing.allocator;
+    const output = try decompilePycFile(allocator, "refs/pycdc/tests/compiled/test_listComprehensions.2.7.pyc");
     defer allocator.free(output);
 
     try testing.expect(output.len > 0);

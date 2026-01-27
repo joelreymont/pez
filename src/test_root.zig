@@ -15,6 +15,7 @@ pub const ast = @import("ast.zig");
 pub const stack = @import("stack.zig");
 pub const codegen = @import("codegen.zig");
 pub const decompile = @import("decompile.zig");
+pub const pycdc_tests = @import("pycdc_tests.zig");
 pub const snapshot_tests = @import("snapshot_tests.zig");
 pub const ternary_boolop_tests = @import("ternary_boolop_tests.zig");
 pub const list_extend_tests = @import("list_extend_tests.zig");
@@ -44,6 +45,7 @@ comptime {
     _ = stack;
     _ = codegen;
     _ = decompile;
+    _ = pycdc_tests;
     _ = property_tests;
     _ = snapshot_tests;
     _ = ternary_boolop_tests;
