@@ -6,7 +6,8 @@ const testing = std.testing;
 test "marshal TYPE_NONE" {
     const data = [_]u8{'N'};
     var reader = pyc.BufferReader{ .data = &data };
-    var mod = pyc.Module.init(testing.allocator);
+    var mod: pyc.Module = undefined;
+    mod.init(testing.allocator);
     defer mod.deinit();
     mod.major_ver = 3;
     mod.minor_ver = 11;
@@ -21,7 +22,8 @@ test "marshal TYPE_NONE" {
 test "marshal TYPE_TRUE" {
     const data = [_]u8{'T'};
     var reader = pyc.BufferReader{ .data = &data };
-    var mod = pyc.Module.init(testing.allocator);
+    var mod: pyc.Module = undefined;
+    mod.init(testing.allocator);
     defer mod.deinit();
     mod.major_ver = 3;
     mod.minor_ver = 11;
@@ -36,7 +38,8 @@ test "marshal TYPE_TRUE" {
 test "marshal TYPE_FALSE" {
     const data = [_]u8{'F'};
     var reader = pyc.BufferReader{ .data = &data };
-    var mod = pyc.Module.init(testing.allocator);
+    var mod: pyc.Module = undefined;
+    mod.init(testing.allocator);
     defer mod.deinit();
     mod.major_ver = 3;
     mod.minor_ver = 11;
@@ -51,7 +54,8 @@ test "marshal TYPE_FALSE" {
 test "marshal TYPE_ELLIPSIS" {
     const data = [_]u8{'.'};
     var reader = pyc.BufferReader{ .data = &data };
-    var mod = pyc.Module.init(testing.allocator);
+    var mod: pyc.Module = undefined;
+    mod.init(testing.allocator);
     defer mod.deinit();
     mod.major_ver = 3;
     mod.minor_ver = 11;
@@ -66,7 +70,8 @@ test "marshal TYPE_ELLIPSIS" {
 test "marshal TYPE_STOPITER" {
     const data = [_]u8{'S'};
     var reader = pyc.BufferReader{ .data = &data };
-    var mod = pyc.Module.init(testing.allocator);
+    var mod: pyc.Module = undefined;
+    mod.init(testing.allocator);
     defer mod.deinit();
     mod.major_ver = 3;
     mod.minor_ver = 11;
@@ -83,7 +88,8 @@ test "marshal TYPE_INT positive" {
     const val_bytes = @as([4]u8, @bitCast(val));
     const data = [_]u8{ 'i', val_bytes[0], val_bytes[1], val_bytes[2], val_bytes[3] };
     var reader = pyc.BufferReader{ .data = &data };
-    var mod = pyc.Module.init(testing.allocator);
+    var mod: pyc.Module = undefined;
+    mod.init(testing.allocator);
     defer mod.deinit();
     mod.major_ver = 3;
     mod.minor_ver = 11;
@@ -102,7 +108,8 @@ test "marshal TYPE_INT negative" {
     const val_bytes = @as([4]u8, @bitCast(val));
     const data = [_]u8{ 'i', val_bytes[0], val_bytes[1], val_bytes[2], val_bytes[3] };
     var reader = pyc.BufferReader{ .data = &data };
-    var mod = pyc.Module.init(testing.allocator);
+    var mod: pyc.Module = undefined;
+    mod.init(testing.allocator);
     defer mod.deinit();
     mod.major_ver = 3;
     mod.minor_ver = 11;
@@ -121,7 +128,8 @@ test "marshal TYPE_INT64 positive" {
     const val_bytes = @as([8]u8, @bitCast(val));
     const data = [_]u8{ 'I', val_bytes[0], val_bytes[1], val_bytes[2], val_bytes[3], val_bytes[4], val_bytes[5], val_bytes[6], val_bytes[7] };
     var reader = pyc.BufferReader{ .data = &data };
-    var mod = pyc.Module.init(testing.allocator);
+    var mod: pyc.Module = undefined;
+    mod.init(testing.allocator);
     defer mod.deinit();
     mod.major_ver = 3;
     mod.minor_ver = 11;
@@ -140,7 +148,8 @@ test "marshal TYPE_INT64 negative" {
     const val_bytes = @as([8]u8, @bitCast(val));
     const data = [_]u8{ 'I', val_bytes[0], val_bytes[1], val_bytes[2], val_bytes[3], val_bytes[4], val_bytes[5], val_bytes[6], val_bytes[7] };
     var reader = pyc.BufferReader{ .data = &data };
-    var mod = pyc.Module.init(testing.allocator);
+    var mod: pyc.Module = undefined;
+    mod.init(testing.allocator);
     defer mod.deinit();
     mod.major_ver = 3;
     mod.minor_ver = 11;
@@ -159,7 +168,8 @@ test "marshal TYPE_BINARY_FLOAT" {
     const val_bytes = @as([8]u8, @bitCast(val));
     const data = [_]u8{ 'g', val_bytes[0], val_bytes[1], val_bytes[2], val_bytes[3], val_bytes[4], val_bytes[5], val_bytes[6], val_bytes[7] };
     var reader = pyc.BufferReader{ .data = &data };
-    var mod = pyc.Module.init(testing.allocator);
+    var mod: pyc.Module = undefined;
+    mod.init(testing.allocator);
     defer mod.deinit();
     mod.major_ver = 3;
     mod.minor_ver = 11;
@@ -176,7 +186,8 @@ test "marshal TYPE_FLOAT text" {
     const text = "2.71828";
     const data = [_]u8{ 'f', text.len } ++ text.*;
     var reader = pyc.BufferReader{ .data = &data };
-    var mod = pyc.Module.init(testing.allocator);
+    var mod: pyc.Module = undefined;
+    mod.init(testing.allocator);
     defer mod.deinit();
     mod.major_ver = 3;
     mod.minor_ver = 11;
@@ -214,7 +225,8 @@ test "marshal TYPE_BINARY_COMPLEX" {
         imag_bytes[7],
     };
     var reader = pyc.BufferReader{ .data = &data };
-    var mod = pyc.Module.init(testing.allocator);
+    var mod: pyc.Module = undefined;
+    mod.init(testing.allocator);
     defer mod.deinit();
     mod.major_ver = 3;
     mod.minor_ver = 11;
@@ -233,7 +245,8 @@ test "marshal TYPE_COMPLEX text" {
     const imag_text = "2.0";
     const data = [_]u8{ 'x', real_text.len } ++ real_text.* ++ [_]u8{imag_text.len} ++ imag_text.*;
     var reader = pyc.BufferReader{ .data = &data };
-    var mod = pyc.Module.init(testing.allocator);
+    var mod: pyc.Module = undefined;
+    mod.init(testing.allocator);
     defer mod.deinit();
     mod.major_ver = 3;
     mod.minor_ver = 11;
@@ -252,7 +265,8 @@ test "marshal TYPE_STRING" {
     const len_bytes = @as([4]u8, @bitCast(@as(u32, str.len)));
     const data = [_]u8{ 's', len_bytes[0], len_bytes[1], len_bytes[2], len_bytes[3] } ++ str.*;
     var reader = pyc.BufferReader{ .data = &data };
-    var mod = pyc.Module.init(testing.allocator);
+    var mod: pyc.Module = undefined;
+    mod.init(testing.allocator);
     defer mod.deinit();
     mod.major_ver = 3;
     mod.minor_ver = 11;
@@ -270,7 +284,8 @@ test "marshal TYPE_ASCII" {
     const len_bytes = @as([4]u8, @bitCast(@as(u32, str.len)));
     const data = [_]u8{ 'a', len_bytes[0], len_bytes[1], len_bytes[2], len_bytes[3] } ++ str.*;
     var reader = pyc.BufferReader{ .data = &data };
-    var mod = pyc.Module.init(testing.allocator);
+    var mod: pyc.Module = undefined;
+    mod.init(testing.allocator);
     defer mod.deinit();
     mod.major_ver = 3;
     mod.minor_ver = 11;
@@ -287,7 +302,8 @@ test "marshal TYPE_SHORT_ASCII" {
     const str = "foo";
     const data = [_]u8{ 'z', str.len } ++ str.*;
     var reader = pyc.BufferReader{ .data = &data };
-    var mod = pyc.Module.init(testing.allocator);
+    var mod: pyc.Module = undefined;
+    mod.init(testing.allocator);
     defer mod.deinit();
     mod.major_ver = 3;
     mod.minor_ver = 11;
@@ -305,7 +321,8 @@ test "marshal TYPE_INTERNED" {
     const len_bytes = @as([4]u8, @bitCast(@as(u32, str.len)));
     const data = [_]u8{ 't', len_bytes[0], len_bytes[1], len_bytes[2], len_bytes[3] } ++ str.*;
     var reader = pyc.BufferReader{ .data = &data };
-    var mod = pyc.Module.init(testing.allocator);
+    var mod: pyc.Module = undefined;
+    mod.init(testing.allocator);
     defer mod.deinit();
     mod.major_ver = 3;
     mod.minor_ver = 11;
@@ -325,7 +342,8 @@ test "marshal TYPE_ASCII_INTERNED" {
     const len_bytes = @as([4]u8, @bitCast(@as(u32, str.len)));
     const data = [_]u8{ 'A', len_bytes[0], len_bytes[1], len_bytes[2], len_bytes[3] } ++ str.*;
     var reader = pyc.BufferReader{ .data = &data };
-    var mod = pyc.Module.init(testing.allocator);
+    var mod: pyc.Module = undefined;
+    mod.init(testing.allocator);
     defer mod.deinit();
     mod.major_ver = 3;
     mod.minor_ver = 11;
@@ -344,7 +362,8 @@ test "marshal TYPE_SHORT_ASCII_INTERNED" {
     const str = "qux";
     const data = [_]u8{ 'Z', str.len } ++ str.*;
     var reader = pyc.BufferReader{ .data = &data };
-    var mod = pyc.Module.init(testing.allocator);
+    var mod: pyc.Module = undefined;
+    mod.init(testing.allocator);
     defer mod.deinit();
     mod.major_ver = 3;
     mod.minor_ver = 11;
@@ -364,7 +383,8 @@ test "marshal TYPE_UNICODE" {
     const len_bytes = @as([4]u8, @bitCast(@as(u32, str.len)));
     const data = [_]u8{ 'u', len_bytes[0], len_bytes[1], len_bytes[2], len_bytes[3] } ++ str.*;
     var reader = pyc.BufferReader{ .data = &data };
-    var mod = pyc.Module.init(testing.allocator);
+    var mod: pyc.Module = undefined;
+    mod.init(testing.allocator);
     defer mod.deinit();
     mod.major_ver = 3;
     mod.minor_ver = 11;
@@ -381,7 +401,8 @@ test "marshal TYPE_TUPLE empty" {
     const count_bytes = @as([4]u8, @bitCast(@as(u32, 0)));
     const data = [_]u8{ '(', count_bytes[0], count_bytes[1], count_bytes[2], count_bytes[3] };
     var reader = pyc.BufferReader{ .data = &data };
-    var mod = pyc.Module.init(testing.allocator);
+    var mod: pyc.Module = undefined;
+    mod.init(testing.allocator);
     defer mod.deinit();
     mod.major_ver = 3;
     mod.minor_ver = 11;
@@ -398,7 +419,8 @@ test "marshal TYPE_TUPLE with items" {
     const count_bytes = @as([4]u8, @bitCast(@as(u32, 2)));
     const data = [_]u8{ '(', count_bytes[0], count_bytes[1], count_bytes[2], count_bytes[3], 'N', 'T' };
     var reader = pyc.BufferReader{ .data = &data };
-    var mod = pyc.Module.init(testing.allocator);
+    var mod: pyc.Module = undefined;
+    mod.init(testing.allocator);
     defer mod.deinit();
     mod.major_ver = 3;
     mod.minor_ver = 11;
@@ -416,7 +438,8 @@ test "marshal TYPE_TUPLE with items" {
 test "marshal TYPE_SMALL_TUPLE" {
     const data = [_]u8{ ')', 3, 'F', 'T', 'N' };
     var reader = pyc.BufferReader{ .data = &data };
-    var mod = pyc.Module.init(testing.allocator);
+    var mod: pyc.Module = undefined;
+    mod.init(testing.allocator);
     defer mod.deinit();
     mod.major_ver = 3;
     mod.minor_ver = 11;
@@ -436,7 +459,8 @@ test "marshal TYPE_LIST empty" {
     const count_bytes = @as([4]u8, @bitCast(@as(u32, 0)));
     const data = [_]u8{ '[', count_bytes[0], count_bytes[1], count_bytes[2], count_bytes[3] };
     var reader = pyc.BufferReader{ .data = &data };
-    var mod = pyc.Module.init(testing.allocator);
+    var mod: pyc.Module = undefined;
+    mod.init(testing.allocator);
     defer mod.deinit();
     mod.major_ver = 3;
     mod.minor_ver = 11;
@@ -453,7 +477,8 @@ test "marshal TYPE_LIST with items" {
     const count_bytes = @as([4]u8, @bitCast(@as(u32, 2)));
     const data = [_]u8{ '[', count_bytes[0], count_bytes[1], count_bytes[2], count_bytes[3], 'T', 'F' };
     var reader = pyc.BufferReader{ .data = &data };
-    var mod = pyc.Module.init(testing.allocator);
+    var mod: pyc.Module = undefined;
+    mod.init(testing.allocator);
     defer mod.deinit();
     mod.major_ver = 3;
     mod.minor_ver = 11;
@@ -472,7 +497,8 @@ test "marshal TYPE_SET empty" {
     const count_bytes = @as([4]u8, @bitCast(@as(u32, 0)));
     const data = [_]u8{ '<', count_bytes[0], count_bytes[1], count_bytes[2], count_bytes[3] };
     var reader = pyc.BufferReader{ .data = &data };
-    var mod = pyc.Module.init(testing.allocator);
+    var mod: pyc.Module = undefined;
+    mod.init(testing.allocator);
     defer mod.deinit();
     mod.major_ver = 3;
     mod.minor_ver = 11;
@@ -489,7 +515,8 @@ test "marshal TYPE_SET with items" {
     const count_bytes = @as([4]u8, @bitCast(@as(u32, 1)));
     const data = [_]u8{ '<', count_bytes[0], count_bytes[1], count_bytes[2], count_bytes[3], 'N' };
     var reader = pyc.BufferReader{ .data = &data };
-    var mod = pyc.Module.init(testing.allocator);
+    var mod: pyc.Module = undefined;
+    mod.init(testing.allocator);
     defer mod.deinit();
     mod.major_ver = 3;
     mod.minor_ver = 11;
@@ -507,7 +534,8 @@ test "marshal TYPE_FROZENSET empty" {
     const count_bytes = @as([4]u8, @bitCast(@as(u32, 0)));
     const data = [_]u8{ '>', count_bytes[0], count_bytes[1], count_bytes[2], count_bytes[3] };
     var reader = pyc.BufferReader{ .data = &data };
-    var mod = pyc.Module.init(testing.allocator);
+    var mod: pyc.Module = undefined;
+    mod.init(testing.allocator);
     defer mod.deinit();
     mod.major_ver = 3;
     mod.minor_ver = 11;
@@ -524,7 +552,8 @@ test "marshal TYPE_FROZENSET with items" {
     const count_bytes = @as([4]u8, @bitCast(@as(u32, 2)));
     const data = [_]u8{ '>', count_bytes[0], count_bytes[1], count_bytes[2], count_bytes[3], 'T', 'F' };
     var reader = pyc.BufferReader{ .data = &data };
-    var mod = pyc.Module.init(testing.allocator);
+    var mod: pyc.Module = undefined;
+    mod.init(testing.allocator);
     defer mod.deinit();
     mod.major_ver = 3;
     mod.minor_ver = 11;
@@ -542,7 +571,8 @@ test "marshal TYPE_FROZENSET with items" {
 test "marshal TYPE_DICT empty" {
     const data = [_]u8{ '{', '0' };
     var reader = pyc.BufferReader{ .data = &data };
-    var mod = pyc.Module.init(testing.allocator);
+    var mod: pyc.Module = undefined;
+    mod.init(testing.allocator);
     defer mod.deinit();
     mod.major_ver = 3;
     mod.minor_ver = 11;
@@ -558,7 +588,8 @@ test "marshal TYPE_DICT empty" {
 test "marshal TYPE_DICT with entries" {
     const data = [_]u8{ '{', 'N', 'T', 'F', 'N', '0' };
     var reader = pyc.BufferReader{ .data = &data };
-    var mod = pyc.Module.init(testing.allocator);
+    var mod: pyc.Module = undefined;
+    mod.init(testing.allocator);
     defer mod.deinit();
     mod.major_ver = 3;
     mod.minor_ver = 11;
@@ -580,7 +611,8 @@ test "marshal string with FLAG_REF" {
     const len_bytes = @as([4]u8, @bitCast(@as(u32, str.len)));
     const data = [_]u8{ 's' | 0x80, len_bytes[0], len_bytes[1], len_bytes[2], len_bytes[3] } ++ str.*;
     var reader = pyc.BufferReader{ .data = &data };
-    var mod = pyc.Module.init(testing.allocator);
+    var mod: pyc.Module = undefined;
+    mod.init(testing.allocator);
     defer mod.deinit();
     mod.major_ver = 3;
     mod.minor_ver = 11;
@@ -602,7 +634,8 @@ test "marshal TYPE_STRINGREF" {
     // First intern a string
     const data1 = [_]u8{ 't', len_bytes[0], len_bytes[1], len_bytes[2], len_bytes[3] } ++ str.*;
     var reader1 = pyc.BufferReader{ .data = &data1 };
-    var mod = pyc.Module.init(testing.allocator);
+    var mod: pyc.Module = undefined;
+    mod.init(testing.allocator);
     defer mod.deinit();
     mod.major_ver = 2;
     mod.minor_ver = 7;

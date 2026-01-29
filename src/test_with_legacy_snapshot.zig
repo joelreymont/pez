@@ -11,7 +11,8 @@ const Version = @import("opcodes.zig").Version;
 test "snapshot with legacy 3.9" {
     const allocator = testing.allocator;
 
-    var module = pyc.Module.init(allocator);
+    var module: pyc.Module = undefined;
+    module.init(allocator);
     defer module.deinit();
     try module.loadFromFile("test/corpus/with_legacy.3.9.pyc");
 

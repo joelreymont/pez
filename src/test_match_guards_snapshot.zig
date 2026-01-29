@@ -11,7 +11,8 @@ const Version = @import("opcodes.zig").Version;
 test "snapshot match guards 3.14" {
     const allocator = testing.allocator;
 
-    var module = pyc.Module.init(allocator);
+    var module: pyc.Module = undefined;
+    module.init(allocator);
     defer module.deinit();
     try module.loadFromFile("test/corpus/match_guards.3.14.pyc");
 

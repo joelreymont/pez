@@ -53,7 +53,8 @@ test "parse pyc version from filename" {
 }
 
 fn decompilePycFile(allocator: std.mem.Allocator, path: []const u8) ![]const u8 {
-    var module = pyc.Module.init(allocator);
+    var module: pyc.Module = undefined;
+    module.init(allocator);
     defer module.deinit();
     try module.loadFromFile(path);
     const version = module.version();

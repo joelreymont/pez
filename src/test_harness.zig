@@ -207,11 +207,23 @@ pub fn runSingleTest(allocator: Allocator, pyc_path: []const u8, writer: anytype
     }
 
     // Load .pyc
-    var module = pyc.Module.init(allocator);
+    var module: pyc.Module = undefined;
+    module.init(allocator);
     defer module.deinit();
 
     module.loadFromFile(pyc_path) catch |err| {
-        try writer.print("ERR  {s}: load failed: {s}\n", .{ basename, @errorName(err) });
+        if (err == error.InvalidPyc) {
+            if (module.last_err) |d| {
+                try writer.print("ERR  {s}: load failed: {s} @ {d}: {s}\n", .{ basename, @errorName(err), d.pos, @errorName(d.err) });
+                if (d.note) |note| {
+                    try writer.print("ERR  {s}: note: {s}\n", .{ basename, note });
+                }
+            } else {
+                try writer.print("ERR  {s}: load failed: {s}\n", .{ basename, @errorName(err) });
+            }
+        } else {
+            try writer.print("ERR  {s}: load failed: {s}\n", .{ basename, @errorName(err) });
+        }
         return false;
     };
 
@@ -276,11 +288,23 @@ pub fn runGoldenTest(
     defer allocator.free(golden_content);
 
     // Load and decompile .pyc
-    var module = pyc.Module.init(allocator);
+    var module: pyc.Module = undefined;
+    module.init(allocator);
     defer module.deinit();
 
     module.loadFromFile(pyc_path) catch |err| {
-        try writer.print("ERR  {s}: load failed: {s}\n", .{ basename, @errorName(err) });
+        if (err == error.InvalidPyc) {
+            if (module.last_err) |d| {
+                try writer.print("ERR  {s}: load failed: {s} @ {d}: {s}\n", .{ basename, @errorName(err), d.pos, @errorName(d.err) });
+                if (d.note) |note| {
+                    try writer.print("ERR  {s}: note: {s}\n", .{ basename, note });
+                }
+            } else {
+                try writer.print("ERR  {s}: load failed: {s}\n", .{ basename, @errorName(err) });
+            }
+        } else {
+            try writer.print("ERR  {s}: load failed: {s}\n", .{ basename, @errorName(err) });
+        }
         return .decompile_error;
     };
 
