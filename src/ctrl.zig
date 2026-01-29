@@ -1463,10 +1463,10 @@ pub const Analyzer = struct {
         } else if (block.predecessors.len > 0) {
             // Trace back through predecessors to find GET_ITER
             // Python 3.14: GET_ITER may be multiple blocks back due to inline comprehension setup
-            var visited: [16]u32 = undefined;
-            var visited_count: usize = 0;
-            var work: [16]u32 = undefined;
-            var work_count: usize = 0;
+            var visited = if (std.DynamicBitSet.initEmpty(self.allocator, self.cfg.blocks.len)) |v| v else |_| return null;
+            defer visited.deinit();
+            var work: std.ArrayList(u32) = .{};
+            defer work.deinit(self.allocator);
 
             // Start with direct predecessors (skip loop_back edges)
             for (block.predecessors) |pred_id| {
@@ -1480,30 +1480,15 @@ pub const Analyzer = struct {
                     }
                 }
                 if (is_loop_back) continue;
-                if (work_count < work.len) {
-                    work[work_count] = pred_id;
-                    work_count += 1;
-                }
+                if (work.append(self.allocator, pred_id)) |_| {} else |_| return null;
             }
 
-            outer: while (work_count > 0) {
-                work_count -= 1;
-                const cur_id = work[work_count];
+            outer: while (work.items.len > 0) {
+                const cur_id = work.pop().?;
                 if (cur_id >= self.cfg.blocks.len) continue;
 
-                // Check if visited
-                var already_visited = false;
-                for (visited[0..visited_count]) |v| {
-                    if (v == cur_id) {
-                        already_visited = true;
-                        break;
-                    }
-                }
-                if (already_visited) continue;
-                if (visited_count < visited.len) {
-                    visited[visited_count] = cur_id;
-                    visited_count += 1;
-                }
+                if (visited.isSet(cur_id)) continue;
+                visited.set(cur_id);
 
                 const cur = &self.cfg.blocks[cur_id];
 
@@ -1527,9 +1512,8 @@ pub const Analyzer = struct {
                         }
                     }
                     if (is_loop_back) continue;
-                    if (work_count < work.len) {
-                        work[work_count] = pred_id;
-                        work_count += 1;
+                    if (!visited.isSet(pred_id)) {
+                        if (work.append(self.allocator, pred_id)) |_| {} else |_| return null;
                     }
                 }
             }
@@ -3270,4 +3254,92 @@ test "isConditionalJump" {
     try testing.expect(analyzer.isConditionalJump(.JUMP_IF_NOT_EXC_MATCH));
     try testing.expect(!analyzer.isConditionalJump(.JUMP_FORWARD));
     try testing.expect(!analyzer.isConditionalJump(.LOAD_CONST));
+}
+
+test "detectForPattern walks deep predecessor chain" {
+    const testing = std.testing;
+    const allocator = testing.allocator;
+
+    const version = Version.init(3, 11);
+    const chain_len: u32 = 18;
+    const setup_block: u32 = 0;
+    const header_block: u32 = chain_len;
+    const body_block: u32 = header_block + 1;
+    const exit_block: u32 = header_block + 2;
+    const total_blocks: usize = @intCast(exit_block + 1);
+
+    const instructions = try allocator.alloc(Instruction, total_blocks);
+    const block_offsets = try allocator.alloc(u32, total_blocks);
+    const blocks = try allocator.alloc(BasicBlock, total_blocks);
+
+    var i: usize = 0;
+    while (i < total_blocks) : (i += 1) {
+        const off: u32 = @intCast(i * 2);
+        instructions[i] = .{
+            .opcode = .NOP,
+            .arg = 0,
+            .offset = off,
+            .size = 2,
+            .cache_entries = 0,
+        };
+        block_offsets[i] = off;
+    }
+    instructions[setup_block].opcode = .GET_ITER;
+    instructions[header_block].opcode = .FOR_ITER;
+
+    i = 0;
+    while (i < total_blocks) : (i += 1) {
+        var succs: []Edge = &.{};
+        var preds: []u32 = &.{};
+
+        if (i < header_block) {
+            succs = try allocator.alloc(Edge, 1);
+            succs[0] = .{ .target = @intCast(i + 1), .edge_type = .normal };
+        } else if (i == header_block) {
+            succs = try allocator.alloc(Edge, 2);
+            succs[0] = .{ .target = body_block, .edge_type = .normal };
+            succs[1] = .{ .target = exit_block, .edge_type = .conditional_false };
+        }
+
+        if (i == 0) {
+            preds = &.{};
+        } else if (i <= header_block) {
+            preds = try allocator.alloc(u32, 1);
+            preds[0] = @intCast(i - 1);
+        } else if (i == body_block or i == exit_block) {
+            preds = try allocator.alloc(u32, 1);
+            preds[0] = header_block;
+        }
+
+        blocks[i] = .{
+            .id = @intCast(i),
+            .start_offset = block_offsets[i],
+            .end_offset = block_offsets[i] + 2,
+            .instructions = instructions[i .. i + 1],
+            .successors = succs,
+            .predecessors = preds,
+            .is_exception_handler = false,
+            .is_loop_header = i == header_block,
+        };
+    }
+
+    var cfg = CFG{
+        .allocator = allocator,
+        .blocks = blocks,
+        .block_offsets = block_offsets,
+        .entry = 0,
+        .instructions = instructions,
+        .version = version,
+    };
+    defer cfg.deinit();
+
+    var dom = try dom_mod.DomTree.init(allocator, &cfg);
+    defer dom.deinit();
+    var analyzer = try Analyzer.init(allocator, &cfg, &dom);
+    defer analyzer.deinit();
+
+    const pattern_opt = analyzer.detectForPattern(header_block);
+    try testing.expect(pattern_opt != null);
+    const pattern = pattern_opt.?;
+    try testing.expectEqual(setup_block, pattern.setup_block);
 }
