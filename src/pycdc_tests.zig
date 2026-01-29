@@ -8,6 +8,10 @@ const opcodes = @import("opcodes.zig");
 
 const Version = opcodes.Version;
 
+fn parseVersionPart(part: []const u8) !u8 {
+    return if (std.fmt.parseInt(u8, part, 10)) |value| value else |_| return error.InvalidFilename;
+}
+
 fn parsePycVersion(filename: []const u8) !Version {
     var it = std.mem.splitScalar(u8, filename, '.');
     var third_last: ?[]const u8 = null;
@@ -27,8 +31,8 @@ fn parsePycVersion(filename: []const u8) !Version {
     for (major_str) |c| if (!std.ascii.isDigit(c)) return error.InvalidFilename;
     for (minor_str) |c| if (!std.ascii.isDigit(c)) return error.InvalidFilename;
 
-    const major = std.fmt.parseInt(u8, major_str, 10) catch return error.InvalidFilename;
-    const minor = std.fmt.parseInt(u8, minor_str, 10) catch return error.InvalidFilename;
+    const major = try parseVersionPart(major_str);
+    const minor = try parseVersionPart(minor_str);
     return Version.init(major, minor);
 }
 
