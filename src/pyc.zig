@@ -1104,8 +1104,15 @@ pub const Module = struct {
                 self.allocator.free(strings);
             }
             for (tuple, 0..) |obj, i| {
-                if (obj != .string) return error.InvalidObjectType;
-                strings[i] = try self.allocator.dupe(u8, obj.string);
+                switch (obj) {
+                    .string => |s| {
+                        strings[i] = try self.allocator.dupe(u8, s);
+                    },
+                    .bytes => |b| {
+                        strings[i] = try self.allocator.dupe(u8, b);
+                    },
+                    else => return error.InvalidObjectType,
+                }
                 initialized += 1;
             }
             return strings;
@@ -1252,17 +1259,17 @@ pub const Module = struct {
                 // Text-based float: 1-byte length followed by ASCII decimal representation
                 const len = try reader.readByte();
                 const slice = try reader.readSlice(len);
-                const value = std.fmt.parseFloat(f64, slice) catch return error.InvalidFloat;
+                const value = if (std.fmt.parseFloat(f64, slice)) |v| v else |_| return error.InvalidFloat;
                 break :blk .{ .float = value };
             },
             .TYPE_COMPLEX => blk: {
                 // Text-based complex: two text floats (real and imaginary)
                 const real_len = try reader.readByte();
                 const real_slice = try reader.readSlice(real_len);
-                const real = std.fmt.parseFloat(f64, real_slice) catch return error.InvalidFloat;
+                const real = if (std.fmt.parseFloat(f64, real_slice)) |v| v else |_| return error.InvalidFloat;
                 const imag_len = try reader.readByte();
                 const imag_slice = try reader.readSlice(imag_len);
-                const imag = std.fmt.parseFloat(f64, imag_slice) catch return error.InvalidFloat;
+                const imag = if (std.fmt.parseFloat(f64, imag_slice)) |v| v else |_| return error.InvalidFloat;
                 break :blk .{ .complex = .{ .real = real, .imag = imag } };
             },
             .TYPE_BINARY_COMPLEX => blk: {
@@ -1664,6 +1671,31 @@ test "readTupleStrings rejects non-tuple type" {
     defer module.deinit();
 
     try testing.expectError(error.InvalidObjectType, module.readTupleStrings(&reader));
+}
+
+test "readTupleStrings accepts bytes in TYPE_REF tuple" {
+    const testing = std.testing;
+    const allocator = testing.allocator;
+
+    var module = Module.init(allocator);
+    defer module.deinit();
+
+    const bytes = try allocator.dupe(u8, "abc");
+    const tuple = try allocator.alloc(Object, 1);
+    tuple[0] = .{ .bytes = bytes };
+    try module.refs.append(allocator, .{ .tuple = tuple });
+
+    const data = [_]u8{ 'r', 0, 0, 0, 0 };
+    var reader = BufferReader{ .data = &data };
+
+    const strings = try module.readTupleStrings(&reader);
+    defer {
+        for (strings) |s| allocator.free(s);
+        allocator.free(strings);
+    }
+
+    try testing.expectEqual(@as(usize, 1), strings.len);
+    try testing.expectEqualStrings("abc", strings[0]);
 }
 
 test "readTupleObjects rejects non-tuple type" {
