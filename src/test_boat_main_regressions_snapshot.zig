@@ -13,9 +13,19 @@ fn runSnapshot(
     path: []const u8,
     comptime expected: []const u8,
 ) !void {
+    return runSnapshotWithAlign(src, path, expected, false);
+}
+
+fn runSnapshotWithAlign(
+    comptime src: std.builtin.SourceLocation,
+    path: []const u8,
+    comptime expected: []const u8,
+    align_defs: bool,
+) !void {
     const allocator = testing.allocator;
 
-    var module = pyc.Module.init(allocator);
+    var module: pyc.Module = undefined;
+    module.init(allocator);
     defer module.deinit();
     try module.loadFromFile(path);
 
@@ -27,10 +37,19 @@ fn runSnapshot(
 
     var output: std.ArrayList(u8) = .{};
     defer output.deinit(allocator);
-    try decompile.decompileToSource(allocator, code, version, output.writer(allocator));
+    const opts = decompile.DecompileOptions{ .align_defs = align_defs };
+    try decompile.decompileToSourceWithOptions(allocator, code, version, output.writer(allocator), null, opts);
 
     const oh = OhSnap{};
     try oh.snap(src, expected).expectEqual(output.items);
+}
+
+fn runSnapshotAligned(
+    comptime src: std.builtin.SourceLocation,
+    path: []const u8,
+    comptime expected: []const u8,
+) !void {
+    return runSnapshotWithAlign(src, path, expected, true);
 }
 
 test "snapshot loop guard 3.9" {
@@ -196,7 +215,7 @@ test "snapshot if attr prelude 3.9" {
 }
 
 test "snapshot ternary attr prelude 3.9" {
-    try runSnapshot(@src(), "test/corpus/ternary_attr_prelude.3.9.pyc",
+    try runSnapshotAligned(@src(), "test/corpus/ternary_attr_prelude.3.9.pyc",
         \\[]u8
         \\  "import asyncio
         \\RETRY_MAX = 3
@@ -820,7 +839,7 @@ test "snapshot guard or 3.9" {
 }
 
 test "snapshot guard or return 3.9" {
-    try runSnapshot(@src(), "test/corpus/if_guard_or_return.3.9.pyc",
+    try runSnapshotAligned(@src(), "test/corpus/if_guard_or_return.3.9.pyc",
         \\[]u8
         \\  "import os
         \\
@@ -868,7 +887,7 @@ test "snapshot chained compare and 3.9" {
 }
 
 test "snapshot loop tail guard 3.9" {
-    try runSnapshot(@src(), "test/corpus/loop_tail_guard.3.9.pyc",
+    try runSnapshotAligned(@src(), "test/corpus/loop_tail_guard.3.9.pyc",
         \\[]u8
         \\  "from typing import List
         \\
@@ -889,7 +908,7 @@ test "snapshot loop tail guard 3.9" {
 }
 
 test "snapshot try if merge 3.9" {
-    try runSnapshot(@src(), "test/corpus/try_if_merge.3.9.pyc",
+    try runSnapshotAligned(@src(), "test/corpus/try_if_merge.3.9.pyc",
         \\[]u8
         \\  "def g():
         \\    pass
@@ -911,7 +930,7 @@ test "snapshot try if merge 3.9" {
 }
 
 test "snapshot loop for prelude 3.9" {
-    try runSnapshot(@src(), "test/corpus/loop_for_prelude.3.9.pyc",
+    try runSnapshotAligned(@src(), "test/corpus/loop_for_prelude.3.9.pyc",
         \\[]u8
         \\  "import asyncio
         \\
@@ -956,7 +975,7 @@ test "snapshot loop try break 3.9" {
 }
 
 test "snapshot loop break guard 3.9" {
-    try runSnapshot(@src(), "test/corpus/loop_break_guard.3.9.pyc",
+    try runSnapshotAligned(@src(), "test/corpus/loop_break_guard.3.9.pyc",
         \\[]u8
         \\  "class _Base:
         \\    pass

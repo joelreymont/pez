@@ -38,6 +38,7 @@ pub fn main() !void {
     var trace_decisions = false;
     var trace_stackflow = false;
     var trace_blocks = false;
+    var align_defs = false;
 
     for (args[1..]) |arg| {
         if (std.mem.eql(u8, arg, "-d") or std.mem.eql(u8, arg, "--disasm")) {
@@ -70,6 +71,10 @@ pub fn main() !void {
             trace_stackflow = true;
         } else if (std.mem.eql(u8, arg, "--trace-blocks")) {
             trace_blocks = true;
+        } else if (std.mem.eql(u8, arg, "--no-align-defs")) {
+            align_defs = false;
+        } else if (std.mem.eql(u8, arg, "--align-defs")) {
+            align_defs = true;
         } else if (std.mem.startsWith(u8, arg, "--trace-sim=")) {
             const raw = arg["--trace-sim=".len..];
             trace_sim_block = std.fmt.parseInt(u32, raw, 10) catch {
@@ -105,7 +110,7 @@ pub fn main() !void {
     }
 
     if (filename == null) {
-        try stderr.print("Usage: {s} [-d|--disasm|--cfg|--dump|--test|--golden] [--focus=PATH] [--trace-loop-guards] [--trace-decisions] [--trace-stackflow] [--trace-blocks] [--trace-sim=BLOCK] <file.pyc>\n", .{args[0]});
+        try stderr.print("Usage: {s} [-d|--disasm|--cfg|--dump|--test|--golden] [--focus=PATH] [--trace-loop-guards] [--trace-decisions] [--trace-stackflow] [--trace-blocks] [--trace-sim=BLOCK] [--no-align-defs] <file.pyc>\n", .{args[0]});
         try stderr.print("  -d, --disasm  Disassemble only\n", .{});
         try stderr.print("  --cfg         Dump CFG analysis\n", .{});
         try stderr.print("  --dump[=list] Dump JSON (bytecode,cfg,dom,postdom,loops,patterns,passes)\n", .{});
@@ -116,6 +121,8 @@ pub fn main() !void {
         try stderr.print("  --trace-stackflow  JSONL stack-flow trace to stderr\n", .{});
         try stderr.print("  --trace-blocks  JSONL block-traversal trace to stderr\n", .{});
         try stderr.print("  --trace-sim=BLOCK  JSONL sim trace for block id to stderr\n", .{});
+        try stderr.print("  --align-defs  Pad module output to match firstlineno\n", .{});
+        try stderr.print("  --no-align-defs  Disable def/class line alignment\n", .{});
         try stderr.print("  --test        Run test suite (decompile check)\n", .{});
         try stderr.print("  --golden      Compare with golden .py files\n", .{});
         try stderr.print("  -V, --version Show version\n", .{});
@@ -123,7 +130,8 @@ pub fn main() !void {
         std.process.exit(1);
     }
 
-    var module = pyc.Module.init(allocator);
+    var module: pyc.Module = undefined;
+    module.init(allocator);
     defer module.deinit();
 
     module.loadFromFile(filename.?) catch |err| {
@@ -162,6 +170,7 @@ pub fn main() !void {
                     null;
                 const opts = decompile.DecompileOptions{
                     .focus = focus,
+                    .align_defs = align_defs,
                     .trace_loop_guards = trace_loop_guards,
                     .trace_sim_block = trace_sim_block,
                     .trace_decisions = trace_decisions,
