@@ -181,6 +181,15 @@ pub const StackValue = union(enum) {
             .comp_builder => |b| {
                 b.deinit(ast_alloc, stack_alloc);
             },
+            .type_alias => |e| {
+                if (e.* == .tuple) {
+                    if (e.tuple.elts.len > 0) ast_alloc.free(e.tuple.elts);
+                    ast_alloc.destroy(e);
+                } else {
+                    e.deinit(ast_alloc);
+                    ast_alloc.destroy(e);
+                }
+            },
             // function_obj and class_obj are consumed by decompiler and ownership transfers
             // to arena or they're cleaned up explicitly by the code that creates them
             else => {},
@@ -1488,18 +1497,9 @@ pub const SimContext = struct {
             },
             .function_obj => |func| {
                 // Calling a function object directly (e.g., generic class pattern)
-                // Create a call expression with function name
-                deinitKeywordsOwned(self.allocator, keywords);
-                self.deinitStackValues(args_vals);
                 const name = if (func.code.name.len > 0) func.code.name else "__anon__";
                 const callee = try self.makeName(name, .load);
-                const call_expr = try self.allocator.create(Expr);
-                call_expr.* = .{ .call = .{
-                    .func = callee,
-                    .args = &.{},
-                    .keywords = &.{},
-                } };
-                try self.stack.push(.{ .expr = call_expr });
+                try self.handleCallExpr(callee, args_vals, keywords);
             },
             else => {
                 deinitKeywordsOwned(self.allocator, keywords);
@@ -6557,6 +6557,10 @@ pub const SimContext = struct {
                             .elts = marker_elts,
                             .ctx = .load,
                         } };
+                        if (arg.expr.* == .tuple) {
+                            if (arg.expr.tuple.elts.len > 0) self.allocator.free(arg.expr.tuple.elts);
+                        }
+                        self.allocator.destroy(arg.expr);
                         try self.stack.push(.{ .type_alias = marker });
                     } else {
                         arg.deinit(self.allocator, self.stack_alloc);
@@ -7248,4 +7252,76 @@ test "stack simulation CALL_FUNCTION_KW error clears moved args" {
         else => false,
     };
     try testing.expect(is_expr);
+}
+
+test "stack simulation function_obj call preserves args" {
+    const testing = std.testing;
+    const allocator = testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    var code = pyc.Code{
+        .allocator = allocator,
+        .name = "f",
+    };
+    const version = Version.init(3, 11);
+
+    var ctx = SimContext.init(a, a, &code, version);
+    defer ctx.deinit();
+
+    const func = try a.create(FunctionValue);
+    func.* = .{
+        .code = &code,
+        .decorators = .{},
+    };
+
+    try ctx.stack.push(.null_marker);
+    try ctx.stack.push(.{ .function_obj = func });
+
+    const arg_expr = try ast.makeConstant(a, .{ .int = 1 });
+    try ctx.stack.push(.{ .expr = arg_expr });
+
+    const inst = Instruction{
+        .opcode = .CALL,
+        .arg = 1,
+        .offset = 0,
+        .size = 2,
+        .cache_entries = 0,
+    };
+    try ctx.simulate(inst);
+
+    try testing.expectEqual(@as(usize, 1), ctx.stack.len());
+    const top = ctx.stack.pop().?;
+    try testing.expect(top == .expr);
+
+    var writer = codegen.Writer.init(allocator);
+    defer writer.deinit(allocator);
+    try writer.writeExpr(allocator, top.expr);
+    const output = try writer.getOutput(allocator);
+    defer allocator.free(output);
+
+    try testing.expectEqualStrings("f(1)", output);
+}
+
+test "stack value type_alias deinit is shallow" {
+    const testing = std.testing;
+    const allocator = testing.allocator;
+
+    const name_expr = try ast.makeName(allocator, "T", .load);
+    const value_expr = try ast.makeName(allocator, "U", .load);
+    const elts = try allocator.alloc(*Expr, 2);
+    elts[0] = name_expr;
+    elts[1] = value_expr;
+
+    const marker = try allocator.create(Expr);
+    marker.* = .{ .tuple = .{ .elts = elts, .ctx = .load } };
+
+    var val: StackValue = .{ .type_alias = marker };
+    val.deinit(allocator, allocator);
+
+    name_expr.deinit(allocator);
+    allocator.destroy(name_expr);
+    value_expr.deinit(allocator);
+    allocator.destroy(value_expr);
 }
