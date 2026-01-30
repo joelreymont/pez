@@ -52,11 +52,19 @@ python3 tools/compare/compare_dir.py \
   --out /tmp/compare.json
 ```
 
+External cross-check (decompyle3):
+
+```bash
+gh repo clone rocky/python-decompile3 /tmp/python-decompile3
+(cd /tmp/python-decompile3 && make check)
+```
+
 ## Test Corpora
 
 - **Local corpus** (`test/corpus/`): 93 files, 88 pass (94.6%)
 - **pycdc corpus** (`refs/pycdc/tests/compiled/`): 190 files, 108 pass (56.8%)
 - **boat_main**: 118/118 files decompile to valid Python
+- **decompyle3 suite** (`/tmp/python-decompile3`): `make check` / `remake --tasks`
 
 ## Project Structure
 
