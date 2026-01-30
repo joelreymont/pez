@@ -685,6 +685,7 @@ pub const Decompiler = struct {
             try cond_stack.ensureTotalCapacity(a, cfg.blocks.len);
         }
         decomp.cond_stack = cond_stack;
+        try decomp.pending_ternary.ensureTotalCapacity(a, @intCast(cfg.blocks.len));
 
         try decomp.initStackFlow();
         decomp.if_in_progress = try std.DynamicBitSet.initEmpty(a, cfg.blocks.len);
@@ -800,6 +801,14 @@ pub const Decompiler = struct {
             if (self.isSoftSimErr(err)) return error.PatternNoMatch;
             return err;
         };
+    }
+
+    pub fn simOptOrNull(self: *Decompiler, sim: *SimContext, inst: decoder.Instruction) DecompileError!bool {
+        self.simOpt(sim, inst) catch |err| switch (err) {
+            error.PatternNoMatch => return false,
+            else => return err,
+        };
+        return true;
     }
 
     pub fn popExprMatch(self: *Decompiler, sim: *SimContext) DecompileError!*Expr {
@@ -1930,7 +1939,7 @@ pub const Decompiler = struct {
         var moved: usize = 0;
         errdefer {
             for (values[moved..]) |val| {
-                val.deinit(self.allocator);
+                val.deinit(self.clone_sim.allocator, self.clone_sim.stack_alloc);
             }
         }
 
@@ -2072,6 +2081,7 @@ pub const Decompiler = struct {
     fn buildExcIncoming(
         self: *Decompiler,
         clone_sim: *SimContext,
+        sim_arena: *std.heap.ArenaAllocator,
         entry: cfg_mod.ExceptionEntry,
         start_block: *const BasicBlock,
         entry_stack: ?[]const StackValue,
@@ -2089,9 +2099,7 @@ pub const Decompiler = struct {
             return null;
         }
 
-        var sim_arena = std.heap.ArenaAllocator.init(self.allocator);
-        defer sim_arena.deinit();
-
+        _ = sim_arena.reset(.retain_capacity);
         var sim = self.initSim(sim_arena.allocator(), sim_arena.allocator(), self.code, self.version);
         defer sim.deinit();
         sim.lenient = true;
@@ -2125,6 +2133,7 @@ pub const Decompiler = struct {
         worklist: *std.ArrayListUnmanaged(u32),
         clone_sim: *SimContext,
         update_counts: ?[]u32,
+        sim_arena: *std.heap.ArenaAllocator,
     ) DecompileError!void {
         const block_count: u32 = @intCast(self.cfg.blocks.len);
         var iterations: usize = 0;
@@ -2149,9 +2158,7 @@ pub const Decompiler = struct {
                 try self.writeTrace(ev);
             }
 
-            var sim_arena = std.heap.ArenaAllocator.init(self.allocator);
-            defer sim_arena.deinit();
-
+            _ = sim_arena.reset(.retain_capacity);
             var sim = self.initSim(sim_arena.allocator(), sim_arena.allocator(), self.code, self.version);
             defer sim.deinit();
             sim.lenient = true;
@@ -2300,7 +2307,9 @@ pub const Decompiler = struct {
         clone_sim.stack.allow_underflow = true;
         defer clone_sim.deinit();
 
-        try self.runStackFlow(&worklist, &clone_sim, update_counts);
+        var flow_arena = std.heap.ArenaAllocator.init(self.allocator);
+        defer flow_arena.deinit();
+        try self.runStackFlow(&worklist, &clone_sim, update_counts, &flow_arena);
 
         if (self.cfg.exception_entries.len > 0) {
             var exc_iters: usize = 0;
@@ -2319,7 +2328,7 @@ pub const Decompiler = struct {
                     else
                         null;
 
-                    const incoming_opt = try self.buildExcIncoming(&clone_sim, entry, start_block, entry_stack, handler_block);
+                    const incoming_opt = try self.buildExcIncoming(&clone_sim, &flow_arena, entry, start_block, entry_stack, handler_block);
                     if (incoming_opt == null) continue;
                     const incoming = incoming_opt.?;
                     defer if (incoming.len > 0) self.deinitStackValues(incoming);
@@ -2365,7 +2374,7 @@ pub const Decompiler = struct {
                 }
 
                 if (worklist.items.len > 0) {
-                    try self.runStackFlow(&worklist, &clone_sim, update_counts);
+                        try self.runStackFlow(&worklist, &clone_sim, update_counts, &flow_arena);
                 }
             }
         }
@@ -2393,7 +2402,7 @@ pub const Decompiler = struct {
             seeded_loose = true;
         }
         if (seeded_loose and worklist.items.len > 0) {
-            try self.runStackFlow(&worklist, &clone_sim, update_counts);
+            try self.runStackFlow(&worklist, &clone_sim, update_counts, &flow_arena);
         }
     }
 
@@ -3338,7 +3347,7 @@ pub const Decompiler = struct {
             }
             if (pend_expr) |expr| {
                 const cloned = try ast.cloneExpr(self.arena.allocator(), expr);
-                try self.pendTernPut(block.id, cloned);
+                self.pendTernPut(block.id, cloned);
             }
             for (vals) |val| {
                 const cloned = try sim.cloneStackValue(val);
@@ -5816,7 +5825,7 @@ pub const Decompiler = struct {
             }
             if (ctrl.Analyzer.isConditionalJump(undefined, inst.opcode)) break;
             if (isStatementOpcode(inst.opcode)) return null;
-            self.simOpt(&sim, inst) catch return null;
+            if (!try self.simOptOrNull(&sim, inst)) return null;
         }
 
         const expr = self.popExprMatch(&sim) catch |err| switch (err) {
@@ -6030,7 +6039,7 @@ pub const Decompiler = struct {
                 while (setup_iter.next()) |inst| {
                     if (inst.offset >= gio) break;
                     if (inst.opcode == .RESUME) continue;
-                    self.simOpt(&setup_sim, inst) catch return null;
+                    if (!try self.simOptOrNull(&setup_sim, inst)) return null;
                 }
 
                 // Get the iterator expression from TOS
@@ -6054,7 +6063,7 @@ pub const Decompiler = struct {
         while (iter.next()) |inst| {
             if (inst.offset < sim_start) continue;
             if (inst.offset >= exit_offset) break;
-            self.simOpt(&sim, inst) catch return null;
+            if (!try self.simOptOrNull(&sim, inst)) return null;
         }
 
         const expr = sim.buildInlineCompExpr() catch |err| {
@@ -6423,8 +6432,8 @@ pub const Decompiler = struct {
         return null;
     }
 
-    pub fn pendTernPut(self: *Decompiler, block_id: u32, expr: *Expr) DecompileError!void {
-        try self.pending_ternary.put(self.allocator, block_id, expr);
+    pub fn pendTernPut(self: *Decompiler, block_id: u32, expr: *Expr) void {
+        self.pending_ternary.putAssumeCapacity(block_id, expr);
     }
 
     fn blockNeedsPredecessorSeed(self: *Decompiler, block: *const BasicBlock) bool {
@@ -7359,7 +7368,7 @@ pub const Decompiler = struct {
             sim.stack.allow_underflow = true;
             try sim.stack.push(.unknown);
             for (block.instructions[i..call_idx.?]) |inst| {
-                self.simOpt(&sim, inst) catch return null;
+                if (!try self.simOptOrNull(&sim, inst)) return null;
             }
             msg = self.popExprMatch(&sim) catch |err| switch (err) {
                 error.PatternNoMatch => null,
@@ -11962,9 +11971,12 @@ pub const Decompiler = struct {
                 if (inst.isUnconditionalJump()) {
                     break;
                 }
-                pred_sim.simulate(inst) catch {
-                    ok = false;
-                    break;
+                pred_sim.simulate(inst) catch |err| {
+                    if (self.isSoftSimErr(err)) {
+                        ok = false;
+                        break;
+                    }
+                    return err;
                 };
                 if (inst.isConditionalJump()) break;
             }
@@ -17390,7 +17402,7 @@ pub const Decompiler = struct {
         return stmt;
     }
 
-    fn stripLoopTargetAssigns(self: *Decompiler, block: *const BasicBlock, stmts: *std.ArrayList(*Stmt)) void {
+    fn stripLoopTargetAssigns(self: *Decompiler, block: *const BasicBlock, stmts: *std.ArrayList(*Stmt)) DecompileError!void {
         var names: std.ArrayListUnmanaged([]const u8) = .{};
         defer names.deinit(self.arena.allocator());
         for (block.instructions) |inst| {
@@ -17407,7 +17419,7 @@ pub const Decompiler = struct {
                 },
                 else => continue,
             };
-            names.append(self.arena.allocator(), name) catch break;
+            try names.append(self.arena.allocator(), name);
         }
         while (names.items.len > 0 and stmts.items.len > 0) {
             const stmt = stmts.items[stmts.items.len - 1];
@@ -19226,7 +19238,7 @@ pub const Decompiler = struct {
             }
             if (pend_expr) |expr| {
                 const cloned = try ast.cloneExpr(self.arena.allocator(), expr);
-                try self.pendTernPut(block.id, cloned);
+                self.pendTernPut(block.id, cloned);
             }
             for (vals) |val| {
                 const cloned = try sim.cloneStackValue(val);
@@ -23476,6 +23488,73 @@ test "simulate condition expr returns null on sim error" {
     defer stmts.deinit(allocator);
     try testing.expect((try decompiler.initCondSim(0, &stmts, allocator)) == null);
     try testing.expect((try decompiler.simulateConditionExpr(0, &.{})) == null);
+}
+
+test "simulate condition expr propagates unsupported constant" {
+    const testing = std.testing;
+    const allocator = testing.allocator;
+    const version = Version.init(3, 9);
+
+    const inner_ops = [_]test_utils.OpArg{
+        .{ .op = .LOAD_CONST, .arg = 0 },
+        .{ .op = .RETURN_VALUE, .arg = 0 },
+    };
+    const inner_consts = [_]pyc.Object{.{ .none = {} }};
+    const inner_code = try test_utils.allocCodeFromOps(
+        allocator,
+        version,
+        "inner",
+        &[_][]const u8{},
+        &inner_consts,
+        &inner_ops,
+        0,
+    );
+    var inner_owned = true;
+    errdefer if (inner_owned) {
+        inner_code.deinit();
+        allocator.destroy(inner_code);
+    };
+
+    const tuple_items = try allocator.alloc(pyc.Object, 1);
+    var tuple_owned = true;
+    errdefer if (tuple_owned) allocator.free(tuple_items);
+    tuple_items[0] = .{ .code = inner_code };
+
+    const consts = [_]pyc.Object{
+        .{ .tuple = tuple_items },
+        .{ .none = {} },
+    };
+    const ops = [_]test_utils.OpArg{
+        .{ .op = .JUMP_FORWARD, .arg = 8 },
+        .{ .op = .LOAD_CONST, .arg = 0 },
+        .{ .op = .POP_JUMP_IF_FALSE, .arg = 8 },
+        .{ .op = .LOAD_CONST, .arg = 1 },
+        .{ .op = .RETURN_VALUE, .arg = 0 },
+        .{ .op = .LOAD_CONST, .arg = 1 },
+        .{ .op = .RETURN_VALUE, .arg = 0 },
+    };
+
+    const bytecode = try test_utils.emitOpsOwned(allocator, version, &ops);
+    const code = try test_utils.allocCode(
+        allocator,
+        "bad_const",
+        &[_][]const u8{},
+        &consts,
+        bytecode,
+        0,
+    );
+    inner_owned = false;
+    tuple_owned = false;
+    defer {
+        code.deinit();
+        allocator.destroy(code);
+    }
+
+    var decompiler = try Decompiler.init(allocator, code, version);
+    defer decompiler.deinit();
+
+    const bad_block = decompiler.cfg.blockAtOffset(2) orelse return error.InvalidBlock;
+    try testing.expectError(error.UnsupportedConstant, decompiler.simulateConditionExpr(bad_block, &.{}));
 }
 
 test "condReach uses scratch and finds path" {
