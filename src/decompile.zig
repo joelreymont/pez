@@ -2307,7 +2307,7 @@ pub const Decompiler = struct {
         clone_sim.stack.allow_underflow = true;
         defer clone_sim.deinit();
 
-        var flow_arena = std.heap.ArenaAllocator.init(self.allocator);
+        var flow_arena = std.heap.ArenaAllocator.init(self.base_alloc);
         defer flow_arena.deinit();
         try self.runStackFlow(&worklist, &clone_sim, update_counts, &flow_arena);
 
@@ -2447,15 +2447,16 @@ pub const Decompiler = struct {
         }
         try worklist.append(self.allocator, start);
 
+        var sim_arena = std.heap.ArenaAllocator.init(self.base_alloc);
+        defer sim_arena.deinit();
+
         while (worklist.items.len > 0) {
             const bid = worklist.items[worklist.items.len - 1];
             worklist.items.len -= 1;
 
             const entry = local[@intCast(bid - start)] orelse continue;
 
-            var sim_arena = std.heap.ArenaAllocator.init(self.allocator);
-            defer sim_arena.deinit();
-
+            _ = sim_arena.reset(.retain_capacity);
             var sim = self.initSim(sim_arena.allocator(), sim_arena.allocator(), self.code, self.version);
             defer sim.deinit();
             sim.lenient = true;
@@ -6438,7 +6439,7 @@ pub const Decompiler = struct {
 
     fn blockNeedsPredecessorSeed(self: *Decompiler, block: *const BasicBlock) bool {
         if (block.instructions.len == 0) return false;
-        var arena = std.heap.ArenaAllocator.init(self.allocator);
+        var arena = std.heap.ArenaAllocator.init(self.base_alloc);
         defer arena.deinit();
 
         var sim = self.initSim(arena.allocator(), arena.allocator(), self.code, self.version);
