@@ -6430,14 +6430,8 @@ pub const SimContext = struct {
             },
 
             .MATCH_KEYS => {
-                // Stack effect 0: pop keys tuple, push values tuple or None (subject stays)
-                if (self.stack.pop()) |v| {
-                    var val = v;
-                    val.deinit(self.allocator, self.stack_alloc);
-                } else {
-                    return error.StackUnderflow;
-                }
-                try self.stack.push(.unknown); // values tuple or None
+                // Stack effect +1: push values tuple or None (subject + keys stay)
+                try self.stack.push(.unknown);
             },
 
             .MATCH_CLASS => {
