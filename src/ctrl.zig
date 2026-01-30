@@ -3059,6 +3059,7 @@ test "analyzer init" {
         .block_offsets = @constCast(block_offsets),
         .entry = 0,
         .instructions = &.{},
+        .exception_entries = &.{},
         .version = Version.init(3, 12),
     };
 
@@ -3138,6 +3139,7 @@ test "analyzer loop membership uses dom" {
         .block_offsets = @constCast(block_offsets),
         .entry = 0,
         .instructions = &.{},
+        .exception_entries = &.{},
         .version = version,
     };
 
@@ -3216,6 +3218,7 @@ test "detectWhilePattern rejects internal exit" {
         .block_offsets = @constCast(block_offsets),
         .entry = 0,
         .instructions = &.{},
+        .exception_entries = &.{},
         .version = version,
     };
 
@@ -3240,6 +3243,7 @@ test "isConditionalJump" {
         .block_offsets = @constCast(block_offsets),
         .entry = 0,
         .instructions = &.{},
+        .exception_entries = &.{},
         .version = Version.init(3, 12),
     };
 
@@ -3329,6 +3333,7 @@ test "detectForPattern walks deep predecessor chain" {
         .block_offsets = block_offsets,
         .entry = 0,
         .instructions = instructions,
+        .exception_entries = &.{},
         .version = version,
     };
     defer cfg.deinit();

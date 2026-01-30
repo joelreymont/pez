@@ -264,6 +264,14 @@ const StackFlowTrace = struct {
     worklist: u32,
 };
 
+const StackFlowMismatch = struct {
+    kind: []const u8,
+    pred: u32,
+    succ: u32,
+    existing_len: u32,
+    incoming_len: u32,
+};
+
 const BlockTrace = struct {
     kind: []const u8,
     phase: []const u8,
@@ -364,8 +372,8 @@ pub const Decompiler = struct {
     nested_decompilers: std.ArrayList(*Decompiler),
     /// Next block after chained comparison (set by tryDecompileChainedComparison).
     chained_cmp_next_block: ?u32 = null,
-    /// Pending ternary expression to be consumed by next STORE instruction.
-    pending_ternary_expr: ?*Expr = null,
+    /// Pending ternary expressions keyed by merge block.
+    pending_ternary: std.AutoHashMapUnmanaged(u32, *Expr) = .{},
     /// Pending inline comprehension expressions keyed by exit block.
     inline_pend: std.ArrayListUnmanaged(InlinePend) = .{},
     /// Pending expression for next STORE (boolop merge with conditional).
@@ -484,13 +492,14 @@ pub const Decompiler = struct {
 
     fn saveTernary(
         self: *Decompiler,
+        merge_block: u32,
         condition: *Expr,
         true_expr: *Expr,
         false_expr: *Expr,
         base_vals: []StackValue,
         base_owned: *bool,
     ) DecompileError!void {
-        return ScPass.saveTernary(self, condition, true_expr, false_expr, base_vals, base_owned);
+        return ScPass.saveTernary(self, merge_block, condition, true_expr, false_expr, base_vals, base_owned);
     }
 
     fn findTernaryLeaf(
@@ -693,6 +702,7 @@ pub const Decompiler = struct {
         self.print_items.deinit(self.allocator);
         self.pending_chain_targets.deinit(self.allocator);
         self.inline_pend.deinit(self.allocator);
+        self.pending_ternary.deinit(self.allocator);
         if (self.pending_vals) |vals| {
             self.deinitStackValues(vals);
             self.pending_vals = null;
@@ -785,12 +795,11 @@ pub const Decompiler = struct {
         };
     }
 
-    pub fn simOpt(self: *Decompiler, sim: *SimContext, inst: decoder.Instruction) DecompileError!bool {
+    pub fn simOpt(self: *Decompiler, sim: *SimContext, inst: decoder.Instruction) DecompileError!void {
         sim.simulate(inst) catch |err| {
-            if (self.isSoftSimErr(err)) return false;
+            if (self.isSoftSimErr(err)) return error.PatternNoMatch;
             return err;
         };
-        return true;
     }
 
     pub fn popExprMatch(self: *Decompiler, sim: *SimContext) DecompileError!*Expr {
@@ -1965,6 +1974,34 @@ pub const Decompiler = struct {
         return out;
     }
 
+    fn allocUnknownStack(self: *Decompiler, len: usize) DecompileError![]StackValue {
+        if (len == 0) return &.{};
+        const out = try self.allocator.alloc(StackValue, len);
+        errdefer self.allocator.free(out);
+        for (out) |*slot| slot.* = .unknown;
+        return out;
+    }
+
+    fn cloneStackExtra(
+        self: *Decompiler,
+        sim: *SimContext,
+        values: []const StackValue,
+        extra: usize,
+    ) DecompileError![]StackValue {
+        const total = values.len + extra;
+        if (total == 0) return &.{};
+
+        const out = try self.allocator.alloc(StackValue, total);
+        errdefer self.allocator.free(out);
+
+        for (values, 0..) |val, idx| {
+            out[idx] = try sim.cloneStackValueFlow(val);
+        }
+        for (out[values.len..]) |*slot| slot.* = .unknown;
+
+        return out;
+    }
+
     fn mergeStackEntry(
         self: *Decompiler,
         existing_opt: ?[]StackValue,
@@ -1983,21 +2020,20 @@ pub const Decompiler = struct {
         const existing_len = existing.len;
         const incoming_len = incoming.len;
         if (existing_len == 0 and incoming_len == 0) return null;
+        if (existing_len != incoming_len) return error.InvalidStackDepth;
 
-        const max_len = @max(existing_len, incoming_len);
-        const existing_off = max_len - existing_len;
-        const incoming_off = max_len - incoming_len;
+        const max_len = existing_len;
 
         if (existing_len == max_len) {
             var unchanged = true;
             for (0..max_len) |idx| {
                 const cur = existing[idx];
-                const inc_opt: ?StackValue = if (idx >= incoming_off) incoming[idx - incoming_off] else null;
-                const next: StackValue = if (inc_opt) |inc| blk: {
+                const inc = incoming[idx];
+                const next: StackValue = blk: {
                     if (cur == .unknown) break :blk cur;
                     if (stack_mod.stackValueEqual(cur, inc)) break :blk cur;
                     break :blk .unknown;
-                } else .unknown;
+                };
                 if (!stack_mod.stackValueEqual(cur, next)) {
                     unchanged = false;
                     break;
@@ -2011,17 +2047,8 @@ pub const Decompiler = struct {
         errdefer self.allocator.free(out);
 
         for (0..max_len) |idx| {
-            const cur_opt: ?StackValue = if (idx >= existing_off) existing[idx - existing_off] else null;
-            const inc_opt: ?StackValue = if (idx >= incoming_off) incoming[idx - incoming_off] else null;
-
-            if (cur_opt == null or inc_opt == null) {
-                out[idx] = .unknown;
-                changed = true;
-                continue;
-            }
-
-            const cur = cur_opt.?;
-            const inc = inc_opt.?;
+            const cur = existing[idx];
+            const inc = incoming[idx];
             if (cur == .unknown) {
                 out[idx] = cur;
                 continue;
@@ -2042,49 +2069,66 @@ pub const Decompiler = struct {
         return out;
     }
 
-    fn initStackFlow(self: *Decompiler) DecompileError!void {
-        const block_count: u32 = @intCast(self.cfg.blocks.len);
-        if (block_count == 0) {
-            self.stack_in = &.{};
-            return;
-        }
+    fn buildExcIncoming(
+        self: *Decompiler,
+        clone_sim: *SimContext,
+        entry: cfg_mod.ExceptionEntry,
+        start_block: *const BasicBlock,
+        entry_stack: ?[]const StackValue,
+        handler: *const BasicBlock,
+    ) DecompileError!?[]StackValue {
+        const exc_count = self.excSeedFlow(handler);
+        const extra = exc_count + @as(usize, if (entry.push_lasti) 1 else 0);
+        const has_table = self.version.gte(3, 11) and self.code.exceptiontable.len > 0;
+        const expect_depth: ?usize = if (has_table) @intCast(entry.depth) else null;
 
-        self.stack_in = try self.allocator.alloc(?[]StackValue, block_count);
-        errdefer {
-            for (self.stack_in) |entry_opt| {
-                if (entry_opt) |entry| {
-                    if (entry.len > 0) self.allocator.free(entry);
-                }
+        if (entry_stack == null) {
+            if (expect_depth) |depth| {
+                return try self.allocUnknownStack(depth + extra);
             }
-            self.allocator.free(self.stack_in);
-            self.stack_in = &.{};
-        }
-        for (self.stack_in) |*slot| {
-            slot.* = null;
+            return null;
         }
 
-        var worklist: std.ArrayListUnmanaged(u32) = .{};
-        defer worklist.deinit(self.allocator);
+        var sim_arena = std.heap.ArenaAllocator.init(self.allocator);
+        defer sim_arena.deinit();
 
-        var update_counts: ?[]u32 = null;
-        if (self.trace_stackflow) {
-            update_counts = try self.allocator.alloc(u32, block_count);
-            @memset(update_counts.?, 0);
+        var sim = self.initSim(sim_arena.allocator(), sim_arena.allocator(), self.code, self.version);
+        defer sim.deinit();
+        sim.lenient = true;
+        sim.flow_mode = true;
+        sim.stack.allow_underflow = true;
+
+        for (entry_stack.?) |val| {
+            const cloned = try clone_sim.cloneStackValueFlow(val);
+            try sim.stack.push(cloned);
         }
-        defer {
-            if (update_counts) |counts| self.allocator.free(counts);
+
+        for (start_block.instructions) |inst| {
+            if (inst.offset >= entry.start) break;
+            sim.simulate(inst) catch |err| {
+                if (sim.lenient and (err == error.NotAnExpression or err == error.StackUnderflow or err == error.InvalidStackDepth)) {
+                    return error.InvalidStackDepth;
+                }
+                return err;
+            };
         }
 
-        self.stack_in[0] = &.{};
-        try worklist.append(self.allocator, 0);
+        if (expect_depth) |depth| {
+            if (sim.stack.items.items.len != depth) return error.InvalidStackDepth;
+        }
 
-        var clone_sim = self.initSim(self.arena.allocator(), self.arena.allocator(), self.code, self.version);
-        clone_sim.flow_mode = true;
-        clone_sim.stack.allow_underflow = true;
-        defer clone_sim.deinit();
+        return try self.cloneStackExtra(clone_sim, sim.stack.items.items, extra);
+    }
 
+    fn runStackFlow(
+        self: *Decompiler,
+        worklist: *std.ArrayListUnmanaged(u32),
+        clone_sim: *SimContext,
+        update_counts: ?[]u32,
+    ) DecompileError!void {
+        const block_count: u32 = @intCast(self.cfg.blocks.len);
         var iterations: usize = 0;
-        const max_iterations: usize = block_count * 100; // Limit iterations to prevent infinite loops
+        const max_iterations: usize = @as(usize, block_count) * 100;
         while (worklist.items.len > 0) {
             iterations += 1;
             if (iterations > max_iterations) break;
@@ -2132,13 +2176,13 @@ pub const Decompiler = struct {
             }
             if (simulate_failed) continue;
 
-            const exit = try self.cloneStackValuesArenaFlow(&clone_sim, sim.stack.items.items);
+            const exit = try self.cloneStackValuesArenaFlow(clone_sim, sim.stack.items.items);
             defer if (exit.len > 0) self.allocator.free(exit);
             const term = block.terminator();
             for (block.successors) |edge| {
-                if (edge.edge_type == .exception) continue;
                 const succ = edge.target;
                 if (succ >= block_count) continue;
+                if (edge.edge_type == .exception) continue;
                 if (self.cfg.blocks[succ].is_exception_handler) continue;
 
                 var incoming = exit;
@@ -2168,7 +2212,22 @@ pub const Decompiler = struct {
                     else => {},
                 };
 
-                const merged = try self.mergeStackEntry(self.stack_in[succ], incoming, &clone_sim, true);
+                if (self.stack_in[succ]) |existing| {
+                    if (existing.len != incoming.len) {
+                        if (self.trace_stackflow and self.trace_file != null) {
+                            const ev = StackFlowMismatch{
+                                .kind = "stackflow_mismatch",
+                                .pred = bid,
+                                .succ = succ,
+                                .existing_len = @intCast(existing.len),
+                                .incoming_len = @intCast(incoming.len),
+                            };
+                            try self.writeTrace(ev);
+                        }
+                        return error.InvalidStackDepth;
+                    }
+                }
+                const merged = try self.mergeStackEntry(self.stack_in[succ], incoming, clone_sim, true);
                 if (merged) |new_entry| {
                     if (self.stack_in[succ]) |old| {
                         if (old.len > 0) self.allocator.free(old);
@@ -2189,6 +2248,152 @@ pub const Decompiler = struct {
                     try worklist.append(self.allocator, succ);
                 }
             }
+        }
+    }
+
+    fn initStackFlow(self: *Decompiler) DecompileError!void {
+        const block_count: u32 = @intCast(self.cfg.blocks.len);
+        if (block_count == 0) {
+            self.stack_in = &.{};
+            return;
+        }
+
+        self.stack_in = try self.allocator.alloc(?[]StackValue, block_count);
+        errdefer {
+            for (self.stack_in) |entry_opt| {
+                if (entry_opt) |entry| {
+                    if (entry.len > 0) self.allocator.free(entry);
+                }
+            }
+            self.allocator.free(self.stack_in);
+            self.stack_in = &.{};
+        }
+        for (self.stack_in) |*slot| {
+            slot.* = null;
+        }
+
+        var worklist: std.ArrayListUnmanaged(u32) = .{};
+        defer worklist.deinit(self.allocator);
+
+        var update_counts: ?[]u32 = null;
+        if (self.trace_stackflow) {
+            update_counts = try self.allocator.alloc(u32, block_count);
+            @memset(update_counts.?, 0);
+        }
+        defer {
+            if (update_counts) |counts| self.allocator.free(counts);
+        }
+
+        if (self.stack_in[0]) |old| {
+            if (old.len > 0) self.allocator.free(old);
+        }
+        const entry_exc = self.excSeedFlow(&self.cfg.blocks[0]);
+        if (entry_exc > 0) {
+            self.stack_in[0] = try self.allocUnknownStack(entry_exc);
+        } else {
+            self.stack_in[0] = &.{};
+        }
+        try worklist.append(self.allocator, 0);
+
+        var clone_sim = self.initSim(self.arena.allocator(), self.arena.allocator(), self.code, self.version);
+        clone_sim.flow_mode = true;
+        clone_sim.stack.allow_underflow = true;
+        defer clone_sim.deinit();
+
+        try self.runStackFlow(&worklist, &clone_sim, update_counts);
+
+        if (self.cfg.exception_entries.len > 0) {
+            var exc_iters: usize = 0;
+            const max_exc_iters: usize = @as(usize, block_count) * 100;
+            var changed = true;
+            while (changed) {
+                exc_iters += 1;
+                if (exc_iters > max_exc_iters) return error.InvalidStackDepth;
+                changed = false;
+
+                for (self.cfg.exception_entries) |entry| {
+                    const handler_block = self.cfg.blockContaining(entry.target) orelse continue;
+                    const start_block = self.cfg.blockContaining(entry.start) orelse continue;
+                    const entry_stack = if (start_block.id < self.stack_in.len)
+                        self.stack_in[start_block.id]
+                    else
+                        null;
+
+                    const incoming_opt = try self.buildExcIncoming(&clone_sim, entry, start_block, entry_stack, handler_block);
+                    if (incoming_opt == null) continue;
+                    const incoming = incoming_opt.?;
+                    defer if (incoming.len > 0) self.deinitStackValues(incoming);
+
+                    const hid = handler_block.id;
+                    if (self.stack_in[hid]) |existing| {
+                        if (existing.len != incoming.len) {
+                            if (self.trace_stackflow and self.trace_file != null) {
+                                const ev = StackFlowMismatch{
+                                    .kind = "stackflow_mismatch",
+                                    .pred = start_block.id,
+                                    .succ = hid,
+                                    .existing_len = @intCast(existing.len),
+                                    .incoming_len = @intCast(incoming.len),
+                                };
+                                try self.writeTrace(ev);
+                            }
+                            return error.InvalidStackDepth;
+                        }
+                    }
+
+                    const merged = try self.mergeStackEntry(self.stack_in[hid], incoming, &clone_sim, true);
+                    if (merged) |new_entry| {
+                        if (self.stack_in[hid]) |old| {
+                            if (old.len > 0) self.allocator.free(old);
+                        }
+                        self.stack_in[hid] = new_entry;
+                        if (self.trace_stackflow and update_counts != null and self.trace_file != null) {
+                            const counts = update_counts.?;
+                            counts[hid] +|= 1;
+                            const ev = StackFlowTrace{
+                                .kind = "stackflow_update",
+                                .block = hid,
+                                .stack_len = @intCast(new_entry.len),
+                                .updates = counts[hid],
+                                .worklist = @intCast(worklist.items.len),
+                            };
+                            try self.writeTrace(ev);
+                        }
+                        try worklist.append(self.allocator, hid);
+                        changed = true;
+                    }
+                }
+
+                if (worklist.items.len > 0) {
+                    try self.runStackFlow(&worklist, &clone_sim, update_counts);
+                }
+            }
+        }
+
+        var seeded_loose = false;
+        for (self.cfg.blocks) |*block| {
+            const exc_count = self.excSeedFlow(block);
+            if (exc_count == 0) continue;
+            const bid = block.id;
+            if (self.stack_in[bid] != null) continue;
+            self.stack_in[bid] = try self.allocUnknownStack(exc_count);
+            if (self.trace_stackflow and update_counts != null and self.trace_file != null) {
+                const counts = update_counts.?;
+                counts[bid] +|= 1;
+                const ev = StackFlowTrace{
+                    .kind = "stackflow_update",
+                    .block = bid,
+                    .stack_len = @intCast(exc_count),
+                    .updates = counts[bid],
+                    .worklist = @intCast(worklist.items.len),
+                };
+                try self.writeTrace(ev);
+            }
+            try worklist.append(self.allocator, bid);
+            seeded_loose = true;
+        }
+        if (seeded_loose and worklist.items.len > 0) {
+            try self.runStackFlow(&worklist, &clone_sim, update_counts);
         }
     }
 
@@ -2302,6 +2507,21 @@ pub const Decompiler = struct {
                 };
 
                 const idx: usize = @intCast(succ - start);
+                if (local[idx]) |existing| {
+                    if (existing.len != incoming.len) {
+                        if (self.trace_stackflow and self.trace_file != null) {
+                            const ev = StackFlowMismatch{
+                                .kind = "stackflow_mismatch",
+                                .pred = bid,
+                                .succ = succ,
+                                .existing_len = @intCast(existing.len),
+                                .incoming_len = @intCast(incoming.len),
+                            };
+                            try self.writeTrace(ev);
+                        }
+                        return error.InvalidStackDepth;
+                    }
+                }
                 const merged = try self.mergeStackEntry(local[idx], incoming, &clone_sim, true);
                 if (merged) |new_entry| {
                     if (local[idx]) |old| {
@@ -3110,14 +3330,15 @@ pub const Decompiler = struct {
         // For inline comprehensions (Python 3.12+), we need to skip cleanup ops
         // before pushing the expression: END_FOR, POP_TOP, SWAP, STORE_FAST (loop var restore)
         var extra_skip: usize = 0;
+        const pend_expr = self.pendTernPeek(block.id);
         if (self.pending_vals) |vals| {
             if (self.pending_store_expr) |expr| {
                 const cloned = try ast.cloneExpr(self.arena.allocator(), expr);
                 self.pending_store_expr = cloned;
             }
-            if (self.pending_ternary_expr) |expr| {
+            if (pend_expr) |expr| {
                 const cloned = try ast.cloneExpr(self.arena.allocator(), expr);
-                self.pending_ternary_expr = cloned;
+                try self.pendTernPut(block.id, cloned);
             }
             for (vals) |val| {
                 const cloned = try sim.cloneStackValue(val);
@@ -3131,15 +3352,15 @@ pub const Decompiler = struct {
             self.pending_store_expr = null;
         }
         const has_inline = self.hasInlinePend(block.id);
-        if (has_inline or self.pending_ternary_expr != null) {
+        const has_pend = self.pendTernPeek(block.id) != null;
+        if (has_inline or has_pend) {
             extra_skip = inlineCleanupSkip(block, skip_first);
         }
         if (has_inline) {
             try self.pushInlinePend(block.id, sim);
         }
-        if (self.pending_ternary_expr) |expr| {
+        if (self.pendTernTake(block.id)) |expr| {
             try sim.stack.push(.{ .expr = expr });
-            self.pending_ternary_expr = null;
         }
         if (sim.stack.len() == 0) {
             sim.lenient = true;
@@ -3207,13 +3428,13 @@ pub const Decompiler = struct {
                 .STORE_NAME, .STORE_FAST, .STORE_GLOBAL, .STORE_DEREF => {
                     if (skip_store_count > 0) {
                         skip_store_count -= 1;
-                        const val = sim.stack.pop() orelse StackValue.unknown;
+                        const val = sim.stack.pop() orelse return error.StackUnderflow;
                         val.deinit(sim.allocator, sim.stack_alloc);
                         continue;
                     }
                     if (skip_first_store) {
                         skip_first_store = false;
-                        const val = sim.stack.pop() orelse StackValue.unknown;
+                        const val = sim.stack.pop() orelse return error.StackUnderflow;
                         val.deinit(sim.allocator, sim.stack_alloc);
                         continue;
                     }
@@ -3383,7 +3604,7 @@ pub const Decompiler = struct {
 
                             if (is_walrus) {
                                 // Pop the copied value (what STORE_* would consume)
-                                const copied = sim.stack.pop() orelse StackValue.unknown;
+                                const copied = sim.stack.pop() orelse return error.StackUnderflow;
                                 const val_expr = switch (copied) {
                                     .expr => |e| e,
                                     else => blk: {
@@ -5595,7 +5816,7 @@ pub const Decompiler = struct {
             }
             if (ctrl.Analyzer.isConditionalJump(undefined, inst.opcode)) break;
             if (isStatementOpcode(inst.opcode)) return null;
-            if (!try self.simOpt(&sim, inst)) return null;
+            self.simOpt(&sim, inst) catch return null;
         }
 
         const expr = self.popExprMatch(&sim) catch |err| switch (err) {
@@ -5809,7 +6030,7 @@ pub const Decompiler = struct {
                 while (setup_iter.next()) |inst| {
                     if (inst.offset >= gio) break;
                     if (inst.opcode == .RESUME) continue;
-                    if (!try self.simOpt(&setup_sim, inst)) return null;
+                    self.simOpt(&setup_sim, inst) catch return null;
                 }
 
                 // Get the iterator expression from TOS
@@ -5833,7 +6054,7 @@ pub const Decompiler = struct {
         while (iter.next()) |inst| {
             if (inst.offset < sim_start) continue;
             if (inst.offset >= exit_offset) break;
-            if (!try self.simOpt(&sim, inst)) return null;
+            self.simOpt(&sim, inst) catch return null;
         }
 
         const expr = sim.buildInlineCompExpr() catch |err| {
@@ -6186,6 +6407,26 @@ pub const Decompiler = struct {
         return true;
     }
 
+    pub fn pendTernHas(self: *Decompiler) bool {
+        return self.pending_ternary.count() > 0;
+    }
+
+    pub fn pendTernPeek(self: *Decompiler, block_id: u32) ?*Expr {
+        return self.pending_ternary.get(block_id);
+    }
+
+    pub fn pendTernTake(self: *Decompiler, block_id: u32) ?*Expr {
+        if (self.pending_ternary.get(block_id)) |expr| {
+            _ = self.pending_ternary.remove(block_id);
+            return expr;
+        }
+        return null;
+    }
+
+    pub fn pendTernPut(self: *Decompiler, block_id: u32, expr: *Expr) DecompileError!void {
+        try self.pending_ternary.put(self.allocator, block_id, expr);
+    }
+
     fn blockNeedsPredecessorSeed(self: *Decompiler, block: *const BasicBlock) bool {
         if (block.instructions.len == 0) return false;
         var arena = std.heap.ArenaAllocator.init(self.allocator);
@@ -6216,38 +6457,103 @@ pub const Decompiler = struct {
         sim.lenient = true;
         sim.stack.allow_underflow = true;
 
-        // Recursively find the chain of fall-through predecessors
-        // and simulate them to build up stack state.
+        const PredStep = struct { pred: u32, edge: cfg_mod.Edge };
+        var chain: std.ArrayListUnmanaged(PredStep) = .{};
+        defer chain.deinit(self.allocator);
+
+        var seen = try std.DynamicBitSet.initEmpty(self.allocator, self.cfg.blocks.len);
+        defer seen.deinit();
+
+        // Walk a unique non-exception predecessor chain.
         var cur_id = block_id;
-        var to_simulate: [16]u32 = undefined;
-        var sim_count: usize = 0;
-        while (sim_count < to_simulate.len) {
-            var found_pred: ?u32 = null;
+        var seed_block = block_id;
+        while (cur_id < self.cfg.blocks.len) {
+            if (seen.isSet(cur_id)) return error.InvalidStackDepth;
+            seen.set(cur_id);
+
             const cur_block = &self.cfg.blocks[cur_id];
-            for (cur_block.predecessors) |pred_id| {
-                if (pred_id < cur_id) {
-                    found_pred = pred_id;
-                    break;
+            var found: ?PredStep = null;
+            var multiple = false;
+            pred_scan: for (cur_block.predecessors) |pred_id| {
+                if (pred_id >= self.cfg.blocks.len) continue;
+                const pred = &self.cfg.blocks[pred_id];
+                for (pred.successors) |edge| {
+                    if (edge.target != cur_id) continue;
+                    if (edge.edge_type == .exception or edge.edge_type == .loop_back) continue;
+                    if (found != null) {
+                        multiple = true;
+                        break :pred_scan;
+                    }
+                    found = .{ .pred = pred_id, .edge = edge };
                 }
             }
-            if (found_pred) |pid| {
-                to_simulate[sim_count] = pid;
-                sim_count += 1;
-                cur_id = pid;
-            } else break;
+
+            if (multiple) {
+                seed_block = cur_id;
+                break;
+            }
+            if (found) |step| {
+                try chain.append(self.allocator, step);
+                cur_id = step.pred;
+                continue;
+            }
+            seed_block = cur_id;
+            break;
         }
 
-        // Simulate from oldest predecessor to newest.
-        var i = sim_count;
+        if (chain.items.len == 0) {
+            if (seed_block < self.stack_in.len) {
+                if (self.stack_in[seed_block]) |entry| {
+                    for (entry) |val| {
+                        const cloned = try sim.cloneStackValue(val);
+                        try sim.stack.push(cloned);
+                    }
+                }
+            }
+            return;
+        }
+
+        // Seed with known entry stack for the oldest predecessor.
+        if (seed_block < self.stack_in.len) {
+            if (self.stack_in[seed_block]) |entry| {
+                for (entry) |val| {
+                    const cloned = try sim.cloneStackValue(val);
+                    try sim.stack.push(cloned);
+                }
+            }
+        }
+
+        // Simulate from oldest predecessor to newest, applying edge-specific stack adjustments.
+        var i = chain.items.len;
         while (i > 0) {
             i -= 1;
-            const pred = &self.cfg.blocks[to_simulate[i]];
+            const step = chain.items[i];
+            const pred = &self.cfg.blocks[step.pred];
             for (pred.instructions) |inst| {
                 if (inst.opcode == .NOT_TAKEN) continue;
                 if (inst.isUnconditionalJump()) break;
                 try sim.simulate(inst);
                 if (inst.isConditionalJump()) break;
             }
+            if (pred.terminator()) |term| switch (term.opcode) {
+                .FOR_ITER => {
+                    if (step.edge.edge_type == .conditional_false and !self.version.gte(3, 12)) {
+                        _ = sim.stack.pop() orelse return error.StackUnderflow;
+                        _ = sim.stack.pop() orelse return error.StackUnderflow;
+                    }
+                },
+                .JUMP_IF_TRUE_OR_POP => {
+                    if (step.edge.edge_type == .conditional_false) {
+                        _ = sim.stack.pop() orelse return error.StackUnderflow;
+                    }
+                },
+                .JUMP_IF_FALSE_OR_POP => {
+                    if (step.edge.edge_type == .conditional_true) {
+                        _ = sim.stack.pop() orelse return error.StackUnderflow;
+                    }
+                },
+                else => {},
+            };
         }
     }
 
@@ -7053,7 +7359,7 @@ pub const Decompiler = struct {
             sim.stack.allow_underflow = true;
             try sim.stack.push(.unknown);
             for (block.instructions[i..call_idx.?]) |inst| {
-                if (!try self.simOpt(&sim, inst)) return null;
+                self.simOpt(&sim, inst) catch return null;
             }
             msg = self.popExprMatch(&sim) catch |err| switch (err) {
                 error.PatternNoMatch => null,
@@ -7320,7 +7626,7 @@ pub const Decompiler = struct {
                     }
 
                     if (is_walrus) {
-                        const copied = sim.stack.pop() orelse StackValue.unknown;
+                        const copied = sim.stack.pop() orelse return error.StackUnderflow;
                         if (copied == .expr) {
                             const expr = copied.expr;
                             const name = switch (inst.opcode) {
@@ -9352,7 +9658,7 @@ pub const Decompiler = struct {
                     }
 
                     if (is_walrus) {
-                        const copied = sim.stack.pop() orelse StackValue.unknown;
+                        const copied = sim.stack.pop() orelse return error.StackUnderflow;
                         if (copied == .expr) {
                             const expr = copied.expr;
                             const name = switch (inst.opcode) {
@@ -15380,7 +15686,18 @@ pub const Decompiler = struct {
             // Find body end by scanning forward for POP_EXCEPT
             var handler_end_block = body_block + 1;
             var scan_block = body_block;
-            while (scan_block < self.cfg.blocks.len) {
+            var scan_limit: u32 = @intCast(self.cfg.blocks.len);
+            if (pattern.exit_block) |exit_id| {
+                if (exit_id < scan_limit) scan_limit = exit_id;
+            }
+            if (pattern.finally_block) |final_id| {
+                if (final_id < scan_limit) scan_limit = final_id;
+            }
+            if (next_handler_block) |next_id| {
+                if (next_id < scan_limit) scan_limit = next_id;
+            }
+            if (scan_limit <= body_block) scan_limit = body_block + 1;
+            while (scan_block < scan_limit) {
                 const scan_blk = &self.cfg.blocks[scan_block];
                 var found_pop_except = false;
                 for (scan_blk.instructions) |inst| {
@@ -15394,7 +15711,6 @@ pub const Decompiler = struct {
                     break;
                 }
                 scan_block += 1;
-                if (scan_block > body_block + 10) break; // Safety limit
             }
 
             // Decompile handler body (seed exception stack for handler context)
@@ -16640,6 +16956,14 @@ pub const Decompiler = struct {
         return 3;
     }
 
+    fn excSeedFlow(self: *Decompiler, block: *const BasicBlock) usize {
+        for (block.instructions) |inst| {
+            if (inst.opcode == .WITH_EXCEPT_START) return 4;
+        }
+        if (block.is_exception_handler or self.hasExceptionHandlerOpcodes(block)) return 3;
+        return 0;
+    }
+
     fn emitForPrelude(
         self: *Decompiler,
         pattern: ctrl.ForPattern,
@@ -17067,8 +17391,8 @@ pub const Decompiler = struct {
     }
 
     fn stripLoopTargetAssigns(self: *Decompiler, block: *const BasicBlock, stmts: *std.ArrayList(*Stmt)) void {
-        var names: [8][]const u8 = undefined;
-        var count: usize = 0;
+        var names: std.ArrayListUnmanaged([]const u8) = .{};
+        defer names.deinit(self.arena.allocator());
         for (block.instructions) |inst| {
             if (ctrl.Analyzer.isConditionalJump(undefined, inst.opcode)) break;
             if (inst.opcode == .JUMP_BACKWARD or inst.opcode == .JUMP_BACKWARD_NO_INTERRUPT) break;
@@ -17083,21 +17407,18 @@ pub const Decompiler = struct {
                 },
                 else => continue,
             };
-            if (count < names.len) {
-                names[count] = name;
-                count += 1;
-            }
+            names.append(self.arena.allocator(), name) catch break;
         }
-        while (count > 0 and stmts.items.len > 0) {
+        while (names.items.len > 0 and stmts.items.len > 0) {
             const stmt = stmts.items[stmts.items.len - 1];
             if (stmt.* != .assign) break;
             if (stmt.assign.targets.len != 1) break;
             const tgt = stmt.assign.targets[0];
             if (tgt.* != .name) break;
             if (stmt.assign.value.* != .constant or stmt.assign.value.constant != .ellipsis) break;
-            if (!std.mem.eql(u8, tgt.name.id, names[count - 1])) break;
+            if (!std.mem.eql(u8, tgt.name.id, names.items[names.items.len - 1])) break;
             stmts.items.len -= 1;
-            count -= 1;
+            names.items.len -= 1;
         }
     }
 
@@ -18555,38 +18876,12 @@ pub const Decompiler = struct {
         if (has_inline) {
             try self.pushInlinePend(block_id, &sim);
         }
-        if (self.pending_ternary_expr) |expr| {
+        if (self.pendTernTake(block_id)) |expr| {
             try sim.stack.push(.{ .expr = expr });
-            self.pending_ternary_expr = null;
         }
 
         if (sim.stack.len() == 0 and self.needsPredecessorSeed(block)) {
-            var cur_id = block.id;
-            var to_simulate: [16]u32 = undefined;
-            var sim_count: usize = 0;
-            while (sim_count < 16) {
-                var found_pred: ?u32 = null;
-                const cur_block = &self.cfg.blocks[cur_id];
-                for (cur_block.predecessors) |pred_id| {
-                    if (pred_id < cur_id) {
-                        found_pred = pred_id;
-                        break;
-                    }
-                }
-                if (found_pred) |pid| {
-                    to_simulate[sim_count] = pid;
-                    sim_count += 1;
-                    cur_id = pid;
-                } else break;
-            }
-            var i: usize = sim_count;
-            while (i > 0) {
-                i -= 1;
-                const pred = &self.cfg.blocks[to_simulate[i]];
-                for (pred.instructions) |inst| {
-                    try sim.simulate(inst);
-                }
-            }
+            try self.seedFromPredecessors(block.id, &sim);
         }
 
         if (sim.stack.len() == 0) {
@@ -18709,13 +19004,13 @@ pub const Decompiler = struct {
                 .STORE_FAST, .STORE_NAME, .STORE_GLOBAL, .STORE_DEREF => {
                     if (skip_store_count > 0) {
                         skip_store_count -= 1;
-                        const val = sim.stack.pop() orelse StackValue.unknown;
+                        const val = sim.stack.pop() orelse return error.StackUnderflow;
                         val.deinit(sim.allocator, sim.stack_alloc);
                         continue;
                     }
                     if (skip_first_store.*) {
                         skip_first_store.* = false;
-                        const val = sim.stack.pop() orelse StackValue.unknown;
+                        const val = sim.stack.pop() orelse return error.StackUnderflow;
                         val.deinit(sim.allocator, sim.stack_alloc);
                         continue;
                     }
@@ -18732,7 +19027,7 @@ pub const Decompiler = struct {
                         idx = chain_idx;
                         continue;
                     }
-                    var value = sim.stack.pop() orelse StackValue.unknown;
+                    var value = sim.stack.pop() orelse return error.StackUnderflow;
                     if (value == .unknown or value == .null_marker) {
                         const real_idx = skip_first + idx;
                         if (try self.tryRecoverTernaryStore(block_id, real_idx)) |expr| {
@@ -18921,41 +19216,17 @@ pub const Decompiler = struct {
             }
         }
         if (sim.stack.len() == 0 and self.needsPredecessorSeed(block)) {
-            var cur_id = block.id;
-            var to_simulate: [16]u32 = undefined;
-            var sim_count: usize = 0;
-            while (sim_count < 16) {
-                var found_pred: ?u32 = null;
-                const cur_block = &self.cfg.blocks[cur_id];
-                for (cur_block.predecessors) |pred_id| {
-                    if (pred_id < cur_id) {
-                        found_pred = pred_id;
-                        break;
-                    }
-                }
-                if (found_pred) |pid| {
-                    to_simulate[sim_count] = pid;
-                    sim_count += 1;
-                    cur_id = pid;
-                } else break;
-            }
-            var i: usize = sim_count;
-            while (i > 0) {
-                i -= 1;
-                const pred = &self.cfg.blocks[to_simulate[i]];
-                for (pred.instructions) |inst| {
-                    try sim.simulate(inst);
-                }
-            }
+            try self.seedFromPredecessors(block.id, &sim);
         }
+        const pend_expr = self.pendTernPeek(block.id);
         if (self.pending_vals) |vals| {
             if (self.pending_store_expr) |expr| {
                 const cloned = try ast.cloneExpr(self.arena.allocator(), expr);
                 self.pending_store_expr = cloned;
             }
-            if (self.pending_ternary_expr) |expr| {
+            if (pend_expr) |expr| {
                 const cloned = try ast.cloneExpr(self.arena.allocator(), expr);
-                self.pending_ternary_expr = cloned;
+                try self.pendTernPut(block.id, cloned);
             }
             for (vals) |val| {
                 const cloned = try sim.cloneStackValue(val);
@@ -18968,9 +19239,8 @@ pub const Decompiler = struct {
             try sim.stack.push(.{ .expr = expr });
             self.pending_store_expr = null;
         }
-        if (self.pending_ternary_expr) |expr| {
+        if (self.pendTernTake(block.id)) |expr| {
             try sim.stack.push(.{ .expr = expr });
-            self.pending_ternary_expr = null;
         }
 
         const instructions = block.instructions;
@@ -19025,7 +19295,7 @@ pub const Decompiler = struct {
                 .STORE_FAST, .STORE_NAME, .STORE_GLOBAL, .STORE_DEREF => {
                     if (skip_store_count > 0) {
                         skip_store_count -= 1;
-                        const val = sim.stack.pop() orelse StackValue.unknown;
+                        const val = sim.stack.pop() orelse return error.StackUnderflow;
                         val.deinit(sim.allocator, sim.stack_alloc);
                         continue;
                     }
@@ -19099,7 +19369,7 @@ pub const Decompiler = struct {
                         }
 
                         if (is_walrus) {
-                            const copied = sim.stack.pop() orelse StackValue.unknown;
+                            const copied = sim.stack.pop() orelse return error.StackUnderflow;
                             const val_expr = switch (copied) {
                                 .expr => |e| e,
                                 else => blk: {
@@ -21308,6 +21578,16 @@ pub const Decompiler = struct {
         return sim;
     }
 
+    fn childOptions(self: *const Decompiler) DecompileOptions {
+        return .{
+            .trace_loop_guards = self.trace_loop_guards,
+            .trace_decisions = self.trace_decisions,
+            .trace_stackflow = self.trace_stackflow,
+            .trace_blocks = self.trace_blocks,
+            .trace_file = self.trace_file,
+        };
+    }
+
     fn decompileNestedBody(self: *Decompiler, code: *const pyc.Code) DecompileError![]const *Stmt {
         return self.decompileNestedBodyWithClass(code, self.class_name);
     }
@@ -21316,7 +21596,7 @@ pub const Decompiler = struct {
         const nested_ptr = try self.allocator.create(Decompiler);
         errdefer self.allocator.destroy(nested_ptr);
 
-        nested_ptr.* = try Decompiler.init(self.allocator, code, self.version);
+        nested_ptr.* = try Decompiler.initWithOptions(self.allocator, code, self.version, self.childOptions());
         errdefer nested_ptr.deinit();
         nested_ptr.class_name = class_name;
         nested_ptr.clone_sim.class_name = class_name;
@@ -23245,12 +23525,16 @@ test "exception seed handles JUMP_IF_NOT_EXC_MATCH" {
     const ops = [_]test_utils.OpArg{
         .{ .op = .DUP_TOP, .arg = 0 },
         .{ .op = .LOAD_GLOBAL, .arg = 0 },
-        .{ .op = .JUMP_IF_NOT_EXC_MATCH, .arg = 14 },
+        .{ .op = .JUMP_IF_NOT_EXC_MATCH, .arg = 16 },
         .{ .op = .POP_TOP, .arg = 0 },
         .{ .op = .STORE_FAST, .arg = 0 },
         .{ .op = .POP_TOP, .arg = 0 },
         .{ .op = .LOAD_CONST, .arg = 0 },
         .{ .op = .RETURN_VALUE, .arg = 0 },
+        .{ .op = .POP_TOP, .arg = 0 },
+        .{ .op = .POP_TOP, .arg = 0 },
+        .{ .op = .POP_TOP, .arg = 0 },
+        .{ .op = .RERAISE, .arg = 0 },
     };
 
     const bytecode = try test_utils.emitOpsOwned(allocator, version, &ops);

@@ -286,6 +286,7 @@ test "dominator simple" {
         .block_offsets = @constCast(block_offsets),
         .entry = 0,
         .instructions = &.{},
+        .exception_entries = &.{},
         .version = version,
     };
 
@@ -360,6 +361,7 @@ test "dominator unreachable block" {
         .block_offsets = @constCast(block_offsets),
         .entry = 0,
         .instructions = &.{},
+        .exception_entries = &.{},
         .version = version,
     };
 
@@ -422,6 +424,7 @@ test "dominator with loop" {
         .block_offsets = @constCast(block_offsets),
         .entry = 0,
         .instructions = &.{},
+        .exception_entries = &.{},
         .version = version,
     };
 

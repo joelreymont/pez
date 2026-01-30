@@ -1,10 +1,10 @@
 const std = @import("std");
 const opcodes = @import("opcodes.zig");
 const decoder = @import("decoder.zig");
-const pyc = @import("pyc.zig");
+pub const pyc = @import("pyc.zig");
 const stack = @import("stack.zig");
 const codegen = @import("codegen.zig");
-const decompile = @import("decompile.zig");
+pub const decompile = @import("decompile.zig");
 
 pub const Allocator = std.mem.Allocator;
 pub const Version = opcodes.Version;

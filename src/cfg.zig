@@ -77,6 +77,8 @@ pub const CFG = struct {
     entry: u32,
     /// All instructions in order.
     instructions: []Instruction,
+    /// Exception table entries (legacy or 3.11+), owned by CFG when non-empty.
+    exception_entries: []const ExceptionEntry,
     /// Python version for jump target calculation.
     version: Version,
 
@@ -88,6 +90,7 @@ pub const CFG = struct {
         if (self.blocks.len > 0) self.allocator.free(self.blocks);
         if (self.block_offsets.len > 0) self.allocator.free(self.block_offsets);
         if (self.instructions.len > 0) self.allocator.free(self.instructions);
+        if (self.exception_entries.len > 0) self.allocator.free(@constCast(self.exception_entries));
     }
 
     /// Get block by id.
@@ -454,8 +457,8 @@ fn buildCFGWithLeaders(
     if (use_legacy) {
         legacy_entries = try collectLegacyExceptionEntries(allocator, instructions, version);
     }
-    defer {
-        if (legacy_entries.len > 0) allocator.free(legacy_entries);
+    errdefer {
+        if (use_legacy and legacy_entries.len > 0) allocator.free(legacy_entries);
     }
     const entries = if (use_legacy) legacy_entries else exception_entries;
 
@@ -466,6 +469,7 @@ fn buildCFGWithLeaders(
             .block_offsets = &.{},
             .entry = 0,
             .instructions = instructions,
+            .exception_entries = entries,
             .version = version,
         };
     }
@@ -649,29 +653,40 @@ fn buildCFGWithLeaders(
         block.successors = try succ_list.toOwnedSlice(allocator);
     }
 
-    // Step 5: Build predecessor lists
-    for (blocks) |*block| {
-        var pred_count: usize = 0;
+    // Step 5: Build predecessor lists (single pass)
+    if (blocks.len > 0) {
+        var pred_counts = try allocator.alloc(usize, blocks.len);
+        defer allocator.free(pred_counts);
+        @memset(pred_counts, 0);
+
         for (blocks) |other| {
             for (other.successors) |edge| {
-                if (edge.target == block.id) {
-                    pred_count += 1;
-                }
+                const tid = edge.target;
+                if (tid >= blocks.len) continue;
+                pred_counts[@intCast(tid)] += 1;
             }
         }
 
-        if (pred_count > 0) {
-            const preds = try allocator.alloc(u32, pred_count);
-            var idx: usize = 0;
-            for (blocks) |other| {
-                for (other.successors) |edge| {
-                    if (edge.target == block.id) {
-                        preds[idx] = other.id;
-                        idx += 1;
-                    }
-                }
+        var pred_offsets = try allocator.alloc(usize, blocks.len);
+        defer allocator.free(pred_offsets);
+        var i: usize = 0;
+        while (i < blocks.len) : (i += 1) {
+            pred_offsets[i] = 0;
+            if (pred_counts[i] > 0) {
+                blocks[i].predecessors = try allocator.alloc(u32, pred_counts[i]);
+            } else {
+                blocks[i].predecessors = &.{};
             }
-            block.predecessors = preds;
+        }
+
+        for (blocks) |other| {
+            for (other.successors) |edge| {
+                const tid = edge.target;
+                if (tid >= blocks.len) continue;
+                const idx = pred_offsets[@intCast(tid)];
+                blocks[@intCast(tid)].predecessors[idx] = other.id;
+                pred_offsets[@intCast(tid)] = idx + 1;
+            }
         }
     }
 
@@ -702,6 +717,7 @@ fn buildCFGWithLeaders(
         .block_offsets = block_offsets,
         .entry = 0,
         .instructions = instructions,
+        .exception_entries = entries,
         .version = version,
     };
 
@@ -1016,10 +1032,12 @@ pub fn buildCFGWithExceptions(
     }
 
     const entries = try parseExceptionTable(exception_table, allocator);
-    defer allocator.free(entries);
+    var entries_owned = true;
+    errdefer if (entries_owned and entries.len > 0) allocator.free(entries);
 
     // Build CFG with exception handler offsets as additional leaders
     var cfg = try buildCFGWithLeaders(allocator, bytecode, version, entries);
+    entries_owned = false;
     errdefer cfg.deinit();
 
     try applyExceptionEntries(allocator, &cfg, entries);

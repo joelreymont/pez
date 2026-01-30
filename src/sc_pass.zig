@@ -53,7 +53,7 @@ pub fn Methods(comptime Self: type, comptime Err: type) type {
                 if (inst.isConditionalJump()) return null;
                 if (inst.isUnconditionalJump()) break;
                 if (Self.isStatementOpcode(inst.opcode)) return null;
-                if (!try self.simOpt(&sim, inst)) return null;
+                self.simOpt(&sim, inst) catch return null;
             }
 
             if (sim.stack.len() != base_vals.len + 1) return null;
@@ -78,7 +78,7 @@ pub fn Methods(comptime Self: type, comptime Err: type) type {
             for (block.instructions) |inst| {
                 if (ctrl.Analyzer.isConditionalJump(undefined, inst.opcode)) break;
                 if (Self.isStatementOpcode(inst.opcode)) return null;
-                if (!try self.simOpt(&sim, inst)) return null;
+                self.simOpt(&sim, inst) catch return null;
             }
 
             const expr = (try popExprNoMatch(self, &sim)) orelse return null;
@@ -107,7 +107,7 @@ pub fn Methods(comptime Self: type, comptime Err: type) type {
                 if (ctrl.Analyzer.isConditionalJump(undefined, inst.opcode)) break;
                 if (inst.isUnconditionalJump()) break;
                 if (Self.isStatementOpcode(inst.opcode)) break;
-                if (!try self.simOpt(&sim, inst)) return null;
+                self.simOpt(&sim, inst) catch return null;
             }
 
             if (sim.stack.len() != base_vals.len + 1) return null;
@@ -145,7 +145,7 @@ pub fn Methods(comptime Self: type, comptime Err: type) type {
                 }
                 if (ctrl.Analyzer.isConditionalJump(undefined, inst.opcode)) break;
                 if (Self.isStatementOpcode(inst.opcode)) return null;
-                if (!try self.simOpt(&sim, inst)) return null;
+                self.simOpt(&sim, inst) catch return null;
             }
 
             const expr = (try popExprNoMatch(self, &sim)) orelse return null;
@@ -244,15 +244,16 @@ pub fn Methods(comptime Self: type, comptime Err: type) type {
 
             const saved_pending_vals = self.pending_vals;
             const saved_pending_store = self.pending_store_expr;
-            const saved_pending_ternary = self.pending_ternary_expr;
+            const saved_pending_ternary = self.pendTernTake(block_id);
             defer {
                 self.pending_vals = saved_pending_vals;
                 self.pending_store_expr = saved_pending_store;
-                self.pending_ternary_expr = null;
+                if (saved_pending_ternary) |expr| {
+                    self.pendTernPut(block_id, expr) catch {};
+                }
             }
             self.pending_vals = null;
             self.pending_store_expr = null;
-            self.pending_ternary_expr = null;
 
             if (saved_pending_vals) |vals| {
                 for (vals) |val| {
@@ -298,11 +299,12 @@ pub fn Methods(comptime Self: type, comptime Err: type) type {
 
         fn saveExpr(
             self: *Self,
+            merge_block: u32,
             expr: *Expr,
             base_vals: []StackValue,
             base_owned: *bool,
         ) DecompileError!void {
-            self.pending_ternary_expr = expr;
+            try self.pendTernPut(merge_block, expr);
             if (self.pending_vals) |vals| {
                 Self.deinitStackValuesSlice(self.clone_sim.allocator, self.clone_sim.stack_alloc, self.allocator, vals);
                 self.pending_vals = null;
@@ -318,6 +320,7 @@ pub fn Methods(comptime Self: type, comptime Err: type) type {
 
         pub fn saveTernary(
             self: *Self,
+            merge_block: u32,
             condition: *Expr,
             true_expr: *Expr,
             false_expr: *Expr,
@@ -332,7 +335,7 @@ pub fn Methods(comptime Self: type, comptime Err: type) type {
                 .else_body = false_expr,
             } };
 
-            try saveExpr(self, if_expr, base_vals, base_owned);
+            try saveExpr(self, merge_block, if_expr, base_vals, base_owned);
         }
 
         fn tryFoldTernaryBoolOp(
@@ -398,7 +401,7 @@ pub fn Methods(comptime Self: type, comptime Err: type) type {
             const skip = boolOpBlockSkip(self, second_blk, .or_pop);
             const second_expr = (try simulateValueExprSkip(self, second, base_vals, skip)) orelse return null;
             const bool_expr = try self.makeBoolPair(if_expr, second_expr, if (is_and) .and_ else .or_);
-            try saveExpr(self, bool_expr, base_vals, base_owned);
+            try saveExpr(self, short, bool_expr, base_vals, base_owned);
             return short;
         }
 
@@ -498,7 +501,7 @@ pub fn Methods(comptime Self: type, comptime Err: type) type {
             if (try tryFoldTernaryBoolOp(self, pattern.merge_block, if_expr, base_vals, &base_owned, limit)) |next_block| {
                 return next_block;
             }
-            try saveExpr(self, if_expr, base_vals, &base_owned);
+            try saveExpr(self, pattern.merge_block, if_expr, base_vals, &base_owned);
             return pattern.merge_block;
         }
 
@@ -597,7 +600,7 @@ pub fn Methods(comptime Self: type, comptime Err: type) type {
                 if (try tryFoldTernaryBoolOp(self, chain.merge_block, if_expr, base_vals, &base_owned, limit)) |next_block| {
                     return next_block;
                 }
-                try saveExpr(self, if_expr, base_vals, &base_owned);
+                try saveExpr(self, chain.merge_block, if_expr, base_vals, &base_owned);
                 return chain.merge_block;
             }
 
@@ -655,7 +658,7 @@ pub fn Methods(comptime Self: type, comptime Err: type) type {
             if (try tryFoldTernaryBoolOp(self, pattern.merge_block, if_expr, base_vals, &base_owned, limit)) |next_block| {
                 return next_block;
             }
-            try saveExpr(self, if_expr, base_vals, &base_owned);
+            try saveExpr(self, pattern.merge_block, if_expr, base_vals, &base_owned);
             return pattern.merge_block;
         }
 
@@ -666,7 +669,7 @@ pub fn Methods(comptime Self: type, comptime Err: type) type {
             stmts: *std.ArrayList(*Stmt),
             stmts_allocator: Allocator,
         ) DecompileError!?u32 {
-            if (self.pending_ternary_expr != null or self.pending_vals != null) {
+            if (self.pendTernHas() or self.pending_vals != null) {
                 return null;
             }
             var use_pending_store = false;
@@ -733,7 +736,7 @@ pub fn Methods(comptime Self: type, comptime Err: type) type {
             if (merge_block.terminator()) |mt| {
                 if (ctrl.Analyzer.isConditionalJump(undefined, mt.opcode)) {
                     if (used_pending_store) self.pending_store_expr = null;
-                    if (self.pending_ternary_expr != null or self.pending_store_expr != null) return null;
+                    if (self.pendTernHas() or self.pending_store_expr != null) return null;
                     self.pending_store_expr = or_expr;
                     if (base_vals.len > 0) {
                         if (self.pending_vals) |vals| {
@@ -792,7 +795,7 @@ pub fn Methods(comptime Self: type, comptime Err: type) type {
                 return null;
             }
 
-            const saved_pending_expr = self.pending_ternary_expr;
+            const saved_pending_expr = self.pendTernTake(block_id);
             const saved_pending_vals = self.pending_vals;
             var saved_pending_vals_copy: ?[]StackValue = null;
             errdefer {
@@ -806,7 +809,9 @@ pub fn Methods(comptime Self: type, comptime Err: type) type {
             var success = false;
             defer {
                 if (!success) {
-                    self.pending_ternary_expr = saved_pending_expr;
+                    if (saved_pending_expr) |expr| {
+                        self.pendTernPut(block_id, expr) catch {};
+                    }
                     self.pending_vals = saved_pending_vals_copy;
                 } else if (saved_pending_vals_copy) |vals| {
                     Self.deinitStackValuesSlice(self.clone_sim.allocator, self.clone_sim.stack_alloc, self.allocator, vals);
@@ -843,7 +848,6 @@ pub fn Methods(comptime Self: type, comptime Err: type) type {
             }
             if (saved_pending_expr) |expr| {
                 try cond_sim.stack.push(.{ .expr = expr });
-                self.pending_ternary_expr = null;
             }
 
             if (pattern.kind == .pop_top) {
@@ -898,7 +902,7 @@ pub fn Methods(comptime Self: type, comptime Err: type) type {
             const merge_block = &self.cfg.blocks[final_merge];
             if (merge_block.terminator()) |mt| {
                 if (ctrl.Analyzer.isConditionalJump(undefined, mt.opcode)) {
-                    if (self.pending_ternary_expr != null or self.pending_store_expr != null) return error.InvalidBlock;
+                    if (self.pendTernHas() or self.pending_store_expr != null) return error.InvalidBlock;
                     self.pending_store_expr = bool_expr;
                     self.pending_vals = null;
                     success = true;
@@ -916,7 +920,7 @@ pub fn Methods(comptime Self: type, comptime Err: type) type {
                     next = edge.target;
                 }
                 if (next) |next_block| {
-                    if (self.pending_ternary_expr != null or self.pending_store_expr != null) return error.InvalidBlock;
+                    if (self.pendTernHas() or self.pending_store_expr != null) return error.InvalidBlock;
                     self.pending_store_expr = bool_expr;
                     try self.markConsumed(final_merge);
                     if (base_vals.len > 0) {
@@ -1173,7 +1177,7 @@ pub fn Methods(comptime Self: type, comptime Err: type) type {
             }
             const stop_idx = cmp_idx.?;
             for (block.instructions[0 .. stop_idx + 1]) |inst| {
-                if (!try self.simOpt(&sim, inst)) return null;
+                self.simOpt(&sim, inst) catch return null;
             }
             const first_cmp = (try popExprNoMatch(self, &sim)) orelse return null;
             if (first_cmp.* != .compare or first_cmp.compare.ops.len != 1 or first_cmp.compare.comparators.len != 1) {
@@ -1195,10 +1199,10 @@ pub fn Methods(comptime Self: type, comptime Err: type) type {
                     cmp2_idx = i;
                     break;
                 }
-                if (!try self.simOpt(&sim2, inst)) return null;
+                self.simOpt(&sim2, inst) catch return null;
             }
             if (cmp2_idx == null) return null;
-            if (!try self.simOpt(&sim2, true_blk.instructions[cmp2_idx.?])) return null;
+            self.simOpt(&sim2, true_blk.instructions[cmp2_idx.?]) catch return null;
             const second_cmp = (try popExprNoMatch(self, &sim2)) orelse return null;
             if (second_cmp.* != .compare or second_cmp.compare.ops.len != 1 or second_cmp.compare.comparators.len != 1) {
                 return null;
