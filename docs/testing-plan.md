@@ -51,6 +51,11 @@ zcheck Features to Use
 - `checkResult` for reproducible failures with captured seeds.
 - Increased `iterations` and `max_shrinks` for decoder/CFG stress.
 
+External Cross-checks
+---------------------
+- decompyle3: `gh repo clone rocky/python-decompile3 /tmp/python-decompile3` then `make check`.
+- Compare pez output against decompyle3 on shared corpora when diagnosing mismatches.
+
 Next Steps
 ----------
 - Implement missing properties in `src/property_tests.zig`.
