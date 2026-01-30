@@ -48,7 +48,6 @@ test "snapshot list comprehension" {
         tu.inst(.STORE_FAST_LOAD_FAST, 0x11),
         tu.inst(.LIST_APPEND, 2),
         tu.inst(.END_FOR, 0),
-        tu.inst(.POP_ITER, 0),
         tu.inst(.SWAP, 2),
         tu.inst(.STORE_FAST, 1),
     };
@@ -101,7 +100,6 @@ test "snapshot list comprehension with if" {
         tu.inst(.LOAD_FAST_BORROW, 1),
         tu.inst(.LIST_APPEND, 2),
         tu.inst(.END_FOR, 0),
-        tu.inst(.POP_ITER, 0),
         tu.inst(.SWAP, 2),
         tu.inst(.STORE_FAST, 1),
     };
@@ -153,7 +151,6 @@ test "snapshot list comprehension with is None" {
         tu.inst(.LOAD_FAST_BORROW, 1),
         tu.inst(.LIST_APPEND, 2),
         tu.inst(.END_FOR, 0),
-        tu.inst(.POP_ITER, 0),
         tu.inst(.SWAP, 2),
         tu.inst(.STORE_FAST, 1),
     };
@@ -255,7 +252,6 @@ test "snapshot set comprehension" {
         tu.inst(.STORE_FAST_LOAD_FAST, 0x11),
         tu.inst(.SET_ADD, 2),
         tu.inst(.END_FOR, 0),
-        tu.inst(.POP_ITER, 0),
         tu.inst(.SWAP, 2),
         tu.inst(.STORE_FAST, 1),
     };
@@ -306,7 +302,6 @@ test "snapshot dict comprehension" {
         tu.inst(.LOAD_FAST_BORROW, 1),
         tu.inst(.MAP_ADD, 2),
         tu.inst(.END_FOR, 0),
-        tu.inst(.POP_ITER, 0),
         tu.inst(.SWAP, 2),
         tu.inst(.STORE_FAST, 1),
     };

@@ -452,6 +452,11 @@ fn buildCFGWithLeaders(
     const instructions = try iter.collectAlloc(allocator);
     errdefer allocator.free(instructions);
 
+    var loop_exits = std.AutoHashMap(u32, u32).init(allocator);
+    defer loop_exits.deinit();
+    var loop_targets: std.ArrayList(u32) = .{};
+    defer loop_targets.deinit(allocator);
+
     var legacy_entries: []ExceptionEntry = &.{};
     const use_legacy = exception_entries.len == 0 and !version.gte(3, 11);
     if (use_legacy) {
@@ -474,6 +479,28 @@ fn buildCFGWithLeaders(
         };
     }
 
+    const loop_multiplier: u32 = if (version.gte(3, 10)) 2 else 1;
+    var loop_stack: std.ArrayList(u32) = .{};
+    defer loop_stack.deinit(allocator);
+    for (instructions) |inst| {
+        while (loop_stack.items.len > 0 and inst.offset >= loop_stack.items[loop_stack.items.len - 1]) {
+            _ = loop_stack.pop();
+        }
+        switch (inst.opcode) {
+            .SETUP_LOOP => {
+                const target = inst.offset + inst.size + inst.arg * loop_multiplier;
+                try loop_stack.append(allocator, target);
+                try loop_targets.append(allocator, target);
+            },
+            .BREAK_LOOP => {
+                if (loop_stack.items.len > 0) {
+                    try loop_exits.put(inst.offset, loop_stack.items[loop_stack.items.len - 1]);
+                }
+            },
+            else => {},
+        }
+    }
+
     // Step 2: Find block leaders (start of basic blocks)
     // Leaders are:
     // - First instruction
@@ -490,6 +517,9 @@ fn buildCFGWithLeaders(
         // This ensures with statements and try blocks have proper block boundaries
         try leaders.put(entry.start, {});
         try leaders.put(entry.end, {});
+    }
+    for (loop_targets.items) |target| {
+        try leaders.put(target, {});
     }
 
     // First instruction is always a leader
@@ -570,7 +600,13 @@ fn buildCFGWithLeaders(
 
         // Check for jump edge
         if (term) |t| {
-            if (t.jumpTarget(version)) |target| {
+            if (t.opcode == .BREAK_LOOP) {
+                if (loop_exits.get(t.offset)) |target| {
+                    if (offset_to_block.get(target)) |target_block| {
+                        try succ_list.append(allocator, .{ .target = target_block, .edge_type = .normal });
+                    }
+                }
+            } else if (t.jumpTarget(version)) |target| {
                 if (offset_to_block.get(target)) |target_block| {
                     const is_back_jump = (t.opcode == .JUMP_BACKWARD or t.opcode == .JUMP_BACKWARD_NO_INTERRUPT) or
                         (t.opcode == .JUMP_ABSOLUTE and target < t.offset);

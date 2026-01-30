@@ -170,6 +170,8 @@ pub const StackValue = union(enum) {
     saved_local: []const u8,
     /// A type alias (name, value) for PEP 695.
     type_alias: *Expr,
+    /// Exception placeholder for handler stacks.
+    exc_marker,
     /// Unknown/untracked value.
     unknown,
 
@@ -190,6 +192,7 @@ pub const StackValue = union(enum) {
                     ast_alloc.destroy(e);
                 }
             },
+            .exc_marker => {},
             // function_obj and class_obj are consumed by decompiler and ownership transfers
             // to arena or they're cleaned up explicitly by the code that creates them
             else => {},
@@ -247,6 +250,10 @@ pub fn stackValueEqual(a: StackValue, b: StackValue) bool {
             .type_alias => |be| ast.exprEqual(ae, be),
             else => false,
         },
+        .exc_marker => switch (b) {
+            .exc_marker => true,
+            else => false,
+        },
         .unknown => switch (b) {
             .unknown => true,
             else => false,
@@ -256,7 +263,7 @@ pub fn stackValueEqual(a: StackValue, b: StackValue) bool {
 
 fn isExcPh(val: StackValue) bool {
     return switch (val) {
-        .unknown => true,
+        .exc_marker => true,
         .expr => |e| switch (e.*) {
             .name => |n| std.mem.eql(u8, n.id, "__exception__"),
             else => false,
@@ -1533,6 +1540,7 @@ pub const SimContext = struct {
             .null_marker => .null_marker,
             .saved_local => |name| .{ .saved_local = name },
             .type_alias => |e| .{ .type_alias = try ast.cloneExpr(self.allocator, e) },
+            .exc_marker => .exc_marker,
             .unknown => .unknown,
         };
     }
@@ -1550,6 +1558,7 @@ pub const SimContext = struct {
             .null_marker => .null_marker,
             .type_alias => .unknown,
             .saved_local => |name| .{ .saved_local = name },
+            .exc_marker => .exc_marker,
             .unknown => .unknown,
         };
     }
@@ -2854,6 +2863,7 @@ pub const SimContext = struct {
             .JUMP_BACKWARD_NO_INTERRUPT,
             .JUMP_ABSOLUTE,
             .CONTINUE_LOOP,
+            .BREAK_LOOP,
             => {
                 // No stack effect
             },
@@ -5543,7 +5553,7 @@ pub const SimContext = struct {
             .PUSH_EXC_INFO => {
                 // PUSH_EXC_INFO - pushes exception info onto stack
                 // Used when entering except handler, pushes (exc, tb)
-                try self.stack.push(.unknown);
+                try self.stack.push(.exc_marker);
             },
 
             .CHECK_EXC_MATCH => {
@@ -5614,6 +5624,41 @@ pub const SimContext = struct {
                     }
                 }
                 try self.stack.push(.unknown);
+            },
+
+            .END_FINALLY => {
+                // END_FINALLY pops a why code plus optional values:
+                // 1: None (normal), 2: return/continue value, 4: exc_type, exc, tb, why.
+                const len = self.stack.items.items.len;
+                var drop: usize = 0;
+                if (len >= 3) {
+                    const a = self.stack.items.items[len - 1];
+                    const b = self.stack.items.items[len - 2];
+                    const c = self.stack.items.items[len - 3];
+                    if (isExcPh(a) and isExcPh(b) and isExcPh(c)) {
+                        drop = 3;
+                    } else if (len >= 2) {
+                        drop = 2;
+                    } else {
+                        drop = 1;
+                    }
+                } else if (len >= 2) {
+                    drop = 2;
+                } else if (len >= 1) {
+                    drop = 1;
+                }
+
+                var i: usize = 0;
+                while (i < drop) : (i += 1) {
+                    if (self.stack.pop()) |v| {
+                        var val = v;
+                        val.deinit(self.allocator, self.stack_alloc);
+                    } else if (!(self.lenient or self.flow_mode)) {
+                        return error.StackUnderflow;
+                    } else {
+                        break;
+                    }
+                }
             },
 
             .SETUP_FINALLY,
@@ -5916,6 +5961,15 @@ pub const SimContext = struct {
                         val.deinit(self.allocator, self.stack_alloc);
                     }
                     try self.stack.push(.unknown);
+                    return;
+                }
+
+                // Pre-2.5 generators cannot receive a value, so yield does not push.
+                if (self.flow_mode and self.version.lt(2, 5)) {
+                    if (self.stack.pop()) |v| {
+                        var val = v;
+                        val.deinit(self.allocator, self.stack_alloc);
+                    }
                     return;
                 }
 
@@ -6389,6 +6443,12 @@ pub const SimContext = struct {
                             builder.deinit(self.allocator, self.stack_alloc);
                         }
                     }
+                }
+                if (self.stack.pop()) |v| {
+                    var val = v;
+                    val.deinit(self.allocator, self.stack_alloc);
+                } else {
+                    return error.StackUnderflow;
                 }
             },
 
@@ -7038,6 +7098,47 @@ test "stack simulation pop except clears exception placeholders" {
     try ctx.stack.push(.{ .expr = exc1 });
     try ctx.stack.push(.{ .expr = exc2 });
     try ctx.stack.push(.{ .expr = exc3 });
+
+    const inst = Instruction{
+        .opcode = .POP_EXCEPT,
+        .arg = 0,
+        .offset = 0,
+        .size = 2,
+        .cache_entries = 0,
+    };
+    try ctx.simulate(inst);
+
+    try testing.expectEqual(@as(usize, 1), ctx.stack.len());
+    const val = ctx.stack.peek().?;
+    try testing.expect(val == .expr);
+    try testing.expect(std.mem.eql(u8, val.expr.name.id, "ret"));
+
+    _ = ctx.stack.pop().?;
+}
+
+test "stack simulation pop except clears exc markers" {
+    const testing = std.testing;
+    const allocator = testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    var consts: [0]pyc.Object = .{};
+    var code = pyc.Code{
+        .allocator = allocator,
+        .consts = &consts,
+    };
+    const version = Version.init(3, 12);
+
+    var ctx = SimContext.init(a, a, &code, version);
+    defer ctx.deinit();
+
+    const ret = try ast.makeName(a, "ret", .load);
+
+    try ctx.stack.push(.{ .expr = ret });
+    try ctx.stack.push(.exc_marker);
+    try ctx.stack.push(.exc_marker);
+    try ctx.stack.push(.exc_marker);
 
     const inst = Instruction{
         .opcode = .POP_EXCEPT,

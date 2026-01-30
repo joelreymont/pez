@@ -1991,13 +1991,22 @@ pub const Decompiler = struct {
         return out;
     }
 
+    fn allocExcStack(self: *Decompiler, len: usize) DecompileError![]StackValue {
+        if (len == 0) return &.{};
+        const out = try self.allocator.alloc(StackValue, len);
+        errdefer self.allocator.free(out);
+        for (out) |*slot| slot.* = .exc_marker;
+        return out;
+    }
+
     fn cloneStackExtra(
         self: *Decompiler,
         sim: *SimContext,
         values: []const StackValue,
-        extra: usize,
+        exc_extra: usize,
+        lasti_extra: usize,
     ) DecompileError![]StackValue {
-        const total = values.len + extra;
+        const total = values.len + exc_extra + lasti_extra;
         if (total == 0) return &.{};
 
         const out = try self.allocator.alloc(StackValue, total);
@@ -2006,7 +2015,17 @@ pub const Decompiler = struct {
         for (values, 0..) |val, idx| {
             out[idx] = try sim.cloneStackValueFlow(val);
         }
-        for (out[values.len..]) |*slot| slot.* = .unknown;
+        var idx = values.len;
+        var i: usize = 0;
+        while (i < lasti_extra) : (i += 1) {
+            out[idx] = .unknown;
+            idx += 1;
+        }
+        i = 0;
+        while (i < exc_extra) : (i += 1) {
+            out[idx] = .exc_marker;
+            idx += 1;
+        }
 
         return out;
     }
@@ -2088,13 +2107,13 @@ pub const Decompiler = struct {
         handler: *const BasicBlock,
     ) DecompileError!?[]StackValue {
         const exc_count = self.excSeedFlow(handler);
-        const extra = exc_count + @as(usize, if (entry.push_lasti) 1 else 0);
+        const lasti_extra: usize = if (entry.push_lasti) 1 else 0;
         const has_table = self.version.gte(3, 11) and self.code.exceptiontable.len > 0;
         const expect_depth: ?usize = if (has_table) @intCast(entry.depth) else null;
 
         if (entry_stack == null) {
             if (expect_depth) |depth| {
-                return try self.allocUnknownStack(depth + extra);
+                return try self.cloneStackExtra(clone_sim, &.{}, exc_count, lasti_extra + depth);
             }
             return null;
         }
@@ -2125,7 +2144,7 @@ pub const Decompiler = struct {
             if (sim.stack.items.items.len != depth) return error.InvalidStackDepth;
         }
 
-        return try self.cloneStackExtra(clone_sim, sim.stack.items.items, extra);
+        return try self.cloneStackExtra(clone_sim, sim.stack.items.items, exc_count, lasti_extra);
     }
 
     fn runStackFlow(
@@ -2196,13 +2215,16 @@ pub const Decompiler = struct {
                 if (term) |t| switch (t.opcode) {
                     .FOR_ITER => {
                         if (edge.edge_type == .conditional_false) {
-                            // Python 3.12+: iterator stays on stack, END_FOR/POP_ITER will pop it
-                            // Python <3.12: FOR_ITER pops iterator on exhaustion, adjust by -2
-                            if (!self.version.gte(3, 12)) {
-                                const false_len = if (incoming.len >= 2) incoming.len - 2 else 0;
-                                incoming = incoming[0..false_len];
-                            }
+                            // False edge sees no iteration value; iterator stays for 3.12+.
+                            const drop: usize = if (self.version.gte(3, 12)) 1 else 2;
+                            const false_len = if (incoming.len >= drop) incoming.len - drop else 0;
+                            incoming = incoming[0..false_len];
                         }
+                    },
+                    .BREAK_LOOP => {
+                        const drop: usize = if (self.version.gte(2, 3)) 1 else 2;
+                        const out_len = if (incoming.len >= drop) incoming.len - drop else 0;
+                        incoming = incoming[0..out_len];
                     },
                     .JUMP_IF_TRUE_OR_POP => {
                         if (edge.edge_type == .conditional_false) {
@@ -2296,7 +2318,7 @@ pub const Decompiler = struct {
         }
         const entry_exc = self.excSeedFlow(&self.cfg.blocks[0]);
         if (entry_exc > 0) {
-            self.stack_in[0] = try self.allocUnknownStack(entry_exc);
+            self.stack_in[0] = try self.allocExcStack(entry_exc);
         } else {
             self.stack_in[0] = &.{};
         }
@@ -2385,7 +2407,7 @@ pub const Decompiler = struct {
             if (exc_count == 0) continue;
             const bid = block.id;
             if (self.stack_in[bid] != null) continue;
-            self.stack_in[bid] = try self.allocUnknownStack(exc_count);
+            self.stack_in[bid] = try self.allocExcStack(exc_count);
             if (self.trace_stackflow and update_counts != null and self.trace_file != null) {
                 const counts = update_counts.?;
                 counts[bid] +|= 1;
@@ -2493,13 +2515,16 @@ pub const Decompiler = struct {
                 if (term) |t| switch (t.opcode) {
                     .FOR_ITER => {
                         if (edge.edge_type == .conditional_false) {
-                            // Python 3.12+: iterator stays on stack, END_FOR/POP_ITER will pop it
-                            // Python <3.12: FOR_ITER pops iterator on exhaustion, adjust by -2
-                            if (!self.version.gte(3, 12)) {
-                                const false_len = if (incoming.len >= 2) incoming.len - 2 else 0;
-                                incoming = incoming[0..false_len];
-                            }
+                            // False edge sees no iteration value; iterator stays for 3.12+.
+                            const drop: usize = if (self.version.gte(3, 12)) 1 else 2;
+                            const false_len = if (incoming.len >= drop) incoming.len - drop else 0;
+                            incoming = incoming[0..false_len];
                         }
+                    },
+                    .BREAK_LOOP => {
+                        const drop: usize = if (self.version.gte(2, 3)) 1 else 2;
+                        const out_len = if (incoming.len >= drop) incoming.len - drop else 0;
+                        incoming = incoming[0..out_len];
                     },
                     .JUMP_IF_TRUE_OR_POP => {
                         if (edge.edge_type == .conditional_false) {
@@ -3852,6 +3877,26 @@ pub const Decompiler = struct {
                 },
                 .POP_TOP => {
                     try self.handlePopTopStmt(sim, block, stmts, stmts_allocator);
+                },
+                .YIELD_VALUE => {
+                    try sim.simulate(inst);
+                    if (self.version.lt(2, 5)) {
+                        if (sim.stack.pop()) |val| {
+                            switch (val) {
+                                .expr => |e| {
+                                    if (self.makeExprStmt(e)) |stmt| {
+                                        try stmts.append(stmts_allocator, stmt);
+                                    } else |err| {
+                                        if (err != error.SkipStatement) return err;
+                                    }
+                                },
+                                else => {
+                                    var tmp = val;
+                                    tmp.deinit(sim.allocator, sim.stack_alloc);
+                                },
+                            }
+                        }
+                    }
                 },
                 .END_FOR, .POP_ITER => {
                     // Loop cleanup opcodes - skip in non-loop context
@@ -18484,6 +18529,7 @@ pub const Decompiler = struct {
             .null_marker => .{ .tag = "null", .text = null },
             .saved_local => |name| .{ .tag = "saved_local", .text = name },
             .type_alias => .{ .tag = "type_alias", .text = null },
+            .exc_marker => .{ .tag = "exc", .text = null },
             .unknown => .{ .tag = "unknown", .text = null },
         };
     }
@@ -21902,7 +21948,7 @@ pub const Decompiler = struct {
                 break :blk try self.makeAssign(target, placeholder);
             },
             .saved_local => null,
-            .code_obj, .comp_obj, .comp_builder, .null_marker, .unknown => blk: {
+            .code_obj, .comp_obj, .comp_builder, .null_marker, .exc_marker, .unknown => blk: {
                 // Fallback for unhandled stack values - emit a valid placeholder
                 const placeholder = try ast.makeConstant(a, .ellipsis);
                 const target = try self.makeName(out_name, .store);
@@ -22698,6 +22744,7 @@ pub const Decompiler = struct {
         _ = self;
         return switch (value) {
             .expr => |expr| expr.* == .name and std.mem.eql(u8, expr.name.id, "__exception__"),
+            .exc_marker => true,
             else => false,
         };
     }

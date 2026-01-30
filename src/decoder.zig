@@ -64,6 +64,7 @@ pub const Instruction = struct {
             .JUMP_BACKWARD_NO_INTERRUPT,
             .JUMP_ABSOLUTE,
             .CONTINUE_LOOP,
+            .BREAK_LOOP,
             => true,
             else => false,
         };
@@ -92,6 +93,7 @@ pub const Instruction = struct {
             .FOR_ITER,
             .FOR_LOOP,
             .SEND,
+            .CONTINUE_LOOP,
             => true,
             else => false,
         };
@@ -110,6 +112,7 @@ pub const Instruction = struct {
             .JUMP_BACKWARD_NO_INTERRUPT,
             .JUMP_ABSOLUTE,
             .CONTINUE_LOOP,
+            .BREAK_LOOP,
             => true,
             else => false,
         };
