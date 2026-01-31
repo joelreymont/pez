@@ -56,7 +56,7 @@ pub const BigInt = struct {
 
         if (len < digits.len) {
             // Shrink allocation
-            const trimmed = allocator.realloc(digits, len) catch digits[0..len];
+            const trimmed = try allocator.realloc(digits, len);
             return .{ .digits = trimmed, .negative = negative };
         }
 
@@ -311,10 +311,12 @@ pub const ObjectType = enum(u8) {
     // added to the refs list for later reference
     pub const FLAG_REF: u8 = 0x80;
 
-    pub fn fromByte(byte: u8) ObjectType {
+    pub fn fromByte(byte: u8) error{InvalidObjectType}!ObjectType {
         // Strip FLAG_REF before matching
         const type_byte = byte & ~FLAG_REF;
-        return std.meta.intToEnum(ObjectType, type_byte) catch .TYPE_UNKNOWN;
+        const obj = std.meta.intToEnum(ObjectType, type_byte) catch return error.InvalidObjectType;
+        if (obj == .TYPE_UNKNOWN) return error.InvalidObjectType;
+        return obj;
     }
 
     pub fn hasRef(byte: u8) bool {
@@ -822,9 +824,8 @@ pub const Module = struct {
 
     fn readObject(self: *Module, reader: *BufferReader) !?*Code {
         const type_byte = try reader.readByte();
-        const obj_type = ObjectType.fromByte(type_byte);
+        const obj_type = try ObjectType.fromByte(type_byte);
         const add_ref = ObjectType.hasRef(type_byte);
-        if (obj_type == .TYPE_UNKNOWN) return error.InvalidObjectType;
 
         // Reserve slot in refs BEFORE parsing children (they may reference this object)
         const ref_idx: ?usize = if (add_ref and obj_type == .TYPE_CODE) blk: {
@@ -1019,9 +1020,8 @@ pub const Module = struct {
 
     fn readBytesAlloc(self: *Module, reader: *BufferReader) ParseError![]const u8 {
         const type_byte = try reader.readByte();
-        const obj_type = ObjectType.fromByte(type_byte);
+        const obj_type = try ObjectType.fromByte(type_byte);
         const add_ref = ObjectType.hasRef(type_byte);
-        if (obj_type == .TYPE_UNKNOWN) return error.InvalidObjectType;
 
         // Handle TYPE_REF - lookup in refs table
         if (obj_type == .TYPE_REF) {
@@ -1078,9 +1078,8 @@ pub const Module = struct {
 
     fn readTupleStrings(self: *Module, reader: *BufferReader) ParseError![][]const u8 {
         const type_byte = try reader.readByte();
-        const obj_type = ObjectType.fromByte(type_byte);
+        const obj_type = try ObjectType.fromByte(type_byte);
         const add_ref = ObjectType.hasRef(type_byte);
-        if (obj_type == .TYPE_UNKNOWN) return error.InvalidObjectType;
 
         // Handle TYPE_REF - look up in refs table
         if (obj_type == .TYPE_REF) {
@@ -1151,9 +1150,8 @@ pub const Module = struct {
 
     fn readTupleObjects(self: *Module, reader: *BufferReader) ParseError![]Object {
         const type_byte = try reader.readByte();
-        const obj_type = ObjectType.fromByte(type_byte);
+        const obj_type = try ObjectType.fromByte(type_byte);
         const add_ref = ObjectType.hasRef(type_byte);
-        if (obj_type == .TYPE_UNKNOWN) return error.InvalidObjectType;
 
         // Handle TYPE_REF - look up in refs table
         if (obj_type == .TYPE_REF) {
@@ -1210,9 +1208,8 @@ pub const Module = struct {
 
     fn readAnyObject(self: *Module, reader: *BufferReader) ParseError!Object {
         const type_byte = try reader.readByte();
-        const obj_type = ObjectType.fromByte(type_byte);
+        const obj_type = try ObjectType.fromByte(type_byte);
         const add_ref = ObjectType.hasRef(type_byte);
-        if (obj_type == .TYPE_UNKNOWN) return error.InvalidObjectType;
 
         // Handle TYPE_REF first - it returns a clone of a previously seen object
         if (obj_type == .TYPE_REF) {
@@ -1383,7 +1380,7 @@ pub const Module = struct {
                 while (true) {
                     // Peek at type byte to check for TYPE_NULL sentinel
                     const type_byte_peek = try reader.readByte();
-                    const peek_type = ObjectType.fromByte(type_byte_peek);
+                    const peek_type = try ObjectType.fromByte(type_byte_peek);
                     if (peek_type == .TYPE_NULL) {
                         // TYPE_NULL ('0') signals end of dict
                         break;
@@ -1605,12 +1602,12 @@ test "magic number parsing" {
 test "object type parsing" {
     const testing = std.testing;
 
-    try testing.expectEqual(ObjectType.TYPE_CODE, ObjectType.fromByte('c'));
-    try testing.expectEqual(ObjectType.TYPE_STRING, ObjectType.fromByte('s'));
-    try testing.expectEqual(ObjectType.TYPE_TUPLE, ObjectType.fromByte('('));
+    try testing.expectEqual(ObjectType.TYPE_CODE, try ObjectType.fromByte('c'));
+    try testing.expectEqual(ObjectType.TYPE_STRING, try ObjectType.fromByte('s'));
+    try testing.expectEqual(ObjectType.TYPE_TUPLE, try ObjectType.fromByte('('));
 
     // Test with FLAG_REF
-    try testing.expectEqual(ObjectType.TYPE_CODE, ObjectType.fromByte('c' | 0x80));
+    try testing.expectEqual(ObjectType.TYPE_CODE, try ObjectType.fromByte('c' | 0x80));
     try testing.expect(ObjectType.hasRef('c' | 0x80));
     try testing.expect(!ObjectType.hasRef('c'));
 }
