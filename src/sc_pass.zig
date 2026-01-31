@@ -19,7 +19,6 @@ pub fn Methods(comptime Self: type, comptime Err: type) type {
         pub const CondSim = struct {
             expr: *Expr,
             base_vals: []StackValue,
-            used_pending_store: bool = false,
         };
 
         pub const BoolOpResult = struct {
@@ -205,7 +204,7 @@ pub fn Methods(comptime Self: type, comptime Err: type) type {
             stmts: *std.ArrayList(*Stmt),
             stmts_allocator: Allocator,
         ) DecompileError!?CondSim {
-            return initCondSimInner(self, block_id, stmts, stmts_allocator, false, false);
+            return initCondSimInner(self, block_id, stmts, stmts_allocator, false);
         }
 
         pub fn initCondSimWithStore(
@@ -214,7 +213,7 @@ pub fn Methods(comptime Self: type, comptime Err: type) type {
             stmts: *std.ArrayList(*Stmt),
             stmts_allocator: Allocator,
         ) DecompileError!?CondSim {
-            return initCondSimInner(self, block_id, stmts, stmts_allocator, true, false);
+            return initCondSimInner(self, block_id, stmts, stmts_allocator, false);
         }
 
         pub fn initCondSimWithSkipStore(
@@ -224,7 +223,7 @@ pub fn Methods(comptime Self: type, comptime Err: type) type {
             stmts_allocator: Allocator,
             skip_first_store: bool,
         ) DecompileError!?CondSim {
-            return initCondSimInner(self, block_id, stmts, stmts_allocator, false, skip_first_store);
+            return initCondSimInner(self, block_id, stmts, stmts_allocator, skip_first_store);
         }
 
         fn initCondSimInner(
@@ -232,7 +231,6 @@ pub fn Methods(comptime Self: type, comptime Err: type) type {
             block_id: u32,
             stmts: *std.ArrayList(*Stmt),
             stmts_allocator: Allocator,
-            use_pending_store: bool,
             skip_first_store: bool,
         ) DecompileError!?CondSim {
             if (block_id >= self.cfg.blocks.len) return null;
@@ -241,38 +239,28 @@ pub fn Methods(comptime Self: type, comptime Err: type) type {
             var cond_sim = self.initSim(self.arena.allocator(), self.arena.allocator(), self.code, self.version);
             defer cond_sim.deinit();
             cond_sim.lenient = true;
-
-            const saved_pending_vals = self.pending_vals;
-            const saved_pending_store = self.pending_store_expr;
-            const saved_pending_ternary = self.pendTernTake(block_id);
-            defer {
-                self.pending_vals = saved_pending_vals;
-                self.pending_store_expr = saved_pending_store;
-                if (saved_pending_ternary) |expr| {
-                    self.pendTernPut(block_id, expr);
-                }
-            }
-            self.pending_vals = null;
-            self.pending_store_expr = null;
-
-            if (saved_pending_vals) |vals| {
-                for (vals) |val| {
-                    const cloned = try cond_sim.cloneStackValue(val);
-                    try cond_sim.stack.push(cloned);
-                }
-            }
-            if (saved_pending_ternary) |expr| {
-                try cond_sim.stack.push(.{ .expr = expr });
-            }
-
-            var used_pending_store = false;
-            if (use_pending_store) {
-                if (saved_pending_store) |expr| {
-                    if (blockHasLeadingStore(cond_block)) {
-                        try cond_sim.stack.push(.{ .expr = expr });
-                        used_pending_store = true;
+            if (block_id < self.stack_in.len) {
+                if (self.stack_in[block_id]) |entry| {
+                    for (entry) |val| {
+                        const cloned = try cond_sim.cloneStackValue(val);
+                        try cond_sim.stack.push(cloned);
                     }
                 }
+            }
+            if (cond_sim.stack.len() > 0) {
+                var all_unknown = true;
+                for (cond_sim.stack.items.items) |val| {
+                    if (val != .unknown) {
+                        all_unknown = false;
+                        break;
+                    }
+                }
+                if (all_unknown and self.needsPredecessorSeed(cond_block)) {
+                    cond_sim.stack.reset();
+                    try self.seedFromPredecessors(block_id, &cond_sim);
+                }
+            } else if (self.needsPredecessorSeed(cond_block)) {
+                try self.seedFromPredecessors(block_id, &cond_sim);
             }
 
             var stop_idx: usize = cond_block.instructions.len;
@@ -294,7 +282,7 @@ pub fn Methods(comptime Self: type, comptime Err: type) type {
 
             const expr = (try popExprNoMatch(self, &cond_sim)) orelse return null;
             const base_vals = try self.cloneStackValues(cond_sim.stack.items.items);
-            return .{ .expr = expr, .base_vals = base_vals, .used_pending_store = used_pending_store };
+            return .{ .expr = expr, .base_vals = base_vals };
         }
 
         fn saveExpr(
@@ -304,18 +292,7 @@ pub fn Methods(comptime Self: type, comptime Err: type) type {
             base_vals: []StackValue,
             base_owned: *bool,
         ) DecompileError!void {
-            self.pendTernPut(merge_block, expr);
-            if (self.pending_vals) |vals| {
-                Self.deinitStackValuesSlice(self.clone_sim.allocator, self.clone_sim.stack_alloc, self.allocator, vals);
-                self.pending_vals = null;
-            }
-            if (base_vals.len > 0) {
-                self.pending_vals = base_vals;
-                if (base_owned.*) base_owned.* = false;
-            } else if (base_owned.*) {
-                Self.deinitStackValuesSlice(self.clone_sim.allocator, self.clone_sim.stack_alloc, self.allocator, base_vals);
-                base_owned.* = false;
-            }
+            try self.setStackEntryWithExpr(merge_block, base_vals, expr, base_owned);
         }
 
         pub fn saveTernary(
@@ -669,15 +646,6 @@ pub fn Methods(comptime Self: type, comptime Err: type) type {
             stmts: *std.ArrayList(*Stmt),
             stmts_allocator: Allocator,
         ) DecompileError!?u32 {
-            if (self.pendTernHas() or self.pending_vals != null) {
-                return null;
-            }
-            var use_pending_store = false;
-            if (self.pending_store_expr != null) {
-                const cond_block = &self.cfg.blocks[block_id];
-                if (!blockHasLeadingStore(cond_block)) return null;
-                use_pending_store = true;
-            }
             const pattern = self.analyzer.detectAndOr(block_id) orelse return null;
             if (pattern.true_block >= limit or pattern.false_block >= limit or pattern.merge_block >= limit) {
                 return null;
@@ -685,10 +653,7 @@ pub fn Methods(comptime Self: type, comptime Err: type) type {
             if (pattern.merge_block <= block_id) return null;
 
             const stmts_len = stmts.items.len;
-            const cond_opt = if (use_pending_store)
-                (try initCondSimWithStore(self, pattern.condition_block, stmts, stmts_allocator))
-            else
-                (try initCondSim(self, pattern.condition_block, stmts, stmts_allocator));
+            const cond_opt = try initCondSim(self, pattern.condition_block, stmts, stmts_allocator);
             const cond_res = cond_opt orelse {
                 stmts.items.len = stmts_len;
                 return null;
@@ -696,7 +661,6 @@ pub fn Methods(comptime Self: type, comptime Err: type) type {
             const base_vals = cond_res.base_vals;
             var base_owned = true;
             defer if (base_owned) Self.deinitStackValuesSlice(self.clone_sim.allocator, self.clone_sim.stack_alloc, self.allocator, base_vals);
-            const used_pending_store = cond_res.used_pending_store;
 
             const true_blk = &self.cfg.blocks[pattern.true_block];
             const false_blk = &self.cfg.blocks[pattern.false_block];
@@ -735,21 +699,11 @@ pub fn Methods(comptime Self: type, comptime Err: type) type {
             const merge_block = &self.cfg.blocks[pattern.merge_block];
             if (merge_block.terminator()) |mt| {
                 if (ctrl.Analyzer.isConditionalJump(undefined, mt.opcode)) {
-                    if (used_pending_store) self.pending_store_expr = null;
-                    if (self.pendTernHas() or self.pending_store_expr != null) return null;
-                    self.pending_store_expr = or_expr;
-                    if (base_vals.len > 0) {
-                        if (self.pending_vals) |vals| {
-                            Self.deinitStackValuesSlice(self.clone_sim.allocator, self.clone_sim.stack_alloc, self.allocator, vals);
-                        }
-                        self.pending_vals = base_vals;
-                        base_owned = false;
-                    }
+                    try self.setStackEntryWithExpr(pattern.merge_block, base_vals, or_expr, &base_owned);
                     return pattern.merge_block;
                 }
             }
 
-            if (used_pending_store) self.pending_store_expr = null;
             var merge_sim = self.initSim(self.arena.allocator(), self.arena.allocator(), self.code, self.version);
             defer merge_sim.deinit();
             if (base_vals.len > 0) {
@@ -795,29 +749,6 @@ pub fn Methods(comptime Self: type, comptime Err: type) type {
                 return null;
             }
 
-            const saved_pending_expr = self.pendTernTake(block_id);
-            const saved_pending_vals = self.pending_vals;
-            var saved_pending_vals_copy: ?[]StackValue = null;
-            errdefer {
-                if (saved_pending_vals_copy) |vals| {
-                    Self.deinitStackValuesSlice(self.clone_sim.allocator, self.clone_sim.stack_alloc, self.allocator, vals);
-                }
-            }
-            if (saved_pending_vals) |vals| {
-                saved_pending_vals_copy = try self.cloneStackValues(vals);
-            }
-            var success = false;
-            defer {
-                if (!success) {
-                    if (saved_pending_expr) |expr| {
-                        self.pendTernPut(block_id, expr);
-                    }
-                    self.pending_vals = saved_pending_vals_copy;
-                } else if (saved_pending_vals_copy) |vals| {
-                    Self.deinitStackValuesSlice(self.clone_sim.allocator, self.clone_sim.stack_alloc, self.allocator, vals);
-                }
-            }
-
             const cond_block = &self.cfg.blocks[pattern.condition_block];
             const jump_idx = blk: {
                 var idx: ?usize = null;
@@ -833,12 +764,7 @@ pub fn Methods(comptime Self: type, comptime Err: type) type {
             try self.processPartialBlock(cond_block, stmts, stmts_allocator, &skip_first_store, jump_idx);
             var cond_sim = self.initSim(self.arena.allocator(), self.arena.allocator(), self.code, self.version);
             defer cond_sim.deinit();
-            if (saved_pending_vals_copy) |vals| {
-                for (vals) |val| {
-                    const cloned = try cond_sim.cloneStackValue(val);
-                    try cond_sim.stack.push(cloned);
-                }
-            } else if (pattern.condition_block < self.stack_in.len) {
+            if (pattern.condition_block < self.stack_in.len) {
                 if (self.stack_in[pattern.condition_block]) |entry| {
                     for (entry) |val| {
                         const cloned = try cond_sim.cloneStackValue(val);
@@ -846,8 +772,8 @@ pub fn Methods(comptime Self: type, comptime Err: type) type {
                     }
                 }
             }
-            if (saved_pending_expr) |expr| {
-                try cond_sim.stack.push(.{ .expr = expr });
+            if (cond_sim.stack.len() == 0 and self.needsPredecessorSeed(cond_block)) {
+                try self.seedFromPredecessors(pattern.condition_block, &cond_sim);
             }
 
             if (pattern.kind == .pop_top) {
@@ -902,10 +828,7 @@ pub fn Methods(comptime Self: type, comptime Err: type) type {
             const merge_block = &self.cfg.blocks[final_merge];
             if (merge_block.terminator()) |mt| {
                 if (ctrl.Analyzer.isConditionalJump(undefined, mt.opcode)) {
-                    if (self.pendTernHas() or self.pending_store_expr != null) return error.InvalidBlock;
-                    self.pending_store_expr = bool_expr;
-                    self.pending_vals = null;
-                    success = true;
+                    try self.setStackEntryWithExpr(final_merge, base_vals, bool_expr, &base_owned);
                     return final_merge;
                 }
             }
@@ -920,19 +843,8 @@ pub fn Methods(comptime Self: type, comptime Err: type) type {
                     next = edge.target;
                 }
                 if (next) |next_block| {
-                    if (self.pendTernHas() or self.pending_store_expr != null) return error.InvalidBlock;
-                    self.pending_store_expr = bool_expr;
                     try self.markConsumed(final_merge);
-                    if (base_vals.len > 0) {
-                        if (self.pending_vals) |vals| {
-                            Self.deinitStackValuesSlice(self.clone_sim.allocator, self.clone_sim.stack_alloc, self.allocator, vals);
-                        }
-                        self.pending_vals = base_vals;
-                        base_owned = false;
-                    } else {
-                        self.pending_vals = null;
-                    }
-                    success = true;
+                    try self.setStackEntryWithExpr(next_block, base_vals, bool_expr, &base_owned);
                     return next_block;
                 }
             }
@@ -953,9 +865,6 @@ pub fn Methods(comptime Self: type, comptime Err: type) type {
                 }
             };
             try self.markConsumed(final_merge);
-
-            self.pending_vals = null;
-            success = true;
             return final_merge + 1;
         }
 
