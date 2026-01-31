@@ -492,8 +492,8 @@ const opcode_table_3_11 = [_]?Opcode{
     .BINARY_SUBSCR, // 25
     .BINARY_FLOOR_DIVIDE, // 26
     .BINARY_TRUE_DIVIDE, // 27
-    null, // 28
-    null, // 29
+    .INPLACE_FLOOR_DIVIDE, // 28
+    .INPLACE_TRUE_DIVIDE, // 29
     .GET_LEN, // 30
     .MATCH_MAPPING, // 31
     .MATCH_SEQUENCE, // 32
@@ -731,7 +731,7 @@ const opcode_table_3_12 = [_]?Opcode{
     .RETURN_VALUE, // 83
     null, // 84
     .SETUP_ANNOTATIONS, // 85
-    null, // 86
+    .YIELD_VALUE, // 86
     .LOAD_LOCALS, // 87
     null, // 88
     .POP_EXCEPT, // 89
@@ -2278,8 +2278,267 @@ const opcode_table_3_6 = [_]?Opcode{
     null, // 255 - <255>
 };
 
-/// Python 1.5-2.2 opcode table (with SET_LINENO at 127)
+/// Python 1.5 opcode table
 const opcode_table_1_5 = [_]?Opcode{
+    .STOP_CODE, // 0
+    .POP_TOP, // 1
+    .ROT_TWO, // 2
+    .ROT_THREE, // 3
+    .DUP_TOP, // 4
+    null, // 5
+    null, // 6
+    null, // 7
+    null, // 8
+    null, // 9
+    .UNARY_POSITIVE, // 10
+    .UNARY_NEGATIVE, // 11
+    .UNARY_NOT, // 12
+    .UNARY_CONVERT, // 13
+    null, // 14
+    .UNARY_INVERT, // 15
+    null, // 16
+    null, // 17
+    null, // 18
+    .BINARY_POWER, // 19
+    .BINARY_MULTIPLY, // 20
+    .BINARY_DIVIDE, // 21
+    .BINARY_MODULO, // 22
+    .BINARY_ADD, // 23
+    .BINARY_SUBTRACT, // 24
+    .BINARY_SUBSCR, // 25
+    null, // 26
+    null, // 27
+    null, // 28
+    null, // 29
+    .SLICE_0, // 30
+    .SLICE_1, // 31
+    .SLICE_2, // 32
+    .SLICE_3, // 33
+    null, // 34
+    null, // 35
+    null, // 36
+    null, // 37
+    null, // 38
+    null, // 39
+    .STORE_SLICE_0, // 40
+    .STORE_SLICE_1, // 41
+    .STORE_SLICE_2, // 42
+    .STORE_SLICE_3, // 43
+    null, // 44
+    null, // 45
+    null, // 46
+    null, // 47
+    null, // 48
+    null, // 49
+    .DELETE_SLICE_0, // 50
+    .DELETE_SLICE_1, // 51
+    .DELETE_SLICE_2, // 52
+    .DELETE_SLICE_3, // 53
+    null, // 54
+    null, // 55
+    null, // 56
+    null, // 57
+    null, // 58
+    null, // 59
+    .STORE_SUBSCR, // 60
+    .DELETE_SUBSCR, // 61
+    .BINARY_LSHIFT, // 62
+    .BINARY_RSHIFT, // 63
+    .BINARY_AND, // 64
+    .BINARY_XOR, // 65
+    .BINARY_OR, // 66
+    null, // 67
+    null, // 68
+    null, // 69
+    .PRINT_EXPR, // 70
+    .PRINT_ITEM, // 71
+    .PRINT_NEWLINE, // 72
+    null, // 73
+    null, // 74
+    null, // 75
+    null, // 76
+    null, // 77
+    null, // 78
+    null, // 79
+    .BREAK_LOOP, // 80
+    null, // 81
+    .LOAD_LOCALS, // 82
+    .RETURN_VALUE, // 83
+    null, // 84
+    .EXEC_STMT, // 85
+    null, // 86
+    .POP_BLOCK, // 87
+    .END_FINALLY, // 88
+    .BUILD_CLASS, // 89
+    .STORE_NAME, // 90
+    .DELETE_NAME, // 91
+    .UNPACK_SEQUENCE, // 92
+    .UNPACK_SEQUENCE, // 93
+    null, // 94
+    .STORE_ATTR, // 95
+    .DELETE_ATTR, // 96
+    .STORE_GLOBAL, // 97
+    .DELETE_GLOBAL, // 98
+    null, // 99
+    .LOAD_CONST, // 100
+    .LOAD_NAME, // 101
+    .BUILD_TUPLE, // 102
+    .BUILD_LIST, // 103
+    .BUILD_MAP, // 104
+    .LOAD_ATTR, // 105
+    .COMPARE_OP, // 106
+    .IMPORT_NAME, // 107
+    .IMPORT_FROM, // 108
+    null, // 109
+    .JUMP_FORWARD, // 110
+    .JUMP_IF_FALSE, // 111
+    .JUMP_IF_TRUE, // 112
+    .JUMP_ABSOLUTE, // 113
+    .FOR_LOOP, // 114
+    null, // 115
+    .LOAD_GLOBAL, // 116
+    null, // 117
+    null, // 118
+    null, // 119
+    .SETUP_LOOP, // 120
+    .SETUP_EXCEPT, // 121
+    .SETUP_FINALLY, // 122
+    null, // 123
+    .LOAD_FAST, // 124
+    .STORE_FAST, // 125
+    .DELETE_FAST, // 126
+    .SET_LINENO, // 127
+    null, // 128
+    null, // 129
+    .RAISE_VARARGS, // 130
+    .CALL_FUNCTION, // 131
+    .MAKE_FUNCTION, // 132
+    .BUILD_SLICE, // 133
+    null, // 134
+    null, // 135
+    null, // 136
+    null, // 137
+    null, // 138
+    null, // 139
+    null, // 140
+    null, // 141
+    null, // 142
+    .EXTENDED_ARG, // 143
+    null, // 144
+    null, // 145
+    null, // 146
+    null, // 147
+    null, // 148
+    null, // 149
+    null, // 150
+    null, // 151
+    null, // 152
+    null, // 153
+    null, // 154
+    null, // 155
+    null, // 156
+    null, // 157
+    null, // 158
+    null, // 159
+    null, // 160
+    null, // 161
+    null, // 162
+    null, // 163
+    null, // 164
+    null, // 165
+    null, // 166
+    null, // 167
+    null, // 168
+    null, // 169
+    null, // 170
+    null, // 171
+    null, // 172
+    null, // 173
+    null, // 174
+    null, // 175
+    null, // 176
+    null, // 177
+    null, // 178
+    null, // 179
+    null, // 180
+    null, // 181
+    null, // 182
+    null, // 183
+    null, // 184
+    null, // 185
+    null, // 186
+    null, // 187
+    null, // 188
+    null, // 189
+    null, // 190
+    null, // 191
+    null, // 192
+    null, // 193
+    null, // 194
+    null, // 195
+    null, // 196
+    null, // 197
+    null, // 198
+    null, // 199
+    null, // 200
+    null, // 201
+    null, // 202
+    null, // 203
+    null, // 204
+    null, // 205
+    null, // 206
+    null, // 207
+    null, // 208
+    null, // 209
+    null, // 210
+    null, // 211
+    null, // 212
+    null, // 213
+    null, // 214
+    null, // 215
+    null, // 216
+    null, // 217
+    null, // 218
+    null, // 219
+    null, // 220
+    null, // 221
+    null, // 222
+    null, // 223
+    null, // 224
+    null, // 225
+    null, // 226
+    null, // 227
+    null, // 228
+    null, // 229
+    null, // 230
+    null, // 231
+    null, // 232
+    null, // 233
+    null, // 234
+    null, // 235
+    null, // 236
+    null, // 237
+    null, // 238
+    null, // 239
+    null, // 240
+    null, // 241
+    null, // 242
+    null, // 243
+    null, // 244
+    null, // 245
+    null, // 246
+    null, // 247
+    null, // 248
+    null, // 249
+    null, // 250
+    null, // 251
+    null, // 252
+    null, // 253
+    null, // 254
+    null, // 255
+};
+
+const opcode_table_2_0 = [_]?Opcode{
     .STOP_CODE, // 0
     .POP_TOP, // 1
     .ROT_TWO, // 2
@@ -2306,8 +2565,8 @@ const opcode_table_1_5 = [_]?Opcode{
     .BINARY_ADD, // 23
     .BINARY_SUBTRACT, // 24
     .BINARY_SUBSCR, // 25
-    .BINARY_FLOOR_DIVIDE, // 26
-    .BINARY_TRUE_DIVIDE, // 27
+    null, // 26
+    null, // 27
     null, // 28
     null, // 29
     .SLICE_0, // 30
@@ -2348,7 +2607,7 @@ const opcode_table_1_5 = [_]?Opcode{
     .BINARY_XOR, // 65
     .BINARY_OR, // 66
     .INPLACE_POWER, // 67
-    .GET_ITER, // 68
+    null, // 68
     null, // 69
     .PRINT_EXPR, // 70
     .PRINT_ITEM, // 71
@@ -2370,10 +2629,269 @@ const opcode_table_1_5 = [_]?Opcode{
     .POP_BLOCK, // 87
     .END_FINALLY, // 88
     .BUILD_CLASS, // 89
-    .STORE_NAME, // 90 (HAVE_ARGUMENT)
+    .STORE_NAME, // 90
     .DELETE_NAME, // 91
     .UNPACK_SEQUENCE, // 92
-    .FOR_ITER, // 93
+    null, // 93
+    null, // 94
+    .STORE_ATTR, // 95
+    .DELETE_ATTR, // 96
+    .STORE_GLOBAL, // 97
+    .DELETE_GLOBAL, // 98
+    .DUP_TOPX, // 99
+    .LOAD_CONST, // 100
+    .LOAD_NAME, // 101
+    .BUILD_TUPLE, // 102
+    .BUILD_LIST, // 103
+    .BUILD_MAP, // 104
+    .LOAD_ATTR, // 105
+    .COMPARE_OP, // 106
+    .IMPORT_NAME, // 107
+    .IMPORT_FROM, // 108
+    null, // 109
+    .JUMP_FORWARD, // 110
+    .JUMP_IF_FALSE, // 111
+    .JUMP_IF_TRUE, // 112
+    .JUMP_ABSOLUTE, // 113
+    .FOR_LOOP, // 114
+    null, // 115
+    .LOAD_GLOBAL, // 116
+    null, // 117
+    null, // 118
+    null, // 119
+    .SETUP_LOOP, // 120
+    .SETUP_EXCEPT, // 121
+    .SETUP_FINALLY, // 122
+    null, // 123
+    .LOAD_FAST, // 124
+    .STORE_FAST, // 125
+    .DELETE_FAST, // 126
+    .SET_LINENO, // 127
+    null, // 128
+    null, // 129
+    .RAISE_VARARGS, // 130
+    .CALL_FUNCTION, // 131
+    .MAKE_FUNCTION, // 132
+    .BUILD_SLICE, // 133
+    null, // 134
+    null, // 135
+    null, // 136
+    null, // 137
+    null, // 138
+    null, // 139
+    .CALL_FUNCTION_VAR, // 140
+    .CALL_FUNCTION_KW, // 141
+    .CALL_FUNCTION_VAR_KW, // 142
+    .EXTENDED_ARG, // 143
+    null, // 144
+    null, // 145
+    null, // 146
+    null, // 147
+    null, // 148
+    null, // 149
+    null, // 150
+    null, // 151
+    null, // 152
+    null, // 153
+    null, // 154
+    null, // 155
+    null, // 156
+    null, // 157
+    null, // 158
+    null, // 159
+    null, // 160
+    null, // 161
+    null, // 162
+    null, // 163
+    null, // 164
+    null, // 165
+    null, // 166
+    null, // 167
+    null, // 168
+    null, // 169
+    null, // 170
+    null, // 171
+    null, // 172
+    null, // 173
+    null, // 174
+    null, // 175
+    null, // 176
+    null, // 177
+    null, // 178
+    null, // 179
+    null, // 180
+    null, // 181
+    null, // 182
+    null, // 183
+    null, // 184
+    null, // 185
+    null, // 186
+    null, // 187
+    null, // 188
+    null, // 189
+    null, // 190
+    null, // 191
+    null, // 192
+    null, // 193
+    null, // 194
+    null, // 195
+    null, // 196
+    null, // 197
+    null, // 198
+    null, // 199
+    null, // 200
+    null, // 201
+    null, // 202
+    null, // 203
+    null, // 204
+    null, // 205
+    null, // 206
+    null, // 207
+    null, // 208
+    null, // 209
+    null, // 210
+    null, // 211
+    null, // 212
+    null, // 213
+    null, // 214
+    null, // 215
+    null, // 216
+    null, // 217
+    null, // 218
+    null, // 219
+    null, // 220
+    null, // 221
+    null, // 222
+    null, // 223
+    null, // 224
+    null, // 225
+    null, // 226
+    null, // 227
+    null, // 228
+    null, // 229
+    null, // 230
+    null, // 231
+    null, // 232
+    null, // 233
+    null, // 234
+    null, // 235
+    null, // 236
+    null, // 237
+    null, // 238
+    null, // 239
+    null, // 240
+    null, // 241
+    null, // 242
+    null, // 243
+    null, // 244
+    null, // 245
+    null, // 246
+    null, // 247
+    null, // 248
+    null, // 249
+    null, // 250
+    null, // 251
+    null, // 252
+    null, // 253
+    null, // 254
+    null, // 255
+};
+
+const opcode_table_2_1 = [_]?Opcode{
+    .STOP_CODE, // 0
+    .POP_TOP, // 1
+    .ROT_TWO, // 2
+    .ROT_THREE, // 3
+    .DUP_TOP, // 4
+    .ROT_FOUR, // 5
+    null, // 6
+    null, // 7
+    null, // 8
+    null, // 9
+    .UNARY_POSITIVE, // 10
+    .UNARY_NEGATIVE, // 11
+    .UNARY_NOT, // 12
+    .UNARY_CONVERT, // 13
+    null, // 14
+    .UNARY_INVERT, // 15
+    null, // 16
+    null, // 17
+    null, // 18
+    .BINARY_POWER, // 19
+    .BINARY_MULTIPLY, // 20
+    .BINARY_DIVIDE, // 21
+    .BINARY_MODULO, // 22
+    .BINARY_ADD, // 23
+    .BINARY_SUBTRACT, // 24
+    .BINARY_SUBSCR, // 25
+    null, // 26
+    null, // 27
+    null, // 28
+    null, // 29
+    .SLICE_0, // 30
+    .SLICE_1, // 31
+    .SLICE_2, // 32
+    .SLICE_3, // 33
+    null, // 34
+    null, // 35
+    null, // 36
+    null, // 37
+    null, // 38
+    null, // 39
+    .STORE_SLICE_0, // 40
+    .STORE_SLICE_1, // 41
+    .STORE_SLICE_2, // 42
+    .STORE_SLICE_3, // 43
+    null, // 44
+    null, // 45
+    null, // 46
+    null, // 47
+    null, // 48
+    null, // 49
+    .DELETE_SLICE_0, // 50
+    .DELETE_SLICE_1, // 51
+    .DELETE_SLICE_2, // 52
+    .DELETE_SLICE_3, // 53
+    null, // 54
+    .INPLACE_ADD, // 55
+    .INPLACE_SUBTRACT, // 56
+    .INPLACE_MULTIPLY, // 57
+    .INPLACE_DIVIDE, // 58
+    .INPLACE_MODULO, // 59
+    .STORE_SUBSCR, // 60
+    .DELETE_SUBSCR, // 61
+    .BINARY_LSHIFT, // 62
+    .BINARY_RSHIFT, // 63
+    .BINARY_AND, // 64
+    .BINARY_XOR, // 65
+    .BINARY_OR, // 66
+    .INPLACE_POWER, // 67
+    null, // 68
+    null, // 69
+    .PRINT_EXPR, // 70
+    .PRINT_ITEM, // 71
+    .PRINT_NEWLINE, // 72
+    .PRINT_ITEM_TO, // 73
+    .PRINT_NEWLINE_TO, // 74
+    .INPLACE_LSHIFT, // 75
+    .INPLACE_RSHIFT, // 76
+    .INPLACE_AND, // 77
+    .INPLACE_XOR, // 78
+    .INPLACE_OR, // 79
+    .BREAK_LOOP, // 80
+    null, // 81
+    .LOAD_LOCALS, // 82
+    .RETURN_VALUE, // 83
+    .IMPORT_STAR, // 84
+    .EXEC_STMT, // 85
+    null, // 86
+    .POP_BLOCK, // 87
+    .END_FINALLY, // 88
+    .BUILD_CLASS, // 89
+    .STORE_NAME, // 90
+    .DELETE_NAME, // 91
+    .UNPACK_SEQUENCE, // 92
+    null, // 93
     null, // 94
     .STORE_ATTR, // 95
     .DELETE_ATTR, // 96
@@ -2424,10 +2942,121 @@ const opcode_table_1_5 = [_]?Opcode{
     .CALL_FUNCTION_KW, // 141
     .CALL_FUNCTION_VAR_KW, // 142
     .EXTENDED_ARG, // 143
+    null, // 144
+    null, // 145
+    null, // 146
+    null, // 147
+    null, // 148
+    null, // 149
+    null, // 150
+    null, // 151
+    null, // 152
+    null, // 153
+    null, // 154
+    null, // 155
+    null, // 156
+    null, // 157
+    null, // 158
+    null, // 159
+    null, // 160
+    null, // 161
+    null, // 162
+    null, // 163
+    null, // 164
+    null, // 165
+    null, // 166
+    null, // 167
+    null, // 168
+    null, // 169
+    null, // 170
+    null, // 171
+    null, // 172
+    null, // 173
+    null, // 174
+    null, // 175
+    null, // 176
+    null, // 177
+    null, // 178
+    null, // 179
+    null, // 180
+    null, // 181
+    null, // 182
+    null, // 183
+    null, // 184
+    null, // 185
+    null, // 186
+    null, // 187
+    null, // 188
+    null, // 189
+    null, // 190
+    null, // 191
+    null, // 192
+    null, // 193
+    null, // 194
+    null, // 195
+    null, // 196
+    null, // 197
+    null, // 198
+    null, // 199
+    null, // 200
+    null, // 201
+    null, // 202
+    null, // 203
+    null, // 204
+    null, // 205
+    null, // 206
+    null, // 207
+    null, // 208
+    null, // 209
+    null, // 210
+    null, // 211
+    null, // 212
+    null, // 213
+    null, // 214
+    null, // 215
+    null, // 216
+    null, // 217
+    null, // 218
+    null, // 219
+    null, // 220
+    null, // 221
+    null, // 222
+    null, // 223
+    null, // 224
+    null, // 225
+    null, // 226
+    null, // 227
+    null, // 228
+    null, // 229
+    null, // 230
+    null, // 231
+    null, // 232
+    null, // 233
+    null, // 234
+    null, // 235
+    null, // 236
+    null, // 237
+    null, // 238
+    null, // 239
+    null, // 240
+    null, // 241
+    null, // 242
+    null, // 243
+    null, // 244
+    null, // 245
+    null, // 246
+    null, // 247
+    null, // 248
+    null, // 249
+    null, // 250
+    null, // 251
+    null, // 252
+    null, // 253
+    null, // 254
+    null, // 255
 };
 
-/// Python 2.3-2.4 opcode table (no SET_LINENO, added GET_ITER and FOR_ITER)
-const opcode_table_2_3 = [_]?Opcode{
+const opcode_table_2_2 = [_]?Opcode{
     .STOP_CODE, // 0
     .POP_TOP, // 1
     .ROT_TWO, // 2
@@ -2437,7 +3066,7 @@ const opcode_table_2_3 = [_]?Opcode{
     null, // 6
     null, // 7
     null, // 8
-    .NOP, // 9
+    null, // 9
     .UNARY_POSITIVE, // 10
     .UNARY_NEGATIVE, // 11
     .UNARY_NOT, // 12
@@ -2518,7 +3147,7 @@ const opcode_table_2_3 = [_]?Opcode{
     .POP_BLOCK, // 87
     .END_FINALLY, // 88
     .BUILD_CLASS, // 89
-    .STORE_NAME, // 90 (HAVE_ARGUMENT)
+    .STORE_NAME, // 90
     .DELETE_NAME, // 91
     .UNPACK_SEQUENCE, // 92
     .FOR_ITER, // 93
@@ -2555,6 +3184,265 @@ const opcode_table_2_3 = [_]?Opcode{
     .LOAD_FAST, // 124
     .STORE_FAST, // 125
     .DELETE_FAST, // 126
+    .SET_LINENO, // 127
+    null, // 128
+    null, // 129
+    .RAISE_VARARGS, // 130
+    .CALL_FUNCTION, // 131
+    .MAKE_FUNCTION, // 132
+    .BUILD_SLICE, // 133
+    .MAKE_CLOSURE, // 134
+    .LOAD_CLOSURE, // 135
+    .LOAD_DEREF, // 136
+    .STORE_DEREF, // 137
+    null, // 138
+    null, // 139
+    .CALL_FUNCTION_VAR, // 140
+    .CALL_FUNCTION_KW, // 141
+    .CALL_FUNCTION_VAR_KW, // 142
+    .EXTENDED_ARG, // 143
+    null, // 144
+    null, // 145
+    null, // 146
+    null, // 147
+    null, // 148
+    null, // 149
+    null, // 150
+    null, // 151
+    null, // 152
+    null, // 153
+    null, // 154
+    null, // 155
+    null, // 156
+    null, // 157
+    null, // 158
+    null, // 159
+    null, // 160
+    null, // 161
+    null, // 162
+    null, // 163
+    null, // 164
+    null, // 165
+    null, // 166
+    null, // 167
+    null, // 168
+    null, // 169
+    null, // 170
+    null, // 171
+    null, // 172
+    null, // 173
+    null, // 174
+    null, // 175
+    null, // 176
+    null, // 177
+    null, // 178
+    null, // 179
+    null, // 180
+    null, // 181
+    null, // 182
+    null, // 183
+    null, // 184
+    null, // 185
+    null, // 186
+    null, // 187
+    null, // 188
+    null, // 189
+    null, // 190
+    null, // 191
+    null, // 192
+    null, // 193
+    null, // 194
+    null, // 195
+    null, // 196
+    null, // 197
+    null, // 198
+    null, // 199
+    null, // 200
+    null, // 201
+    null, // 202
+    null, // 203
+    null, // 204
+    null, // 205
+    null, // 206
+    null, // 207
+    null, // 208
+    null, // 209
+    null, // 210
+    null, // 211
+    null, // 212
+    null, // 213
+    null, // 214
+    null, // 215
+    null, // 216
+    null, // 217
+    null, // 218
+    null, // 219
+    null, // 220
+    null, // 221
+    null, // 222
+    null, // 223
+    null, // 224
+    null, // 225
+    null, // 226
+    null, // 227
+    null, // 228
+    null, // 229
+    null, // 230
+    null, // 231
+    null, // 232
+    null, // 233
+    null, // 234
+    null, // 235
+    null, // 236
+    null, // 237
+    null, // 238
+    null, // 239
+    null, // 240
+    null, // 241
+    null, // 242
+    null, // 243
+    null, // 244
+    null, // 245
+    null, // 246
+    null, // 247
+    null, // 248
+    null, // 249
+    null, // 250
+    null, // 251
+    null, // 252
+    null, // 253
+    null, // 254
+    null, // 255
+};
+
+const opcode_table_2_3 = [_]?Opcode{
+    .STOP_CODE, // 0
+    .POP_TOP, // 1
+    .ROT_TWO, // 2
+    .ROT_THREE, // 3
+    .DUP_TOP, // 4
+    .ROT_FOUR, // 5
+    null, // 6
+    null, // 7
+    null, // 8
+    null, // 9
+    .UNARY_POSITIVE, // 10
+    .UNARY_NEGATIVE, // 11
+    .UNARY_NOT, // 12
+    .UNARY_CONVERT, // 13
+    null, // 14
+    .UNARY_INVERT, // 15
+    null, // 16
+    null, // 17
+    null, // 18
+    .BINARY_POWER, // 19
+    .BINARY_MULTIPLY, // 20
+    .BINARY_DIVIDE, // 21
+    .BINARY_MODULO, // 22
+    .BINARY_ADD, // 23
+    .BINARY_SUBTRACT, // 24
+    .BINARY_SUBSCR, // 25
+    .BINARY_FLOOR_DIVIDE, // 26
+    .BINARY_TRUE_DIVIDE, // 27
+    .INPLACE_FLOOR_DIVIDE, // 28
+    .INPLACE_TRUE_DIVIDE, // 29
+    .SLICE_0, // 30
+    .SLICE_1, // 31
+    .SLICE_2, // 32
+    .SLICE_3, // 33
+    null, // 34
+    null, // 35
+    null, // 36
+    null, // 37
+    null, // 38
+    null, // 39
+    .STORE_SLICE_0, // 40
+    .STORE_SLICE_1, // 41
+    .STORE_SLICE_2, // 42
+    .STORE_SLICE_3, // 43
+    null, // 44
+    null, // 45
+    null, // 46
+    null, // 47
+    null, // 48
+    null, // 49
+    .DELETE_SLICE_0, // 50
+    .DELETE_SLICE_1, // 51
+    .DELETE_SLICE_2, // 52
+    .DELETE_SLICE_3, // 53
+    null, // 54
+    .INPLACE_ADD, // 55
+    .INPLACE_SUBTRACT, // 56
+    .INPLACE_MULTIPLY, // 57
+    .INPLACE_DIVIDE, // 58
+    .INPLACE_MODULO, // 59
+    .STORE_SUBSCR, // 60
+    .DELETE_SUBSCR, // 61
+    .BINARY_LSHIFT, // 62
+    .BINARY_RSHIFT, // 63
+    .BINARY_AND, // 64
+    .BINARY_XOR, // 65
+    .BINARY_OR, // 66
+    .INPLACE_POWER, // 67
+    .GET_ITER, // 68
+    null, // 69
+    .PRINT_EXPR, // 70
+    .PRINT_ITEM, // 71
+    .PRINT_NEWLINE, // 72
+    .PRINT_ITEM_TO, // 73
+    .PRINT_NEWLINE_TO, // 74
+    .INPLACE_LSHIFT, // 75
+    .INPLACE_RSHIFT, // 76
+    .INPLACE_AND, // 77
+    .INPLACE_XOR, // 78
+    .INPLACE_OR, // 79
+    .BREAK_LOOP, // 80
+    null, // 81
+    .LOAD_LOCALS, // 82
+    .RETURN_VALUE, // 83
+    .IMPORT_STAR, // 84
+    .EXEC_STMT, // 85
+    .YIELD_VALUE, // 86
+    .POP_BLOCK, // 87
+    .END_FINALLY, // 88
+    .BUILD_CLASS, // 89
+    .STORE_NAME, // 90
+    .DELETE_NAME, // 91
+    .UNPACK_SEQUENCE, // 92
+    .FOR_ITER, // 93
+    null, // 94
+    .STORE_ATTR, // 95
+    .DELETE_ATTR, // 96
+    .STORE_GLOBAL, // 97
+    .DELETE_GLOBAL, // 98
+    .DUP_TOPX, // 99
+    .LOAD_CONST, // 100
+    .LOAD_NAME, // 101
+    .BUILD_TUPLE, // 102
+    .BUILD_LIST, // 103
+    .BUILD_MAP, // 104
+    .LOAD_ATTR, // 105
+    .COMPARE_OP, // 106
+    .IMPORT_NAME, // 107
+    .IMPORT_FROM, // 108
+    null, // 109
+    .JUMP_FORWARD, // 110
+    .JUMP_IF_FALSE, // 111
+    .JUMP_IF_TRUE, // 112
+    .JUMP_ABSOLUTE, // 113
+    null, // 114
+    null, // 115
+    .LOAD_GLOBAL, // 116
+    null, // 117
+    null, // 118
+    .CONTINUE_LOOP, // 119
+    .SETUP_LOOP, // 120
+    .SETUP_EXCEPT, // 121
+    .SETUP_FINALLY, // 122
+    null, // 123
+    .LOAD_FAST, // 124
+    .STORE_FAST, // 125
+    .DELETE_FAST, // 126
     null, // 127
     null, // 128
     null, // 129
@@ -2572,9 +3460,638 @@ const opcode_table_2_3 = [_]?Opcode{
     .CALL_FUNCTION_KW, // 141
     .CALL_FUNCTION_VAR_KW, // 142
     .EXTENDED_ARG, // 143
+    null, // 144
+    null, // 145
+    null, // 146
+    null, // 147
+    null, // 148
+    null, // 149
+    null, // 150
+    null, // 151
+    null, // 152
+    null, // 153
+    null, // 154
+    null, // 155
+    null, // 156
+    null, // 157
+    null, // 158
+    null, // 159
+    null, // 160
+    null, // 161
+    null, // 162
+    null, // 163
+    null, // 164
+    null, // 165
+    null, // 166
+    null, // 167
+    null, // 168
+    null, // 169
+    null, // 170
+    null, // 171
+    null, // 172
+    null, // 173
+    null, // 174
+    null, // 175
+    null, // 176
+    null, // 177
+    null, // 178
+    null, // 179
+    null, // 180
+    null, // 181
+    null, // 182
+    null, // 183
+    null, // 184
+    null, // 185
+    null, // 186
+    null, // 187
+    null, // 188
+    null, // 189
+    null, // 190
+    null, // 191
+    null, // 192
+    null, // 193
+    null, // 194
+    null, // 195
+    null, // 196
+    null, // 197
+    null, // 198
+    null, // 199
+    null, // 200
+    null, // 201
+    null, // 202
+    null, // 203
+    null, // 204
+    null, // 205
+    null, // 206
+    null, // 207
+    null, // 208
+    null, // 209
+    null, // 210
+    null, // 211
+    null, // 212
+    null, // 213
+    null, // 214
+    null, // 215
+    null, // 216
+    null, // 217
+    null, // 218
+    null, // 219
+    null, // 220
+    null, // 221
+    null, // 222
+    null, // 223
+    null, // 224
+    null, // 225
+    null, // 226
+    null, // 227
+    null, // 228
+    null, // 229
+    null, // 230
+    null, // 231
+    null, // 232
+    null, // 233
+    null, // 234
+    null, // 235
+    null, // 236
+    null, // 237
+    null, // 238
+    null, // 239
+    null, // 240
+    null, // 241
+    null, // 242
+    null, // 243
+    null, // 244
+    null, // 245
+    null, // 246
+    null, // 247
+    null, // 248
+    null, // 249
+    null, // 250
+    null, // 251
+    null, // 252
+    null, // 253
+    null, // 254
+    null, // 255
 };
 
-/// Python 2.5-2.6 opcode table (BUILD_MAP at 104, no BUILD_SET)
+const opcode_table_2_4 = [_]?Opcode{
+    .STOP_CODE, // 0
+    .POP_TOP, // 1
+    .ROT_TWO, // 2
+    .ROT_THREE, // 3
+    .DUP_TOP, // 4
+    .ROT_FOUR, // 5
+    null, // 6
+    null, // 7
+    null, // 8
+    .NOP, // 9
+    .UNARY_POSITIVE, // 10
+    .UNARY_NEGATIVE, // 11
+    .UNARY_NOT, // 12
+    .UNARY_CONVERT, // 13
+    null, // 14
+    .UNARY_INVERT, // 15
+    null, // 16
+    null, // 17
+    .LIST_APPEND, // 18
+    .BINARY_POWER, // 19
+    .BINARY_MULTIPLY, // 20
+    .BINARY_DIVIDE, // 21
+    .BINARY_MODULO, // 22
+    .BINARY_ADD, // 23
+    .BINARY_SUBTRACT, // 24
+    .BINARY_SUBSCR, // 25
+    .BINARY_FLOOR_DIVIDE, // 26
+    .BINARY_TRUE_DIVIDE, // 27
+    .INPLACE_FLOOR_DIVIDE, // 28
+    .INPLACE_TRUE_DIVIDE, // 29
+    .SLICE_0, // 30
+    .SLICE_1, // 31
+    .SLICE_2, // 32
+    .SLICE_3, // 33
+    null, // 34
+    null, // 35
+    null, // 36
+    null, // 37
+    null, // 38
+    null, // 39
+    .STORE_SLICE_0, // 40
+    .STORE_SLICE_1, // 41
+    .STORE_SLICE_2, // 42
+    .STORE_SLICE_3, // 43
+    null, // 44
+    null, // 45
+    null, // 46
+    null, // 47
+    null, // 48
+    null, // 49
+    .DELETE_SLICE_0, // 50
+    .DELETE_SLICE_1, // 51
+    .DELETE_SLICE_2, // 52
+    .DELETE_SLICE_3, // 53
+    null, // 54
+    .INPLACE_ADD, // 55
+    .INPLACE_SUBTRACT, // 56
+    .INPLACE_MULTIPLY, // 57
+    .INPLACE_DIVIDE, // 58
+    .INPLACE_MODULO, // 59
+    .STORE_SUBSCR, // 60
+    .DELETE_SUBSCR, // 61
+    .BINARY_LSHIFT, // 62
+    .BINARY_RSHIFT, // 63
+    .BINARY_AND, // 64
+    .BINARY_XOR, // 65
+    .BINARY_OR, // 66
+    .INPLACE_POWER, // 67
+    .GET_ITER, // 68
+    null, // 69
+    .PRINT_EXPR, // 70
+    .PRINT_ITEM, // 71
+    .PRINT_NEWLINE, // 72
+    .PRINT_ITEM_TO, // 73
+    .PRINT_NEWLINE_TO, // 74
+    .INPLACE_LSHIFT, // 75
+    .INPLACE_RSHIFT, // 76
+    .INPLACE_AND, // 77
+    .INPLACE_XOR, // 78
+    .INPLACE_OR, // 79
+    .BREAK_LOOP, // 80
+    null, // 81
+    .LOAD_LOCALS, // 82
+    .RETURN_VALUE, // 83
+    .IMPORT_STAR, // 84
+    .EXEC_STMT, // 85
+    .YIELD_VALUE, // 86
+    .POP_BLOCK, // 87
+    .END_FINALLY, // 88
+    .BUILD_CLASS, // 89
+    .STORE_NAME, // 90
+    .DELETE_NAME, // 91
+    .UNPACK_SEQUENCE, // 92
+    .FOR_ITER, // 93
+    null, // 94
+    .STORE_ATTR, // 95
+    .DELETE_ATTR, // 96
+    .STORE_GLOBAL, // 97
+    .DELETE_GLOBAL, // 98
+    .DUP_TOPX, // 99
+    .LOAD_CONST, // 100
+    .LOAD_NAME, // 101
+    .BUILD_TUPLE, // 102
+    .BUILD_LIST, // 103
+    .BUILD_MAP, // 104
+    .LOAD_ATTR, // 105
+    .COMPARE_OP, // 106
+    .IMPORT_NAME, // 107
+    .IMPORT_FROM, // 108
+    null, // 109
+    .JUMP_FORWARD, // 110
+    .JUMP_IF_FALSE, // 111
+    .JUMP_IF_TRUE, // 112
+    .JUMP_ABSOLUTE, // 113
+    null, // 114
+    null, // 115
+    .LOAD_GLOBAL, // 116
+    null, // 117
+    null, // 118
+    .CONTINUE_LOOP, // 119
+    .SETUP_LOOP, // 120
+    .SETUP_EXCEPT, // 121
+    .SETUP_FINALLY, // 122
+    null, // 123
+    .LOAD_FAST, // 124
+    .STORE_FAST, // 125
+    .DELETE_FAST, // 126
+    null, // 127
+    null, // 128
+    null, // 129
+    .RAISE_VARARGS, // 130
+    .CALL_FUNCTION, // 131
+    .MAKE_FUNCTION, // 132
+    .BUILD_SLICE, // 133
+    .MAKE_CLOSURE, // 134
+    .LOAD_CLOSURE, // 135
+    .LOAD_DEREF, // 136
+    .STORE_DEREF, // 137
+    null, // 138
+    null, // 139
+    .CALL_FUNCTION_VAR, // 140
+    .CALL_FUNCTION_KW, // 141
+    .CALL_FUNCTION_VAR_KW, // 142
+    .EXTENDED_ARG, // 143
+    null, // 144
+    null, // 145
+    null, // 146
+    null, // 147
+    null, // 148
+    null, // 149
+    null, // 150
+    null, // 151
+    null, // 152
+    null, // 153
+    null, // 154
+    null, // 155
+    null, // 156
+    null, // 157
+    null, // 158
+    null, // 159
+    null, // 160
+    null, // 161
+    null, // 162
+    null, // 163
+    null, // 164
+    null, // 165
+    null, // 166
+    null, // 167
+    null, // 168
+    null, // 169
+    null, // 170
+    null, // 171
+    null, // 172
+    null, // 173
+    null, // 174
+    null, // 175
+    null, // 176
+    null, // 177
+    null, // 178
+    null, // 179
+    null, // 180
+    null, // 181
+    null, // 182
+    null, // 183
+    null, // 184
+    null, // 185
+    null, // 186
+    null, // 187
+    null, // 188
+    null, // 189
+    null, // 190
+    null, // 191
+    null, // 192
+    null, // 193
+    null, // 194
+    null, // 195
+    null, // 196
+    null, // 197
+    null, // 198
+    null, // 199
+    null, // 200
+    null, // 201
+    null, // 202
+    null, // 203
+    null, // 204
+    null, // 205
+    null, // 206
+    null, // 207
+    null, // 208
+    null, // 209
+    null, // 210
+    null, // 211
+    null, // 212
+    null, // 213
+    null, // 214
+    null, // 215
+    null, // 216
+    null, // 217
+    null, // 218
+    null, // 219
+    null, // 220
+    null, // 221
+    null, // 222
+    null, // 223
+    null, // 224
+    null, // 225
+    null, // 226
+    null, // 227
+    null, // 228
+    null, // 229
+    null, // 230
+    null, // 231
+    null, // 232
+    null, // 233
+    null, // 234
+    null, // 235
+    null, // 236
+    null, // 237
+    null, // 238
+    null, // 239
+    null, // 240
+    null, // 241
+    null, // 242
+    null, // 243
+    null, // 244
+    null, // 245
+    null, // 246
+    null, // 247
+    null, // 248
+    null, // 249
+    null, // 250
+    null, // 251
+    null, // 252
+    null, // 253
+    null, // 254
+    null, // 255
+};
+
+const opcode_table_2_5 = [_]?Opcode{
+    .STOP_CODE, // 0
+    .POP_TOP, // 1
+    .ROT_TWO, // 2
+    .ROT_THREE, // 3
+    .DUP_TOP, // 4
+    .ROT_FOUR, // 5
+    null, // 6
+    null, // 7
+    null, // 8
+    .NOP, // 9
+    .UNARY_POSITIVE, // 10
+    .UNARY_NEGATIVE, // 11
+    .UNARY_NOT, // 12
+    .UNARY_CONVERT, // 13
+    null, // 14
+    .UNARY_INVERT, // 15
+    null, // 16
+    null, // 17
+    .LIST_APPEND, // 18
+    .BINARY_POWER, // 19
+    .BINARY_MULTIPLY, // 20
+    .BINARY_DIVIDE, // 21
+    .BINARY_MODULO, // 22
+    .BINARY_ADD, // 23
+    .BINARY_SUBTRACT, // 24
+    .BINARY_SUBSCR, // 25
+    .BINARY_FLOOR_DIVIDE, // 26
+    .BINARY_TRUE_DIVIDE, // 27
+    .INPLACE_FLOOR_DIVIDE, // 28
+    .INPLACE_TRUE_DIVIDE, // 29
+    .SLICE_0, // 30
+    .SLICE_1, // 31
+    .SLICE_2, // 32
+    .SLICE_3, // 33
+    null, // 34
+    null, // 35
+    null, // 36
+    null, // 37
+    null, // 38
+    null, // 39
+    .STORE_SLICE_0, // 40
+    .STORE_SLICE_1, // 41
+    .STORE_SLICE_2, // 42
+    .STORE_SLICE_3, // 43
+    null, // 44
+    null, // 45
+    null, // 46
+    null, // 47
+    null, // 48
+    null, // 49
+    .DELETE_SLICE_0, // 50
+    .DELETE_SLICE_1, // 51
+    .DELETE_SLICE_2, // 52
+    .DELETE_SLICE_3, // 53
+    null, // 54
+    .INPLACE_ADD, // 55
+    .INPLACE_SUBTRACT, // 56
+    .INPLACE_MULTIPLY, // 57
+    .INPLACE_DIVIDE, // 58
+    .INPLACE_MODULO, // 59
+    .STORE_SUBSCR, // 60
+    .DELETE_SUBSCR, // 61
+    .BINARY_LSHIFT, // 62
+    .BINARY_RSHIFT, // 63
+    .BINARY_AND, // 64
+    .BINARY_XOR, // 65
+    .BINARY_OR, // 66
+    .INPLACE_POWER, // 67
+    .GET_ITER, // 68
+    null, // 69
+    .PRINT_EXPR, // 70
+    .PRINT_ITEM, // 71
+    .PRINT_NEWLINE, // 72
+    .PRINT_ITEM_TO, // 73
+    .PRINT_NEWLINE_TO, // 74
+    .INPLACE_LSHIFT, // 75
+    .INPLACE_RSHIFT, // 76
+    .INPLACE_AND, // 77
+    .INPLACE_XOR, // 78
+    .INPLACE_OR, // 79
+    .BREAK_LOOP, // 80
+    .WITH_CLEANUP, // 81
+    .LOAD_LOCALS, // 82
+    .RETURN_VALUE, // 83
+    .IMPORT_STAR, // 84
+    .EXEC_STMT, // 85
+    .YIELD_VALUE, // 86
+    .POP_BLOCK, // 87
+    .END_FINALLY, // 88
+    .BUILD_CLASS, // 89
+    .STORE_NAME, // 90
+    .DELETE_NAME, // 91
+    .UNPACK_SEQUENCE, // 92
+    .FOR_ITER, // 93
+    null, // 94
+    .STORE_ATTR, // 95
+    .DELETE_ATTR, // 96
+    .STORE_GLOBAL, // 97
+    .DELETE_GLOBAL, // 98
+    .DUP_TOPX, // 99
+    .LOAD_CONST, // 100
+    .LOAD_NAME, // 101
+    .BUILD_TUPLE, // 102
+    .BUILD_LIST, // 103
+    .BUILD_MAP, // 104
+    .LOAD_ATTR, // 105
+    .COMPARE_OP, // 106
+    .IMPORT_NAME, // 107
+    .IMPORT_FROM, // 108
+    null, // 109
+    .JUMP_FORWARD, // 110
+    .JUMP_IF_FALSE, // 111
+    .JUMP_IF_TRUE, // 112
+    .JUMP_ABSOLUTE, // 113
+    null, // 114
+    null, // 115
+    .LOAD_GLOBAL, // 116
+    null, // 117
+    null, // 118
+    .CONTINUE_LOOP, // 119
+    .SETUP_LOOP, // 120
+    .SETUP_EXCEPT, // 121
+    .SETUP_FINALLY, // 122
+    null, // 123
+    .LOAD_FAST, // 124
+    .STORE_FAST, // 125
+    .DELETE_FAST, // 126
+    null, // 127
+    null, // 128
+    null, // 129
+    .RAISE_VARARGS, // 130
+    .CALL_FUNCTION, // 131
+    .MAKE_FUNCTION, // 132
+    .BUILD_SLICE, // 133
+    .MAKE_CLOSURE, // 134
+    .LOAD_CLOSURE, // 135
+    .LOAD_DEREF, // 136
+    .STORE_DEREF, // 137
+    null, // 138
+    null, // 139
+    .CALL_FUNCTION_VAR, // 140
+    .CALL_FUNCTION_KW, // 141
+    .CALL_FUNCTION_VAR_KW, // 142
+    .EXTENDED_ARG, // 143
+    null, // 144
+    null, // 145
+    null, // 146
+    null, // 147
+    null, // 148
+    null, // 149
+    null, // 150
+    null, // 151
+    null, // 152
+    null, // 153
+    null, // 154
+    null, // 155
+    null, // 156
+    null, // 157
+    null, // 158
+    null, // 159
+    null, // 160
+    null, // 161
+    null, // 162
+    null, // 163
+    null, // 164
+    null, // 165
+    null, // 166
+    null, // 167
+    null, // 168
+    null, // 169
+    null, // 170
+    null, // 171
+    null, // 172
+    null, // 173
+    null, // 174
+    null, // 175
+    null, // 176
+    null, // 177
+    null, // 178
+    null, // 179
+    null, // 180
+    null, // 181
+    null, // 182
+    null, // 183
+    null, // 184
+    null, // 185
+    null, // 186
+    null, // 187
+    null, // 188
+    null, // 189
+    null, // 190
+    null, // 191
+    null, // 192
+    null, // 193
+    null, // 194
+    null, // 195
+    null, // 196
+    null, // 197
+    null, // 198
+    null, // 199
+    null, // 200
+    null, // 201
+    null, // 202
+    null, // 203
+    null, // 204
+    null, // 205
+    null, // 206
+    null, // 207
+    null, // 208
+    null, // 209
+    null, // 210
+    null, // 211
+    null, // 212
+    null, // 213
+    null, // 214
+    null, // 215
+    null, // 216
+    null, // 217
+    null, // 218
+    null, // 219
+    null, // 220
+    null, // 221
+    null, // 222
+    null, // 223
+    null, // 224
+    null, // 225
+    null, // 226
+    null, // 227
+    null, // 228
+    null, // 229
+    null, // 230
+    null, // 231
+    null, // 232
+    null, // 233
+    null, // 234
+    null, // 235
+    null, // 236
+    null, // 237
+    null, // 238
+    null, // 239
+    null, // 240
+    null, // 241
+    null, // 242
+    null, // 243
+    null, // 244
+    null, // 245
+    null, // 246
+    null, // 247
+    null, // 248
+    null, // 249
+    null, // 250
+    null, // 251
+    null, // 252
+    null, // 253
+    null, // 254
+    null, // 255
+};
+
 const opcode_table_2_6 = [_]?Opcode{
     .STOP_CODE, // 0
     .POP_TOP, // 1
@@ -2594,7 +4111,7 @@ const opcode_table_2_6 = [_]?Opcode{
     .UNARY_INVERT, // 15
     null, // 16
     null, // 17
-    null, // 18
+    .LIST_APPEND, // 18
     .BINARY_POWER, // 19
     .BINARY_MULTIPLY, // 20
     .BINARY_DIVIDE, // 21
@@ -2666,11 +4183,11 @@ const opcode_table_2_6 = [_]?Opcode{
     .POP_BLOCK, // 87
     .END_FINALLY, // 88
     .BUILD_CLASS, // 89
-    .STORE_NAME, // 90 (HAVE_ARGUMENT)
+    .STORE_NAME, // 90
     .DELETE_NAME, // 91
     .UNPACK_SEQUENCE, // 92
     .FOR_ITER, // 93
-    .LIST_APPEND, // 94
+    null, // 94
     .STORE_ATTR, // 95
     .DELETE_ATTR, // 96
     .STORE_GLOBAL, // 97
@@ -2680,18 +4197,18 @@ const opcode_table_2_6 = [_]?Opcode{
     .LOAD_NAME, // 101
     .BUILD_TUPLE, // 102
     .BUILD_LIST, // 103
-    .BUILD_MAP, // 104 - Python 2.5/2.6 BUILD_MAP is at 104
+    .BUILD_MAP, // 104
     .LOAD_ATTR, // 105
     .COMPARE_OP, // 106
     .IMPORT_NAME, // 107
     .IMPORT_FROM, // 108
     null, // 109
     .JUMP_FORWARD, // 110
-    .JUMP_IF_FALSE, // 111 - Python 2.5/2.6: JUMP_IF_FALSE (not OR_POP variant)
-    .JUMP_IF_TRUE, // 112 - Python 2.5/2.6: JUMP_IF_TRUE (not OR_POP variant)
+    .JUMP_IF_FALSE, // 111
+    .JUMP_IF_TRUE, // 112
     .JUMP_ABSOLUTE, // 113
-    null, // 114 - POP_JUMP_IF_FALSE is Python 2.7+
-    null, // 115 - POP_JUMP_IF_TRUE is Python 2.7+
+    null, // 114
+    null, // 115
     .LOAD_GLOBAL, // 116
     null, // 117
     null, // 118
@@ -2703,7 +4220,7 @@ const opcode_table_2_6 = [_]?Opcode{
     .LOAD_FAST, // 124
     .STORE_FAST, // 125
     .DELETE_FAST, // 126
-    .SET_LINENO, // 127
+    null, // 127
     null, // 128
     null, // 129
     .RAISE_VARARGS, // 130
@@ -2720,9 +4237,120 @@ const opcode_table_2_6 = [_]?Opcode{
     .CALL_FUNCTION_KW, // 141
     .CALL_FUNCTION_VAR_KW, // 142
     .EXTENDED_ARG, // 143
+    null, // 144
+    null, // 145
+    null, // 146
+    null, // 147
+    null, // 148
+    null, // 149
+    null, // 150
+    null, // 151
+    null, // 152
+    null, // 153
+    null, // 154
+    null, // 155
+    null, // 156
+    null, // 157
+    null, // 158
+    null, // 159
+    null, // 160
+    null, // 161
+    null, // 162
+    null, // 163
+    null, // 164
+    null, // 165
+    null, // 166
+    null, // 167
+    null, // 168
+    null, // 169
+    null, // 170
+    null, // 171
+    null, // 172
+    null, // 173
+    null, // 174
+    null, // 175
+    null, // 176
+    null, // 177
+    null, // 178
+    null, // 179
+    null, // 180
+    null, // 181
+    null, // 182
+    null, // 183
+    null, // 184
+    null, // 185
+    null, // 186
+    null, // 187
+    null, // 188
+    null, // 189
+    null, // 190
+    null, // 191
+    null, // 192
+    null, // 193
+    null, // 194
+    null, // 195
+    null, // 196
+    null, // 197
+    null, // 198
+    null, // 199
+    null, // 200
+    null, // 201
+    null, // 202
+    null, // 203
+    null, // 204
+    null, // 205
+    null, // 206
+    null, // 207
+    null, // 208
+    null, // 209
+    null, // 210
+    null, // 211
+    null, // 212
+    null, // 213
+    null, // 214
+    null, // 215
+    null, // 216
+    null, // 217
+    null, // 218
+    null, // 219
+    null, // 220
+    null, // 221
+    null, // 222
+    null, // 223
+    null, // 224
+    null, // 225
+    null, // 226
+    null, // 227
+    null, // 228
+    null, // 229
+    null, // 230
+    null, // 231
+    null, // 232
+    null, // 233
+    null, // 234
+    null, // 235
+    null, // 236
+    null, // 237
+    null, // 238
+    null, // 239
+    null, // 240
+    null, // 241
+    null, // 242
+    null, // 243
+    null, // 244
+    null, // 245
+    null, // 246
+    null, // 247
+    null, // 248
+    null, // 249
+    null, // 250
+    null, // 251
+    null, // 252
+    null, // 253
+    null, // 254
+    null, // 255
 };
 
-/// Python 2.7 opcode table (BUILD_SET added at 104)
 const opcode_table_2_7 = [_]?Opcode{
     .STOP_CODE, // 0
     .POP_TOP, // 1
@@ -2814,7 +4442,7 @@ const opcode_table_2_7 = [_]?Opcode{
     .POP_BLOCK, // 87
     .END_FINALLY, // 88
     .BUILD_CLASS, // 89
-    .STORE_NAME, // 90 (HAVE_ARGUMENT)
+    .STORE_NAME, // 90
     .DELETE_NAME, // 91
     .UNPACK_SEQUENCE, // 92
     .FOR_ITER, // 93
@@ -2851,7 +4479,7 @@ const opcode_table_2_7 = [_]?Opcode{
     .LOAD_FAST, // 124
     .STORE_FAST, // 125
     .DELETE_FAST, // 126
-    .SET_LINENO, // 127
+    null, // 127
     null, // 128
     null, // 129
     .RAISE_VARARGS, // 130
@@ -2872,6 +4500,114 @@ const opcode_table_2_7 = [_]?Opcode{
     .EXTENDED_ARG, // 145
     .SET_ADD, // 146
     .MAP_ADD, // 147
+    null, // 148
+    null, // 149
+    null, // 150
+    null, // 151
+    null, // 152
+    null, // 153
+    null, // 154
+    null, // 155
+    null, // 156
+    null, // 157
+    null, // 158
+    null, // 159
+    null, // 160
+    null, // 161
+    null, // 162
+    null, // 163
+    null, // 164
+    null, // 165
+    null, // 166
+    null, // 167
+    null, // 168
+    null, // 169
+    null, // 170
+    null, // 171
+    null, // 172
+    null, // 173
+    null, // 174
+    null, // 175
+    null, // 176
+    null, // 177
+    null, // 178
+    null, // 179
+    null, // 180
+    null, // 181
+    null, // 182
+    null, // 183
+    null, // 184
+    null, // 185
+    null, // 186
+    null, // 187
+    null, // 188
+    null, // 189
+    null, // 190
+    null, // 191
+    null, // 192
+    null, // 193
+    null, // 194
+    null, // 195
+    null, // 196
+    null, // 197
+    null, // 198
+    null, // 199
+    null, // 200
+    null, // 201
+    null, // 202
+    null, // 203
+    null, // 204
+    null, // 205
+    null, // 206
+    null, // 207
+    null, // 208
+    null, // 209
+    null, // 210
+    null, // 211
+    null, // 212
+    null, // 213
+    null, // 214
+    null, // 215
+    null, // 216
+    null, // 217
+    null, // 218
+    null, // 219
+    null, // 220
+    null, // 221
+    null, // 222
+    null, // 223
+    null, // 224
+    null, // 225
+    null, // 226
+    null, // 227
+    null, // 228
+    null, // 229
+    null, // 230
+    null, // 231
+    null, // 232
+    null, // 233
+    null, // 234
+    null, // 235
+    null, // 236
+    null, // 237
+    null, // 238
+    null, // 239
+    null, // 240
+    null, // 241
+    null, // 242
+    null, // 243
+    null, // 244
+    null, // 245
+    null, // 246
+    null, // 247
+    null, // 248
+    null, // 249
+    null, // 250
+    null, // 251
+    null, // 252
+    null, // 253
+    null, // 254
+    null, // 255
 };
 
 /// Python 3.1-3.4 opcode byte values (variable-length instructions like Python 2)
@@ -3195,6 +4931,7 @@ const opcode_table_3_5 = [_]?Opcode{
 };
 
 /// Python 3.0 opcode byte values (variable-length instructions like Python 2)
+
 const opcode_table_3_0 = [_]?Opcode{
     .STOP_CODE, // 0
     .POP_TOP, // 1
@@ -3357,9 +5094,14 @@ pub fn getOpcodeTable(ver: Version) []const ?Opcode {
     if (ver.gte(3, 1)) return &opcode_table_3_1;
     if (ver.major == 3) return &opcode_table_3_0;
     if (ver.gte(2, 7)) return &opcode_table_2_7;
-    if (ver.gte(2, 5)) return &opcode_table_2_6;
+    if (ver.gte(2, 6)) return &opcode_table_2_6;
+    if (ver.gte(2, 5)) return &opcode_table_2_5;
+    if (ver.gte(2, 4)) return &opcode_table_2_4;
     if (ver.gte(2, 3)) return &opcode_table_2_3;
-    if (ver.major >= 1) return &opcode_table_1_5;
+    if (ver.gte(2, 2)) return &opcode_table_2_2;
+    if (ver.gte(2, 1)) return &opcode_table_2_1;
+    if (ver.gte(2, 0)) return &opcode_table_2_0;
+    if (ver.gte(1, 5)) return &opcode_table_1_5;
     std.debug.panic("unsupported Python version {d}.{d}", .{ ver.major, ver.minor });
 }
 
@@ -3541,6 +5283,33 @@ test "opcode has arg 3.11" {
     try testing.expect(Opcode.LOAD_CONST.hasArg(v311));
     try testing.expect(Opcode.LOAD_FAST.hasArg(v311));
     try testing.expect(Opcode.CALL.hasArg(v311));
+}
+
+test "opcode table 2.2 includes yield and inplace divide" {
+    const testing = std.testing;
+    const v22 = Version.init(2, 2);
+    const table = getOpcodeTable(v22);
+    try testing.expectEqual(Opcode.INPLACE_FLOOR_DIVIDE, table[28].?);
+    try testing.expectEqual(Opcode.INPLACE_TRUE_DIVIDE, table[29].?);
+    try testing.expectEqual(Opcode.YIELD_VALUE, table[86].?);
+}
+
+test "opcode table 2.3 drops for_loop and set_lineno" {
+    const testing = std.testing;
+    const v23 = Version.init(2, 3);
+    const table = getOpcodeTable(v23);
+    try testing.expect(table[114] == null);
+    try testing.expect(table[127] == null);
+}
+
+test "opcode table 2.5 vs 2.6 store_map" {
+    const testing = std.testing;
+    const v25 = Version.init(2, 5);
+    const v26 = Version.init(2, 6);
+    const t25 = getOpcodeTable(v25);
+    const t26 = getOpcodeTable(v26);
+    try testing.expect(t25[54] == null);
+    try testing.expectEqual(Opcode.STORE_MAP, t26[54].?);
 }
 
 test "opcode has arg 3.14" {
