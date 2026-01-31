@@ -59,9 +59,20 @@ External Cross-checks
   - xdis (pre-opcode reorg, compatible with decompyle3): `/tmp/decompyle3-venv-312/bin/pip install git+https://github.com/rocky/python-xdis.git@f19046be089a515f2041a14a696774e82851d3c5`
   - Install: `/tmp/decompyle3-venv-312/bin/pip install -e /tmp/python-decompile3`
   - Tests: `PYTHON=/tmp/decompyle3-venv-312/bin/python make -C /tmp/python-decompile3 check-3.12`
+  - Harness:
+    - `/tmp/python-decompile3/test/test_pythonlib.py`
+    - `/tmp/python-decompile3/test/test_pyenvlib.py`
+    - `/tmp/python-decompile3/test/simple-decompile-code-test.py`
+    - `/tmp/python-decompile3/compile_tests`
 - External corpora to compare against decompyle3 (3.x only):
   - `/tmp/python-decompile3/test/bytecode_3.7`
+  - `/tmp/python-decompile3/test/bytecode_3.7pypy`
   - `/tmp/python-decompile3/test/bytecode_3.8`
+  - `/tmp/python-decompile3/test/bytecode_3.8pypy`
+  - `/tmp/python-decompile3/test/bytecode_pypy37_run`
+  - `/tmp/python-decompile3/test/bytecode_pypy38_run`
+  - `/tmp/python-decompile3/test/bytecompile-tests`
+  - `/tmp/python-decompile3/test/decompyle`
   - `/tmp/python-decompile3/test/simple_source`
   - `/tmp/python-decompile3/test/stdlib`
   - `/tmp/python-decompile3/test/test_one`
