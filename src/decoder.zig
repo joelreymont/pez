@@ -524,7 +524,7 @@ fn parseLnotab(
     allocator: std.mem.Allocator,
 ) !void {
     if (lnotab.len == 0) return;
-    if (lnotab.len % 2 != 0) return; // Invalid: must be pairs
+    if (lnotab.len % 2 != 0) return error.InvalidLineTable; // Invalid: must be pairs
 
     var addr: u32 = 0;
     var line: i32 = @intCast(firstlineno);
@@ -578,7 +578,7 @@ fn parseLineTable310(
     allocator: std.mem.Allocator,
 ) !void {
     if (linetable.len == 0) return;
-    if (linetable.len % 2 != 0) return;
+    if (linetable.len % 2 != 0) return error.InvalidLineTable;
 
     var addr: u32 = 0;
     var line: i32 = @intCast(firstlineno);
@@ -628,7 +628,7 @@ fn parseLocationsTable(
         pos += 1;
 
         // Header byte must have bit 7 set
-        if ((header & 0x80) == 0) break;
+        if ((header & 0x80) == 0) return error.InvalidLineTable;
 
         const code: u4 = @intCast((header >> 3) & 0x0F);
         const length: u32 = @as(u32, header & 0x07) + 1; // Length in code units
@@ -642,9 +642,8 @@ fn parseLocationsTable(
         switch (code) {
             0...9 => {
                 // Short form: 2 bytes total, same line
-                if (pos < linetable.len) {
-                    pos += 1; // Skip column byte
-                }
+                if (pos >= linetable.len) return error.InvalidLineTable;
+                pos += 1; // Skip column byte
                 entry_line = if (line >= 0) @intCast(line) else null;
             },
             10, 11, 12 => {
@@ -652,14 +651,13 @@ fn parseLocationsTable(
                 const line_delta: i32 = @as(i32, code) - 10;
                 line += line_delta;
                 // Skip start_col and end_col bytes
-                if (pos + 1 < linetable.len) {
-                    pos += 2;
-                }
+                if (pos + 1 >= linetable.len) return error.InvalidLineTable;
+                pos += 2;
                 entry_line = if (line >= 0) @intCast(line) else null;
             },
             13 => {
                 // No column info: line_delta as svarint
-                const varint_result = readVarint(linetable, pos);
+                const varint_result = try readVarint(linetable, pos);
                 pos = varint_result.new_pos;
                 const line_delta = decodeSvarint(varint_result.value);
                 line += line_delta;
@@ -667,17 +665,17 @@ fn parseLocationsTable(
             },
             14 => {
                 // Long form: all fields as varints
-                const line_delta_result = readVarint(linetable, pos);
+                const line_delta_result = try readVarint(linetable, pos);
                 pos = line_delta_result.new_pos;
                 const line_delta = decodeSvarint(line_delta_result.value);
                 line += line_delta;
 
                 // Skip end_line_delta, start_col, end_col
-                const end_line_result = readVarint(linetable, pos);
+                const end_line_result = try readVarint(linetable, pos);
                 pos = end_line_result.new_pos;
-                const start_col_result = readVarint(linetable, pos);
+                const start_col_result = try readVarint(linetable, pos);
                 pos = start_col_result.new_pos;
-                const end_col_result = readVarint(linetable, pos);
+                const end_col_result = try readVarint(linetable, pos);
                 pos = end_col_result.new_pos;
 
                 entry_line = if (line >= 0) @intCast(line) else null;
@@ -700,7 +698,7 @@ fn parseLocationsTable(
 }
 
 /// Read a variable-length unsigned integer (6-bit chunks, LSB first).
-fn readVarint(data: []const u8, start_pos: usize) struct { value: u32, new_pos: usize } {
+fn readVarint(data: []const u8, start_pos: usize) !struct { value: u32, new_pos: usize } {
     var result: u32 = 0;
     var shift: u5 = 0;
     var pos = start_pos;
@@ -712,13 +710,15 @@ fn readVarint(data: []const u8, start_pos: usize) struct { value: u32, new_pos: 
         result |= @as(u32, byte & 0x3F) << shift;
 
         // Bit 6 not set = last chunk
-        if ((byte & 0x40) == 0) break;
+        if ((byte & 0x40) == 0) {
+            return .{ .value = result, .new_pos = pos };
+        }
 
         shift +|= 6;
-        if (shift > 30) break; // Overflow protection
+        if (shift > 30) return error.InvalidLineTable; // Overflow protection
     }
 
-    return .{ .value = result, .new_pos = pos };
+    return error.InvalidLineTable;
 }
 
 /// Decode a zigzag-encoded signed integer.
@@ -747,6 +747,22 @@ test "lnotab parsing basic" {
     try testing.expectEqual(@as(?u32, 3), table.getLine(50));
 }
 
+test "lnotab parsing rejects odd length" {
+    const testing = std.testing;
+    const lnotab = [_]u8{ 6, 1, 44 };
+    const v37 = Version.init(3, 7);
+
+    try testing.expectError(error.InvalidLineTable, parseLineTable(&lnotab, 1, v37, testing.allocator));
+}
+
+test "linetable310 rejects odd length" {
+    const testing = std.testing;
+    const linetable = [_]u8{1};
+    const v310 = Version.init(3, 10);
+
+    try testing.expectError(error.InvalidLineTable, parseLineTable(&linetable, 1, v310, testing.allocator));
+}
+
 test "lnotab parsing with signed deltas" {
     const testing = std.testing;
 
@@ -762,6 +778,22 @@ test "lnotab parsing with signed deltas" {
 
     try testing.expectEqual(@as(?u32, 10), table.getLine(0));
     try testing.expectEqual(@as(?u32, 8), table.getLine(20));
+}
+
+test "locations table rejects invalid header" {
+    const testing = std.testing;
+    const linetable = [_]u8{0x00};
+    const v311 = Version.init(3, 11);
+
+    try testing.expectError(error.InvalidLineTable, parseLineTable(&linetable, 1, v311, testing.allocator));
+}
+
+test "locations table rejects truncated varint" {
+    const testing = std.testing;
+    const linetable = [_]u8{ 0xE8, 0x40 };
+    const v311 = Version.init(3, 11);
+
+    try testing.expectError(error.InvalidLineTable, parseLineTable(&linetable, 1, v311, testing.allocator));
 }
 
 test "locations table parsing code 15" {
