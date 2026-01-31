@@ -24195,6 +24195,13 @@ test "py_compile decompile 3.14" {
     try expectDecompileFixture(allocator, "test/corpus/py_compile.3.14.pyc");
 }
 
+test "pyimod02_importers decompile 3.9" {
+    const testing = std.testing;
+    const allocator = testing.allocator;
+
+    try expectDecompileFixture(allocator, "test/corpus/pyimod02_importers.3.9.pyc");
+}
+
 test "genset reuse" {
     const allocator = std.testing.allocator;
     var set = try GenSet.init(allocator, 4);
