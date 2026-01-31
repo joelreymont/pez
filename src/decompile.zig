@@ -24209,6 +24209,13 @@ test "pyimod03_ctypes decompile 3.9" {
     try expectDecompileFixture(allocator, "test/corpus/pyimod03_ctypes.3.9.pyc");
 }
 
+test "sysconfig decompile 3.9" {
+    const testing = std.testing;
+    const allocator = testing.allocator;
+
+    try expectDecompileFixture(allocator, "test/corpus/sysconfig.3.9.pyc");
+}
+
 test "genset reuse" {
     const allocator = std.testing.allocator;
     var set = try GenSet.init(allocator, 4);
