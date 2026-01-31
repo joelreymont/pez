@@ -56,10 +56,10 @@ External Cross-checks
 - decompyle3:
   - Clone: `gh repo clone rocky/python-decompile3 /tmp/python-decompile3`
   - Venv (py3.12): `/opt/homebrew/bin/python3.12 -m venv /tmp/decompyle3-venv-312`
-  - xdis from git: `/tmp/decompyle3-venv-312/bin/pip install git+https://github.com/rocky/python-xdis.git`
+  - xdis (pre-opcode reorg, compatible with decompyle3): `/tmp/decompyle3-venv-312/bin/pip install git+https://github.com/rocky/python-xdis.git@f19046be089a515f2041a14a696774e82851d3c5`
   - Install: `/tmp/decompyle3-venv-312/bin/pip install -e /tmp/python-decompile3`
   - Tests: `PYTHON=/tmp/decompyle3-venv-312/bin/python make -C /tmp/python-decompile3 check-3.12`
-- External corpora to compare against decompyle3:
+- External corpora to compare against decompyle3 (3.x only):
   - `/tmp/python-decompile3/test/bytecode_3.7`
   - `/tmp/python-decompile3/test/bytecode_3.8`
   - `/tmp/python-decompile3/test/simple_source`
