@@ -7774,6 +7774,9 @@ pub const Decompiler = struct {
                 }
             }
         }
+        if (is_elif and merge_block != null and merge_block.? == then_block) {
+            merge_block = null;
+        }
         var force_else = blk: {
             if (else_block) |eid| {
                 if (self.isTerminalBlock(then_block) and self.isTerminalBlock(eid)) break :blk true;
