@@ -53,7 +53,18 @@ zcheck Features to Use
 
 External Cross-checks
 ---------------------
-- decompyle3: `gh repo clone rocky/python-decompile3 /tmp/python-decompile3` then `make check`.
+- decompyle3:
+  - Clone: `gh repo clone rocky/python-decompile3 /tmp/python-decompile3`
+  - Venv (py3.12): `/opt/homebrew/bin/python3.12 -m venv /tmp/decompyle3-venv-312`
+  - xdis from git: `/tmp/decompyle3-venv-312/bin/pip install git+https://github.com/rocky/python-xdis.git`
+  - Install: `/tmp/decompyle3-venv-312/bin/pip install -e /tmp/python-decompile3`
+  - Tests: `PYTHON=/tmp/decompyle3-venv-312/bin/python make -C /tmp/python-decompile3 check-3.12`
+- External corpora to compare against decompyle3:
+  - `/tmp/python-decompile3/test/bytecode_3.7`
+  - `/tmp/python-decompile3/test/bytecode_3.8`
+  - `/tmp/python-decompile3/test/simple_source`
+  - `/tmp/python-decompile3/test/stdlib`
+  - `/tmp/python-decompile3/test/test_one`
 - Compare pez output against decompyle3 on shared corpora when diagnosing mismatches.
 
 Next Steps
