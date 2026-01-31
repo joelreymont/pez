@@ -427,7 +427,7 @@ pub const Stack = struct {
             .expr => |e| e,
             .unknown => {
                 const expr = try self.ast_alloc.create(Expr);
-                expr.* = .{ .name = .{ .id = "__unknown__", .ctx = .load } };
+                expr.* = .unknown;
                 return expr;
             },
             else => {
@@ -435,7 +435,7 @@ pub const Stack = struct {
                     var tmp = val;
                     tmp.deinit(self.ast_alloc, self.stack_alloc);
                     const expr = try self.ast_alloc.create(Expr);
-                    expr.* = .{ .name = .{ .id = "__unknown__", .ctx = .load } };
+                    expr.* = .unknown;
                     return expr;
                 }
                 var tmp = val;
@@ -520,7 +520,7 @@ pub const Stack = struct {
                 .expr => |e| e,
                 .unknown => blk: {
                     const expr = try self.ast_alloc.create(Expr);
-                    expr.* = .{ .name = .{ .id = "__unknown__", .ctx = .load } };
+                    expr.* = .unknown;
                     try created.append(self.stack_alloc, expr);
                     break :blk expr;
                 },
@@ -529,7 +529,7 @@ pub const Stack = struct {
                         var tmp = v;
                         tmp.deinit(self.ast_alloc, self.stack_alloc);
                         const expr = try self.ast_alloc.create(Expr);
-                        expr.* = .{ .name = .{ .id = "__unknown__", .ctx = .load } };
+                        expr.* = .unknown;
                         try created.append(self.stack_alloc, expr);
                         break :blk expr;
                     }
@@ -1496,8 +1496,10 @@ pub const SimContext = struct {
                 try self.stack.push(.{ .expr = comp_expr });
             },
             .unknown => {
-                const unknown_expr = try self.makeName("__unknown__", .load);
-                try self.handleCallExpr(unknown_expr, args_vals, keywords);
+                deinitKeywordsOwned(self.allocator, keywords);
+                self.deinitStackValues(args_vals);
+                try self.stack.push(.unknown);
+                return;
             },
             .expr => |callee_expr| {
                 try self.handleCallExpr(callee_expr, args_vals, keywords);
@@ -3632,7 +3634,7 @@ pub const SimContext = struct {
             .CALL_FUNCTION => {
                 if (self.flow_mode) {
                     var argc_flow: usize = if (self.version.lt(3, 6))
-                        @intCast(inst.arg & 0xFF)
+                        @intCast((inst.arg & 0xFF) + (((inst.arg >> 8) & 0xFF) * 2))
                     else
                         @intCast(inst.arg);
                     while (argc_flow > 0) : (argc_flow -= 1) {
@@ -4948,6 +4950,17 @@ pub const SimContext = struct {
                 try self.stack.push(.{ .expr = expr });
             },
 
+            .UNARY_CONVERT => {
+                const operand = try self.stack.popExpr();
+                errdefer {
+                    operand.deinit(self.allocator);
+                    self.allocator.destroy(operand);
+                }
+                const expr = try self.allocator.create(Expr);
+                expr.* = .{ .repr_expr = .{ .value = operand } };
+                try self.stack.push(.{ .expr = expr });
+            },
+
             // Iterator opcodes
             .GET_ITER => {
                 // GET_ITER - get an iterator from TOS, leave iterator on stack
@@ -5216,6 +5229,40 @@ pub const SimContext = struct {
                 try self.stack.push(.{ .expr = expr });
             },
 
+            .SLICE_0, .SLICE_1, .SLICE_2, .SLICE_3 => {
+                var lower: ?*Expr = null;
+                var upper: ?*Expr = null;
+                const container = switch (inst.opcode) {
+                    .SLICE_0 => try self.stack.popExpr(),
+                    .SLICE_1 => blk: {
+                        const start = try self.stack.popExpr();
+                        lower = start;
+                        break :blk try self.stack.popExpr();
+                    },
+                    .SLICE_2 => blk: {
+                        const stop = try self.stack.popExpr();
+                        upper = stop;
+                        break :blk try self.stack.popExpr();
+                    },
+                    .SLICE_3 => blk: {
+                        const stop = try self.stack.popExpr();
+                        upper = stop;
+                        const start = try self.stack.popExpr();
+                        lower = start;
+                        break :blk try self.stack.popExpr();
+                    },
+                    else => unreachable,
+                };
+
+                const lower_val = if (lower) |l| (if (isNoneExpr(l)) null else l) else null;
+                const upper_val = if (upper) |u| (if (isNoneExpr(u)) null else u) else null;
+
+                const slice = try self.allocator.create(Expr);
+                slice.* = .{ .slice = .{ .lower = lower_val, .upper = upper_val, .step = null } };
+                const expr = try ast.makeSubscript(self.allocator, container, slice, .load);
+                try self.stack.push(.{ .expr = expr });
+            },
+
             .BINARY_SLICE => {
                 // BINARY_SLICE (Python 3.12+) - TOS = TOS2[TOS1:TOS]
                 const stop = try self.stack.popExpr();
@@ -5239,6 +5286,30 @@ pub const SimContext = struct {
                 _ = self.stack.pop();
                 _ = self.stack.pop();
                 _ = self.stack.pop();
+            },
+
+            .STORE_SLICE_0, .STORE_SLICE_1, .STORE_SLICE_2, .STORE_SLICE_3 => {
+                // Legacy STORE_SLICE+* (Python 2.x)
+                _ = self.stack.pop(); // value
+                switch (inst.opcode) {
+                    .STORE_SLICE_0 => {
+                        _ = self.stack.pop(); // container
+                    },
+                    .STORE_SLICE_1 => {
+                        _ = self.stack.pop(); // start
+                        _ = self.stack.pop(); // container
+                    },
+                    .STORE_SLICE_2 => {
+                        _ = self.stack.pop(); // stop
+                        _ = self.stack.pop(); // container
+                    },
+                    .STORE_SLICE_3 => {
+                        _ = self.stack.pop(); // stop
+                        _ = self.stack.pop(); // start
+                        _ = self.stack.pop(); // container
+                    },
+                    else => {},
+                }
             },
 
             .STORE_SUBSCR => {
@@ -5612,18 +5683,38 @@ pub const SimContext = struct {
 
             .WITH_EXCEPT_START => {
                 // WITH_EXCEPT_START - call __exit__ with exception details
-                // Stack: exit, exc_type, exc, tb -> result
-                var i: usize = 0;
-                while (i < 4) : (i += 1) {
+                // Stack effect is +1 (result); inputs remain for cleanup path.
+                try self.stack.push(.unknown);
+            },
+
+            .WITH_CLEANUP => {
+                // WITH_CLEANUP (Python 2.x/3.3 legacy) - cleanup for with statement
+                // 2.x stack effect: pop 4, push 3 (exc info placeholders)
+                // 3.3 legacy: pop 1, push 0
+                if (self.version.major <= 2) {
+                    var i: usize = 0;
+                    while (i < 4) : (i += 1) {
+                        if (self.stack.pop()) |v| {
+                            var val = v;
+                            val.deinit(self.allocator, self.stack_alloc);
+                        } else if (!(self.lenient or self.flow_mode)) {
+                            return error.StackUnderflow;
+                        } else {
+                            break;
+                        }
+                    }
+                    i = 0;
+                    while (i < 3) : (i += 1) {
+                        try self.stack.push(.exc_marker);
+                    }
+                } else {
                     if (self.stack.pop()) |v| {
                         var val = v;
                         val.deinit(self.allocator, self.stack_alloc);
-                    } else {
-                        if (self.lenient or self.flow_mode) break;
+                    } else if (!(self.lenient or self.flow_mode)) {
                         return error.StackUnderflow;
                     }
                 }
-                try self.stack.push(.unknown);
             },
 
             .END_FINALLY => {
@@ -5631,7 +5722,9 @@ pub const SimContext = struct {
                 // 1: None (normal), 2: return/continue value, 4: exc_type, exc, tb, why.
                 const len = self.stack.items.items.len;
                 var drop: usize = 0;
-                if (len >= 3) {
+                if (self.version.major <= 2) {
+                    drop = if (len >= 3) 3 else len;
+                } else if (len >= 3) {
                     const a = self.stack.items.items[len - 1];
                     const b = self.stack.items.items[len - 2];
                     const c = self.stack.items.items[len - 3];
@@ -5672,19 +5765,16 @@ pub const SimContext = struct {
             },
 
             .POP_EXCEPT => {
-                if (self.stack.items.items.len >= 3) {
-                    const len = self.stack.items.items.len;
-                    const a = self.stack.items.items[len - 1];
-                    const b = self.stack.items.items[len - 2];
-                    const c = self.stack.items.items[len - 3];
-                    if (isExcPh(a) and isExcPh(b) and isExcPh(c)) {
-                        var i: usize = 0;
-                        while (i < 3) : (i += 1) {
-                            if (self.stack.pop()) |v| {
-                                var val = v;
-                                val.deinit(self.allocator, self.stack_alloc);
-                            }
-                        }
+                const drop: usize = if (self.version.gte(3, 11)) 1 else 3;
+                var i: usize = 0;
+                while (i < drop) : (i += 1) {
+                    if (self.stack.pop()) |v| {
+                        var val = v;
+                        val.deinit(self.allocator, self.stack_alloc);
+                    } else if (!(self.lenient or self.flow_mode)) {
+                        return error.StackUnderflow;
+                    } else {
+                        break;
                     }
                 }
             },
@@ -5713,6 +5803,55 @@ pub const SimContext = struct {
                 key_val.deinit(self.allocator, self.stack_alloc);
                 container_val.deinit(self.allocator, self.stack_alloc);
             },
+            .DELETE_SLICE_0, .DELETE_SLICE_1, .DELETE_SLICE_2, .DELETE_SLICE_3 => {
+                // Legacy DELETE_SLICE+* (Python 2.x)
+                const container = switch (inst.opcode) {
+                    .DELETE_SLICE_0 => self.stack.pop() orelse return error.StackUnderflow,
+                    .DELETE_SLICE_1 => blk: {
+                        const start = self.stack.pop() orelse return error.StackUnderflow;
+                        const cont = self.stack.pop() orelse {
+                            var v = start;
+                            v.deinit(self.allocator, self.stack_alloc);
+                            return error.StackUnderflow;
+                        };
+                        var start_val = start;
+                        start_val.deinit(self.allocator, self.stack_alloc);
+                        break :blk cont;
+                    },
+                    .DELETE_SLICE_2 => blk: {
+                        const stop = self.stack.pop() orelse return error.StackUnderflow;
+                        const cont = self.stack.pop() orelse {
+                            var v = stop;
+                            v.deinit(self.allocator, self.stack_alloc);
+                            return error.StackUnderflow;
+                        };
+                        var stop_val = stop;
+                        stop_val.deinit(self.allocator, self.stack_alloc);
+                        break :blk cont;
+                    },
+                    .DELETE_SLICE_3 => blk: {
+                        const stop = self.stack.pop() orelse return error.StackUnderflow;
+                        const start = self.stack.pop() orelse {
+                            var v = stop;
+                            v.deinit(self.allocator, self.stack_alloc);
+                            return error.StackUnderflow;
+                        };
+                        const cont = self.stack.pop() orelse {
+                            var v = start;
+                            v.deinit(self.allocator, self.stack_alloc);
+                            return error.StackUnderflow;
+                        };
+                        var stop_val = stop;
+                        stop_val.deinit(self.allocator, self.stack_alloc);
+                        var start_val = start;
+                        start_val.deinit(self.allocator, self.stack_alloc);
+                        break :blk cont;
+                    },
+                    else => unreachable,
+                };
+                var container_val = container;
+                container_val.deinit(self.allocator, self.stack_alloc);
+            },
             .DELETE_ATTR => {
                 // DELETE_ATTR namei - delete attribute from TOS
                 if (self.stack.pop()) |v| {
@@ -5721,6 +5860,29 @@ pub const SimContext = struct {
                 } else {
                     return error.StackUnderflow;
                 }
+            },
+
+            .EXEC_STMT => {
+                // EXEC_STMT (Python 2.x) - pops code, globals, locals
+                const locals_val = self.stack.pop() orelse return error.StackUnderflow;
+                const globals_val = self.stack.pop() orelse {
+                    var v = locals_val;
+                    v.deinit(self.allocator, self.stack_alloc);
+                    return error.StackUnderflow;
+                };
+                const code_val = self.stack.pop() orelse {
+                    var v = locals_val;
+                    v.deinit(self.allocator, self.stack_alloc);
+                    var g = globals_val;
+                    g.deinit(self.allocator, self.stack_alloc);
+                    return error.StackUnderflow;
+                };
+                var l = locals_val;
+                var g = globals_val;
+                var c = code_val;
+                l.deinit(self.allocator, self.stack_alloc);
+                g.deinit(self.allocator, self.stack_alloc);
+                c.deinit(self.allocator, self.stack_alloc);
             },
 
             .CONVERT_VALUE => {
@@ -7072,7 +7234,7 @@ test "stack simulation dup top clones expr" {
     allocator.destroy(second.expr);
 }
 
-test "stack simulation pop except clears exception placeholders" {
+test "stack simulation pop except clears exception placeholders pre311" {
     const testing = std.testing;
     const allocator = testing.allocator;
     var arena = std.heap.ArenaAllocator.init(allocator);
@@ -7084,7 +7246,7 @@ test "stack simulation pop except clears exception placeholders" {
         .allocator = allocator,
         .consts = &consts,
     };
-    const version = Version.init(3, 12);
+    const version = Version.init(3, 10);
 
     var ctx = SimContext.init(a, a, &code, version);
     defer ctx.deinit();
@@ -7116,7 +7278,7 @@ test "stack simulation pop except clears exception placeholders" {
     _ = ctx.stack.pop().?;
 }
 
-test "stack simulation pop except clears exc markers" {
+test "stack simulation pop except clears exc markers pre311" {
     const testing = std.testing;
     const allocator = testing.allocator;
     var arena = std.heap.ArenaAllocator.init(allocator);
@@ -7128,7 +7290,7 @@ test "stack simulation pop except clears exc markers" {
         .allocator = allocator,
         .consts = &consts,
     };
-    const version = Version.init(3, 12);
+    const version = Version.init(3, 10);
 
     var ctx = SimContext.init(a, a, &code, version);
     defer ctx.deinit();
@@ -7154,6 +7316,292 @@ test "stack simulation pop except clears exc markers" {
     try testing.expect(val == .expr);
     try testing.expect(std.mem.eql(u8, val.expr.name.id, "ret"));
 
+    _ = ctx.stack.pop().?;
+}
+
+test "stack simulation pop except clears exception placeholders 3.11+" {
+    const testing = std.testing;
+    const allocator = testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    var consts: [0]pyc.Object = .{};
+    var code = pyc.Code{
+        .allocator = allocator,
+        .consts = &consts,
+    };
+    const version = Version.init(3, 12);
+
+    var ctx = SimContext.init(a, a, &code, version);
+    defer ctx.deinit();
+
+    const ret = try ast.makeName(a, "ret", .load);
+    const exc1 = try ast.makeName(a, "__exception__", .load);
+
+    try ctx.stack.push(.{ .expr = ret });
+    try ctx.stack.push(.{ .expr = exc1 });
+
+    const inst = Instruction{
+        .opcode = .POP_EXCEPT,
+        .arg = 0,
+        .offset = 0,
+        .size = 2,
+        .cache_entries = 0,
+    };
+    try ctx.simulate(inst);
+
+    try testing.expectEqual(@as(usize, 1), ctx.stack.len());
+    const val = ctx.stack.peek().?;
+    try testing.expect(val == .expr);
+    try testing.expect(std.mem.eql(u8, val.expr.name.id, "ret"));
+
+    _ = ctx.stack.pop().?;
+}
+
+test "stack simulation pop except clears exc markers 3.11+" {
+    const testing = std.testing;
+    const allocator = testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    var consts: [0]pyc.Object = .{};
+    var code = pyc.Code{
+        .allocator = allocator,
+        .consts = &consts,
+    };
+    const version = Version.init(3, 12);
+
+    var ctx = SimContext.init(a, a, &code, version);
+    defer ctx.deinit();
+
+    const ret = try ast.makeName(a, "ret", .load);
+
+    try ctx.stack.push(.{ .expr = ret });
+    try ctx.stack.push(.exc_marker);
+
+    const inst = Instruction{
+        .opcode = .POP_EXCEPT,
+        .arg = 0,
+        .offset = 0,
+        .size = 2,
+        .cache_entries = 0,
+    };
+    try ctx.simulate(inst);
+
+    try testing.expectEqual(@as(usize, 1), ctx.stack.len());
+    const val = ctx.stack.peek().?;
+    try testing.expect(val == .expr);
+    try testing.expect(std.mem.eql(u8, val.expr.name.id, "ret"));
+
+    _ = ctx.stack.pop().?;
+}
+
+test "stack simulation except prologue preserves exc markers pre311" {
+    const testing = std.testing;
+    const allocator = testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    var consts: [0]pyc.Object = .{};
+    var names: [1][]const u8 = .{"KeyError"};
+    var code = pyc.Code{
+        .allocator = allocator,
+        .consts = &consts,
+        .names = &names,
+    };
+    const version = Version.init(3, 10);
+
+    var ctx = SimContext.init(a, a, &code, version);
+    defer ctx.deinit();
+
+    var i: usize = 0;
+    while (i < 6) : (i += 1) {
+        try ctx.stack.push(.exc_marker);
+    }
+
+    const prologue = [_]Instruction{
+        .{ .opcode = .DUP_TOP, .arg = 0, .offset = 0, .size = 2, .cache_entries = 0 },
+        .{ .opcode = .LOAD_GLOBAL, .arg = 0, .offset = 2, .size = 2, .cache_entries = 0 },
+        .{ .opcode = .JUMP_IF_NOT_EXC_MATCH, .arg = 8, .offset = 4, .size = 2, .cache_entries = 0 },
+        .{ .opcode = .POP_TOP, .arg = 0, .offset = 6, .size = 2, .cache_entries = 0 },
+        .{ .opcode = .POP_TOP, .arg = 0, .offset = 8, .size = 2, .cache_entries = 0 },
+        .{ .opcode = .POP_TOP, .arg = 0, .offset = 10, .size = 2, .cache_entries = 0 },
+    };
+    for (prologue) |inst| {
+        try ctx.simulate(inst);
+    }
+
+    try testing.expectEqual(@as(usize, 3), ctx.stack.len());
+    try testing.expect(ctx.stack.items.items[0] == .exc_marker);
+    try testing.expect(ctx.stack.items.items[1] == .exc_marker);
+    try testing.expect(ctx.stack.items.items[2] == .exc_marker);
+
+    _ = ctx.stack.pop().?;
+    _ = ctx.stack.pop().?;
+    _ = ctx.stack.pop().?;
+}
+
+test "stack simulation WITH_EXCEPT_START keeps inputs pre311" {
+    const testing = std.testing;
+    const allocator = testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    var consts: [0]pyc.Object = .{};
+    var code = pyc.Code{
+        .allocator = allocator,
+        .consts = &consts,
+    };
+    const version = Version.init(3, 9);
+
+    var ctx = SimContext.init(a, a, &code, version);
+    defer ctx.deinit();
+
+    const exit_expr = try ast.makeName(a, "__exit__", .load);
+    try ctx.stack.push(.{ .expr = exit_expr });
+    var i: usize = 0;
+    while (i < 6) : (i += 1) {
+        try ctx.stack.push(.exc_marker);
+    }
+
+    const inst = Instruction{
+        .opcode = .WITH_EXCEPT_START,
+        .arg = 0,
+        .offset = 0,
+        .size = 2,
+        .cache_entries = 0,
+    };
+    try ctx.simulate(inst);
+
+    try testing.expectEqual(@as(usize, 8), ctx.stack.len());
+    const top = ctx.stack.peek().?;
+    try testing.expect(top == .unknown);
+    // Ensure the previous item wasn't popped.
+    const prev = ctx.stack.items.items[ctx.stack.items.items.len - 2];
+    try testing.expect(prev == .exc_marker);
+
+    _ = ctx.stack.pop().?;
+    while (ctx.stack.len() > 0) {
+        _ = ctx.stack.pop().?;
+    }
+}
+
+test "stack simulation WITH_CLEANUP py2 pushes exc markers" {
+    const testing = std.testing;
+    const allocator = testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    var consts: [0]pyc.Object = .{};
+    var code = pyc.Code{
+        .allocator = allocator,
+        .consts = &consts,
+    };
+    const version = Version.init(2, 7);
+
+    var ctx = SimContext.init(a, a, &code, version);
+    defer ctx.deinit();
+
+    try ctx.stack.push(.unknown);
+    try ctx.stack.push(.unknown);
+    try ctx.stack.push(.unknown);
+    try ctx.stack.push(.unknown);
+
+    const inst = Instruction{
+        .opcode = .WITH_CLEANUP,
+        .arg = 0,
+        .offset = 0,
+        .size = 1,
+        .cache_entries = 0,
+    };
+    try ctx.simulate(inst);
+
+    try testing.expectEqual(@as(usize, 3), ctx.stack.len());
+    try testing.expect(ctx.stack.items.items[0] == .exc_marker);
+    try testing.expect(ctx.stack.items.items[1] == .exc_marker);
+    try testing.expect(ctx.stack.items.items[2] == .exc_marker);
+    _ = ctx.stack.pop().?;
+    _ = ctx.stack.pop().?;
+    _ = ctx.stack.pop().?;
+}
+
+test "stack simulation END_FINALLY py2 pops three" {
+    const testing = std.testing;
+    const allocator = testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    var consts: [0]pyc.Object = .{};
+    var code = pyc.Code{
+        .allocator = allocator,
+        .consts = &consts,
+    };
+    const version = Version.init(2, 7);
+
+    var ctx = SimContext.init(a, a, &code, version);
+    defer ctx.deinit();
+
+    try ctx.stack.push(.unknown);
+    try ctx.stack.push(.exc_marker);
+    try ctx.stack.push(.exc_marker);
+    try ctx.stack.push(.exc_marker);
+    try ctx.stack.push(.unknown);
+
+    const inst = Instruction{
+        .opcode = .END_FINALLY,
+        .arg = 0,
+        .offset = 0,
+        .size = 1,
+        .cache_entries = 0,
+    };
+    try ctx.simulate(inst);
+
+    try testing.expectEqual(@as(usize, 2), ctx.stack.len());
+    _ = ctx.stack.pop().?;
+    _ = ctx.stack.pop().?;
+}
+
+test "flow CALL_FUNCTION pops py2 keyword pairs" {
+    const testing = std.testing;
+    const allocator = testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    var consts: [0]pyc.Object = .{};
+    var code = pyc.Code{
+        .allocator = allocator,
+        .consts = &consts,
+    };
+    const version = Version.init(2, 7);
+
+    var ctx = SimContext.init(a, a, &code, version);
+    defer ctx.deinit();
+    ctx.flow_mode = true;
+    ctx.stack.allow_underflow = true;
+
+    try ctx.stack.push(.unknown); // callable
+    try ctx.stack.push(.unknown); // pos arg
+    try ctx.stack.push(.unknown); // kw name
+    try ctx.stack.push(.unknown); // kw value
+
+    const inst = Instruction{
+        .opcode = .CALL_FUNCTION,
+        .arg = 0x0101, // 1 positional, 1 keyword
+        .offset = 0,
+        .size = 1,
+        .cache_entries = 0,
+    };
+    try ctx.simulate(inst);
+
+    try testing.expectEqual(@as(usize, 1), ctx.stack.len());
+    try testing.expect(ctx.stack.peek().? == .unknown);
     _ = ctx.stack.pop().?;
 }
 

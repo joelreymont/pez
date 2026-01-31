@@ -177,6 +177,8 @@ pub const ExprContext = enum {
 
 /// Expression node types.
 pub const Expr = union(enum) {
+    /// Unknown expression placeholder.
+    unknown,
     /// Boolean operation: x and y, x or y
     bool_op: struct {
         op: BoolOp,
@@ -200,6 +202,11 @@ pub const Expr = union(enum) {
     unary_op: struct {
         op: UnaryOp,
         operand: *Expr,
+    },
+
+    /// Python 2.x backtick repr: `x`
+    repr_expr: struct {
+        value: *Expr,
     },
 
     /// Lambda expression: lambda x: x + 1
@@ -344,6 +351,7 @@ pub const Expr = union(enum) {
     pub fn deinit(self: *Expr, allocator: Allocator) void {
         // Recursively free child nodes
         switch (self.*) {
+            .unknown => {},
             .bool_op => |v| {
                 deinitExprSlice(allocator, v.values);
             },
@@ -362,6 +370,10 @@ pub const Expr = union(enum) {
             .unary_op => |v| {
                 v.operand.deinit(allocator);
                 allocator.destroy(v.operand);
+            },
+            .repr_expr => |v| {
+                v.value.deinit(allocator);
+                allocator.destroy(v.value);
             },
             .lambda => |v| {
                 deinitArguments(allocator, v.args);
@@ -925,6 +937,7 @@ pub fn cloneExpr(allocator: Allocator, expr: *const Expr) CloneError!*Expr {
     errdefer allocator.destroy(out);
 
     out.* = switch (expr.*) {
+        .unknown => .unknown,
         .bool_op => |v| .{ .bool_op = .{
             .op = v.op,
             .values = try cloneExprSlice(allocator, v.values),
@@ -957,6 +970,10 @@ pub fn cloneExpr(allocator: Allocator, expr: *const Expr) CloneError!*Expr {
         .unary_op => |v| blk: {
             const operand = try cloneExpr(allocator, v.operand);
             break :blk .{ .unary_op = .{ .op = v.op, .operand = operand } };
+        },
+        .repr_expr => |v| blk: {
+            const value = try cloneExpr(allocator, v.value);
+            break :blk .{ .repr_expr = .{ .value = value } };
         },
         .lambda => |v| blk: {
             const args = try cloneArguments(allocator, v.args);
@@ -1285,6 +1302,10 @@ fn argsEq(a: *const Arguments, b: *const Arguments) bool {
 pub fn exprEqual(left: *const Expr, right: *const Expr) bool {
     if (left == right) return true;
     return switch (left.*) {
+        .unknown => switch (right.*) {
+            .unknown => true,
+            else => false,
+        },
         .bool_op => |l| switch (right.*) {
             .bool_op => |r| l.op == r.op and exprSliceEq(l.values, r.values),
             else => false,
@@ -1299,6 +1320,10 @@ pub fn exprEqual(left: *const Expr, right: *const Expr) bool {
         },
         .unary_op => |l| switch (right.*) {
             .unary_op => |r| l.op == r.op and exprEqual(l.operand, r.operand),
+            else => false,
+        },
+        .repr_expr => |l| switch (right.*) {
+            .repr_expr => |r| exprEqual(l.value, r.value),
             else => false,
         },
         .lambda => |l| switch (right.*) {
@@ -1561,6 +1586,13 @@ pub const Stmt = union(enum) {
         nl: bool, // whether to print newline
     },
 
+    /// Python 2.x exec statement
+    exec_stmt: struct {
+        code: *Expr,
+        globals: ?*Expr,
+        locals: ?*Expr,
+    },
+
     pub fn deinit(self: *Stmt, allocator: Allocator) void {
         switch (self.*) {
             .function_def => |v| {
@@ -1690,6 +1722,18 @@ pub const Stmt = union(enum) {
                 if (v.dest) |d| {
                     d.deinit(allocator);
                     allocator.destroy(d);
+                }
+            },
+            .exec_stmt => |v| {
+                v.code.deinit(allocator);
+                allocator.destroy(v.code);
+                if (v.globals) |g| {
+                    g.deinit(allocator);
+                    allocator.destroy(g);
+                }
+                if (v.locals) |l| {
+                    l.deinit(allocator);
+                    allocator.destroy(l);
                 }
             },
             .pass, .break_stmt, .continue_stmt => {},

@@ -127,7 +127,7 @@ pub const Writer = struct {
         try self.write(allocator, result);
     }
 
-    pub const WriteError = std.mem.Allocator.Error;
+    pub const WriteError = std.mem.Allocator.Error || error{UnknownExpr};
 
     /// Write an expression with operator precedence handling.
     pub fn writeExpr(self: *Writer, allocator: std.mem.Allocator, expr: *const Expr) WriteError!void {
@@ -220,6 +220,9 @@ pub const Writer = struct {
     /// Write an expression, adding parentheses if needed based on precedence.
     fn writeExprPrec(self: *Writer, allocator: std.mem.Allocator, expr: *const Expr, parent_prec: u8) WriteError!void {
         switch (expr.*) {
+            .unknown => {
+                return error.UnknownExpr;
+            },
             .constant => |c| try self.writeConstant(allocator, c),
             .name => |n| try self.write(allocator, n.id),
             .bin_op => |b| {
@@ -239,6 +242,15 @@ pub const Writer = struct {
                 if (needs_parens) try self.writeByte(allocator, '(');
                 try self.write(allocator, u.op.symbol());
                 try self.writeExprPrec(allocator, u.operand, prec);
+                if (needs_parens) try self.writeByte(allocator, ')');
+            },
+            .repr_expr => |r| {
+                const prec: u8 = 14;
+                const needs_parens = prec < parent_prec;
+                if (needs_parens) try self.writeByte(allocator, '(');
+                try self.writeByte(allocator, '`');
+                try self.writeExprPrec(allocator, r.value, prec);
+                try self.writeByte(allocator, '`');
                 if (needs_parens) try self.writeByte(allocator, ')');
             },
             .compare => |c| {
@@ -1050,6 +1062,23 @@ pub const Writer = struct {
                 if (!p.nl and p.values.len > 0) try self.writeByte(allocator, ',');
                 try self.writeByte(allocator, '\n');
             },
+            .exec_stmt => |e| {
+                try self.write(allocator, "exec ");
+                try self.writeExpr(allocator, e.code);
+                if (e.globals != null or e.locals != null) {
+                    try self.write(allocator, " in ");
+                    if (e.globals) |g| {
+                        try self.writeExpr(allocator, g);
+                    } else {
+                        try self.write(allocator, "None");
+                    }
+                    if (e.locals) |l| {
+                        try self.write(allocator, ", ");
+                        try self.writeExpr(allocator, l);
+                    }
+                }
+                try self.writeByte(allocator, '\n');
+            },
             .return_stmt => |r| {
                 try self.write(allocator, "return");
                 if (r.value) |v| {
@@ -1653,6 +1682,9 @@ pub const DebugPrinter = struct {
     pub fn printExpr(self: *DebugPrinter, w: anytype, expr: *const Expr) !void {
         try self.writeIndent(w);
         switch (expr.*) {
+            .unknown => {
+                try w.writeAll("Unknown\n");
+            },
             .constant => |c| {
                 try w.writeAll("Constant(");
                 try self.printConstant(w, c);
@@ -1672,6 +1704,12 @@ pub const DebugPrinter = struct {
                 try w.print("UnaryOp({s})\n", .{@tagName(u.op)});
                 self.indent_level += 1;
                 try self.printExpr(w, u.operand);
+                self.indent_level -= 1;
+            },
+            .repr_expr => |r| {
+                try w.writeAll("ReprExpr\n");
+                self.indent_level += 1;
+                try self.printExpr(w, r.value);
                 self.indent_level -= 1;
             },
             .compare => |c| {

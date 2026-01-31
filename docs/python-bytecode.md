@@ -343,6 +343,11 @@ Multiple EXTENDED_ARG can chain for larger values.
 | 87 | LOAD_LOCALS | Push locals() |
 | 89 | POP_EXCEPT | Pop exception handler |
 
+Notes:
+- POP_EXCEPT stack effect is versioned: <=3.10 pops 3 values; >=3.11 pops 1 value.
+- 3.0-3.10 exception handler entry stack depth is 6 values; 2.x handlers use 3 (verified via `dis.stack_effect`).
+- WITH_EXCEPT_START net stack effect is +1 in 3.x (inputs remain on stack for cleanup).
+
 #### Argument Opcodes (>= 90)
 | Value | Name | Description |
 |-------|------|-------------|
