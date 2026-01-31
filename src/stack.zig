@@ -1524,6 +1524,22 @@ pub const SimContext = struct {
         }
     }
 
+    fn resolveCallTarget(self: *SimContext, tos: StackValue, tos1: StackValue) SimError!StackValue {
+        if (tos == .null_marker) {
+            if (tos1 == .null_marker) return error.StackUnderflow;
+            return tos1;
+        }
+        if (tos1 == .null_marker) {
+            return tos;
+        }
+        if (tos == .expr) {
+            tos1.deinit(self.allocator, self.stack_alloc);
+            return tos;
+        }
+        tos1.deinit(self.allocator, self.stack_alloc);
+        return tos;
+    }
+
     pub fn cloneStackValue(self: *SimContext, value: StackValue) !StackValue {
         return switch (value) {
             .expr => |e| blk: {
@@ -3511,34 +3527,7 @@ pub const SimContext = struct {
                     self.stack.releasePop(args_vals);
                     try self.stack.push(tos);
                 } else {
-                    // Two stack orders for function calls with NULL:
-                    // 1. LOAD_GLOBAL with push_null: [NULL, callable] → tos=callable, tos1=NULL
-                    // 2. LOAD_NAME + PUSH_NULL: [callable, NULL] → tos=NULL, tos1=callable
-                    if (tos == .null_marker and tos1 == .expr) {
-                        // Case 2: LOAD_NAME + PUSH_NULL order
-                        callable = tos1;
-                        // tos (null_marker) is discarded
-                    } else if (tos == .null_marker and tos1 == .function_obj) {
-                        // MAKE_FUNCTION + PUSH_NULL + CALL (generic class pattern)
-                        callable = tos1;
-                        // tos (null_marker) is discarded
-                    } else if (tos1 == .null_marker and tos == .expr) {
-                        // Case 1: LOAD_GLOBAL with push_null order
-                        callable = tos;
-                        // tos1 (null_marker) is discarded
-                    } else if (tos1 == .null_marker and tos == .function_obj) {
-                        // PUSH_NULL + MAKE_FUNCTION + CALL order
-                        callable = tos;
-                        // tos1 (null_marker) is discarded
-                    } else if (tos == .expr and tos1 != .null_marker) {
-                        // Method call - tos is callable, tos1 is self
-                        callable = tos;
-                        tos1.deinit(self.allocator, self.stack_alloc);
-                    } else {
-                        // Fallback: try tos as callable
-                        callable = tos;
-                        tos1.deinit(self.allocator, self.stack_alloc);
-                    }
+                    callable = try self.resolveCallTarget(tos, tos1);
 
                     // Check if KW_NAMES set up keyword argument names
                     if (self.pending_kwnames) |kwnames| {
@@ -3580,13 +3569,14 @@ pub const SimContext = struct {
 
                 // Pop all args (positional + keyword values)
                 const all_vals = try self.stack.popN(argc);
+                errdefer self.deinitStackValues(all_vals);
 
-                // Pop callable (with optional NULL marker)
-                const maybe_null = self.stack.pop() orelse return error.StackUnderflow;
-                var callable = maybe_null;
-                if (maybe_null == .null_marker) {
-                    callable = self.stack.pop() orelse return error.StackUnderflow;
-                }
+                const tos = self.stack.pop() orelse return error.StackUnderflow;
+                const tos1 = self.stack.pop() orelse {
+                    tos.deinit(self.allocator, self.stack_alloc);
+                    return error.StackUnderflow;
+                };
+                const callable = try self.resolveCallTarget(tos, tos1);
 
                 const split = try self.buildPosArgsAndKeywords(all_vals, kwnames);
                 try self.handleCall(callable, split.posargs, split.keywords, null);

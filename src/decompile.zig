@@ -2173,6 +2173,33 @@ pub const Decompiler = struct {
             if (unchanged) return null;
         }
 
+        if (flow_mode) {
+            var changed = false;
+            const out = try self.allocator.alloc(StackValue, max_len);
+            errdefer self.allocator.free(out);
+
+            for (0..max_len) |idx| {
+                const cur = existing[idx];
+                const inc = incoming[idx];
+                if (cur == .unknown) {
+                    out[idx] = cur;
+                    continue;
+                }
+                if (stack_mod.stackValueEqual(cur, inc)) {
+                    out[idx] = cur;
+                    continue;
+                }
+                out[idx] = .unknown;
+                changed = true;
+            }
+
+            if (!changed) {
+                self.allocator.free(out);
+                return null;
+            }
+            return out;
+        }
+
         var changed = false;
         var ternary_expr: ?*Expr = null;
         const out = try self.allocator.alloc(StackValue, max_len);
@@ -2254,7 +2281,22 @@ pub const Decompiler = struct {
         }
 
         if (expect_depth) |depth| {
-            if (sim.stack.items.items.len != depth) return error.InvalidStackDepth;
+            if (sim.stack.items.items.len < depth) {
+                if (self.last_error_ctx == null) {
+                    self.last_error_ctx = .{
+                        .code_name = self.code.name,
+                        .block_id = start_block.id,
+                        .offset = entry.start,
+                        .opcode = "exc_depth_underflow",
+                    };
+                }
+                return error.InvalidStackDepth;
+            }
+            while (sim.stack.items.items.len > depth) {
+                if (sim.stack.pop()) |val| {
+                    val.deinit(sim.allocator, sim.stack_alloc);
+                }
+            }
         }
 
         return try self.cloneStackExtra(clone_sim, sim.stack.items.items, exc_count, lasti_extra);
@@ -15686,6 +15728,8 @@ pub const Decompiler = struct {
 
         var best_pop: ?u32 = null;
         var best_off: u32 = 0;
+        var best_any: ?u32 = null;
+        var best_any_off: u32 = 0;
 
         while (self.cond_stack.items.len > 0) {
             const cur = self.cond_stack.items[self.cond_stack.items.len - 1];
@@ -15703,8 +15747,12 @@ pub const Decompiler = struct {
                 }
             }
             if (has_pop_except) {
+                const off = blk.start_offset;
+                if (best_any == null or off > best_any_off or (off == best_any_off and cur > best_any.?)) {
+                    best_any = cur;
+                    best_any_off = off;
+                }
                 if (try self.postDominates(cur, body_block)) {
-                    const off = blk.start_offset;
                     if (best_pop == null or off > best_off or (off == best_off and cur > best_pop.?)) {
                         best_pop = cur;
                         best_off = off;
@@ -15722,6 +15770,7 @@ pub const Decompiler = struct {
         }
 
         if (best_pop) |pop_id| return pop_id + 1;
+        if (best_any) |pop_id| return pop_id + 1;
 
         if (self.last_error_ctx == null) {
             self.last_error_ctx = .{
@@ -23762,6 +23811,23 @@ fn alignDefLines(allocator: Allocator, code: *const pyc.Code, src: []const u8) A
 // Tests
 // ============================================================================
 
+fn expectDecompileFixture(allocator: Allocator, path: []const u8) !void {
+    var module: pyc.Module = undefined;
+    module.init(allocator);
+    defer module.deinit();
+    try module.loadFromFile(path);
+
+    try std.testing.expect(module.code != null);
+    const code = module.code.?;
+    const version = module.version();
+
+    var out: std.ArrayList(u8) = .{};
+    defer out.deinit(allocator);
+
+    try decompileToSource(allocator, code, version, out.writer(allocator));
+    try std.testing.expect(out.items.len > 0);
+}
+
 test "decompiler init" {
     const testing = std.testing;
     const allocator = testing.allocator;
@@ -24111,20 +24177,7 @@ test "exception handler decompile frees allocations" {
     };
 
     for (paths) |path| {
-        var module: pyc.Module = undefined;
-        module.init(allocator);
-        defer module.deinit();
-        try module.loadFromFile(path);
-
-        try testing.expect(module.code != null);
-        const code = module.code.?;
-        const version = module.version();
-
-        var out: std.ArrayList(u8) = .{};
-        defer out.deinit(allocator);
-
-        try decompileToSource(allocator, code, version, out.writer(allocator));
-        try testing.expect(out.items.len > 0);
+        try expectDecompileFixture(allocator, path);
     }
 }
 
@@ -24132,20 +24185,14 @@ test "while loop decompile frees allocations" {
     const testing = std.testing;
     const allocator = testing.allocator;
 
-    var module: pyc.Module = undefined;
-    module.init(allocator);
-    defer module.deinit();
-    try module.loadFromFile("refs/pycdc/tests/compiled/while_loop.2.6.pyc");
+    try expectDecompileFixture(allocator, "refs/pycdc/tests/compiled/while_loop.2.6.pyc");
+}
 
-    try testing.expect(module.code != null);
-    const code = module.code.?;
-    const version = module.version();
+test "py_compile decompile 3.14" {
+    const testing = std.testing;
+    const allocator = testing.allocator;
 
-    var out: std.ArrayList(u8) = .{};
-    defer out.deinit(allocator);
-
-    try decompileToSource(allocator, code, version, out.writer(allocator));
-    try testing.expect(out.items.len > 0);
+    try expectDecompileFixture(allocator, "test/corpus/py_compile.3.14.pyc");
 }
 
 test "genset reuse" {
