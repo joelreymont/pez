@@ -426,17 +426,13 @@ pub const Stack = struct {
         return switch (val) {
             .expr => |e| e,
             .unknown => {
-                const expr = try self.ast_alloc.create(Expr);
-                expr.* = .unknown;
-                return expr;
+                return ast.makeName(self.ast_alloc, "__unknown__", .load);
             },
             else => {
                 if (self.allow_underflow) {
                     var tmp = val;
                     tmp.deinit(self.ast_alloc, self.stack_alloc);
-                    const expr = try self.ast_alloc.create(Expr);
-                    expr.* = .unknown;
-                    return expr;
+                    return ast.makeName(self.ast_alloc, "__unknown__", .load);
                 }
                 var tmp = val;
                 tmp.deinit(self.ast_alloc, self.stack_alloc);
@@ -519,8 +515,7 @@ pub const Stack = struct {
             exprs[i] = switch (v) {
                 .expr => |e| e,
                 .unknown => blk: {
-                    const expr = try self.ast_alloc.create(Expr);
-                    expr.* = .unknown;
+                    const expr = try ast.makeName(self.ast_alloc, "__unknown__", .load);
                     try created.append(self.stack_alloc, expr);
                     break :blk expr;
                 },
@@ -528,8 +523,7 @@ pub const Stack = struct {
                     if (self.allow_underflow) {
                         var tmp = v;
                         tmp.deinit(self.ast_alloc, self.stack_alloc);
-                        const expr = try self.ast_alloc.create(Expr);
-                        expr.* = .unknown;
+                        const expr = try ast.makeName(self.ast_alloc, "__unknown__", .load);
                         try created.append(self.stack_alloc, expr);
                         break :blk expr;
                     }
@@ -7741,6 +7735,25 @@ test "stack simulation yield value strict error" {
     };
 
     try testing.expectError(error.NotAnExpression, ctx.simulate(inst));
+}
+
+test "stack pop expr unknown uses placeholder name" {
+    const testing = std.testing;
+    const allocator = testing.allocator;
+
+    var stack = Stack.init(allocator, allocator);
+    defer stack.deinit();
+
+    try stack.push(.unknown);
+    const expr = try stack.popExpr();
+    defer {
+        expr.deinit(allocator);
+        allocator.destroy(expr);
+    }
+
+    try testing.expect(expr.* == .name);
+    try testing.expectEqualStrings("__unknown__", expr.name.id);
+    try testing.expect(expr.name.ctx == .load);
 }
 
 test "stack simulation set append grows cap" {
