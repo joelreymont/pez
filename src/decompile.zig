@@ -24101,6 +24101,33 @@ test "handler end 311 picks postdom pop_except" {
     try testing.expectEqual(@as(u32, 4), end);
 }
 
+test "exception handler decompile frees allocations" {
+    const testing = std.testing;
+    const allocator = testing.allocator;
+
+    const paths = [_][]const u8{
+        "refs/pycdc/tests/compiled/async_for.3.7.pyc",
+        "refs/pycdc/tests/compiled/try_except_finally.2.6.pyc",
+    };
+
+    for (paths) |path| {
+        var module: pyc.Module = undefined;
+        module.init(allocator);
+        defer module.deinit();
+        try module.loadFromFile(path);
+
+        try testing.expect(module.code != null);
+        const code = module.code.?;
+        const version = module.version();
+
+        var out: std.ArrayList(u8) = .{};
+        defer out.deinit(allocator);
+
+        try decompileToSource(allocator, code, version, out.writer(allocator));
+        try testing.expect(out.items.len > 0);
+    }
+}
+
 test "genset reuse" {
     const allocator = std.testing.allocator;
     var set = try GenSet.init(allocator, 4);
