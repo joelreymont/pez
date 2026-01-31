@@ -5724,6 +5724,8 @@ pub const SimContext = struct {
                 var drop: usize = 0;
                 if (self.version.major <= 2) {
                     drop = if (len >= 3) 3 else len;
+                } else if (self.version.gte(3, 7) and self.version.lt(3, 9)) {
+                    drop = if (len >= 6) 6 else len;
                 } else if (len >= 3) {
                     const a = self.stack.items.items[len - 1];
                     const b = self.stack.items.items[len - 2];
@@ -5765,16 +5767,23 @@ pub const SimContext = struct {
             },
 
             .POP_EXCEPT => {
-                const drop: usize = if (self.version.gte(3, 11)) 1 else 3;
-                var i: usize = 0;
-                while (i < drop) : (i += 1) {
-                    if (self.stack.pop()) |v| {
-                        var val = v;
-                        val.deinit(self.allocator, self.stack_alloc);
-                    } else if (!(self.lenient or self.flow_mode)) {
-                        return error.StackUnderflow;
-                    } else {
-                        break;
+                const drop: usize = if (self.version.gte(3, 11))
+                    1
+                else if (self.version.gte(3, 7))
+                    3
+                else
+                    0;
+                if (drop > 0) {
+                    var i: usize = 0;
+                    while (i < drop) : (i += 1) {
+                        if (self.stack.pop()) |v| {
+                            var val = v;
+                            val.deinit(self.allocator, self.stack_alloc);
+                        } else if (!(self.lenient or self.flow_mode)) {
+                            return error.StackUnderflow;
+                        } else {
+                            break;
+                        }
                     }
                 }
             },
@@ -7319,6 +7328,50 @@ test "stack simulation pop except clears exc markers pre311" {
     _ = ctx.stack.pop().?;
 }
 
+test "stack simulation pop except no-op pre37" {
+    const testing = std.testing;
+    const allocator = testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    var consts: [0]pyc.Object = .{};
+    var code = pyc.Code{
+        .allocator = allocator,
+        .consts = &consts,
+    };
+    const version = Version.init(3, 6);
+
+    var ctx = SimContext.init(a, a, &code, version);
+    defer ctx.deinit();
+
+    const ret = try ast.makeName(a, "ret", .load);
+
+    try ctx.stack.push(.{ .expr = ret });
+    try ctx.stack.push(.exc_marker);
+    try ctx.stack.push(.exc_marker);
+    try ctx.stack.push(.exc_marker);
+
+    const inst = Instruction{
+        .opcode = .POP_EXCEPT,
+        .arg = 0,
+        .offset = 0,
+        .size = 2,
+        .cache_entries = 0,
+    };
+    try ctx.simulate(inst);
+
+    try testing.expectEqual(@as(usize, 4), ctx.stack.len());
+    try testing.expect(ctx.stack.items.items[0] == .expr);
+    try testing.expect(ctx.stack.items.items[1] == .exc_marker);
+    try testing.expect(ctx.stack.items.items[2] == .exc_marker);
+    try testing.expect(ctx.stack.items.items[3] == .exc_marker);
+
+    while (ctx.stack.len() > 0) {
+        _ = ctx.stack.pop().?;
+    }
+}
+
 test "stack simulation pop except clears exception placeholders 3.11+" {
     const testing = std.testing;
     const allocator = testing.allocator;
@@ -7565,6 +7618,73 @@ test "stack simulation END_FINALLY py2 pops three" {
     try testing.expectEqual(@as(usize, 2), ctx.stack.len());
     _ = ctx.stack.pop().?;
     _ = ctx.stack.pop().?;
+}
+
+test "stack simulation END_FINALLY pre37 pops exc markers" {
+    const testing = std.testing;
+    const allocator = testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    var consts: [0]pyc.Object = .{};
+    var code = pyc.Code{
+        .allocator = allocator,
+        .consts = &consts,
+    };
+    const version = Version.init(3, 1);
+
+    var ctx = SimContext.init(a, a, &code, version);
+    defer ctx.deinit();
+
+    try ctx.stack.push(.exc_marker);
+    try ctx.stack.push(.exc_marker);
+    try ctx.stack.push(.exc_marker);
+
+    const inst = Instruction{
+        .opcode = .END_FINALLY,
+        .arg = 0,
+        .offset = 0,
+        .size = 2,
+        .cache_entries = 0,
+    };
+    try ctx.simulate(inst);
+
+    try testing.expectEqual(@as(usize, 0), ctx.stack.len());
+}
+
+test "stack simulation END_FINALLY 3.7 pops six" {
+    const testing = std.testing;
+    const allocator = testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    var consts: [0]pyc.Object = .{};
+    var code = pyc.Code{
+        .allocator = allocator,
+        .consts = &consts,
+    };
+    const version = Version.init(3, 7);
+
+    var ctx = SimContext.init(a, a, &code, version);
+    defer ctx.deinit();
+
+    var i: usize = 0;
+    while (i < 6) : (i += 1) {
+        try ctx.stack.push(.unknown);
+    }
+
+    const inst = Instruction{
+        .opcode = .END_FINALLY,
+        .arg = 0,
+        .offset = 0,
+        .size = 2,
+        .cache_entries = 0,
+    };
+    try ctx.simulate(inst);
+
+    try testing.expectEqual(@as(usize, 0), ctx.stack.len());
 }
 
 test "flow CALL_FUNCTION pops py2 keyword pairs" {

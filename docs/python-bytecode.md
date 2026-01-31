@@ -344,10 +344,10 @@ Multiple EXTENDED_ARG can chain for larger values.
 | 89 | POP_EXCEPT | Pop exception handler |
 
 Notes:
-- POP_EXCEPT stack effect is versioned: <=3.10 pops 3 values; >=3.11 pops 1 value.
-- 3.0-3.10 exception handler entry stack depth is 6 values; 2.x handlers use 3 (verified via `dis.stack_effect`).
+- POP_EXCEPT stack effect is versioned: 3.0-3.6 pops 0, 3.7-3.10 pops 3, 3.11+ pops 1.
+- Exception handler entry stack depth: 3.0-3.6 = 3 values, 3.7-3.10 = 6, 3.11+ = 1; 2.x handlers use 3 (verified via `dis.stack_effect`/xdis).
 - WITH_EXCEPT_START net stack effect is +1 in 3.x (inputs remain on stack for cleanup).
-
+- END_FINALLY stack effect is versioned: 3.0-3.6 pops 1, 3.7-3.8 pops 6; opcode removed in 3.9+.
 #### Argument Opcodes (>= 90)
 | Value | Name | Description |
 |-------|------|-------------|

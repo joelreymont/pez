@@ -17230,13 +17230,15 @@ pub const Decompiler = struct {
     fn excHandlerSeedCount(self: *Decompiler) usize {
         if (self.version.major < 3) return 3;
         if (self.version.gte(3, 11)) return 1;
-        return 6;
+        if (self.version.gte(3, 7)) return 6;
+        return 3;
     }
 
     fn withExcSeedCount(self: *Decompiler) usize {
         if (self.version.major < 3) return 4;
         if (self.version.gte(3, 11)) return 2;
-        return 6;
+        if (self.version.gte(3, 9)) return 6;
+        return 4;
     }
 
     fn emitForPrelude(
