@@ -141,6 +141,9 @@ pub const TestStats = struct {
     errors: usize = 0,
 };
 
+/// Result for running a single .pyc test.
+pub const RunResult = enum { pass, fail, skip };
+
 /// Check if version is supported by pez.
 fn isVersionSupported(version: Version) bool {
     if (version.major == 2) return true;
@@ -193,22 +196,26 @@ fn normalizeSource(allocator: Allocator, source: []const u8) ![]const u8 {
 }
 
 /// Run a single .pyc file test, return true if decompilation succeeds.
-pub fn runSingleTest(allocator: Allocator, pyc_path: []const u8, writer: anytype) !bool {
+pub fn runSingleTest(allocator: Allocator, pyc_path: []const u8, writer: anytype) !RunResult {
     const basename = std.fs.path.basename(pyc_path);
+
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
 
     const version = if (parseVersion(basename)) |ver| ver else |_| {
         try writer.print("SKIP {s} (no version)\n", .{basename});
-        return false;
+        return .skip;
     };
 
     if (!isVersionSupported(version)) {
         try writer.print("SKIP {s} (unsupported {d}.{d})\n", .{ basename, version.major, version.minor });
-        return false;
+        return .skip;
     }
 
     // Load .pyc
     var module: pyc.Module = undefined;
-    module.init(allocator);
+    module.init(a);
     defer module.deinit();
 
     module.loadFromFile(pyc_path) catch |err| {
@@ -224,25 +231,25 @@ pub fn runSingleTest(allocator: Allocator, pyc_path: []const u8, writer: anytype
         } else {
             try writer.print("ERR  {s}: load failed: {s}\n", .{ basename, @errorName(err) });
         }
-        return false;
+        return err;
     };
 
     const code = module.code orelse {
         try writer.print("ERR  {s}: no code object\n", .{basename});
-        return false;
+        return .fail;
     };
 
     // Decompile
     var output: std.ArrayList(u8) = .{};
-    defer output.deinit(allocator);
+    defer output.deinit(a);
 
-    decompile.decompileToSource(allocator, code, version, output.writer(allocator)) catch |err| {
+    decompile.decompileToSource(a, code, version, output.writer(a)) catch |err| {
         try writer.print("FAIL {s}: {s}\n", .{ basename, @errorName(err) });
-        return false;
+        return .fail;
     };
 
     try writer.print("PASS {s} ({d} bytes)\n", .{ basename, output.items.len });
-    return true;
+    return .pass;
 }
 
 /// Compare result with golden file and return match status.
@@ -257,6 +264,10 @@ pub fn runGoldenTest(
 ) !CompareResult {
     const basename = std.fs.path.basename(pyc_path);
     const base_name = getBaseName(basename);
+
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
 
     const version = if (parseVersion(basename)) |ver| ver else |_| {
         try writer.print("SKIP {s} (no version)\n", .{basename});
@@ -281,15 +292,15 @@ pub fn runGoldenTest(
     };
     defer golden_file.close();
 
-    const golden_content = golden_file.readToEndAlloc(allocator, 1024 * 1024) catch {
+    const golden_content = golden_file.readToEndAlloc(a, 1024 * 1024) catch {
         try writer.print("ERR  {s}: cannot read golden\n", .{basename});
         return .no_golden;
     };
-    defer allocator.free(golden_content);
+    defer a.free(golden_content);
 
     // Load and decompile .pyc
     var module: pyc.Module = undefined;
-    module.init(allocator);
+    module.init(a);
     defer module.deinit();
 
     module.loadFromFile(pyc_path) catch |err| {
@@ -305,7 +316,7 @@ pub fn runGoldenTest(
         } else {
             try writer.print("ERR  {s}: load failed: {s}\n", .{ basename, @errorName(err) });
         }
-        return .decompile_error;
+        return err;
     };
 
     const code = module.code orelse {
@@ -314,9 +325,9 @@ pub fn runGoldenTest(
     };
 
     var output: std.ArrayList(u8) = .{};
-    defer output.deinit(allocator);
+    defer output.deinit(a);
 
-    decompile.decompileToSource(allocator, code, version, output.writer(allocator)) catch |err| {
+    decompile.decompileToSource(a, code, version, output.writer(a)) catch |err| {
         try writer.print("FAIL {s}: {s}\n", .{ basename, @errorName(err) });
         return .decompile_error;
     };
@@ -367,14 +378,10 @@ pub fn runAllTests(allocator: Allocator, test_dir: []const u8, writer: anytype) 
         var path_buf: [std.fs.max_path_bytes]u8 = undefined;
         const full_path = std.fmt.bufPrint(&path_buf, "{s}/{s}", .{ test_dir, entry.name }) catch continue;
 
-        if (runSingleTest(allocator, full_path, writer) catch false) {
-            stats.passed += 1;
-        } else {
-            if (parseVersion(entry.name)) |_| {
-                stats.failed += 1;
-            } else |_| {
-                stats.skipped += 1;
-            }
+        switch (try runSingleTest(allocator, full_path, writer)) {
+            .pass => stats.passed += 1,
+            .fail => stats.failed += 1,
+            .skip => stats.skipped += 1,
         }
     }
 
@@ -421,7 +428,7 @@ pub fn runAllGoldenTests(
         var path_buf: [std.fs.max_path_bytes]u8 = undefined;
         const full_path = std.fmt.bufPrint(&path_buf, "{s}/{s}", .{ compiled_dir, entry.name }) catch continue;
 
-        const result = runGoldenTest(allocator, full_path, input_dir, writer) catch .decompile_error;
+        const result = try runGoldenTest(allocator, full_path, input_dir, writer);
         switch (result) {
             .match => stats.matched += 1,
             .mismatch => stats.mismatched += 1,
