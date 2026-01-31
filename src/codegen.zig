@@ -220,9 +220,7 @@ pub const Writer = struct {
     /// Write an expression, adding parentheses if needed based on precedence.
     fn writeExprPrec(self: *Writer, allocator: std.mem.Allocator, expr: *const Expr, parent_prec: u8) WriteError!void {
         switch (expr.*) {
-            .unknown => {
-                return error.UnknownExpr;
-            },
+            .unknown => return error.UnknownExpr,
             .constant => |c| try self.writeConstant(allocator, c),
             .name => |n| try self.write(allocator, n.id),
             .bin_op => |b| {
