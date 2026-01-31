@@ -24128,6 +24128,26 @@ test "exception handler decompile frees allocations" {
     }
 }
 
+test "while loop decompile frees allocations" {
+    const testing = std.testing;
+    const allocator = testing.allocator;
+
+    var module: pyc.Module = undefined;
+    module.init(allocator);
+    defer module.deinit();
+    try module.loadFromFile("refs/pycdc/tests/compiled/while_loop.2.6.pyc");
+
+    try testing.expect(module.code != null);
+    const code = module.code.?;
+    const version = module.version();
+
+    var out: std.ArrayList(u8) = .{};
+    defer out.deinit(allocator);
+
+    try decompileToSource(allocator, code, version, out.writer(allocator));
+    try testing.expect(out.items.len > 0);
+}
+
 test "genset reuse" {
     const allocator = std.testing.allocator;
     var set = try GenSet.init(allocator, 4);
