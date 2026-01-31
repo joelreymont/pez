@@ -15666,6 +15666,74 @@ pub const Decompiler = struct {
         return try self.rewriteContRaise(merged);
     }
 
+    fn computeHandlerEnd311(self: *Decompiler, body_block: u32) DecompileError!u32 {
+        if (body_block >= self.cfg.blocks.len) {
+            if (self.last_error_ctx == null) {
+                self.last_error_ctx = .{
+                    .code_name = self.code.name,
+                    .block_id = body_block,
+                    .offset = 0,
+                    .opcode = "handler_body_oob",
+                };
+            }
+            return error.InvalidBlock;
+        }
+
+        try self.cond_seen.ensureSize(self.allocator, self.cfg.blocks.len);
+        self.cond_seen.reset();
+        self.cond_stack.clearRetainingCapacity();
+        try self.cond_stack.append(self.allocator, body_block);
+
+        var best_pop: ?u32 = null;
+        var best_off: u32 = 0;
+
+        while (self.cond_stack.items.len > 0) {
+            const cur = self.cond_stack.items[self.cond_stack.items.len - 1];
+            self.cond_stack.items.len -= 1;
+            if (cur >= self.cfg.blocks.len) continue;
+            if (self.cond_seen.isSet(cur)) continue;
+            try self.cond_seen.set(self.allocator, cur);
+
+            const blk = &self.cfg.blocks[cur];
+            var has_pop_except = false;
+            for (blk.instructions) |inst| {
+                if (inst.opcode == .POP_EXCEPT) {
+                    has_pop_except = true;
+                    break;
+                }
+            }
+            if (has_pop_except) {
+                if (try self.postDominates(cur, body_block)) {
+                    const off = blk.start_offset;
+                    if (best_pop == null or off > best_off or (off == best_off and cur > best_pop.?)) {
+                        best_pop = cur;
+                        best_off = off;
+                    }
+                }
+            }
+
+            for (blk.successors) |edge| {
+                if (edge.edge_type == .exception) continue;
+                const next = edge.target;
+                if (!self.cond_seen.isSet(next)) {
+                    try self.cond_stack.append(self.allocator, next);
+                }
+            }
+        }
+
+        if (best_pop) |pop_id| return pop_id + 1;
+
+        if (self.last_error_ctx == null) {
+            self.last_error_ctx = .{
+                .code_name = self.code.name,
+                .block_id = body_block,
+                .offset = self.cfg.blocks[body_block].start_offset,
+                .opcode = "handler_end_no_pop_except",
+            };
+        }
+        return error.InvalidBlock;
+    }
+
     /// Decompile try/except for Python 3.11+
     fn decompileTry311(
         self: *Decompiler,
@@ -15932,35 +16000,7 @@ pub const Decompiler = struct {
                 }
             }
 
-            // Find body end by scanning forward for POP_EXCEPT
-            var handler_end_block = body_block + 1;
-            var scan_block = body_block;
-            var scan_limit: u32 = @intCast(self.cfg.blocks.len);
-            if (pattern.exit_block) |exit_id| {
-                if (exit_id < scan_limit) scan_limit = exit_id;
-            }
-            if (pattern.finally_block) |final_id| {
-                if (final_id < scan_limit) scan_limit = final_id;
-            }
-            if (next_handler_block) |next_id| {
-                if (next_id < scan_limit) scan_limit = next_id;
-            }
-            if (scan_limit <= body_block) scan_limit = body_block + 1;
-            while (scan_block < scan_limit) {
-                const scan_blk = &self.cfg.blocks[scan_block];
-                var found_pop_except = false;
-                for (scan_blk.instructions) |inst| {
-                    if (inst.opcode == .POP_EXCEPT) {
-                        found_pop_except = true;
-                        break;
-                    }
-                }
-                if (found_pop_except) {
-                    handler_end_block = scan_block + 1;
-                    break;
-                }
-                scan_block += 1;
-            }
+            const handler_end_block = try self.computeHandlerEnd311(body_block);
 
             // Decompile handler body (seed exception stack for handler context)
             const handler_seed = if (handler_block.is_exception_handler or self.cfg.blocks[body_block].is_exception_handler) blk: {
@@ -23920,6 +23960,145 @@ test "exception seed handles JUMP_IF_NOT_EXC_MATCH" {
     defer out.deinit(allocator);
     try decompileToSource(allocator, code, version, out.writer(allocator));
     try testing.expect(out.items.len > 0);
+}
+
+test "handler end 311 picks postdom pop_except" {
+    const testing = std.testing;
+    const allocator = testing.allocator;
+    const version = Version.init(3, 11);
+
+    const bytecode = try test_utils.emitOpsOwned(allocator, version, &.{});
+    const code = try test_utils.allocCode(
+        allocator,
+        "handler_end_311",
+        &[_][]const u8{},
+        &[_]pyc.Object{},
+        bytecode,
+        0,
+    );
+    defer {
+        code.deinit();
+        allocator.destroy(code);
+    }
+
+    var decompiler = try Decompiler.init(allocator, code, version);
+    defer decompiler.deinit();
+
+    const a = decompiler.allocator;
+
+    const inst0 = try a.alloc(decoder.Instruction, 1);
+    inst0[0] = test_utils.inst(.NOP, 0);
+    const inst1 = try a.alloc(decoder.Instruction, 1);
+    inst1[0] = test_utils.inst(.POP_EXCEPT, 0);
+    const inst2 = try a.alloc(decoder.Instruction, 1);
+    inst2[0] = test_utils.inst(.NOP, 0);
+    const inst3 = try a.alloc(decoder.Instruction, 1);
+    inst3[0] = test_utils.inst(.POP_EXCEPT, 0);
+    const inst4 = try a.alloc(decoder.Instruction, 1);
+    inst4[0] = test_utils.inst(.RETURN_VALUE, 0);
+
+    const succ0 = try a.alloc(cfg_mod.Edge, 2);
+    succ0[0] = .{ .target = 1, .edge_type = .conditional_true };
+    succ0[1] = .{ .target = 2, .edge_type = .conditional_false };
+    const succ1 = try a.alloc(cfg_mod.Edge, 1);
+    succ1[0] = .{ .target = 3, .edge_type = .normal };
+    const succ2 = try a.alloc(cfg_mod.Edge, 1);
+    succ2[0] = .{ .target = 3, .edge_type = .normal };
+    const succ3 = try a.alloc(cfg_mod.Edge, 1);
+    succ3[0] = .{ .target = 4, .edge_type = .normal };
+    const succ4 = &[_]cfg_mod.Edge{};
+
+    const pred0 = &[_]u32{};
+    const pred1 = try a.alloc(u32, 1);
+    pred1[0] = 0;
+    const pred2 = try a.alloc(u32, 1);
+    pred2[0] = 0;
+    const pred3 = try a.alloc(u32, 2);
+    pred3[0] = 1;
+    pred3[1] = 2;
+    const pred4 = try a.alloc(u32, 1);
+    pred4[0] = 3;
+
+    const blocks = try a.alloc(BasicBlock, 5);
+    blocks[0] = .{
+        .id = 0,
+        .start_offset = 0,
+        .end_offset = 2,
+        .instructions = inst0,
+        .successors = succ0,
+        .predecessors = pred0,
+        .is_exception_handler = false,
+        .is_loop_header = false,
+    };
+    blocks[1] = .{
+        .id = 1,
+        .start_offset = 10,
+        .end_offset = 12,
+        .instructions = inst1,
+        .successors = succ1,
+        .predecessors = pred1,
+        .is_exception_handler = false,
+        .is_loop_header = false,
+    };
+    blocks[2] = .{
+        .id = 2,
+        .start_offset = 20,
+        .end_offset = 22,
+        .instructions = inst2,
+        .successors = succ2,
+        .predecessors = pred2,
+        .is_exception_handler = false,
+        .is_loop_header = false,
+    };
+    blocks[3] = .{
+        .id = 3,
+        .start_offset = 30,
+        .end_offset = 32,
+        .instructions = inst3,
+        .successors = succ3,
+        .predecessors = pred3,
+        .is_exception_handler = false,
+        .is_loop_header = false,
+    };
+    blocks[4] = .{
+        .id = 4,
+        .start_offset = 40,
+        .end_offset = 42,
+        .instructions = inst4,
+        .successors = succ4,
+        .predecessors = pred4,
+        .is_exception_handler = false,
+        .is_loop_header = false,
+    };
+
+    const offsets = try a.alloc(u32, 5);
+    offsets[0] = 0;
+    offsets[1] = 10;
+    offsets[2] = 20;
+    offsets[3] = 30;
+    offsets[4] = 40;
+
+    const all_insts = try a.alloc(decoder.Instruction, 0);
+
+    const cfg = try a.create(CFG);
+    cfg.* = .{
+        .allocator = a,
+        .blocks = blocks,
+        .block_offsets = offsets,
+        .entry = 0,
+        .instructions = all_insts,
+        .exception_entries = &.{},
+        .version = version,
+    };
+
+    decompiler.cfg = cfg;
+    if (decompiler.postdom_idom) |idom| {
+        decompiler.allocator.free(idom);
+        decompiler.postdom_idom = null;
+    }
+
+    const end = try decompiler.computeHandlerEnd311(0);
+    try testing.expectEqual(@as(u32, 4), end);
 }
 
 test "genset reuse" {
