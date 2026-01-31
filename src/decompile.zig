@@ -395,6 +395,8 @@ pub const Decompiler = struct {
     phi_incoming: std.AutoHashMapUnmanaged(PhiIncomingKey, *Expr) = .{},
     /// Phi temp counter.
     phi_counter: u32 = 0,
+    /// Blocks eligible for phi merges (if-chain merge ends).
+    phi_merge_ok: ?std.DynamicBitSet = null,
     /// Guard against recursive if/elif cycles.
     if_in_progress: ?std.DynamicBitSet = null,
     /// Guard against recursive structured range cycles.
@@ -719,6 +721,9 @@ pub const Decompiler = struct {
         self.phi_by_block.deinit(self.allocator);
         self.phi_slots.deinit(self.allocator);
         self.phi_incoming.deinit(self.allocator);
+        if (self.phi_merge_ok) |*set| {
+            set.deinit();
+        }
         if (self.if_in_progress) |*set| set.deinit();
         if (self.loop_in_progress) |*set| set.deinit();
         self.range_in_progress.deinit();
@@ -2233,6 +2238,24 @@ pub const Decompiler = struct {
         return out;
     }
 
+    fn initPhiMergeOk(self: *Decompiler) DecompileError!void {
+        if (self.phi_merge_ok != null) return;
+        if (self.cfg.blocks.len == 0) return;
+
+        var set = try std.DynamicBitSet.initEmpty(self.allocator, self.cfg.blocks.len);
+        var bid: u32 = 0;
+        while (bid < self.cfg.blocks.len) : (bid += 1) {
+            const pat = try self.analyzer.detectPattern(bid);
+            if (pat == .if_stmt) {
+                const end = try self.findIfChainEnd(pat.if_stmt);
+                if (end < self.cfg.blocks.len) {
+                    set.set(@intCast(end));
+                }
+            }
+        }
+        self.phi_merge_ok = set;
+    }
+
     fn allocExcStack(self: *Decompiler, len: usize) DecompileError![]StackValue {
         if (len == 0) return &.{};
         const out = try self.allocator.alloc(StackValue, len);
@@ -2276,36 +2299,16 @@ pub const Decompiler = struct {
         if (merge_block >= self.cfg.blocks.len) return false;
         const block = &self.cfg.blocks[merge_block];
         if (block.is_loop_header or block.is_exception_handler) return false;
+        if (self.phi_merge_ok) |set| {
+            if (!set.isSet(@intCast(merge_block))) return false;
+        }
 
-        var preds: [2]u32 = undefined;
         var pred_count: usize = 0;
         for (block.predecessors) |pid| {
             if (!self.isNormalPred(pid, merge_block)) continue;
-            if (pred_count < preds.len) preds[pred_count] = pid;
             pred_count += 1;
         }
-        if (pred_count != 2) return false;
-        const p0 = preds[0];
-        const p1 = preds[1];
-        if (p0 >= self.cfg.blocks.len or p1 >= self.cfg.blocks.len) return false;
-
-        const p0_blk = &self.cfg.blocks[p0];
-        const p1_blk = &self.cfg.blocks[p1];
-        var cond_id: ?u32 = null;
-        for (p0_blk.predecessors) |cand| {
-            if (cand >= self.cfg.blocks.len) continue;
-            for (p1_blk.predecessors) |cand2| {
-                if (cand == cand2) {
-                    cond_id = cand;
-                    break;
-                }
-            }
-            if (cond_id != null) break;
-        }
-        const cond_block = cond_id orelse return false;
-        const cond_blk = &self.cfg.blocks[cond_block];
-        const term = cond_blk.terminator() orelse return false;
-        return self.analyzer.isConditionalJump(term.opcode);
+        return pred_count >= 2;
     }
 
     fn mergeStackEntry(
@@ -2494,10 +2497,23 @@ pub const Decompiler = struct {
         const max_iterations: usize = @as(usize, block_count) * 100;
         while (worklist.items.len > 0) {
             iterations += 1;
-            if (iterations > max_iterations) break;
-
             const bid = worklist.items[worklist.items.len - 1];
             worklist.items.len -= 1;
+            if (iterations > max_iterations) {
+                if (self.last_error_ctx == null) {
+                    const offset = if (bid < self.cfg.blocks.len)
+                        self.cfg.blocks[bid].start_offset
+                    else
+                        0;
+                    self.last_error_ctx = .{
+                        .code_name = self.code.name,
+                        .block_id = bid,
+                        .offset = offset,
+                        .opcode = "stackflow_iter_limit",
+                    };
+                }
+                return error.InvalidStackDepth;
+            }
 
             const entry = self.stack_in[bid] orelse continue;
             if (self.trace_stackflow and update_counts != null and self.trace_file != null) {
@@ -2625,10 +2641,23 @@ pub const Decompiler = struct {
         const max_iterations: usize = @as(usize, block_count) * 100;
         while (worklist.items.len > 0) {
             iterations += 1;
-            if (iterations > max_iterations) break;
-
             const bid = worklist.items[worklist.items.len - 1];
             worklist.items.len -= 1;
+            if (iterations > max_iterations) {
+                if (self.last_error_ctx == null) {
+                    const offset = if (bid < self.cfg.blocks.len)
+                        self.cfg.blocks[bid].start_offset
+                    else
+                        0;
+                    self.last_error_ctx = .{
+                        .code_name = self.code.name,
+                        .block_id = bid,
+                        .offset = offset,
+                        .opcode = "stackflow_iter_limit",
+                    };
+                }
+                return error.InvalidStackDepth;
+            }
 
             const entry = self.stack_in[bid] orelse continue;
             if (self.trace_stackflow and update_counts != null and self.trace_file != null) {
@@ -2795,6 +2824,7 @@ pub const Decompiler = struct {
 
         var flow_arena = std.heap.ArenaAllocator.init(self.base_alloc);
         defer flow_arena.deinit();
+        try self.initPhiMergeOk();
         try self.runStackSSA(&worklist, &clone_sim, update_counts, &flow_arena);
 
         if (self.cfg.exception_entries.len > 0) {
@@ -10192,20 +10222,18 @@ pub const Decompiler = struct {
             self.if_next = null;
         }
 
-        if (!is_elif) {
-            if (merge_block) |merge_id| {
-                if (!no_merge and self.phi_by_block.contains(merge_id)) {
-                    then_body = try self.appendPhiAssignmentsForBranch(merge_id, then_block, then_body, a);
-                    if (else_block != null) {
-                        if (else_start) |es| {
-                            else_body = try self.appendPhiAssignmentsForBranch(merge_id, es, else_body, a);
-                        }
-                    } else {
-                        if (try self.findPredForBranch(merge_id, pattern.condition_block)) |pred| {
-                            const assigns = try self.phiAssignmentsForEdge(pred, merge_id);
-                            if (assigns.len > 0) {
-                                else_body = assigns;
-                            }
+        if (merge_block) |merge_id| {
+            if (!no_merge and self.phi_by_block.contains(merge_id)) {
+                then_body = try self.appendPhiAssignmentsForBranch(merge_id, then_block, then_body, a);
+                if (else_block != null) {
+                    if (else_start) |es| {
+                        else_body = try self.appendPhiAssignmentsForBranch(merge_id, es, else_body, a);
+                    }
+                } else {
+                    if (try self.findPredForBranch(merge_id, pattern.condition_block)) |pred| {
+                        const assigns = try self.phiAssignmentsForEdge(pred, merge_id);
+                        if (assigns.len > 0) {
+                            else_body = assigns;
                         }
                     }
                 }
@@ -22366,7 +22394,7 @@ pub const Decompiler = struct {
         body = try self.trimTrailingReturnNone(body);
 
         // Generate global/nonlocal declarations
-        var decls: std.ArrayListUnmanaged(*Stmt) = .{};
+        var decls: std.ArrayList(*Stmt) = .{};
         defer decls.deinit(a);
 
         // Nonlocal: only freevars that are assigned in this scope
@@ -24207,6 +24235,56 @@ test "decompiler init" {
     defer decompiler.deinit();
 
     try testing.expectEqual(@as(usize, 0), decompiler.cfg.blocks.len);
+}
+
+test "runStackSSA hard-fails iteration cap" {
+    const testing = std.testing;
+    const allocator = testing.allocator;
+    const version = Version.init(3, 9);
+
+    const ops = [_]test_utils.OpArg{
+        .{ .op = .LOAD_CONST, .arg = 0 },
+        .{ .op = .RETURN_VALUE, .arg = 0 },
+    };
+    const bytecode = try test_utils.emitOpsOwned(allocator, version, &ops);
+    const consts = [_]pyc.Object{.{ .none = {} }};
+    const code = try test_utils.allocCode(
+        allocator,
+        "ssa_iter",
+        &[_][]const u8{},
+        &consts,
+        bytecode,
+        1,
+    );
+    defer {
+        code.deinit();
+        allocator.destroy(code);
+    }
+
+    var decompiler = try Decompiler.init(allocator, code, version);
+    defer decompiler.deinit();
+
+    var worklist: std.ArrayListUnmanaged(u32) = .{};
+    defer worklist.deinit(allocator);
+    const block_count: u32 = @intCast(decompiler.cfg.blocks.len);
+    try testing.expect(block_count > 0);
+    const max_iterations: usize = @as(usize, block_count) * 100;
+    try worklist.ensureTotalCapacity(allocator, max_iterations + 1);
+    var i: usize = 0;
+    while (i < max_iterations + 1) : (i += 1) {
+        try worklist.append(allocator, 0);
+    }
+
+    var clone_sim = decompiler.initSim(decompiler.arena.allocator(), decompiler.arena.allocator(), code, version);
+    defer clone_sim.deinit();
+
+    var flow_arena = std.heap.ArenaAllocator.init(allocator);
+    defer flow_arena.deinit();
+
+    try testing.expectError(error.InvalidStackDepth, decompiler.runStackSSA(&worklist, &clone_sim, null, &flow_arena));
+    try testing.expect(decompiler.last_error_ctx != null);
+    const ctx = decompiler.last_error_ctx.?;
+    try testing.expectEqualStrings("stackflow_iter_limit", ctx.opcode);
 }
 
 test "simulate condition expr returns null on sim error" {
