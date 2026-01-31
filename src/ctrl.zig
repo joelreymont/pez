@@ -529,8 +529,9 @@ pub const Analyzer = struct {
             if (self.detectWhilePattern(block_id, allow_loop_if)) |pattern| {
                 return .{ .while_loop = pattern };
             }
+            const async_for_header = self.isAsyncForHeader(block);
             // Loop headers that don't form a well-structured while shouldn't be treated as if.
-            if (!allow_loop_if and term.opcode != .FOR_ITER and term.opcode != .FOR_LOOP) {
+            if (!allow_loop_if and term.opcode != .FOR_ITER and term.opcode != .FOR_LOOP and !async_for_header) {
                 return .unknown;
             }
         }
@@ -623,6 +624,22 @@ pub const Analyzer = struct {
             }
         }
         return false;
+    }
+
+    fn isAsyncForHeader(self: *const Analyzer, block: *const BasicBlock) bool {
+        if (self.cfg.version.lt(3, 5)) return false;
+        var has_setup = false;
+        var has_anext = false;
+        var has_yield = false;
+        for (block.instructions) |inst| {
+            switch (inst.opcode) {
+                .SETUP_EXCEPT => has_setup = true,
+                .GET_ANEXT => has_anext = true,
+                .YIELD_FROM => has_yield = true,
+                else => {},
+            }
+        }
+        return has_setup and has_anext and has_yield;
     }
 
     /// Check if block has CHECK_EXC_MATCH (exception handler).
@@ -3229,6 +3246,101 @@ test "detectWhilePattern rejects internal exit" {
     defer analyzer.deinit();
 
     try testing.expect(analyzer.detectWhilePattern(0, false) == null);
+}
+
+test "detectPattern async for header prefers try" {
+    const testing = std.testing;
+    const allocator = testing.allocator;
+
+    const version = cfg_mod.Version.init(3, 7);
+    const total_blocks: usize = 3;
+
+    const instructions = try allocator.alloc(cfg_mod.Instruction, 6);
+    const block_offsets = try allocator.alloc(u32, total_blocks);
+    const blocks = try allocator.alloc(cfg_mod.BasicBlock, total_blocks);
+
+    instructions[0] = .{ .opcode = .SETUP_EXCEPT, .arg = 0, .offset = 0, .size = 2, .cache_entries = 0 };
+    instructions[1] = .{ .opcode = .GET_ANEXT, .arg = 0, .offset = 2, .size = 2, .cache_entries = 0 };
+    instructions[2] = .{ .opcode = .LOAD_CONST, .arg = 0, .offset = 4, .size = 2, .cache_entries = 0 };
+    instructions[3] = .{ .opcode = .YIELD_FROM, .arg = 0, .offset = 6, .size = 2, .cache_entries = 0 };
+    instructions[4] = .{ .opcode = .POP_BLOCK, .arg = 0, .offset = 8, .size = 2, .cache_entries = 0 };
+    instructions[5] = .{ .opcode = .NOP, .arg = 0, .offset = 10, .size = 2, .cache_entries = 0 };
+
+    block_offsets[0] = 0;
+    block_offsets[1] = 10;
+    block_offsets[2] = 12;
+
+    var succ_0 = try allocator.alloc(cfg_mod.Edge, 2);
+    succ_0[0] = .{ .target = 2, .edge_type = .normal };
+    succ_0[1] = .{ .target = 1, .edge_type = .exception };
+
+    var succ_1 = try allocator.alloc(cfg_mod.Edge, 1);
+    succ_1[0] = .{ .target = 2, .edge_type = .normal };
+
+    var succ_2 = try allocator.alloc(cfg_mod.Edge, 1);
+    succ_2[0] = .{ .target = 0, .edge_type = .loop_back };
+
+    var preds_0 = try allocator.alloc(u32, 1);
+    preds_0[0] = 2;
+    var preds_1 = try allocator.alloc(u32, 1);
+    preds_1[0] = 0;
+    var preds_2 = try allocator.alloc(u32, 2);
+    preds_2[0] = 0;
+    preds_2[1] = 1;
+
+    blocks[0] = .{
+        .id = 0,
+        .start_offset = 0,
+        .end_offset = 10,
+        .instructions = instructions[0..5],
+        .successors = succ_0,
+        .predecessors = preds_0,
+        .is_exception_handler = false,
+        .is_loop_header = true,
+    };
+    blocks[1] = .{
+        .id = 1,
+        .start_offset = 10,
+        .end_offset = 12,
+        .instructions = instructions[5..6],
+        .successors = succ_1,
+        .predecessors = preds_1,
+        .is_exception_handler = true,
+        .is_loop_header = false,
+    };
+    blocks[2] = .{
+        .id = 2,
+        .start_offset = 12,
+        .end_offset = 12,
+        .instructions = instructions[6..6],
+        .successors = succ_2,
+        .predecessors = preds_2,
+        .is_exception_handler = false,
+        .is_loop_header = false,
+    };
+
+    var cfg = cfg_mod.CFG{
+        .allocator = allocator,
+        .blocks = blocks,
+        .block_offsets = block_offsets,
+        .entry = 0,
+        .instructions = instructions,
+        .exception_entries = &.{},
+        .version = version,
+    };
+    defer cfg.deinit();
+
+    var dom = try dom_mod.DomTree.init(allocator, &cfg);
+    defer dom.deinit();
+
+    var analyzer = try Analyzer.init(allocator, &cfg, &dom);
+    defer analyzer.deinit();
+
+    const pat = try analyzer.detectPattern(0);
+    switch (pat) {
+        .try_stmt => {},
+        else => try testing.expect(false),
+    }
 }
 
 test "isConditionalJump" {
