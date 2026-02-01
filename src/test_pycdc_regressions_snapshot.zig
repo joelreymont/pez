@@ -59,3 +59,58 @@ test "snapshot pycdc try/except/finally 2.6" {
         \\"
     ).expectEqual(output);
 }
+
+test "snapshot pycdc chain compare with 3.9" {
+    const allocator = testing.allocator;
+    const output = try tu.renderPycFile(allocator, "refs/pycdc/tests/compiled/chain_compare_with.3.9.pyc", false);
+    defer allocator.free(output);
+
+    const oh = OhSnap{};
+    try oh.snap(@src(),
+        \\[]u8
+        \\  "def full(self):
+        \\    with self.mutex:
+        \\        return 0 < self.maxsize <= self._qsize()
+        \\"
+    ).expectEqual(output);
+}
+
+test "snapshot pycdc with nested if 3.9" {
+    const allocator = testing.allocator;
+    const output = try tu.renderPycFile(allocator, "refs/pycdc/tests/compiled/with_nested_if.3.9.pyc", false);
+    defer allocator.free(output);
+
+    const oh = OhSnap{};
+    try oh.snap(@src(),
+        \\[]u8
+        \\  "def task_done(self):
+        \\    with self.all_tasks_done:
+        \\        unfinished = self.unfinished_tasks - 1
+        \\        if unfinished <= 0:
+        \\            if unfinished < 0:
+        \\                raise ValueError('task_done() called too many times')
+        \\            self.all_tasks_done.notify_all()
+        \\        self.unfinished_tasks = unfinished
+        \\"
+    ).expectEqual(output);
+}
+
+test "snapshot pycdc guard raise loop 3.9" {
+    const allocator = testing.allocator;
+    const output = try tu.renderPycFile(allocator, "test/corpus/guard_raise_loop.3.9.pyc", false);
+    defer allocator.free(output);
+
+    const oh = OhSnap{};
+    try oh.snap(@src(),
+        \\[]u8
+        \\  "def wait(x):
+        \\    pass
+        \\def f(cond, endtime):
+        \\    while cond:
+        \\        remaining = endtime - time()
+        \\        if remaining <= 0.0:
+        \\            raise Exception('x')
+        \\        wait(remaining)
+        \\"
+    ).expectEqual(output);
+}
