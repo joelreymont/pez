@@ -11,6 +11,7 @@
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 const opcodes = @import("opcodes.zig");
+const decoder = @import("decoder.zig");
 
 pub const Version = opcodes.Version;
 
@@ -742,6 +743,12 @@ pub const Module = struct {
     file_data: ?[]const u8 = null,
     last_err: ?ParseDiag = null,
 
+    const CodeDiag = struct {
+        pos: u32,
+        err: anyerror,
+        note: ?[]const u8,
+    };
+
     pub fn init(self: *Module, allocator: Allocator) void {
         self.* = .{
             .arena = std.heap.ArenaAllocator.init(allocator),
@@ -820,6 +827,13 @@ pub const Module = struct {
             };
             return error.InvalidPyc;
         }
+
+        if (self.code) |code| {
+            if (try self.validateCodeGraph(code)) |diag| {
+                self.last_err = .{ .pos = diag.pos, .err = diag.err, .note = diag.note };
+                return error.InvalidPyc;
+            }
+        }
     }
 
     fn readObject(self: *Module, reader: *BufferReader) !?*Code {
@@ -864,6 +878,74 @@ pub const Module = struct {
         InvalidObjectType,
         InvalidFloat,
     };
+
+    fn validateCodeGraph(self: *Module, code: *Code) Allocator.Error!?CodeDiag {
+        var seen = std.AutoHashMap(usize, void).init(self.allocator);
+        defer seen.deinit();
+        var diag: ?CodeDiag = null;
+        try self.validateCodeInner(code, &seen, &diag);
+        return diag;
+    }
+
+    fn validateCodeInner(
+        self: *Module,
+        code: *Code,
+        seen: *std.AutoHashMap(usize, void),
+        diag: *?CodeDiag,
+    ) Allocator.Error!void {
+        if (diag.* != null) return;
+        const key = @intFromPtr(code);
+        if (seen.contains(key)) return;
+        try seen.put(key, {});
+
+        var bc_diag: decoder.BytecodeDiag = .{ .pos = 0, .note = null };
+        decoder.validateBytecode(code.code, self.version(), &bc_diag) catch |err| {
+            const detail = bc_diag.note orelse "invalid bytecode";
+            const note = try std.fmt.allocPrint(self.allocator, "code {s}: {s}", .{ code.name, detail });
+            diag.* = .{ .pos = bc_diag.pos, .err = err, .note = note };
+            return;
+        };
+
+        for (code.consts) |obj| {
+            try self.validateObjectInner(obj, seen, diag);
+            if (diag.* != null) return;
+        }
+    }
+
+    fn validateObjectInner(
+        self: *Module,
+        obj: Object,
+        seen: *std.AutoHashMap(usize, void),
+        diag: *?CodeDiag,
+    ) Allocator.Error!void {
+        if (diag.* != null) return;
+        switch (obj) {
+            .code => |c| try self.validateCodeInner(c, seen, diag),
+            .code_ref => |c| try self.validateCodeInner(c, seen, diag),
+            .tuple, .list, .set, .frozenset => |items| {
+                for (items) |item| {
+                    try self.validateObjectInner(item, seen, diag);
+                    if (diag.* != null) return;
+                }
+            },
+            .dict => |entries| {
+                for (entries) |entry| {
+                    try self.validateObjectInner(entry.key, seen, diag);
+                    if (diag.* != null) return;
+                    try self.validateObjectInner(entry.value, seen, diag);
+                    if (diag.* != null) return;
+                }
+            },
+            .slice => |s| {
+                try self.validateObjectInner(s.start.*, seen, diag);
+                if (diag.* != null) return;
+                try self.validateObjectInner(s.stop.*, seen, diag);
+                if (diag.* != null) return;
+                try self.validateObjectInner(s.step.*, seen, diag);
+            },
+            else => {},
+        }
+    }
 
     fn readCode(self: *Module, reader: *BufferReader) ParseError!*Code {
         const allocator = self.allocator;
@@ -1738,6 +1820,34 @@ test "loadFromFile invalid pyc hard-fails" {
     try testing.expectEqual(@as(usize, 17), d.pos);
     try testing.expectEqualStrings("InvalidObjectType", @errorName(d.err));
     try testing.expect(d.note == null);
+}
+
+test "validateCodeGraph rejects invalid bytecode" {
+    const testing = std.testing;
+    const allocator = testing.allocator;
+
+    var module: Module = undefined;
+    module.init(allocator);
+    defer module.deinit();
+    module.major_ver = 3;
+    module.minor_ver = 9;
+
+    const code = try module.allocator.create(Code);
+    code.* = .{ .allocator = module.allocator };
+    code.code = try module.allocator.dupe(u8, &[_]u8{ 0x64 }); // LOAD_CONST without arg
+    code.consts = &.{};
+    code.names = &.{};
+    code.varnames = &.{};
+    code.freevars = &.{};
+    code.cellvars = &.{};
+    code.filename = try module.allocator.dupe(u8, "<test>");
+    code.name = try module.allocator.dupe(u8, "f");
+    code.linetable = &.{};
+    code.exceptiontable = &.{};
+
+    const diag = try module.validateCodeGraph(code);
+    try testing.expect(diag != null);
+    try testing.expectEqualStrings("InvalidBytecode", @errorName(diag.?.err));
 }
 
 test "buffer reader" {

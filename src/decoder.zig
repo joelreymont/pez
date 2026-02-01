@@ -267,6 +267,86 @@ pub const InstructionIterator = struct {
     }
 };
 
+pub const BytecodeDiag = struct {
+    pos: u32,
+    note: ?[]const u8,
+};
+
+pub fn validateBytecode(bytecode: []const u8, version: Version, diag: *BytecodeDiag) error{InvalidBytecode}!void {
+    diag.* = .{ .pos = 0, .note = null };
+    var pos: usize = 0;
+    var extended_arg: u32 = 0;
+    const word_based = version.gte(3, 6);
+    const ext_shift: u5 = if (word_based) 8 else 16;
+
+    while (pos < bytecode.len) {
+        const start = pos;
+        const op_byte = bytecode[pos];
+        pos += 1;
+
+        const opcode = opcodes.byteToOpcode(version, op_byte) orelse {
+            diag.* = .{ .pos = @intCast(start), .note = "invalid opcode" };
+            return error.InvalidBytecode;
+        };
+
+        var arg: u32 = 0;
+        if (word_based) {
+            if (pos >= bytecode.len) {
+                diag.* = .{ .pos = @intCast(start), .note = "truncated instruction" };
+                return error.InvalidBytecode;
+            }
+            arg = bytecode[pos];
+            pos += 1;
+        } else if (opcode.hasArg(version)) {
+            if (pos + 1 >= bytecode.len) {
+                diag.* = .{ .pos = @intCast(start), .note = "truncated instruction" };
+                return error.InvalidBytecode;
+            }
+            arg = @as(u32, bytecode[pos]) | (@as(u32, bytecode[pos + 1]) << 8);
+            pos += 2;
+        }
+
+        if (opcode == .EXTENDED_ARG) {
+            extended_arg = (extended_arg | arg) << ext_shift;
+            continue;
+        }
+
+        if (extended_arg != 0) {
+            arg |= extended_arg;
+            extended_arg = 0;
+        }
+
+        const cache_count = opcodes.cacheEntries(opcode, version);
+        const cache_bytes = @as(usize, cache_count) * 2;
+        if (pos + cache_bytes > bytecode.len) {
+            diag.* = .{ .pos = @intCast(start), .note = "truncated cache" };
+            return error.InvalidBytecode;
+        }
+        pos += cache_bytes;
+
+        const base_size: u16 = if (word_based) 2 else if (opcode.hasArg(version)) 3 else 1;
+        const inst = Instruction{
+            .opcode = opcode,
+            .arg = arg,
+            .offset = @intCast(start),
+            .size = base_size + @as(u16, cache_count) * 2,
+            .cache_entries = cache_count,
+        };
+
+        if (inst.jumpTarget(version)) |target| {
+            if (target >= bytecode.len) {
+                diag.* = .{ .pos = @intCast(start), .note = "jump target out of range" };
+                return error.InvalidBytecode;
+            }
+        }
+    }
+
+    if (extended_arg != 0) {
+        diag.* = .{ .pos = @intCast(bytecode.len), .note = "dangling EXTENDED_ARG" };
+        return error.InvalidBytecode;
+    }
+}
+
 fn opcodeByte(version: Version, op: Opcode) u8 {
     const table = opcodes.getOpcodeTable(version);
     for (table, 0..) |entry, idx| {
