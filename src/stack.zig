@@ -35,7 +35,7 @@ pub const SimError = Allocator.Error || error{
 
 pub const FunctionValue = struct {
     code: *const pyc.Code,
-    decorators: std.ArrayList(*Expr),
+    decorators: std.ArrayListUnmanaged(*Expr),
     defaults: []const *Expr = &.{},
     kw_defaults: []const ?*Expr = &.{},
     annotations: []const signature.Annotation = &.{},
@@ -52,7 +52,7 @@ pub const ClassValue = struct {
     name: []const u8,
     bases: []const *Expr,
     keywords: []const ast.Keyword,
-    decorators: std.ArrayList(*Expr),
+    decorators: std.ArrayListUnmanaged(*Expr),
 
     pub fn deinit(self: *ClassValue, allocator: Allocator) void {
         // Arena-allocated, no cleanup needed
@@ -76,7 +76,7 @@ const CompObject = struct {
 const PendingComp = struct {
     target: ?*Expr,
     iter: ?*Expr,
-    ifs: std.ArrayList(*Expr),
+    ifs: std.ArrayListUnmanaged(*Expr),
     is_async: bool,
 
     fn deinit(self: *PendingComp, ast_alloc: Allocator, stack_alloc: Allocator) void {
@@ -99,7 +99,7 @@ const PendingComp = struct {
 const PendingUnpack = struct {
     builder: *CompBuilder,
     remain: u32,
-    names: std.ArrayList(*Expr),
+    names: std.ArrayListUnmanaged(*Expr),
 
     fn deinit(self: *PendingUnpack, ast_alloc: Allocator, stack_alloc: Allocator) void {
         for (self.names.items) |expr| {
@@ -112,8 +112,8 @@ const PendingUnpack = struct {
 
 const CompBuilder = struct {
     kind: CompKind,
-    generators: std.ArrayList(PendingComp),
-    loop_stack: std.ArrayList(usize),
+    generators: std.ArrayListUnmanaged(PendingComp),
+    loop_stack: std.ArrayListUnmanaged(usize),
     elt: ?*Expr,
     key: ?*Expr,
     value: ?*Expr,
@@ -369,7 +369,7 @@ fn optExprEqual(a: ?*Expr, b: ?*Expr) bool {
 
 /// Simulated Python evaluation stack.
 pub const Stack = struct {
-    items: std.ArrayList(StackValue),
+    items: std.ArrayListUnmanaged(StackValue),
     stack_alloc: Allocator,
     ast_alloc: Allocator,
     allow_underflow: bool = false,
@@ -567,7 +567,7 @@ pub const SimContext = struct {
     /// Pending keyword argument names from KW_NAMES (3.11+).
     pending_kwnames: ?[]const []const u8 = null,
     /// Pending conditional expressions (linear simulation).
-    pending_ifexp: std.ArrayList(PendingIfExp) = .{},
+    pending_ifexp: std.ArrayListUnmanaged(PendingIfExp) = .{},
     /// Enable conditional expression handling in linear simulation.
     enable_ifexp: bool = false,
     /// GET_AWAITABLE was seen, next YIELD_FROM should be await.
@@ -2808,7 +2808,7 @@ pub const SimContext = struct {
         nested.comp_builder = builder;
         nested.iter_override = .{ .index = 0, .expr = iter_expr };
 
-        var pending: std.ArrayList(PendingBoolOp) = .{};
+        var pending: std.ArrayListUnmanaged(PendingBoolOp) = .{};
         defer pending.deinit(self.allocator);
 
         var iter = decoder.InstructionIterator.init(comp.code.code, self.version);
@@ -5025,7 +5025,7 @@ pub const SimContext = struct {
                 if (fromlist_val) |fv| {
                     if (fv == .expr and fv.expr.* == .tuple) {
                         const tuple_elts = fv.expr.tuple.elts;
-                        var names: std.ArrayList([]const u8) = .{};
+                        var names: std.ArrayListUnmanaged([]const u8) = .{};
                         for (tuple_elts) |elt| {
                             if (elt.* == .constant and elt.constant == .string) {
                                 try names.append(self.allocator, elt.constant.string);
@@ -5066,7 +5066,7 @@ pub const SimContext = struct {
                                 }
                             }
                         }
-                        var new_fromlist: std.ArrayList([]const u8) = .{};
+                        var new_fromlist: std.ArrayListUnmanaged([]const u8) = .{};
                         try new_fromlist.appendSlice(self.allocator, imp.fromlist);
                         try new_fromlist.append(self.allocator, attr_name);
                         const top_idx = self.stack.items.items.len - 1;
@@ -6871,7 +6871,7 @@ fn makeIfExp(allocator: Allocator, condition: *Expr, body: *Expr, else_body: *Ex
 fn resolveIfExps(
     allocator: Allocator,
     stack: *Stack,
-    pending: *std.ArrayList(PendingIfExp),
+    pending: *std.ArrayListUnmanaged(PendingIfExp),
     offset: u32,
 ) !bool {
     if (pending.items.len == 0) return false;
@@ -6919,7 +6919,7 @@ fn resolveIfExps(
 
 fn captureIfExpThen(
     stack: *Stack,
-    pending: *std.ArrayList(PendingIfExp),
+    pending: *std.ArrayListUnmanaged(PendingIfExp),
     offset: u32,
     merge_target: u32,
 ) !bool {
@@ -6950,7 +6950,7 @@ fn captureIfExpThen(
 fn resolveBoolOps(
     allocator: Allocator,
     stack: *Stack,
-    pending: *std.ArrayList(PendingBoolOp),
+    pending: *std.ArrayListUnmanaged(PendingBoolOp),
     offset: u32,
 ) !bool {
     if (pending.items.len == 0) return false;
@@ -7005,7 +7005,7 @@ pub fn buildLambdaExpr(allocator: Allocator, code: *const pyc.Code, version: Ver
     ctx.enable_ifexp = true;
 
     var body_expr: ?*Expr = null;
-    var pending: std.ArrayList(PendingBoolOp) = .{};
+    var pending: std.ArrayListUnmanaged(PendingBoolOp) = .{};
     defer pending.deinit(allocator);
 
     var iter = decoder.InstructionIterator.init(code.code, version);
@@ -7754,6 +7754,7 @@ test "stack pop expr unknown uses placeholder name" {
     try testing.expect(expr.* == .name);
     try testing.expectEqualStrings("__unknown__", expr.name.id);
     try testing.expect(expr.name.ctx == .load);
+    try testing.expectEqual(@as(usize, 0), stack.items.items.len);
 }
 
 test "stack simulation set append grows cap" {
