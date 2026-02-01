@@ -73,7 +73,7 @@ pub const DomTree = struct {
     /// Get all loop headers.
     /// Caller owns the returned slice.
     pub fn getLoopHeaders(self: *const DomTree) ![]const u32 {
-        var headers: std.ArrayList(u32) = .{};
+        var headers: std.ArrayListUnmanaged(u32) = .{};
         errdefer headers.deinit(self.allocator);
         var it = self.loop_bodies.keyIterator();
         while (it.next()) |key| {
@@ -107,10 +107,10 @@ fn computeReversePostOrder(allocator: std.mem.Allocator, cfg: *const cfg_mod.CFG
     var visited = try std.DynamicBitSet.initEmpty(allocator, count);
     defer visited.deinit();
 
-    var postorder: std.ArrayList(u32) = .{};
+    var postorder: std.ArrayListUnmanaged(u32) = .{};
     errdefer postorder.deinit(allocator);
 
-    var stack: std.ArrayList(struct { node: u32, next_idx: usize }) = .{};
+    var stack: std.ArrayListUnmanaged(struct { node: u32, next_idx: usize }) = .{};
     defer stack.deinit(allocator);
 
     visited.set(0);
@@ -240,7 +240,7 @@ fn findNaturalLoops(
 
                 if (tail != h) {
                     // Use reverse DFS from b to find all nodes that reach b
-                    var worklist: std.ArrayList(u32) = .{};
+                    var worklist: std.ArrayListUnmanaged(u32) = .{};
                     defer worklist.deinit(allocator);
 
                     try worklist.append(allocator, tail);
@@ -347,6 +347,10 @@ test "dominator simple" {
     try std.testing.expect(!dom.dominates(2, 0));
     try std.testing.expect(!dom.dominates(2, 1));
     try std.testing.expect(dom.dominates(2, 2));
+
+    const headers = try dom.getLoopHeaders();
+    defer allocator.free(headers);
+    try std.testing.expectEqual(@as(usize, 0), headers.len);
 }
 
 test "dominator unreachable block" {
