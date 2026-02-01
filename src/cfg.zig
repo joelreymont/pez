@@ -169,26 +169,31 @@ pub const CFG = struct {
     }
 };
 
-/// Post-dominator tree and sets for a CFG.
+/// Post-dominator tree for a CFG.
 pub const PostDom = struct {
     allocator: Allocator,
-    sets: []std.DynamicBitSet,
     ipdom: []?u32,
     depth: []u32,
     virtual_exit: ?u32,
 
     pub fn deinit(self: *PostDom) void {
-        for (self.sets) |*set| {
-            set.deinit();
-        }
-        if (self.sets.len > 0) self.allocator.free(self.sets);
         if (self.ipdom.len > 0) self.allocator.free(self.ipdom);
         if (self.depth.len > 0) self.allocator.free(self.depth);
     }
 
     pub fn postdominates(self: *const PostDom, a: u32, b: u32) bool {
-        if (b >= self.sets.len or a >= self.sets.len) return false;
-        return self.sets[b].isSet(a);
+        if (b >= self.ipdom.len or a >= self.ipdom.len) return false;
+        if (a == b) return true;
+        var cur = b;
+        var steps: u32 = 0;
+        const limit: u32 = @intCast(self.ipdom.len);
+        while (steps < limit) : (steps += 1) {
+            const p = self.ipdom[@intCast(cur)] orelse return false;
+            if (p == a) return true;
+            if (p == cur) return false;
+            cur = p;
+        }
+        return false;
     }
 
     pub fn merge(self: *const PostDom, a: u32, b: u32) ?u32 {
@@ -217,16 +222,28 @@ pub const PostDom = struct {
     }
 };
 
-/// Compute post-dominator sets and tree.
+/// Compute post-dominator tree.
 pub fn computePostDom(allocator: Allocator, cfg: *const CFG, include_exceptions: bool) !PostDom {
     const n: u32 = @intCast(cfg.blocks.len);
+    if (n == 0) {
+        return PostDom{
+            .allocator = allocator,
+            .ipdom = &.{},
+            .depth = &.{},
+            .virtual_exit = null,
+        };
+    }
+
     var exits = try collectExitBlocks(allocator, cfg, include_exceptions);
     defer exits.deinit(allocator);
 
     var rev = try allocator.alloc(std.ArrayListUnmanaged(u32), @intCast(n));
+    var rev_owns = true;
     errdefer {
-        for (rev) |*lst| lst.deinit(allocator);
-        allocator.free(rev);
+        if (rev_owns) {
+            for (rev) |*lst| lst.deinit(allocator);
+            allocator.free(rev);
+        }
     }
     for (rev) |*lst| {
         lst.* = .{};
@@ -239,10 +256,6 @@ pub fn computePostDom(allocator: Allocator, cfg: *const CFG, include_exceptions:
             if (tgt >= n) continue;
             try rev[@intCast(tgt)].append(allocator, src);
         }
-    }
-    defer {
-        for (rev) |*lst| lst.deinit(allocator);
-        allocator.free(rev);
     }
 
     var reachable = try std.DynamicBitSet.initEmpty(allocator, @intCast(n));
@@ -268,6 +281,7 @@ pub fn computePostDom(allocator: Allocator, cfg: *const CFG, include_exceptions:
             }
         }
     }
+
     var any_unreach = exits.items.len == 0;
     if (!any_unreach) {
         var bid: u32 = 0;
@@ -285,113 +299,97 @@ pub fn computePostDom(allocator: Allocator, cfg: *const CFG, include_exceptions:
         virtual_exit = n;
         total = n + 1;
     }
-
     const total_usize: usize = @intCast(total);
-    var sets = try allocator.alloc(std.DynamicBitSet, total_usize);
+
+    var succ_lists = try allocator.alloc(std.ArrayListUnmanaged(u32), total_usize);
     errdefer {
-        for (sets) |*set| set.deinit();
-        allocator.free(sets);
+        for (succ_lists) |*lst| lst.deinit(allocator);
+        allocator.free(succ_lists);
     }
+    for (0..@intCast(n)) |i| {
+        succ_lists[i] = rev[i];
+    }
+    for (@intCast(n)..total_usize) |i| {
+        succ_lists[i] = .{};
+    }
+    rev_owns = false;
+    allocator.free(rev);
+
+    var pred_lists = try allocator.alloc(std.ArrayListUnmanaged(u32), total_usize);
+    errdefer {
+        for (pred_lists) |*lst| lst.deinit(allocator);
+        allocator.free(pred_lists);
+    }
+    for (pred_lists) |*lst| {
+        lst.* = .{};
+    }
+
+    src = 0;
+    while (src < n) : (src += 1) {
+        for (cfg.blocks[@intCast(src)].successors) |edge| {
+            if (!include_exceptions and edge.edge_type == .exception) continue;
+            const tgt = edge.target;
+            if (tgt >= n) continue;
+            try pred_lists[@intCast(src)].append(allocator, tgt);
+        }
+    }
+
+    if (virtual_exit) |ve| {
+        for (exits.items) |eid| {
+            if (eid >= n) continue;
+            try succ_lists[@intCast(ve)].append(allocator, eid);
+            try pred_lists[@intCast(eid)].append(allocator, ve);
+        }
+    }
+
+    var succs = try allocator.alloc([]const u32, total_usize);
+    errdefer allocator.free(succs);
+    var preds = try allocator.alloc([]const u32, total_usize);
+    errdefer allocator.free(preds);
+    for (0..total_usize) |i| {
+        succs[i] = try succ_lists[i].toOwnedSlice(allocator);
+        preds[i] = try pred_lists[i].toOwnedSlice(allocator);
+    }
+    for (succ_lists) |*lst| lst.deinit(allocator);
+    for (pred_lists) |*lst| lst.deinit(allocator);
+    allocator.free(succ_lists);
+    allocator.free(pred_lists);
+    defer {
+        for (0..total_usize) |i| {
+            if (succs[i].len > 0) allocator.free(succs[i]);
+            if (preds[i].len > 0) allocator.free(preds[i]);
+        }
+        allocator.free(succs);
+        allocator.free(preds);
+    }
+
+    const entry: u32 = if (virtual_exit) |ve|
+        ve
+    else if (exits.items.len > 0)
+        exits.items[0]
+    else
+        0;
+
+    const idom = try postIdomFrom(allocator, succs, preds, entry);
+    defer allocator.free(idom);
+
     var ipdom = try allocator.alloc(?u32, total_usize);
     errdefer allocator.free(ipdom);
     var depth = try allocator.alloc(u32, total_usize);
     errdefer allocator.free(depth);
 
-    var is_exit = try std.DynamicBitSet.initEmpty(allocator, total_usize);
-    defer is_exit.deinit();
-    for (exits.items) |bid| {
-        if (bid < n) is_exit.set(@intCast(bid));
-    }
-
-    var i: usize = 0;
-    while (i < total_usize) : (i += 1) {
-        if (virtual_exit != null and i == @as(usize, @intCast(virtual_exit.?))) {
-            sets[i] = try std.DynamicBitSet.initEmpty(allocator, total_usize);
-            sets[i].set(i);
-        } else if (i < n and (!reachable.isSet(i) or (virtual_exit == null and is_exit.isSet(i)))) {
-            sets[i] = try std.DynamicBitSet.initEmpty(allocator, total_usize);
-            sets[i].set(i);
+    for (0..total_usize) |i| {
+        const node: u32 = @intCast(i);
+        if (node == entry) {
+            ipdom[i] = null;
+        } else if (idom[i] == node) {
+            ipdom[i] = null;
         } else {
-            sets[i] = try std.DynamicBitSet.initFull(allocator, total_usize);
+            ipdom[i] = idom[i];
         }
     }
 
-    var scratch = try std.DynamicBitSet.initEmpty(allocator, total_usize);
-    defer scratch.deinit();
-
-    var changed = true;
-    while (changed) {
-        changed = false;
-        var bid: u32 = 0;
-        while (bid < n) : (bid += 1) {
-            if (!reachable.isSet(@intCast(bid))) continue;
-            if (virtual_exit == null and is_exit.isSet(@intCast(bid))) continue;
-            scratch.setRangeValue(.{ .start = 0, .end = total_usize }, false);
-            var has_succ = false;
-
-            for (cfg.blocks[@intCast(bid)].successors) |edge| {
-                if (!include_exceptions and edge.edge_type == .exception) continue;
-                const tid = edge.target;
-                if (tid >= n) continue;
-                if (!has_succ) {
-                    scratch.setUnion(sets[@intCast(tid)]);
-                    has_succ = true;
-                } else {
-                    scratch.setIntersection(sets[@intCast(tid)]);
-                }
-            }
-            if (!has_succ) {
-                if (virtual_exit) |ve| {
-                    scratch.setUnion(sets[@intCast(ve)]);
-                    has_succ = true;
-                }
-            }
-            scratch.set(@intCast(bid));
-
-            const idx: usize = @intCast(bid);
-            if (!scratch.eql(sets[idx])) {
-                sets[idx].setRangeValue(.{ .start = 0, .end = total_usize }, false);
-                sets[idx].setUnion(scratch);
-                changed = true;
-            }
-        }
-    }
-
-    // Compute immediate post-dominator.
-    i = 0;
-    while (i < total_usize) : (i += 1) {
-        if (virtual_exit != null and i == @as(usize, @intCast(virtual_exit.?))) {
-            ipdom[i] = null;
-            continue;
-        }
-        var best: ?u32 = null;
-        if (i >= n) {
-            ipdom[i] = null;
-            continue;
-        }
-        var it = sets[i].iterator(.{});
-        while (it.next()) |cand| {
-            if (cand == i) continue;
-            var ok = true;
-            var it2 = sets[i].iterator(.{});
-            while (it2.next()) |other| {
-                if (other == i or other == cand) continue;
-                if (!sets[cand].isSet(other)) {
-                    ok = false;
-                    break;
-                }
-            }
-            if (ok) {
-                best = @intCast(cand);
-                break;
-            }
-        }
-        ipdom[i] = best;
-    }
-
-    // Compute depth from postdom root.
-    i = 0;
-    while (i < total_usize) : (i += 1) {
+    for (0..total_usize) |i| {
         var d: u32 = 0;
         var cur: ?u32 = @intCast(i);
         var steps: u32 = 0;
@@ -399,6 +397,7 @@ pub fn computePostDom(allocator: Allocator, cfg: *const CFG, include_exceptions:
             steps += 1;
             if (steps > total) break;
             const p = ipdom[@intCast(c)] orelse break;
+            if (p == c) break;
             d += 1;
             cur = p;
         }
@@ -407,11 +406,151 @@ pub fn computePostDom(allocator: Allocator, cfg: *const CFG, include_exceptions:
 
     return PostDom{
         .allocator = allocator,
-        .sets = sets,
         .ipdom = ipdom,
         .depth = depth,
         .virtual_exit = virtual_exit,
     };
+}
+
+pub fn postIdomFrom(
+    allocator: Allocator,
+    succs: []const []const u32,
+    preds: []const []const u32,
+    entry: u32,
+) ![]u32 {
+    const total: u32 = @intCast(succs.len);
+    const count: usize = @intCast(total);
+    const undef = std.math.maxInt(u32);
+
+    var idom = try allocator.alloc(u32, count);
+    @memset(idom, undef);
+
+    const rpo = try postRpo(allocator, succs, entry);
+    defer allocator.free(rpo);
+
+    if (rpo.len == 0) {
+        for (0..count) |i| {
+            idom[i] = @intCast(i);
+        }
+        return idom;
+    }
+
+    var rpo_index = try allocator.alloc(u32, count);
+    defer allocator.free(rpo_index);
+    @memset(rpo_index, undef);
+    for (rpo, 0..) |node, idx| {
+        rpo_index[@intCast(node)] = @intCast(idx);
+    }
+
+    idom[@intCast(rpo[0])] = rpo[0];
+
+    var changed = true;
+    while (changed) {
+        changed = false;
+        for (rpo[1..]) |node| {
+            const node_idx: usize = @intCast(node);
+            var new_idom: ?u32 = null;
+
+            for (preds[node_idx]) |pred| {
+                if (idom[@intCast(pred)] == undef) continue;
+                if (new_idom == null) {
+                    new_idom = pred;
+                } else {
+                    new_idom = postIntersectIdom(idom, rpo_index, pred, new_idom.?);
+                }
+            }
+
+            if (new_idom == null) continue;
+            if (idom[node_idx] != new_idom.?) {
+                idom[node_idx] = new_idom.?;
+                changed = true;
+            }
+        }
+    }
+
+    for (idom, 0..) |*dom, i| {
+        if (dom.* == undef) {
+            dom.* = @intCast(i);
+        }
+    }
+
+    return idom;
+}
+
+fn postRpo(
+    allocator: Allocator,
+    succs: []const []const u32,
+    entry: u32,
+) ![]u32 {
+    const succ_len: u32 = @intCast(succs.len);
+    if (entry >= succ_len) return &.{};
+    var visited = try std.DynamicBitSet.initEmpty(allocator, succs.len);
+    defer visited.deinit();
+
+    var postorder: std.ArrayListUnmanaged(u32) = .{};
+    errdefer postorder.deinit(allocator);
+
+    var stack: std.ArrayListUnmanaged(struct { node: u32, next_idx: usize }) = .{};
+    defer stack.deinit(allocator);
+
+    try stack.append(allocator, .{ .node = entry, .next_idx = 0 });
+    while (stack.items.len > 0) {
+        var top = &stack.items[stack.items.len - 1];
+        const node = top.node;
+        const node_idx: usize = @intCast(node);
+        if (!visited.isSet(node_idx)) {
+            visited.set(node_idx);
+        }
+        if (top.next_idx < succs[node_idx].len) {
+            const succ = succs[node_idx][top.next_idx];
+            top.next_idx += 1;
+            if (succ < succ_len and !visited.isSet(@intCast(succ))) {
+                try stack.append(allocator, .{ .node = succ, .next_idx = 0 });
+            }
+        } else {
+            _ = stack.pop();
+            try postorder.append(allocator, node);
+        }
+    }
+
+    const out = try allocator.alloc(u32, postorder.items.len);
+    var i: usize = 0;
+    while (i < postorder.items.len) : (i += 1) {
+        out[i] = postorder.items[postorder.items.len - 1 - i];
+    }
+    postorder.deinit(allocator);
+    return out;
+}
+
+fn postIntersectIdom(idom: []const u32, rpo_index: []const u32, a: u32, b: u32) u32 {
+    var finger1 = a;
+    var finger2 = b;
+    while (finger1 != finger2) {
+        while (rpo_index[@intCast(finger1)] > rpo_index[@intCast(finger2)]) {
+            finger1 = idom[@intCast(finger1)];
+        }
+        while (rpo_index[@intCast(finger2)] > rpo_index[@intCast(finger1)]) {
+            finger2 = idom[@intCast(finger2)];
+        }
+    }
+    return finger1;
+}
+
+pub fn postDominatesIdom(idom: []const u32, total: u32, entry: u32, a: u32, b: u32) bool {
+    if (a >= total or b >= total) return false;
+    if (a == b) return true;
+    if (b != entry and idom[@intCast(b)] == b) return false;
+    var current: u32 = b;
+    var steps: u32 = 0;
+    while (current != entry) {
+        steps += 1;
+        if (steps > total) return false;
+        const parent = idom[@intCast(current)];
+        if (parent == current) return false;
+        if (parent == a) return true;
+        current = parent;
+    }
+    return false;
 }
 
 fn collectExitBlocks(
