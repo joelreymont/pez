@@ -400,7 +400,7 @@ pub const Analyzer = struct {
         var body = try std.DynamicBitSet.initEmpty(self.allocator, self.cfg.blocks.len);
         body.set(@intCast(header));
 
-        var stack: std.ArrayList(u32) = .{};
+        var stack: std.ArrayListUnmanaged(u32) = .{};
         defer stack.deinit(self.allocator);
         try stack.append(self.allocator, body_id);
 
@@ -1186,7 +1186,7 @@ pub const Analyzer = struct {
                         var reaches_then = false;
                         var seen = try std.DynamicBitSet.initEmpty(self.allocator, self.cfg.blocks.len);
                         defer seen.deinit();
-                        var queue: std.ArrayList(u32) = .{};
+                        var queue: std.ArrayListUnmanaged(u32) = .{};
                         defer queue.deinit(self.allocator);
                         try queue.append(self.allocator, else_id);
                         while (queue.items.len > 0 and !reaches_then) {
@@ -1482,7 +1482,7 @@ pub const Analyzer = struct {
             // Python 3.14: GET_ITER may be multiple blocks back due to inline comprehension setup
             var visited = if (std.DynamicBitSet.initEmpty(self.allocator, self.cfg.blocks.len)) |v| v else |_| return null;
             defer visited.deinit();
-            var work: std.ArrayList(u32) = .{};
+            var work: std.ArrayListUnmanaged(u32) = .{};
             defer work.deinit(self.allocator);
 
             // Start with direct predecessors (skip loop_back edges)
@@ -1631,7 +1631,7 @@ pub const Analyzer = struct {
         }
 
 
-        var handler_targets: std.ArrayList(u32) = .{};
+        var handler_targets: std.ArrayListUnmanaged(u32) = .{};
         defer handler_targets.deinit(self.allocator);
 
         try self.collectExceptionTargets(block_id, &handler_targets);
@@ -1675,7 +1675,7 @@ pub const Analyzer = struct {
             const first_handler = handler_targets.items[0];
             var reachable = try std.DynamicBitSet.initEmpty(self.allocator, self.cfg.blocks.len);
             defer reachable.deinit();
-            var queue: std.ArrayList(u32) = .{};
+            var queue: std.ArrayListUnmanaged(u32) = .{};
             defer queue.deinit(self.allocator);
             try queue.append(self.allocator, first_handler);
             while (queue.items.len > 0) {
@@ -1693,7 +1693,7 @@ pub const Analyzer = struct {
                     }
                 }
             }
-            var filtered: std.ArrayList(u32) = .{};
+            var filtered: std.ArrayListUnmanaged(u32) = .{};
             defer filtered.deinit(self.allocator);
             for (handler_targets.items) |hid| {
                 if (hid < self.cfg.blocks.len and reachable.isSet(hid)) {
@@ -1707,7 +1707,7 @@ pub const Analyzer = struct {
         }
 
         // Collect all exception handlers reachable from this block
-        var handler_list: std.ArrayList(HandlerInfo) = .{};
+        var handler_list: std.ArrayListUnmanaged(HandlerInfo) = .{};
         defer handler_list.deinit(self.allocator);
 
         for (handler_targets.items) |hid| {
@@ -1840,7 +1840,7 @@ pub const Analyzer = struct {
 
         var seen = try std.DynamicBitSet.initEmpty(self.allocator, self.cfg.blocks.len);
         defer seen.deinit();
-        var queue: std.ArrayList(u32) = .{};
+        var queue: std.ArrayListUnmanaged(u32) = .{};
         defer queue.deinit(self.allocator);
 
         for (handlers) |h| {
@@ -1890,7 +1890,7 @@ pub const Analyzer = struct {
 
         var seen = try std.DynamicBitSet.initEmpty(self.allocator, self.cfg.blocks.len);
         defer seen.deinit();
-        var queue: std.ArrayList(u32) = .{};
+        var queue: std.ArrayListUnmanaged(u32) = .{};
         defer queue.deinit(self.allocator);
         try queue.append(self.allocator, start);
 
@@ -1981,7 +1981,7 @@ pub const Analyzer = struct {
 
     fn collectReachableNormal(self: *Analyzer, start: u32, seen: *std.DynamicBitSet) !void {
         if (start >= self.cfg.blocks.len) return;
-        var queue: std.ArrayList(u32) = .{};
+        var queue: std.ArrayListUnmanaged(u32) = .{};
         defer queue.deinit(self.allocator);
         try queue.append(self.allocator, start);
 
@@ -2131,7 +2131,7 @@ pub const Analyzer = struct {
         // Walk normal edges through try body (bounded before first handler)
         var try_body = try std.DynamicBitSet.initEmpty(self.allocator, self.cfg.blocks.len);
         defer try_body.deinit();
-        var work: std.ArrayList(u32) = .{};
+        var work: std.ArrayListUnmanaged(u32) = .{};
         defer work.deinit(self.allocator);
         if (try_block < first_handler) {
             try work.append(self.allocator, try_block);
@@ -2243,7 +2243,7 @@ pub const Analyzer = struct {
         // - all exception handlers
 
         // Collect candidates from try/else normal exits
-        var candidates: std.ArrayList(u32) = .{};
+        var candidates: std.ArrayListUnmanaged(u32) = .{};
         defer candidates.deinit(self.allocator);
 
         // Start with try body's normal successor
@@ -2378,7 +2378,7 @@ pub const Analyzer = struct {
         // 2. Normal exit from else block (if present)
         // 3. Normal exit from each handler
 
-        var candidates: std.ArrayList(u32) = .{};
+        var candidates: std.ArrayListUnmanaged(u32) = .{};
         defer candidates.deinit(self.allocator);
 
         // Add try body normal successor
@@ -2486,7 +2486,7 @@ pub const Analyzer = struct {
     fn collectExceptionTargets(
         self: *Analyzer,
         block_id: u32,
-        targets: *std.ArrayList(u32),
+        targets: *std.ArrayListUnmanaged(u32),
     ) !void {
         targets.clearRetainingCapacity();
         if (block_id >= self.cfg.blocks.len) return;
@@ -2852,7 +2852,7 @@ pub const Analyzer = struct {
     fn detectMatchPattern(self: *Analyzer, block_id: u32) !?MatchPattern {
         const block = &self.cfg.blocks[block_id];
 
-        var case_blocks: std.ArrayList(u32) = .{};
+        var case_blocks: std.ArrayListUnmanaged(u32) = .{};
         defer case_blocks.deinit(self.allocator);
 
         // If current block has MATCH_* or pattern, it's both subject and first case
@@ -2957,7 +2957,7 @@ pub const Analyzer = struct {
         if (start >= self.cfg.blocks.len or target >= self.cfg.blocks.len) return false;
         var seen = try std.DynamicBitSet.initEmpty(self.allocator, self.cfg.blocks.len);
         defer seen.deinit();
-        var stack: std.ArrayList(u32) = .{};
+        var stack: std.ArrayListUnmanaged(u32) = .{};
         defer stack.deinit(self.allocator);
         try stack.append(self.allocator, start);
         while (stack.items.len > 0) {
@@ -3086,6 +3086,7 @@ test "analyzer init" {
     defer analyzer.deinit();
 
     try testing.expectEqual(@as(usize, 2), cfg_val.blocks.len);
+    try testing.expectEqual(@as(usize, 0), analyzer.findEnclosingLoops(0).len);
 }
 
 test "analyzer loop membership uses dom" {
