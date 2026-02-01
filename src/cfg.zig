@@ -454,7 +454,7 @@ fn buildCFGWithLeaders(
 
     var loop_exits = std.AutoHashMap(u32, u32).init(allocator);
     defer loop_exits.deinit();
-    var loop_targets: std.ArrayList(u32) = .{};
+    var loop_targets: std.ArrayListUnmanaged(u32) = .{};
     defer loop_targets.deinit(allocator);
 
     var legacy_entries: []ExceptionEntry = &.{};
@@ -480,7 +480,7 @@ fn buildCFGWithLeaders(
     }
 
     const loop_multiplier: u32 = if (version.gte(3, 10)) 2 else 1;
-    var loop_stack: std.ArrayList(u32) = .{};
+    var loop_stack: std.ArrayListUnmanaged(u32) = .{};
     defer loop_stack.deinit(allocator);
     for (instructions) |inst| {
         while (loop_stack.items.len > 0 and inst.offset >= loop_stack.items[loop_stack.items.len - 1]) {
@@ -541,7 +541,7 @@ fn buildCFGWithLeaders(
 
     // Step 3: Create basic blocks from leaders
     // Sort leader offsets
-    var leader_offsets: std.ArrayList(u32) = .{};
+    var leader_offsets: std.ArrayListUnmanaged(u32) = .{};
     defer leader_offsets.deinit(allocator);
 
     var leader_iter = leaders.keyIterator();
@@ -593,7 +593,7 @@ fn buildCFGWithLeaders(
 
     // Step 4: Build edges
     for (blocks, 0..) |*block, block_idx| {
-        var succ_list: std.ArrayList(Edge) = .{};
+        var succ_list: std.ArrayListUnmanaged(Edge) = .{};
         errdefer succ_list.deinit(allocator);
 
         const term = block.terminator();
@@ -769,7 +769,7 @@ fn collectLegacyExceptionEntries(
     instructions: []const Instruction,
     version: Version,
 ) ![]ExceptionEntry {
-    var entries: std.ArrayList(ExceptionEntry) = .{};
+    var entries: std.ArrayListUnmanaged(ExceptionEntry) = .{};
     errdefer entries.deinit(allocator);
 
     const SetupKind = enum { loop, except, finally, with };
@@ -779,7 +779,7 @@ fn collectLegacyExceptionEntries(
         target: u32,
     };
 
-    var stack: std.ArrayList(SetupEntry) = .{};
+    var stack: std.ArrayListUnmanaged(SetupEntry) = .{};
     defer stack.deinit(allocator);
 
     const multiplier: u32 = if (version.gte(3, 10)) 2 else 1;
@@ -908,7 +908,7 @@ fn applyExceptionEntries(allocator: Allocator, cfg: *CFG, entries: []const Excep
     if (entries.len == 0) return;
 
     const EdgeToAdd = struct { from: u32, to: u32 };
-    var edges_to_add: std.ArrayList(EdgeToAdd) = .{};
+    var edges_to_add: std.ArrayListUnmanaged(EdgeToAdd) = .{};
     defer edges_to_add.deinit(allocator);
 
     for (entries) |entry| {
@@ -994,7 +994,7 @@ pub const ExceptionEntry = struct {
 pub fn parseExceptionTable(table: []const u8, allocator: Allocator) ![]ExceptionEntry {
     if (table.len == 0) return &.{};
 
-    var entries: std.ArrayList(ExceptionEntry) = .{};
+    var entries: std.ArrayListUnmanaged(ExceptionEntry) = .{};
     errdefer entries.deinit(allocator);
 
     var pos: usize = 0;
@@ -1150,6 +1150,11 @@ test "cfg simple function" {
     try testing.expectEqual(@as(u32, 0), cfg.blocks[0].start_offset);
     try testing.expectEqual(@as(u32, 12), cfg.blocks[0].end_offset);
     try testing.expectEqual(@as(usize, 5), cfg.blocks[0].instructions.len);
+
+    var exits = try collectExitBlocks(allocator, &cfg, false);
+    defer exits.deinit(allocator);
+    try testing.expectEqual(@as(usize, 1), exits.items.len);
+    try testing.expectEqual(@as(u32, 0), exits.items[0]);
 }
 
 test "cfg with conditional" {
