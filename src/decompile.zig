@@ -368,15 +368,15 @@ pub const Decompiler = struct {
     postdom_idom: ?[]u32 = null,
 
     /// Accumulated statements.
-    statements: std.ArrayList(*Stmt),
+    statements: std.ArrayListUnmanaged(*Stmt),
     /// Nested decompilers (kept alive for arena lifetime).
-    nested_decompilers: std.ArrayList(*Decompiler),
+    nested_decompilers: std.ArrayListUnmanaged(*Decompiler),
     /// Next block after chained comparison (set by tryDecompileChainedComparison).
     chained_cmp_next_block: ?u32 = null,
     /// Pending inline comprehension expressions keyed by exit block.
     inline_pend: std.ArrayListUnmanaged(InlinePend) = .{},
     /// Accumulated print items for Python 2.x PRINT_ITEM/PRINT_NEWLINE.
-    print_items: std.ArrayList(*Expr),
+    print_items: std.ArrayListUnmanaged(*Expr),
     /// Print destination for PRINT_ITEM_TO.
     print_dest: ?*Expr = null,
     /// Error context for debugging.
@@ -487,7 +487,7 @@ pub const Decompiler = struct {
     fn initCondSim(
         self: *Decompiler,
         block_id: u32,
-        stmts: *std.ArrayList(*Stmt),
+        stmts: *std.ArrayListUnmanaged(*Stmt),
         stmts_allocator: Allocator,
     ) DecompileError!?ScPass.CondSim {
         return ScPass.initCondSim(self, block_id, stmts, stmts_allocator) catch |err| switch (err) {
@@ -523,7 +523,7 @@ pub const Decompiler = struct {
         self: *Decompiler,
         block_id: u32,
         limit: u32,
-        stmts: *std.ArrayList(*Stmt),
+        stmts: *std.ArrayListUnmanaged(*Stmt),
         stmts_allocator: Allocator,
     ) DecompileError!?u32 {
         return ScPass.tryDecompileTernaryTreeInto(self, block_id, limit, stmts, stmts_allocator) catch |err| switch (err) {
@@ -536,7 +536,7 @@ pub const Decompiler = struct {
         self: *Decompiler,
         block_id: u32,
         limit: u32,
-        stmts: *std.ArrayList(*Stmt),
+        stmts: *std.ArrayListUnmanaged(*Stmt),
         stmts_allocator: Allocator,
     ) DecompileError!?u32 {
         return self.tryDecompileTernaryIntoWithSkip(block_id, limit, stmts, stmts_allocator, false);
@@ -546,7 +546,7 @@ pub const Decompiler = struct {
         self: *Decompiler,
         block_id: u32,
         limit: u32,
-        stmts: *std.ArrayList(*Stmt),
+        stmts: *std.ArrayListUnmanaged(*Stmt),
         stmts_allocator: Allocator,
         skip_first_store: bool,
     ) DecompileError!?u32 {
@@ -560,7 +560,7 @@ pub const Decompiler = struct {
         self: *Decompiler,
         block_id: u32,
         limit: u32,
-        stmts: *std.ArrayList(*Stmt),
+        stmts: *std.ArrayListUnmanaged(*Stmt),
         stmts_allocator: Allocator,
     ) DecompileError!?u32 {
         return ScPass.tryDecompileAndOrInto(self, block_id, limit, stmts, stmts_allocator) catch |err| switch (err) {
@@ -573,7 +573,7 @@ pub const Decompiler = struct {
         self: *Decompiler,
         block_id: u32,
         limit: u32,
-        stmts: *std.ArrayList(*Stmt),
+        stmts: *std.ArrayListUnmanaged(*Stmt),
         stmts_allocator: Allocator,
     ) DecompileError!?u32 {
         return self.tryDecompileBoolOpIntoWithSkip(block_id, limit, stmts, stmts_allocator, false);
@@ -583,7 +583,7 @@ pub const Decompiler = struct {
         self: *Decompiler,
         block_id: u32,
         limit: u32,
-        stmts: *std.ArrayList(*Stmt),
+        stmts: *std.ArrayListUnmanaged(*Stmt),
         stmts_allocator: Allocator,
         skip_first_store: bool,
     ) DecompileError!?u32 {
@@ -2114,7 +2114,7 @@ pub const Decompiler = struct {
         const slots = self.phi_by_block.get(succ) orelse return &.{};
         if (slots.items.len == 0) return &.{};
         const a = self.arena.allocator();
-        var out: std.ArrayList(*Stmt) = .{};
+        var out: std.ArrayListUnmanaged(*Stmt) = .{};
         errdefer out.deinit(a);
         for (slots.items) |slot_idx| {
             const incoming = self.phi_incoming.get(.{ .pred = pred, .succ = succ, .slot = slot_idx }) orelse continue;
@@ -3155,7 +3155,7 @@ pub const Decompiler = struct {
         self: *Decompiler,
         block: *const BasicBlock,
         sim: *SimContext,
-        stmts: *std.ArrayList(*Stmt),
+        stmts: *std.ArrayListUnmanaged(*Stmt),
         stmts_allocator: Allocator,
     ) DecompileError!void {
         return self.processBlockWithSimAndSkipInner(block, sim, stmts, stmts_allocator, 0, false);
@@ -3165,7 +3165,7 @@ pub const Decompiler = struct {
         self: *Decompiler,
         block: *const BasicBlock,
         sim: *SimContext,
-        stmts: *std.ArrayList(*Stmt),
+        stmts: *std.ArrayListUnmanaged(*Stmt),
         stmts_allocator: Allocator,
         skip_first_store: bool,
     ) DecompileError!void {
@@ -3178,7 +3178,7 @@ pub const Decompiler = struct {
         instructions: []const decoder.Instruction,
         idx: *usize,
         name: []const u8,
-        stmts: *std.ArrayList(*Stmt),
+        stmts: *std.ArrayListUnmanaged(*Stmt),
         stmts_allocator: Allocator,
     ) DecompileError!bool {
         if (idx.* == 0) return false;
@@ -3186,7 +3186,7 @@ pub const Decompiler = struct {
         if (prev.opcode != .DUP_TOP and prev.opcode != .COPY) return false;
 
         const arena = self.arena.allocator();
-        var targets: std.ArrayList(*Expr) = .{};
+        var targets: std.ArrayListUnmanaged(*Expr) = .{};
 
         const first_target = try self.makeName(name, .store);
         try targets.append(arena, first_target);
@@ -3234,7 +3234,7 @@ pub const Decompiler = struct {
                         continue;
                     } else if (following.opcode == .UNPACK_SEQUENCE) {
                         const unpack_cnt = following.arg;
-                        var tup_targets: std.ArrayList(*Expr) = .{};
+                        var tup_targets: std.ArrayListUnmanaged(*Expr) = .{};
                         try tup_targets.ensureTotalCapacity(arena, unpack_cnt);
 
                         var kk: usize = j + 2;
@@ -3334,7 +3334,7 @@ pub const Decompiler = struct {
                 break;
             } else if (next_inst.opcode == .UNPACK_SEQUENCE) {
                 const unpack_count = next_inst.arg;
-                var tuple_targets: std.ArrayList(*Expr) = .{};
+                var tuple_targets: std.ArrayListUnmanaged(*Expr) = .{};
                 try tuple_targets.ensureTotalCapacity(arena, unpack_count);
 
                 var k: usize = j + 1;
@@ -3430,7 +3430,7 @@ pub const Decompiler = struct {
         sim: *SimContext,
         instructions: []const decoder.Instruction,
         idx: *usize,
-        stmts: *std.ArrayList(*Stmt),
+        stmts: *std.ArrayListUnmanaged(*Stmt),
         stmts_allocator: Allocator,
     ) DecompileError!bool {
         const real_idx = idx.*;
@@ -3450,7 +3450,7 @@ pub const Decompiler = struct {
         if (!is_chain) return false;
 
         const arena = self.arena.allocator();
-        var targets: std.ArrayList(*Expr) = .{};
+        var targets: std.ArrayListUnmanaged(*Expr) = .{};
 
         const key_val = sim.stack.pop() orelse {
             try sim.simulate(instructions[idx.*]);
@@ -3516,7 +3516,7 @@ pub const Decompiler = struct {
                         continue;
                     } else if (following.opcode == .UNPACK_SEQUENCE) {
                         const unpack_cnt = following.arg;
-                        var tup_targets: std.ArrayList(*Expr) = .{};
+                        var tup_targets: std.ArrayListUnmanaged(*Expr) = .{};
                         try tup_targets.ensureTotalCapacity(arena, unpack_cnt);
 
                         var kk: usize = j + 2;
@@ -3616,7 +3616,7 @@ pub const Decompiler = struct {
                 break;
             } else if (next_inst.opcode == .UNPACK_SEQUENCE) {
                 const unpack_count = next_inst.arg;
-                var tuple_targets: std.ArrayList(*Expr) = .{};
+                var tuple_targets: std.ArrayListUnmanaged(*Expr) = .{};
                 try tuple_targets.ensureTotalCapacity(arena, unpack_count);
 
                 var k: usize = j + 1;
@@ -3739,7 +3739,7 @@ pub const Decompiler = struct {
             break :blk before;
         } else null;
 
-        var tgts = try std.ArrayList(*Expr).initCapacity(arena, cnt_usize);
+        var tgts = try std.ArrayListUnmanaged(*Expr).initCapacity(arena, cnt_usize);
         var skip: usize = 0;
         var inst_idx: usize = unpack_idx + 1;
         var found: usize = 0;
@@ -3818,10 +3818,10 @@ pub const Decompiler = struct {
     fn handleUnpack(
         self: *Decompiler,
         sim: *SimContext,
-        chain_targets: *std.ArrayList(*Expr),
+        chain_targets: *std.ArrayListUnmanaged(*Expr),
         instructions: []const decoder.Instruction,
         idx: usize,
-        stmts: *std.ArrayList(*Stmt),
+        stmts: *std.ArrayListUnmanaged(*Stmt),
         stmts_allocator: Allocator,
     ) DecompileError!usize {
         const inst = instructions[idx];
@@ -3884,7 +3884,7 @@ pub const Decompiler = struct {
         self: *Decompiler,
         block: *const BasicBlock,
         sim: *SimContext,
-        stmts: *std.ArrayList(*Stmt),
+        stmts: *std.ArrayListUnmanaged(*Stmt),
         stmts_allocator: Allocator,
         skip_first: usize,
     ) DecompileError!void {
@@ -3937,7 +3937,7 @@ pub const Decompiler = struct {
         self: *Decompiler,
         block: *const BasicBlock,
         sim: *SimContext,
-        stmts: *std.ArrayList(*Stmt),
+        stmts: *std.ArrayListUnmanaged(*Stmt),
         stmts_allocator: Allocator,
         skip_first: usize,
         skip_first_store_param: bool,
@@ -3958,7 +3958,7 @@ pub const Decompiler = struct {
             sim.stack.allow_underflow = true;
         }
 
-        var chain_targets: std.ArrayList(*Expr) = .{};
+        var chain_targets: std.ArrayListUnmanaged(*Expr) = .{};
         defer chain_targets.deinit(self.allocator);
 
         const instructions = block.instructions[skip_first + extra_skip ..];
@@ -5139,7 +5139,7 @@ pub const Decompiler = struct {
     fn mergeBreakGuards(self: *Decompiler, stmts: []const *Stmt) DecompileError![]const *Stmt {
         if (stmts.len == 0) return stmts;
         const a = self.arena.allocator();
-        var out: std.ArrayList(*Stmt) = .{};
+        var out: std.ArrayListUnmanaged(*Stmt) = .{};
         errdefer out.deinit(a);
 
         var i: usize = 0;
@@ -5195,7 +5195,7 @@ pub const Decompiler = struct {
     fn mergeContGuards(self: *Decompiler, stmts: []const *Stmt) DecompileError![]const *Stmt {
         if (stmts.len < 2) return stmts;
         const a = self.arena.allocator();
-        var out: std.ArrayList(*Stmt) = .{};
+        var out: std.ArrayListUnmanaged(*Stmt) = .{};
         errdefer out.deinit(a);
 
         var i: usize = 0;
@@ -5238,7 +5238,7 @@ pub const Decompiler = struct {
     fn rewriteContRaise(self: *Decompiler, stmts: []const *Stmt) DecompileError![]const *Stmt {
         if (stmts.len < 2) return stmts;
         const a = self.arena.allocator();
-        var out: std.ArrayList(*Stmt) = .{};
+        var out: std.ArrayListUnmanaged(*Stmt) = .{};
         errdefer out.deinit(a);
 
         var i: usize = 0;
@@ -5277,7 +5277,7 @@ pub const Decompiler = struct {
         stmts: []const *Stmt,
     ) DecompileError![]const *Stmt {
         if (stmts.len < 2) return stmts;
-        var out: std.ArrayList(*Stmt) = .{};
+        var out: std.ArrayListUnmanaged(*Stmt) = .{};
         errdefer out.deinit(allocator);
         var changed = false;
         var i: usize = 0;
@@ -5444,7 +5444,7 @@ pub const Decompiler = struct {
     ) DecompileError![]const *Stmt {
         _ = self;
         if (stmts.len < 2) return stmts;
-        var out: std.ArrayList(*Stmt) = .{};
+        var out: std.ArrayListUnmanaged(*Stmt) = .{};
         errdefer out.deinit(allocator);
         var changed = false;
         var i: usize = 0;
@@ -5666,7 +5666,7 @@ pub const Decompiler = struct {
         const groups = try self.collectImportFromGroups(allocator);
         if (groups.len == 0) return stmts;
 
-        var out: std.ArrayList(*Stmt) = .{};
+        var out: std.ArrayListUnmanaged(*Stmt) = .{};
         errdefer out.deinit(allocator);
 
         var i: usize = 0;
@@ -5899,7 +5899,7 @@ pub const Decompiler = struct {
         stmts: []const *Stmt,
     ) DecompileError![]const *Stmt {
         if (stmts.len < 2) return stmts;
-        var out: std.ArrayList(*Stmt) = .{};
+        var out: std.ArrayListUnmanaged(*Stmt) = .{};
         errdefer out.deinit(allocator);
         var changed = false;
         var i: usize = 0;
@@ -6179,7 +6179,7 @@ pub const Decompiler = struct {
             try self.cond_seen.set(self.allocator, cur);
 
             if (self.isTerminalBlock(cur)) {
-                var tmp: std.ArrayList(*Stmt) = .{};
+                var tmp: std.ArrayListUnmanaged(*Stmt) = .{};
                 defer tmp.deinit(a);
                 try self.decompileBlockIntoWithStackAndSkip(cur, &tmp, a, &.{}, 0);
                 if (tmp.items.len == 1 and self.stmtIsTerminal(tmp.items[0])) {
@@ -6795,7 +6795,7 @@ pub const Decompiler = struct {
     fn tryDecompileTryAsComprehension(
         self: *Decompiler,
         pattern: ctrl.TryPattern,
-        stmts: *std.ArrayList(*Stmt),
+        stmts: *std.ArrayListUnmanaged(*Stmt),
     ) DecompileError!?u32 {
         if (!self.version.gte(3, 12)) return null;
         if (pattern.handlers.len == 0) return null;
@@ -7599,7 +7599,7 @@ pub const Decompiler = struct {
         if (start_block >= limit) return &[_]*Stmt{};
 
         const a = self.arena.allocator();
-        var stmts: std.ArrayList(*Stmt) = .{};
+        var stmts: std.ArrayListUnmanaged(*Stmt) = .{};
         errdefer stmts.deinit(a);
 
         const defer_prelude = skip_first == 0 and init_stack.len == 0 and
@@ -7646,7 +7646,7 @@ pub const Decompiler = struct {
     }
 
     /// Decompile a single block's statements into the provided list.
-    fn decompileBlockInto(self: *Decompiler, block_id: u32, stmts: *std.ArrayList(*Stmt), stmts_allocator: Allocator) DecompileError!void {
+    fn decompileBlockInto(self: *Decompiler, block_id: u32, stmts: *std.ArrayListUnmanaged(*Stmt), stmts_allocator: Allocator) DecompileError!void {
         return self.decompileBlockIntoWithStack(block_id, stmts, stmts_allocator, &.{});
     }
 
@@ -7654,7 +7654,7 @@ pub const Decompiler = struct {
     fn decompileBlockIntoWithStack(
         self: *Decompiler,
         block_id: u32,
-        stmts: *std.ArrayList(*Stmt),
+        stmts: *std.ArrayListUnmanaged(*Stmt),
         stmts_allocator: Allocator,
         init_stack: []const StackValue,
     ) DecompileError!void {
@@ -7665,7 +7665,7 @@ pub const Decompiler = struct {
     fn decompileBlockIntoWithStackAndSkip(
         self: *Decompiler,
         block_id: u32,
-        stmts: *std.ArrayList(*Stmt),
+        stmts: *std.ArrayListUnmanaged(*Stmt),
         stmts_allocator: Allocator,
         init_stack: []const StackValue,
         skip_first: usize,
@@ -7969,7 +7969,7 @@ pub const Decompiler = struct {
         };
     }
 
-    fn appendIfTail(self: *Decompiler, stmts: *std.ArrayList(*Stmt), allocator: Allocator) DecompileError!void {
+    fn appendIfTail(self: *Decompiler, stmts: *std.ArrayListUnmanaged(*Stmt), allocator: Allocator) DecompileError!void {
         if (self.if_tail) |tail| {
             try stmts.appendSlice(allocator, tail);
             self.if_tail = null;
@@ -9645,7 +9645,7 @@ pub const Decompiler = struct {
                                 if (self.isTerminalBlock(succ_id) and self.termSinglePred(succ_id) and
                                     (merge_block == null or succ_id != merge_block.?))
                                 {
-                                    var tmp: std.ArrayList(*Stmt) = .{};
+                                    var tmp: std.ArrayListUnmanaged(*Stmt) = .{};
                                     defer tmp.deinit(a);
                                     try self.decompileBlockIntoWithStackAndSkip(succ_id, &tmp, a, &.{}, 0);
                                     if (tmp.items.len > 0) {
@@ -9682,7 +9682,7 @@ pub const Decompiler = struct {
                             if (self.isTerminalBlock(succ_id) and self.termSinglePred(succ_id) and
                                 (merge_block == null or succ_id != merge_block.?))
                             {
-                                var tmp: std.ArrayList(*Stmt) = .{};
+                                var tmp: std.ArrayListUnmanaged(*Stmt) = .{};
                                 defer tmp.deinit(a);
                                 try self.decompileBlockIntoWithStackAndSkip(succ_id, &tmp, a, &.{}, 0);
                                 if (tmp.items.len > 0) {
@@ -10055,7 +10055,7 @@ pub const Decompiler = struct {
                                 cur = next.?;
                             }
                             if (linear and term_id != null) {
-                                var tmp: std.ArrayList(*Stmt) = .{};
+                                var tmp: std.ArrayListUnmanaged(*Stmt) = .{};
                                 defer tmp.deinit(a);
                                 try self.decompileBlockIntoWithStackAndSkip(term_id.?, &tmp, a, &.{}, 0);
                                 if (tmp.items.len == 1 and self.stmtIsTerminal(tmp.items[0])) {
@@ -10286,7 +10286,7 @@ pub const Decompiler = struct {
 
         if (skip_first > 0 or base_vals.len > 0) {
             const a = self.arena.allocator();
-            var stmts: std.ArrayList(*Stmt) = .{};
+            var stmts: std.ArrayListUnmanaged(*Stmt) = .{};
             errdefer stmts.deinit(a);
 
             try self.decompileBlockIntoWithStackAndSkip(start_block, &stmts, a, base_vals, skip_first);
@@ -10509,7 +10509,7 @@ pub const Decompiler = struct {
         );
 
         const a = self.arena.allocator();
-        var header_stmts: std.ArrayList(*Stmt) = .{};
+        var header_stmts: std.ArrayListUnmanaged(*Stmt) = .{};
         errdefer header_stmts.deinit(a);
         var skip_first_store = false;
         if (cond_idx > 0) {
@@ -10799,7 +10799,7 @@ pub const Decompiler = struct {
                         }
                         const cond = try sim.stack.popExpr();
                         const guard_cond = try self.guardCondForBranch(cond, term.opcode, branch.taken);
-                        var tmp: std.ArrayList(*Stmt) = .{};
+                        var tmp: std.ArrayListUnmanaged(*Stmt) = .{};
                         defer tmp.deinit(self.arena.allocator());
                         var skip_first_store = false;
                         var term_idx: usize = header_block.instructions.len;
@@ -12933,7 +12933,7 @@ pub const Decompiler = struct {
     fn emitMatchPrelude(
         self: *Decompiler,
         block_id: u32,
-        stmts: *std.ArrayList(*Stmt),
+        stmts: *std.ArrayListUnmanaged(*Stmt),
         stmts_allocator: Allocator,
     ) DecompileError!void {
         if (block_id >= self.cfg.blocks.len) return;
@@ -13366,7 +13366,7 @@ pub const Decompiler = struct {
     }
 
     fn guardExprsFromBlocks(self: *Decompiler, blocks: []const u32) DecompileError![]const *Expr {
-        var guard_exprs: std.ArrayList(*Expr) = .{};
+        var guard_exprs: std.ArrayListUnmanaged(*Expr) = .{};
         errdefer guard_exprs.deinit(self.allocator);
 
         var sim = self.initSim(self.arena.allocator(), self.arena.allocator(), self.code, self.version);
@@ -14825,7 +14825,7 @@ pub const Decompiler = struct {
                     try body_insts.appendSlice(self.allocator, final_block.instructions[start_idx..]);
 
                     const a = self.arena.allocator();
-                    var stmts: std.ArrayList(*Stmt) = .{};
+                    var stmts: std.ArrayListUnmanaged(*Stmt) = .{};
                     defer stmts.deinit(a);
 
                     var sim = self.initSim(a, a, self.code, self.version);
@@ -14860,7 +14860,7 @@ pub const Decompiler = struct {
                         try fb_insts.appendSlice(self.allocator, final_block.instructions[fb_start..]);
 
                         const a = self.arena.allocator();
-                        var stmts: std.ArrayList(*Stmt) = .{};
+                        var stmts: std.ArrayListUnmanaged(*Stmt) = .{};
                         defer stmts.deinit(a);
 
                         var sim = self.initSim(a, a, self.code, self.version);
@@ -14987,7 +14987,7 @@ pub const Decompiler = struct {
                     if (skip > 0 and skip < body_blk.instructions.len) {
                         // Decompile body inline, skipping pattern instructions
                         const a = self.arena.allocator();
-                        var stmts: std.ArrayList(*Stmt) = .{};
+                        var stmts: std.ArrayListUnmanaged(*Stmt) = .{};
                         defer stmts.deinit(a);
 
                         var sim = self.initSim(a, a, self.code, self.version);
@@ -15100,7 +15100,7 @@ pub const Decompiler = struct {
 
                 if (start_idx) |start| {
                     const aa = self.arena.allocator();
-                    var stmts: std.ArrayList(*Stmt) = .{};
+                    var stmts: std.ArrayListUnmanaged(*Stmt) = .{};
                     defer stmts.deinit(aa);
                     var sim = self.initSim(aa, aa, self.code, self.version);
                     defer sim.deinit();
@@ -15133,7 +15133,7 @@ pub const Decompiler = struct {
                         try fb_insts.appendSlice(self.allocator, final_block.instructions[fb_start..]);
 
                         const aa = self.arena.allocator();
-                        var stmts: std.ArrayList(*Stmt) = .{};
+                        var stmts: std.ArrayListUnmanaged(*Stmt) = .{};
                         defer stmts.deinit(aa);
                         var sim = self.initSim(aa, aa, self.code, self.version);
                         defer sim.deinit();
@@ -15799,7 +15799,7 @@ pub const Decompiler = struct {
         defer self.br_limit = prev_limit;
 
         const a = self.arena.allocator();
-        var stmts: std.ArrayList(*Stmt) = .{};
+        var stmts: std.ArrayListUnmanaged(*Stmt) = .{};
         errdefer stmts.deinit(a);
 
         var block_idx = start;
@@ -16600,7 +16600,7 @@ pub const Decompiler = struct {
         if (has_cond) {
             {
                 const a = self.arena.allocator();
-                var stmts: std.ArrayList(*Stmt) = .{};
+                var stmts: std.ArrayListUnmanaged(*Stmt) = .{};
                 errdefer stmts.deinit(a);
                 if (try self.tryDecompileBoolOpInto(start, end, &stmts, a)) |next_block| {
                     if (next_block < end and next_block < self.cfg.blocks.len) {
@@ -16854,7 +16854,7 @@ pub const Decompiler = struct {
                         try self.decompileIf(if_pat);
                 }
                 if (stmt) |s| {
-                    var stmts: std.ArrayList(*Stmt) = .{};
+                    var stmts: std.ArrayListUnmanaged(*Stmt) = .{};
                     errdefer stmts.deinit(a);
                     if (skip_cond > 0) {
                         var skip_first_store = false;
@@ -16959,7 +16959,7 @@ pub const Decompiler = struct {
         }
 
         const a = self.arena.allocator();
-        var stmts: std.ArrayList(*Stmt) = .{};
+        var stmts: std.ArrayListUnmanaged(*Stmt) = .{};
         errdefer stmts.deinit(a);
 
         var skip_store = false;
@@ -17218,7 +17218,7 @@ pub const Decompiler = struct {
         skip: usize,
     ) DecompileError![]const *Stmt {
         const a = self.arena.allocator();
-        var stmts: std.ArrayList(*Stmt) = .{};
+        var stmts: std.ArrayListUnmanaged(*Stmt) = .{};
         errdefer stmts.deinit(a);
 
         if (start >= end or start >= self.cfg.blocks.len) {
@@ -17289,7 +17289,7 @@ pub const Decompiler = struct {
         defer sim.deinit();
         sim.lenient = true;
         sim.stack.allow_underflow = true;
-        var chain_targets: std.ArrayList(*Expr) = .{};
+        var chain_targets: std.ArrayListUnmanaged(*Expr) = .{};
         defer chain_targets.deinit(self.allocator);
 
         // Python pushes (type, value, traceback) on stack when entering handler
@@ -17475,7 +17475,7 @@ pub const Decompiler = struct {
     ) DecompileError![]const *Stmt {
         if (start >= end or start >= self.cfg.blocks.len) return &[_]*Stmt{};
         const a = self.arena.allocator();
-        var stmts: std.ArrayList(*Stmt) = .{};
+        var stmts: std.ArrayListUnmanaged(*Stmt) = .{};
         errdefer stmts.deinit(a);
 
         var sim = self.initSim(a, a, self.code, self.version);
@@ -17741,7 +17741,7 @@ pub const Decompiler = struct {
     fn emitForPrelude(
         self: *Decompiler,
         pattern: ctrl.ForPattern,
-        stmts: *std.ArrayList(*Stmt),
+        stmts: *std.ArrayListUnmanaged(*Stmt),
         alloc: std.mem.Allocator,
     ) DecompileError!void {
         if (pattern.setup_block >= self.cfg.blocks.len) return;
@@ -17756,7 +17756,7 @@ pub const Decompiler = struct {
         var prelude_block = setup.*;
         prelude_block.instructions = setup.instructions[0..get_iter_idx.?];
 
-        var tmp: std.ArrayList(*Stmt) = .{};
+        var tmp: std.ArrayListUnmanaged(*Stmt) = .{};
         defer tmp.deinit(self.arena.allocator());
         var skip_first_store = false;
         var pred_for_iter = false;
@@ -18164,7 +18164,7 @@ pub const Decompiler = struct {
         return stmt;
     }
 
-    fn stripLoopTargetAssigns(self: *Decompiler, block: *const BasicBlock, stmts: *std.ArrayList(*Stmt)) DecompileError!void {
+    fn stripLoopTargetAssigns(self: *Decompiler, block: *const BasicBlock, stmts: *std.ArrayListUnmanaged(*Stmt)) DecompileError!void {
         var names: std.ArrayListUnmanaged([]const u8) = .{};
         defer names.deinit(self.arena.allocator());
         for (block.instructions) |inst| {
@@ -18199,7 +18199,7 @@ pub const Decompiler = struct {
     /// Decompile a for loop body using loop-region membership.
     fn decompileForBody(self: *Decompiler, body_block_id: u32, header_block_id: u32) DecompileError![]const *Stmt {
         const a = self.arena.allocator();
-        var stmts: std.ArrayList(*Stmt) = .{};
+        var stmts: std.ArrayListUnmanaged(*Stmt) = .{};
         errdefer stmts.deinit(a);
 
         var visited = try std.DynamicBitSet.initEmpty(self.allocator, self.cfg.blocks.len);
@@ -19332,7 +19332,7 @@ pub const Decompiler = struct {
     fn emitStoreSubscr(
         self: *Decompiler,
         sim: *SimContext,
-        stmts: *std.ArrayList(*Stmt),
+        stmts: *std.ArrayListUnmanaged(*Stmt),
         stmts_allocator: Allocator,
     ) DecompileError!void {
         const a = self.arena.allocator();
@@ -19385,7 +19385,7 @@ pub const Decompiler = struct {
     fn emitStoreSlice(
         self: *Decompiler,
         sim: *SimContext,
-        stmts: *std.ArrayList(*Stmt),
+        stmts: *std.ArrayListUnmanaged(*Stmt),
         stmts_allocator: Allocator,
     ) DecompileError!void {
         const a = self.arena.allocator();
@@ -19412,11 +19412,11 @@ pub const Decompiler = struct {
     fn emitStoreAttr(
         self: *Decompiler,
         sim: *SimContext,
-        chain_targets: *std.ArrayList(*Expr),
+        chain_targets: *std.ArrayListUnmanaged(*Expr),
         block_id: u32,
         instructions: []const decoder.Instruction,
         idx: *usize,
-        stmts: *std.ArrayList(*Stmt),
+        stmts: *std.ArrayListUnmanaged(*Stmt),
         stmts_allocator: Allocator,
         skip_first: usize,
         limit: ?usize,
@@ -19452,7 +19452,7 @@ pub const Decompiler = struct {
 
         if (is_chain) {
             // This is an attribute chain assignment
-            var targets: std.ArrayList(*Expr) = .{};
+            var targets: std.ArrayListUnmanaged(*Expr) = .{};
 
             // Build first target from current instruction's context
             const container_val = sim.stack.pop() orelse return error.StackUnderflow;
@@ -19588,7 +19588,7 @@ pub const Decompiler = struct {
         self: *Decompiler,
         block_id: u32,
         block: *const cfg_mod.BasicBlock,
-        stmts: *std.ArrayList(*Stmt),
+        stmts: *std.ArrayListUnmanaged(*Stmt),
         skip_first_store: *bool,
         seed_pop: *bool,
         stop_at_jump: bool,
@@ -19598,7 +19598,7 @@ pub const Decompiler = struct {
         const a = self.arena.allocator();
         var sim = self.initSim(a, a, self.code, self.version);
         defer sim.deinit();
-        var chain_targets: std.ArrayList(*Expr) = .{};
+        var chain_targets: std.ArrayListUnmanaged(*Expr) = .{};
         defer chain_targets.deinit(self.allocator);
         if (self.hasExceptionSuccessor(block) or self.hasWithExitCleanup(block)) {
             sim.lenient = true;
@@ -19922,7 +19922,7 @@ pub const Decompiler = struct {
         self: *Decompiler,
         sim: *SimContext,
         block: *const cfg_mod.BasicBlock,
-        stmts: *std.ArrayList(*Stmt),
+        stmts: *std.ArrayListUnmanaged(*Stmt),
         stmts_allocator: Allocator,
     ) DecompileError!void {
         if (sim.stack.len() == 0) {
@@ -19984,7 +19984,7 @@ pub const Decompiler = struct {
     pub fn processPartialBlock(
         self: *Decompiler,
         block: *const cfg_mod.BasicBlock,
-        stmts: *std.ArrayList(*Stmt),
+        stmts: *std.ArrayListUnmanaged(*Stmt),
         stmts_allocator: Allocator,
         skip_first_store: *bool,
         stop_idx: ?usize,
@@ -19993,7 +19993,7 @@ pub const Decompiler = struct {
         sim.lenient = true;
         sim.stack.allow_underflow = true;
         defer sim.deinit();
-        var chain_targets: std.ArrayList(*Expr) = .{};
+        var chain_targets: std.ArrayListUnmanaged(*Expr) = .{};
         defer chain_targets.deinit(self.allocator);
 
         if (block.id < self.stack_in.len) {
@@ -21015,7 +21015,7 @@ pub const Decompiler = struct {
                         if (!multi) {
                             if (single_succ) |succ_id| {
                                 if (succ_id < self.cfg.blocks.len and self.isTerminalBlock(succ_id) and self.termSinglePred(succ_id)) {
-                                    var tmp: std.ArrayList(*Stmt) = .{};
+                                    var tmp: std.ArrayListUnmanaged(*Stmt) = .{};
                                     defer tmp.deinit(a);
                                     try self.decompileBlockIntoWithStackAndSkip(succ_id, &tmp, a, &.{}, 0);
                                     if (tmp.items.len > 0) {
@@ -21343,7 +21343,7 @@ pub const Decompiler = struct {
         ignore_header_while: bool,
     ) DecompileError![]const *Stmt {
         const a = self.arena.allocator();
-        var stmts: std.ArrayList(*Stmt) = .{};
+        var stmts: std.ArrayListUnmanaged(*Stmt) = .{};
         errdefer stmts.deinit(a);
 
         var block_idx = start_block;
@@ -22310,7 +22310,7 @@ pub const Decompiler = struct {
         return out;
     }
 
-    fn takeDecorators(self: *Decompiler, decorators: *std.ArrayList(*Expr)) DecompileError![]const *Expr {
+    fn takeDecorators(self: *Decompiler, decorators: *std.ArrayListUnmanaged(*Expr)) DecompileError![]const *Expr {
         if (decorators.items.len == 0) return &.{};
         const count = decorators.items.len;
         const a = self.arena.allocator();
@@ -22319,7 +22319,7 @@ pub const Decompiler = struct {
         while (i < count) : (i += 1) {
             out[i] = decorators.items[count - 1 - i];
         }
-        decorators.* = .{};
+        decorators.clearRetainingCapacity();
         return out;
     }
 
@@ -22394,7 +22394,7 @@ pub const Decompiler = struct {
         body = try self.trimTrailingReturnNone(body);
 
         // Generate global/nonlocal declarations
-        var decls: std.ArrayList(*Stmt) = .{};
+        var decls: std.ArrayListUnmanaged(*Stmt) = .{};
         defer decls.deinit(a);
 
         // Nonlocal: only freevars that are assigned in this scope
@@ -23056,7 +23056,7 @@ pub const Decompiler = struct {
         sim: *SimContext,
         instructions: []const decoder.Instruction,
         start_idx: usize,
-        stmts: *std.ArrayList(*Stmt),
+        stmts: *std.ArrayListUnmanaged(*Stmt),
         stmts_allocator: Allocator,
     ) DecompileError!?usize {
         if (start_idx >= instructions.len) return null;
@@ -23469,7 +23469,7 @@ pub const Decompiler = struct {
         const a = self.arena.allocator();
 
         // Create tuple of Name expressions for targets
-        var target_exprs = try std.ArrayList(*Expr).initCapacity(a, names.len);
+        var target_exprs = try std.ArrayListUnmanaged(*Expr).initCapacity(a, names.len);
         for (names) |name| {
             const name_expr = try a.create(Expr);
             name_expr.* = .{ .name = .{ .id = name, .ctx = .store } };
@@ -24235,6 +24235,33 @@ test "decompiler init" {
     defer decompiler.deinit();
 
     try testing.expectEqual(@as(usize, 0), decompiler.cfg.blocks.len);
+    try testing.expectEqual(@as(usize, 0), decompiler.statements.items.len);
+    try testing.expectEqual(@as(usize, 0), decompiler.print_items.items.len);
+}
+
+test "takeDecorators drains list" {
+    const testing = std.testing;
+    const allocator = testing.allocator;
+    const version = Version.init(3, 12);
+
+    var code = pyc.Code{
+        .allocator = allocator,
+        .name = "decorators",
+        .code = &.{},
+    };
+
+    var decompiler = try Decompiler.init(allocator, &code, version);
+    defer decompiler.deinit();
+
+    var decorators: std.ArrayListUnmanaged(*Expr) = .{};
+    defer decorators.deinit(allocator);
+
+    const expr = try decompiler.makeRawName("dec", .load);
+    try decorators.append(allocator, expr);
+
+    const out = try decompiler.takeDecorators(&decorators);
+    try testing.expectEqual(@as(usize, 1), out.len);
+    try testing.expectEqual(@as(usize, 0), decorators.items.len);
 }
 
 test "runStackSSA hard-fails iteration cap" {
@@ -24314,7 +24341,7 @@ test "simulate condition expr returns null on sim error" {
     var decompiler = try Decompiler.init(allocator, code, version);
     defer decompiler.deinit();
 
-    var stmts: std.ArrayList(*Stmt) = .{};
+    var stmts: std.ArrayListUnmanaged(*Stmt) = .{};
     defer stmts.deinit(allocator);
     try testing.expect((try decompiler.initCondSim(0, &stmts, allocator)) == null);
     try testing.expect((try decompiler.simulateConditionExpr(0, &.{})) == null);
