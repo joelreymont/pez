@@ -787,6 +787,13 @@ pub fn Methods(comptime Self: type, comptime Err: type) type {
             if (cond_sim.stack.len() == 0 and self.needsPredecessorSeed(cond_block)) {
                 try self.seedFromPredecessors(pattern.condition_block, &cond_sim);
             }
+            const entry_all = try self.cloneStackValues(cond_sim.stack.items.items);
+            defer Self.deinitStackValuesSlice(
+                self.clone_sim.allocator,
+                self.clone_sim.stack_alloc,
+                self.allocator,
+                entry_all,
+            );
 
             if (pattern.kind == .pop_top) {
                 // Simulate condition block up to COPY (before TO_BOOL)
@@ -822,19 +829,45 @@ pub fn Methods(comptime Self: type, comptime Err: type) type {
                 return err;
             };
 
-            const base_vals = try self.cloneStackValues(cond_sim.stack.items.items);
+            const base_all = try self.cloneStackValues(cond_sim.stack.items.items);
+            var base_vals = base_all;
             var base_owned = true;
-            defer if (base_owned) Self.deinitStackValuesSlice(self.clone_sim.allocator, self.clone_sim.stack_alloc, self.allocator, base_vals);
+            defer if (base_owned) Self.deinitStackValuesSlice(
+                self.clone_sim.allocator,
+                self.clone_sim.stack_alloc,
+                self.allocator,
+                base_all,
+            );
 
-            // Build potentially nested BoolOp expression
-            const bool_result = buildBoolOpExpr(self, first, pattern, base_vals) catch |err| {
-                if (err == error.InvalidBlock or err == error.PatternNoMatch) return error.PatternNoMatch;
-                return err;
-            };
-            const bool_expr = bool_result.expr;
-            const final_merge = bool_result.merge_block;
+            var bool_expr: *Expr = undefined;
+            var final_merge: u32 = undefined;
+            var chain_used = false;
+            if (try tryBuildChainCompareExpr(self, pattern.condition_block, entry_all)) |chain| {
+                bool_expr = chain.expr;
+                final_merge = chain.merge_block;
+                chain_used = true;
+                if (bool_expr.* == .compare and base_all.len > 0) {
+                    const mid = bool_expr.compare.comparators[0];
+                    const last_idx = base_all.len - 1;
+                    const last = base_all[last_idx];
+                    if (last == .expr and ast.exprEqual(last.expr, mid)) {
+                        base_vals = base_all[0..last_idx];
+                    }
+                }
+            } else {
+                // Build potentially nested BoolOp expression
+                const bool_result = buildBoolOpExpr(self, first, pattern, base_vals) catch |err| {
+                    if (err == error.InvalidBlock or err == error.PatternNoMatch) return error.PatternNoMatch;
+                    return err;
+                };
+                bool_expr = bool_result.expr;
+                final_merge = bool_result.merge_block;
+            }
             try self.markConsumed(pattern.condition_block);
             try self.markConsumed(pattern.second_block);
+            if (chain_used and pattern.merge_block != final_merge) {
+                try self.markConsumed(pattern.merge_block);
+            }
 
             // Process merge block with the bool expression on stack
             const merge_block = &self.cfg.blocks[final_merge];
