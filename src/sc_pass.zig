@@ -201,7 +201,7 @@ pub fn Methods(comptime Self: type, comptime Err: type) type {
         pub fn initCondSim(
             self: *Self,
             block_id: u32,
-            stmts: *std.ArrayList(*Stmt),
+            stmts: *std.ArrayListUnmanaged(*Stmt),
             stmts_allocator: Allocator,
         ) DecompileError!?CondSim {
             return initCondSimInner(self, block_id, stmts, stmts_allocator, false);
@@ -210,7 +210,7 @@ pub fn Methods(comptime Self: type, comptime Err: type) type {
         pub fn initCondSimWithStore(
             self: *Self,
             block_id: u32,
-            stmts: *std.ArrayList(*Stmt),
+            stmts: *std.ArrayListUnmanaged(*Stmt),
             stmts_allocator: Allocator,
         ) DecompileError!?CondSim {
             return initCondSimInner(self, block_id, stmts, stmts_allocator, false);
@@ -219,7 +219,7 @@ pub fn Methods(comptime Self: type, comptime Err: type) type {
         pub fn initCondSimWithSkipStore(
             self: *Self,
             block_id: u32,
-            stmts: *std.ArrayList(*Stmt),
+            stmts: *std.ArrayListUnmanaged(*Stmt),
             stmts_allocator: Allocator,
             skip_first_store: bool,
         ) DecompileError!?CondSim {
@@ -229,7 +229,7 @@ pub fn Methods(comptime Self: type, comptime Err: type) type {
         fn initCondSimInner(
             self: *Self,
             block_id: u32,
-            stmts: *std.ArrayList(*Stmt),
+            stmts: *std.ArrayListUnmanaged(*Stmt),
             stmts_allocator: Allocator,
             skip_first_store: bool,
         ) DecompileError!?CondSim {
@@ -423,7 +423,7 @@ pub fn Methods(comptime Self: type, comptime Err: type) type {
             self: *Self,
             block_id: u32,
             limit: u32,
-            stmts: *std.ArrayList(*Stmt),
+            stmts: *std.ArrayListUnmanaged(*Stmt),
             stmts_allocator: Allocator,
         ) DecompileError!?u32 {
             const pattern = (try findTernaryLeaf(self, block_id, limit)) orelse return null;
@@ -486,7 +486,7 @@ pub fn Methods(comptime Self: type, comptime Err: type) type {
             self: *Self,
             block_id: u32,
             limit: u32,
-            stmts: *std.ArrayList(*Stmt),
+            stmts: *std.ArrayListUnmanaged(*Stmt),
             stmts_allocator: Allocator,
         ) DecompileError!?u32 {
             return self.tryDecompileTernaryIntoWithSkip(block_id, limit, stmts, stmts_allocator, false);
@@ -496,7 +496,7 @@ pub fn Methods(comptime Self: type, comptime Err: type) type {
             self: *Self,
             block_id: u32,
             limit: u32,
-            stmts: *std.ArrayList(*Stmt),
+            stmts: *std.ArrayListUnmanaged(*Stmt),
             stmts_allocator: Allocator,
             skip_first_store: bool,
         ) DecompileError!?u32 {
@@ -643,7 +643,7 @@ pub fn Methods(comptime Self: type, comptime Err: type) type {
             self: *Self,
             block_id: u32,
             limit: u32,
-            stmts: *std.ArrayList(*Stmt),
+            stmts: *std.ArrayListUnmanaged(*Stmt),
             stmts_allocator: Allocator,
         ) DecompileError!?u32 {
             const pattern = self.analyzer.detectAndOr(block_id) orelse return null;
@@ -730,7 +730,7 @@ pub fn Methods(comptime Self: type, comptime Err: type) type {
             self: *Self,
             block_id: u32,
             limit: u32,
-            stmts: *std.ArrayList(*Stmt),
+            stmts: *std.ArrayListUnmanaged(*Stmt),
             stmts_allocator: Allocator,
         ) DecompileError!?u32 {
             return self.tryDecompileBoolOpIntoWithSkip(block_id, limit, stmts, stmts_allocator, false);
@@ -740,7 +740,7 @@ pub fn Methods(comptime Self: type, comptime Err: type) type {
             self: *Self,
             block_id: u32,
             limit: u32,
-            stmts: *std.ArrayList(*Stmt),
+            stmts: *std.ArrayListUnmanaged(*Stmt),
             stmts_allocator: Allocator,
             skip_first_store_param: bool,
         ) DecompileError!?u32 {

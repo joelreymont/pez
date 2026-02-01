@@ -24344,6 +24344,7 @@ test "simulate condition expr returns null on sim error" {
     var stmts: std.ArrayListUnmanaged(*Stmt) = .{};
     defer stmts.deinit(allocator);
     try testing.expect((try decompiler.initCondSim(0, &stmts, allocator)) == null);
+    try testing.expectEqual(@as(usize, 0), stmts.items.len);
     try testing.expect((try decompiler.simulateConditionExpr(0, &.{})) == null);
 }
 
