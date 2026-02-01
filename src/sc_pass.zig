@@ -52,7 +52,10 @@ pub fn Methods(comptime Self: type, comptime Err: type) type {
                 if (inst.isConditionalJump()) return null;
                 if (inst.isUnconditionalJump()) break;
                 if (Self.isStatementOpcode(inst.opcode)) return null;
-                if (!try self.simOptOrNull(&sim, inst)) return null;
+                self.simOpt(&sim, inst) catch |err| switch (err) {
+                    error.PatternNoMatch => return null,
+                    else => return err,
+                };
             }
 
             if (sim.stack.len() != base_vals.len + 1) return null;
@@ -77,7 +80,10 @@ pub fn Methods(comptime Self: type, comptime Err: type) type {
             for (block.instructions) |inst| {
                 if (ctrl.Analyzer.isConditionalJump(undefined, inst.opcode)) break;
                 if (Self.isStatementOpcode(inst.opcode)) return null;
-                if (!try self.simOptOrNull(&sim, inst)) return null;
+                self.simOpt(&sim, inst) catch |err| switch (err) {
+                    error.PatternNoMatch => return null,
+                    else => return err,
+                };
             }
 
             const expr = (try popExprNoMatch(self, &sim)) orelse return null;
@@ -106,7 +112,10 @@ pub fn Methods(comptime Self: type, comptime Err: type) type {
                 if (ctrl.Analyzer.isConditionalJump(undefined, inst.opcode)) break;
                 if (inst.isUnconditionalJump()) break;
                 if (Self.isStatementOpcode(inst.opcode)) break;
-                if (!try self.simOptOrNull(&sim, inst)) return null;
+                self.simOpt(&sim, inst) catch |err| switch (err) {
+                    error.PatternNoMatch => return null,
+                    else => return err,
+                };
             }
 
             if (sim.stack.len() != base_vals.len + 1) return null;
@@ -144,7 +153,10 @@ pub fn Methods(comptime Self: type, comptime Err: type) type {
                 }
                 if (ctrl.Analyzer.isConditionalJump(undefined, inst.opcode)) break;
                 if (Self.isStatementOpcode(inst.opcode)) return null;
-                if (!try self.simOptOrNull(&sim, inst)) return null;
+                self.simOpt(&sim, inst) catch |err| switch (err) {
+                    error.PatternNoMatch => return null,
+                    else => return err,
+                };
             }
 
             const expr = (try popExprNoMatch(self, &sim)) orelse return null;
@@ -1086,7 +1098,10 @@ pub fn Methods(comptime Self: type, comptime Err: type) type {
             }
             const stop_idx = cmp_idx.?;
             for (block.instructions[0 .. stop_idx + 1]) |inst| {
-                if (!try self.simOptOrNull(&sim, inst)) return null;
+                self.simOpt(&sim, inst) catch |err| switch (err) {
+                    error.PatternNoMatch => return null,
+                    else => return err,
+                };
             }
             const first_cmp = (try popExprNoMatch(self, &sim)) orelse return null;
             if (first_cmp.* != .compare or first_cmp.compare.ops.len != 1 or first_cmp.compare.comparators.len != 1) {
@@ -1108,10 +1123,16 @@ pub fn Methods(comptime Self: type, comptime Err: type) type {
                     cmp2_idx = i;
                     break;
                 }
-                if (!try self.simOptOrNull(&sim2, inst)) return null;
+                self.simOpt(&sim2, inst) catch |err| switch (err) {
+                    error.PatternNoMatch => return null,
+                    else => return err,
+                };
             }
             if (cmp2_idx == null) return null;
-            if (!try self.simOptOrNull(&sim2, true_blk.instructions[cmp2_idx.?])) return null;
+            self.simOpt(&sim2, true_blk.instructions[cmp2_idx.?]) catch |err| switch (err) {
+                error.PatternNoMatch => return null,
+                else => return err,
+            };
             const second_cmp = (try popExprNoMatch(self, &sim2)) orelse return null;
             if (second_cmp.* != .compare or second_cmp.compare.ops.len != 1 or second_cmp.compare.comparators.len != 1) {
                 return null;

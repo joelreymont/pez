@@ -811,14 +811,6 @@ pub const Decompiler = struct {
         };
     }
 
-    pub fn simOptOrNull(self: *Decompiler, sim: *SimContext, inst: decoder.Instruction) DecompileError!bool {
-        self.simOpt(sim, inst) catch |err| switch (err) {
-            error.PatternNoMatch => return false,
-            else => return err,
-        };
-        return true;
-    }
-
     pub fn popExprMatch(self: *Decompiler, sim: *SimContext) DecompileError!*Expr {
         return sim.stack.popExpr() catch |err| {
             if (self.isSoftSimErr(err)) return error.PatternNoMatch;
@@ -6505,7 +6497,10 @@ pub const Decompiler = struct {
             }
             if (ctrl.Analyzer.isConditionalJump(undefined, inst.opcode)) break;
             if (isStatementOpcode(inst.opcode)) return null;
-            if (!try self.simOptOrNull(&sim, inst)) return null;
+            self.simOpt(&sim, inst) catch |err| switch (err) {
+                error.PatternNoMatch => return null,
+                else => return err,
+            };
         }
 
         const expr = self.popExprMatch(&sim) catch |err| switch (err) {
@@ -6719,7 +6714,10 @@ pub const Decompiler = struct {
                 while (setup_iter.next()) |inst| {
                     if (inst.offset >= gio) break;
                     if (inst.opcode == .RESUME) continue;
-                    if (!try self.simOptOrNull(&setup_sim, inst)) return null;
+                    self.simOpt(&setup_sim, inst) catch |err| switch (err) {
+                        error.PatternNoMatch => return null,
+                        else => return err,
+                    };
                 }
 
                 // Get the iterator expression from TOS
@@ -6743,7 +6741,10 @@ pub const Decompiler = struct {
         while (iter.next()) |inst| {
             if (inst.offset < sim_start) continue;
             if (inst.offset >= exit_offset) break;
-            if (!try self.simOptOrNull(&sim, inst)) return null;
+            self.simOpt(&sim, inst) catch |err| switch (err) {
+                error.PatternNoMatch => return null,
+                else => return err,
+            };
         }
 
         const expr = sim.buildInlineCompExpr() catch |err| {
@@ -8030,7 +8031,10 @@ pub const Decompiler = struct {
             sim.stack.allow_underflow = true;
             try sim.stack.push(.unknown);
             for (block.instructions[i..call_idx.?]) |inst| {
-                if (!try self.simOptOrNull(&sim, inst)) return null;
+                self.simOpt(&sim, inst) catch |err| switch (err) {
+                    error.PatternNoMatch => return null,
+                    else => return err,
+                };
             }
             msg = self.popExprMatch(&sim) catch |err| switch (err) {
                 error.PatternNoMatch => null,
@@ -24323,6 +24327,34 @@ test "runStackSSA hard-fails iteration cap" {
     try testing.expect(decompiler.last_error_ctx != null);
     const ctx = decompiler.last_error_ctx.?;
     try testing.expectEqualStrings("stackflow_iter_limit", ctx.opcode);
+}
+
+test "simOpt soft errors return PatternNoMatch" {
+    const testing = std.testing;
+    const allocator = testing.allocator;
+
+    var code = pyc.Code{
+        .allocator = allocator,
+        .name = "simopt",
+        .code = &.{},
+    };
+
+    const version = Version.init(3, 9);
+    var decompiler = try Decompiler.init(allocator, &code, version);
+    defer decompiler.deinit();
+
+    var sim = decompiler.initSim(decompiler.arena.allocator(), decompiler.arena.allocator(), &code, version);
+    defer sim.deinit();
+
+    const inst = decoder.Instruction{
+        .opcode = .DUP_TOP,
+        .arg = 0,
+        .offset = 0,
+        .size = 2,
+        .cache_entries = 0,
+    };
+
+    try testing.expectError(error.PatternNoMatch, decompiler.simOpt(&sim, inst));
 }
 
 test "simulate condition expr returns null on sim error" {
