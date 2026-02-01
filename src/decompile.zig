@@ -1773,7 +1773,7 @@ pub const Decompiler = struct {
         self: *Decompiler,
         final_body: []const *Stmt,
     ) DecompileError![]const []const u8 {
-        var names: std.ArrayList([]const u8) = .{};
+        var names: std.ArrayListUnmanaged([]const u8) = .{};
         errdefer names.deinit(self.allocator);
         for (final_body) |stmt| {
             if (stmt.* != .assign) continue;
@@ -4679,7 +4679,7 @@ pub const Decompiler = struct {
         var seen = try std.DynamicBitSet.initEmpty(self.allocator, self.cfg.blocks.len);
         if (start >= limit or start >= self.cfg.blocks.len) return seen;
 
-        var stack: std.ArrayList(u32) = .{};
+        var stack: std.ArrayListUnmanaged(u32) = .{};
         defer stack.deinit(self.allocator);
         try stack.append(self.allocator, start);
 
@@ -4753,7 +4753,7 @@ pub const Decompiler = struct {
         var seen = try std.DynamicBitSet.initEmpty(self.allocator, self.cfg.blocks.len);
         if (start >= limit or start >= self.cfg.blocks.len) return seen;
 
-        var stack: std.ArrayList(u32) = .{};
+        var stack: std.ArrayListUnmanaged(u32) = .{};
         defer stack.deinit(self.allocator);
         try stack.append(self.allocator, start);
 
@@ -4946,10 +4946,10 @@ pub const Decompiler = struct {
         var visited = try std.DynamicBitSet.initEmpty(allocator, succs.len);
         defer visited.deinit();
 
-        var postorder: std.ArrayList(u32) = .{};
+        var postorder: std.ArrayListUnmanaged(u32) = .{};
         errdefer postorder.deinit(allocator);
 
-        var stack: std.ArrayList(struct { node: u32, next_idx: usize }) = .{};
+        var stack: std.ArrayListUnmanaged(struct { node: u32, next_idx: usize }) = .{};
         defer stack.deinit(allocator);
 
         visited.set(@intCast(entry));
@@ -5603,7 +5603,7 @@ pub const Decompiler = struct {
     }
 
     fn collectImportFromGroups(self: *Decompiler, allocator: Allocator) DecompileError![]const ImportGroup {
-        var groups: std.ArrayList(ImportGroup) = .{};
+        var groups: std.ArrayListUnmanaged(ImportGroup) = .{};
         errdefer groups.deinit(allocator);
 
         const insts = self.cfg.instructions;
@@ -5622,7 +5622,7 @@ pub const Decompiler = struct {
                 }
             }
 
-            var names: std.ArrayList([]const u8) = .{};
+            var names: std.ArrayListUnmanaged([]const u8) = .{};
             defer names.deinit(allocator);
             var j = i + 1;
             while (j + 1 < insts.len and insts[j].opcode == .IMPORT_FROM) {
@@ -5680,7 +5680,7 @@ pub const Decompiler = struct {
                     continue;
                 }
                 var j = i;
-                var aliases: std.ArrayList(ast.Alias) = .{};
+                var aliases: std.ArrayListUnmanaged(ast.Alias) = .{};
                 defer aliases.deinit(allocator);
                 while (j < stmts.len and stmts[j].* == .import_from) : (j += 1) {
                     const cur = stmts[j].import_from;
@@ -10267,7 +10267,7 @@ pub const Decompiler = struct {
 
         var reachable = try self.reachableInRange(start_block, limit, end_block);
         defer reachable.deinit();
-        var masked: std.ArrayList(u32) = .{};
+        var masked: std.ArrayListUnmanaged(u32) = .{};
         defer masked.deinit(self.allocator);
         var bid = start_block;
         while (bid < limit) : (bid += 1) {
@@ -12725,9 +12725,9 @@ pub const Decompiler = struct {
         const subject = try sim.stack.popExpr();
 
         // Decompile each case
-        var cases: std.ArrayList(ast.MatchCase) = .{};
+        var cases: std.ArrayListUnmanaged(ast.MatchCase) = .{};
         errdefer cases.deinit(a);
-        var extra_blocks: std.ArrayList(u32) = .{};
+        var extra_blocks: std.ArrayListUnmanaged(u32) = .{};
         defer extra_blocks.deinit(self.allocator);
 
         var idx: usize = 0;
@@ -13852,7 +13852,7 @@ pub const Decompiler = struct {
 
     fn tryMatchOrChain(self: *Decompiler, case_blocks: []const u32, start_idx: usize) DecompileError!?OrChain {
         const a = self.arena.allocator();
-        var patterns: std.ArrayList(*ast.Pattern) = .{};
+        var patterns: std.ArrayListUnmanaged(*ast.Pattern) = .{};
         defer patterns.deinit(a);
 
         var success_target: ?u32 = null;
@@ -14325,7 +14325,7 @@ pub const Decompiler = struct {
         }
 
         if (filled != attr_list.len) {
-            var all_insts: std.ArrayList(cfg_mod.Instruction) = .{};
+            var all_insts: std.ArrayListUnmanaged(cfg_mod.Instruction) = .{};
             defer all_insts.deinit(self.allocator);
             for (blocks) |bid| {
                 const blk = &self.cfg.blocks[bid];
@@ -14462,12 +14462,12 @@ pub const Decompiler = struct {
         // Need to collect all pattern+guard blocks by following conditional_true edges
         // until we reach the body block.
 
-        var pattern_blocks: std.ArrayList(u32) = .{};
+        var pattern_blocks: std.ArrayListUnmanaged(u32) = .{};
         defer pattern_blocks.deinit(self.allocator);
 
         var current_block_id = block_id;
         var last_test: u32 = block_id;
-        var test_blocks: std.ArrayList(u32) = .{};
+        var test_blocks: std.ArrayListUnmanaged(u32) = .{};
         defer test_blocks.deinit(self.allocator);
 
         // Follow conditional edges while blocks contain pattern/guard logic
@@ -14576,7 +14576,7 @@ pub const Decompiler = struct {
         }
 
         // Collect all instructions from pattern blocks for extraction
-        var all_insts: std.ArrayList(cfg_mod.Instruction) = .{};
+        var all_insts: std.ArrayListUnmanaged(cfg_mod.Instruction) = .{};
         defer all_insts.deinit(self.allocator);
         for (pattern_blocks.items) |pid| {
             const pb = &self.cfg.blocks[pid];
@@ -14820,7 +14820,7 @@ pub const Decompiler = struct {
 
                 if (body_start_idx) |start_idx| {
                     // Create a temporary block with just the body instructions
-                    var body_insts: std.ArrayList(cfg_mod.Instruction) = .{};
+                    var body_insts: std.ArrayListUnmanaged(cfg_mod.Instruction) = .{};
                     defer body_insts.deinit(self.allocator);
                     try body_insts.appendSlice(self.allocator, final_block.instructions[start_idx..]);
 
@@ -14855,7 +14855,7 @@ pub const Decompiler = struct {
 
                 if (fallback_body == null) {
                     if (fallback_start_idx) |fb_start| {
-                        var fb_insts: std.ArrayList(cfg_mod.Instruction) = .{};
+                        var fb_insts: std.ArrayListUnmanaged(cfg_mod.Instruction) = .{};
                         defer fb_insts.deinit(self.allocator);
                         try fb_insts.appendSlice(self.allocator, final_block.instructions[fb_start..]);
 
@@ -15128,7 +15128,7 @@ pub const Decompiler = struct {
                 }
                 if (fallback_body == null) {
                     if (fallback_start_idx) |fb_start| {
-                        var fb_insts: std.ArrayList(cfg_mod.Instruction) = .{};
+                        var fb_insts: std.ArrayListUnmanaged(cfg_mod.Instruction) = .{};
                         defer fb_insts.deinit(self.allocator);
                         try fb_insts.appendSlice(self.allocator, final_block.instructions[fb_start..]);
 
@@ -16214,7 +16214,7 @@ pub const Decompiler = struct {
         );
 
         // Decompile handlers - follow the chain of CHECK_EXC_MATCH blocks
-        var handlers: std.ArrayList(ast.ExceptHandler) = .{};
+        var handlers: std.ArrayListUnmanaged(ast.ExceptHandler) = .{};
         errdefer handlers.deinit(a);
 
         // Track actual end of all handler blocks for marking processed
@@ -23089,7 +23089,7 @@ pub const Decompiler = struct {
         }
 
         var idx = start_idx + 1;
-        var aliases: std.ArrayList(ast.Alias) = .{};
+        var aliases: std.ArrayListUnmanaged(ast.Alias) = .{};
         defer aliases.deinit(self.allocator);
 
         if (idx < instructions.len and instructions[idx].opcode == .IMPORT_STAR) {
@@ -23844,7 +23844,7 @@ const TopPadState = struct {
 };
 
 fn splitLines(allocator: Allocator, src: []const u8) ![]LineInfo {
-    var lines: std.ArrayList(LineInfo) = .{};
+    var lines: std.ArrayListUnmanaged(LineInfo) = .{};
     errdefer lines.deinit(allocator);
     var it = std.mem.splitScalar(u8, src, '\n');
     while (it.next()) |line| {
@@ -23889,8 +23889,8 @@ const ChildState = struct {
 };
 
 fn collectChildCodeObjects(allocator: Allocator, code: *const pyc.Code) !ChildCodes {
-    var named: std.ArrayList(*const pyc.Code) = .{};
-    var anon: std.ArrayList(*const pyc.Code) = .{};
+    var named: std.ArrayListUnmanaged(*const pyc.Code) = .{};
+    var anon: std.ArrayListUnmanaged(*const pyc.Code) = .{};
     errdefer {
         named.deinit(allocator);
         anon.deinit(allocator);
@@ -24006,12 +24006,12 @@ fn lineHasAnonCode(line: []const u8, indent: usize) bool {
     return true;
 }
 
-fn writeLine(out: *std.ArrayList(u8), allocator: Allocator, line: []const u8) AlignError!void {
+fn writeLine(out: *std.ArrayListUnmanaged(u8), allocator: Allocator, line: []const u8) AlignError!void {
     try out.appendSlice(allocator, line);
     try out.append(allocator, '\n');
 }
 
-fn padToLine(out: *std.ArrayList(u8), allocator: Allocator, line_no: *u32, target: u32) AlignError!void {
+fn padToLine(out: *std.ArrayListUnmanaged(u8), allocator: Allocator, line_no: *u32, target: u32) AlignError!void {
     while (line_no.* < target) {
         try out.append(allocator, '\n');
         line_no.* += 1;
@@ -24019,7 +24019,7 @@ fn padToLine(out: *std.ArrayList(u8), allocator: Allocator, line_no: *u32, targe
 }
 
 fn padToLineHeuristic(
-    out: *std.ArrayList(u8),
+    out: *std.ArrayListUnmanaged(u8),
     allocator: Allocator,
     line_no: *u32,
     target: u32,
@@ -24038,7 +24038,7 @@ fn padToLineHeuristic(
 
 fn processBlockInner(
     allocator: Allocator,
-    out: *std.ArrayList(u8),
+    out: *std.ArrayListUnmanaged(u8),
     lines: []const LineInfo,
     idx: *usize,
     indent: usize,
@@ -24172,7 +24172,7 @@ fn processBlockInner(
 
 fn processBlock(
     allocator: Allocator,
-    out: *std.ArrayList(u8),
+    out: *std.ArrayListUnmanaged(u8),
     lines: []const LineInfo,
     idx: *usize,
     indent: usize,
@@ -24188,7 +24188,7 @@ fn processBlock(
 fn alignDefLines(allocator: Allocator, code: *const pyc.Code, src: []const u8) AlignError![]const u8 {
     const lines = try splitLines(allocator, src);
     defer allocator.free(lines);
-    var out: std.ArrayList(u8) = .{};
+    var out: std.ArrayListUnmanaged(u8) = .{};
     errdefer out.deinit(allocator);
     var idx: usize = 0;
     const base_line: u32 = 1;
@@ -24211,11 +24211,22 @@ fn expectDecompileFixture(allocator: Allocator, path: []const u8) !void {
     const code = module.code.?;
     const version = module.version();
 
-    var out: std.ArrayList(u8) = .{};
+    var out: std.ArrayListUnmanaged(u8) = .{};
     defer out.deinit(allocator);
 
     try decompileToSource(allocator, code, version, out.writer(allocator));
     try std.testing.expect(out.items.len > 0);
+}
+
+test "writeLine appends newline" {
+    const testing = std.testing;
+    const allocator = testing.allocator;
+
+    var out: std.ArrayListUnmanaged(u8) = .{};
+    defer out.deinit(allocator);
+
+    try writeLine(&out, allocator, "hi");
+    try testing.expectEqualStrings("hi\n", out.items);
 }
 
 test "decompiler init" {
@@ -24490,7 +24501,7 @@ test "exception seed handles JUMP_IF_NOT_EXC_MATCH" {
         allocator.destroy(code);
     }
 
-    var out: std.ArrayList(u8) = .{};
+    var out: std.ArrayListUnmanaged(u8) = .{};
     defer out.deinit(allocator);
     try decompileToSource(allocator, code, version, out.writer(allocator));
     try testing.expect(out.items.len > 0);
