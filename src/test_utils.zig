@@ -41,6 +41,22 @@ pub fn renderModule(allocator: Allocator, code: *const pyc.Code, version: Versio
     return out.toOwnedSlice(allocator);
 }
 
+pub fn renderPycFile(allocator: Allocator, path: []const u8, align_defs: bool) ![]u8 {
+    var module: pyc.Module = undefined;
+    module.init(allocator);
+    defer module.deinit();
+    try module.loadFromFile(path);
+
+    const code = module.code orelse return error.InvalidPyc;
+    const version = Version.init(@intCast(module.major_ver), @intCast(module.minor_ver));
+
+    var output: std.ArrayList(u8) = .{};
+    errdefer output.deinit(allocator);
+    const opts = decompile.DecompileOptions{ .align_defs = align_defs };
+    try decompile.decompileToSourceWithOptions(allocator, code, version, output.writer(allocator), null, opts);
+    return output.toOwnedSlice(allocator);
+}
+
 pub fn dupeStrings(allocator: Allocator, items: []const []const u8) ![][]const u8 {
     const out = try allocator.alloc([]const u8, items.len);
     var count: usize = 0;

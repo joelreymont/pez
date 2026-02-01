@@ -25,6 +25,7 @@ pub const test_with_legacy_snapshot = @import("test_with_legacy_snapshot.zig");
 pub const test_kw_defaults_snapshot = @import("test_kw_defaults_snapshot.zig");
 pub const test_boat_main_regressions_snapshot = @import("test_boat_main_regressions_snapshot.zig");
 pub const test_if_chain_snapshot = @import("test_if_chain_snapshot.zig");
+pub const test_pycdc_regressions_snapshot = @import("test_pycdc_regressions_snapshot.zig");
 pub const stack_flow_tests = @import("stack_flow_tests.zig");
 
 // Property testing
@@ -56,6 +57,7 @@ comptime {
     _ = test_kw_defaults_snapshot;
     _ = test_boat_main_regressions_snapshot;
     _ = test_if_chain_snapshot;
+    _ = test_pycdc_regressions_snapshot;
     _ = stack_flow_tests;
 }
 

@@ -428,6 +428,9 @@ pub const Stack = struct {
             .unknown => {
                 return ast.makeName(self.ast_alloc, "__unknown__", .load);
             },
+            .exc_marker => {
+                return ast.makeName(self.ast_alloc, "__exception__", .load);
+            },
             else => {
                 if (self.allow_underflow) {
                     var tmp = val;
@@ -6119,20 +6122,13 @@ pub const SimContext = struct {
                     return;
                 }
 
-                // Pre-2.5 generators cannot receive a value, so yield does not push.
-                if (self.flow_mode and self.version.lt(2, 5)) {
-                    if (self.stack.pop()) |v| {
-                        var val = v;
-                        val.deinit(self.allocator, self.stack_alloc);
-                    }
-                    return;
-                }
-
                 const value = self.stack.popExpr() catch |err| {
                     if (self.lenient or self.flow_mode) {
-                        // If we can't get an expr, push unknown and continue
-                        _ = self.stack.pop();
-                        try self.stack.push(.unknown);
+                        // If we can't get an expr, push unknown and continue (2.5+)
+                        if (self.version.gte(2, 5)) {
+                            _ = self.stack.pop();
+                            try self.stack.push(.unknown);
+                        }
                         return;
                     }
                     return err;
@@ -6149,6 +6145,13 @@ pub const SimContext = struct {
                         try self.stack.push(.unknown);
                         return;
                     }
+                }
+
+                // Pre-2.5 generators cannot receive a value, so yield does not push.
+                if (self.version.lt(2, 5)) {
+                    value.deinit(self.allocator);
+                    self.allocator.destroy(value);
+                    return;
                 }
 
                 errdefer {

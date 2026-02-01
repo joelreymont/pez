@@ -1619,22 +1619,54 @@ pub const Analyzer = struct {
         const block = &self.cfg.blocks[block_id];
         if (block.is_exception_handler) return null;
 
+        var has_setup = false;
+        var has_setup_except = false;
+        var has_setup_finally = false;
+        var setup_finally_target: ?u32 = null;
+        const setup_multiplier: u32 = if (self.cfg.version.gte(3, 10)) 2 else 1;
         if (!self.cfg.version.gte(3, 11)) {
-            var has_setup = false;
             for (block.instructions) |inst| {
-                if (inst.opcode == .SETUP_EXCEPT or inst.opcode == .SETUP_FINALLY) {
+                if (inst.opcode == .SETUP_EXCEPT) {
                     has_setup = true;
-                    break;
+                    has_setup_except = true;
+                } else if (inst.opcode == .SETUP_FINALLY) {
+                    has_setup = true;
+                    has_setup_finally = true;
+                    if (setup_finally_target == null) {
+                        const target_off = inst.offset + inst.size + inst.arg * setup_multiplier;
+                        if (self.cfg.blockAtOffset(target_off)) |target_id| {
+                            setup_finally_target = target_id;
+                        }
+                    }
                 }
             }
             if (!has_setup) return null;
         }
 
-
         var handler_targets: std.ArrayListUnmanaged(u32) = .{};
         defer handler_targets.deinit(self.allocator);
 
-        try self.collectExceptionTargets(block_id, &handler_targets);
+        if (!self.cfg.version.gte(3, 11)) {
+            for (block.instructions) |inst| {
+                if (inst.opcode != .SETUP_EXCEPT and inst.opcode != .SETUP_FINALLY) continue;
+                const target_off = inst.offset + inst.size + inst.arg * setup_multiplier;
+                if (self.cfg.blockAtOffset(target_off)) |target_id| {
+                    var seen = false;
+                    for (handler_targets.items) |existing| {
+                        if (existing == target_id) {
+                            seen = true;
+                            break;
+                        }
+                    }
+                    if (!seen) {
+                        try handler_targets.append(self.allocator, target_id);
+                    }
+                }
+            }
+        }
+        if (handler_targets.items.len == 0) {
+            try self.collectExceptionTargets(block_id, &handler_targets);
+        }
         if (handler_targets.items.len == 0) return null;
         if (!self.cfg.version.gte(3, 11)) {
             var idx: usize = 0;
@@ -1643,7 +1675,9 @@ pub const Analyzer = struct {
                 if (hid >= self.cfg.blocks.len) continue;
                 const hblk = &self.cfg.blocks[hid];
                 const term = hblk.terminator() orelse continue;
-                if (term.opcode == .JUMP_IF_NOT_EXC_MATCH) {
+                if (term.opcode == .JUMP_IF_NOT_EXC_MATCH or
+                    term.opcode == .JUMP_IF_FALSE or term.opcode == .POP_JUMP_IF_FALSE)
+                {
                     if (term.jumpTarget(self.cfg.version)) |target_off| {
                         if (self.cfg.blockAtOffset(target_off)) |target_id| {
                             var next_id = target_id;
@@ -1749,8 +1783,17 @@ pub const Analyzer = struct {
             else_block = try self.detectElseBlock311(block_id, handler_list.items, exit_block);
             finally_block = try self.detectFinallyBlock311(block_id, handler_list.items, else_block, exit_block);
         } else {
-            else_block = try self.detectElseBlockLegacy(block_id, handler_list.items, exit_block);
-            finally_block = try self.detectFinallyBlockLegacy(block_id, handler_list.items, else_block, exit_block);
+            if (has_setup_except) {
+                else_block = try self.detectElseBlockLegacy(block_id, handler_list.items, exit_block);
+            } else {
+                else_block = null;
+            }
+            if (has_setup_finally) {
+                finally_block = setup_finally_target orelse
+                    try self.detectFinallyBlockLegacy(block_id, handler_list.items, else_block, exit_block);
+            } else {
+                finally_block = null;
+            }
         }
 
         const pattern = TryPattern{

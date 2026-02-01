@@ -4,9 +4,7 @@ const std = @import("std");
 const testing = std.testing;
 const OhSnap = @import("ohsnap");
 
-const pyc = @import("pyc.zig");
-const decompile = @import("decompile.zig");
-const Version = @import("opcodes.zig").Version;
+const tu = @import("test_utils.zig");
 
 fn runSnapshot(
     comptime src: std.builtin.SourceLocation,
@@ -23,25 +21,11 @@ fn runSnapshotWithAlign(
     align_defs: bool,
 ) !void {
     const allocator = testing.allocator;
-
-    var module: pyc.Module = undefined;
-    module.init(allocator);
-    defer module.deinit();
-    try module.loadFromFile(path);
-
-    const code = module.code orelse {
-        try testing.expect(false);
-        return;
-    };
-    const version = Version.init(@intCast(module.major_ver), @intCast(module.minor_ver));
-
-    var output: std.ArrayList(u8) = .{};
-    defer output.deinit(allocator);
-    const opts = decompile.DecompileOptions{ .align_defs = align_defs };
-    try decompile.decompileToSourceWithOptions(allocator, code, version, output.writer(allocator), null, opts);
+    const output = try tu.renderPycFile(allocator, path, align_defs);
+    defer allocator.free(output);
 
     const oh = OhSnap{};
-    try oh.snap(src, expected).expectEqual(output.items);
+    try oh.snap(src, expected).expectEqual(output);
 }
 
 fn runSnapshotAligned(

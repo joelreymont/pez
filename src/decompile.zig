@@ -360,6 +360,9 @@ pub const Decompiler = struct {
     base_alloc: Allocator,
     arena: *std.heap.ArenaAllocator,
     clone_arena: *std.heap.ArenaAllocator,
+    flow_arena: *std.heap.ArenaAllocator,
+    sim_arena: *std.heap.ArenaAllocator,
+    seed_arena: *std.heap.ArenaAllocator,
     code: *const pyc.Code,
     version: Version,
     cfg: *CFG,
@@ -622,6 +625,9 @@ pub const Decompiler = struct {
             .base_alloc = allocator,
             .arena = arena,
             .clone_arena = undefined,
+            .flow_arena = undefined,
+            .sim_arena = undefined,
+            .seed_arena = undefined,
             .code = code,
             .version = version,
             .cfg = undefined,
@@ -654,6 +660,24 @@ pub const Decompiler = struct {
         errdefer clone_arena.deinit();
         decomp.clone_arena = clone_arena;
         decomp.clone_sim = SimContext.init(clone_arena.allocator(), clone_arena.allocator(), code, version);
+
+        const flow_arena = try a.create(std.heap.ArenaAllocator);
+        errdefer a.destroy(flow_arena);
+        flow_arena.* = std.heap.ArenaAllocator.init(allocator);
+        errdefer flow_arena.deinit();
+        decomp.flow_arena = flow_arena;
+
+        const sim_arena = try a.create(std.heap.ArenaAllocator);
+        errdefer a.destroy(sim_arena);
+        sim_arena.* = std.heap.ArenaAllocator.init(allocator);
+        errdefer sim_arena.deinit();
+        decomp.sim_arena = sim_arena;
+
+        const seed_arena = try a.create(std.heap.ArenaAllocator);
+        errdefer a.destroy(seed_arena);
+        seed_arena.* = std.heap.ArenaAllocator.init(allocator);
+        errdefer seed_arena.deinit();
+        decomp.seed_arena = seed_arena;
 
         // Allocate CFG on heap so pointer stays valid
         const cfg = try a.create(CFG);
@@ -706,6 +730,12 @@ pub const Decompiler = struct {
         self.nested_decompilers.deinit(self.allocator);
         self.print_items.deinit(self.allocator);
         self.inline_pend.deinit(self.allocator);
+        self.flow_arena.deinit();
+        self.allocator.destroy(self.flow_arena);
+        self.sim_arena.deinit();
+        self.allocator.destroy(self.sim_arena);
+        self.seed_arena.deinit();
+        self.allocator.destroy(self.seed_arena);
         self.clone_arena.deinit();
         self.allocator.destroy(self.clone_arena);
         for (self.stack_in) |entry_opt| {
@@ -750,6 +780,7 @@ pub const Decompiler = struct {
         handler_reach: GenSet,
         normal_reach: GenSet,
         queue: std.ArrayListUnmanaged(u32),
+        handler_end: std.AutoHashMapUnmanaged(u32, u32),
 
         fn init(allocator: Allocator, bit_len: usize) !TryScratch {
             return .{
@@ -758,6 +789,7 @@ pub const Decompiler = struct {
                 .handler_reach = try GenSet.init(allocator, bit_len),
                 .normal_reach = try GenSet.init(allocator, bit_len),
                 .queue = .{},
+                .handler_end = .{},
             };
         }
 
@@ -770,6 +802,8 @@ pub const Decompiler = struct {
                 try self.queue.ensureTotalCapacity(allocator, bit_len);
             }
             self.queue.clearRetainingCapacity();
+            const cap: u32 = @intCast(bit_len);
+            try self.handler_end.ensureTotalCapacity(allocator, cap);
         }
 
         fn deinit(self: *TryScratch, allocator: Allocator) void {
@@ -778,6 +812,7 @@ pub const Decompiler = struct {
             self.handler_reach.deinit(allocator);
             self.normal_reach.deinit(allocator);
             self.queue.deinit(allocator);
+            self.handler_end.deinit(allocator);
         }
     };
 
@@ -2291,14 +2326,18 @@ pub const Decompiler = struct {
         if (merge_block >= self.cfg.blocks.len) return false;
         const block = &self.cfg.blocks[merge_block];
         if (block.is_loop_header or block.is_exception_handler) return false;
-        if (self.phi_merge_ok) |set| {
-            if (!set.isSet(@intCast(merge_block))) return false;
-        }
 
         var pred_count: usize = 0;
         for (block.predecessors) |pid| {
             if (!self.isNormalPred(pid, merge_block)) continue;
             pred_count += 1;
+        }
+        if (self.hasConditionalPred(merge_block)) {
+            if (self.phi_merge_ok) |set| {
+                if (!set.isSet(@intCast(merge_block))) return false;
+            } else {
+                return false;
+            }
         }
         return pred_count >= 2;
     }
@@ -2814,10 +2853,10 @@ pub const Decompiler = struct {
         var clone_sim = self.initSim(self.arena.allocator(), self.arena.allocator(), self.code, self.version);
         defer clone_sim.deinit();
 
-        var flow_arena = std.heap.ArenaAllocator.init(self.base_alloc);
-        defer flow_arena.deinit();
+        const flow_arena = self.flow_arena;
+        _ = flow_arena.reset(.retain_capacity);
         try self.initPhiMergeOk();
-        try self.runStackSSA(&worklist, &clone_sim, update_counts, &flow_arena);
+        try self.runStackSSA(&worklist, &clone_sim, update_counts, flow_arena);
 
         if (self.cfg.exception_entries.len > 0) {
             var exc_iters: usize = 0;
@@ -2836,7 +2875,7 @@ pub const Decompiler = struct {
                     else
                         null;
 
-                    const incoming_opt = try self.buildExcIncoming(&clone_sim, &flow_arena, entry, start_block, entry_stack, handler_block);
+                    const incoming_opt = try self.buildExcIncoming(&clone_sim, flow_arena, entry, start_block, entry_stack, handler_block);
                     if (incoming_opt == null) continue;
                     const incoming = incoming_opt.?;
                     defer if (incoming.len > 0) self.deinitStackValues(incoming);
@@ -2882,7 +2921,7 @@ pub const Decompiler = struct {
                 }
 
                 if (worklist.items.len > 0) {
-                    try self.runStackSSA(&worklist, &clone_sim, update_counts, &flow_arena);
+                    try self.runStackSSA(&worklist, &clone_sim, update_counts, flow_arena);
                 }
             }
         }
@@ -2910,7 +2949,7 @@ pub const Decompiler = struct {
             seeded_loose = true;
         }
         if (seeded_loose and worklist.items.len > 0) {
-            try self.runStackSSA(&worklist, &clone_sim, update_counts, &flow_arena);
+            try self.runStackSSA(&worklist, &clone_sim, update_counts, flow_arena);
         }
         try self.collectPhiIncoming();
     }
@@ -2919,8 +2958,8 @@ pub const Decompiler = struct {
         if (self.phi_by_block.count() == 0) return;
         self.phi_incoming.clearRetainingCapacity();
 
-        var sim_arena = std.heap.ArenaAllocator.init(self.base_alloc);
-        defer sim_arena.deinit();
+        const sim_arena = self.sim_arena;
+        _ = sim_arena.reset(.retain_capacity);
 
         var bid: u32 = 0;
         while (bid < self.cfg.blocks.len) : (bid += 1) {
@@ -3041,8 +3080,8 @@ pub const Decompiler = struct {
         }
         try worklist.append(self.allocator, start);
 
-        var sim_arena = std.heap.ArenaAllocator.init(self.base_alloc);
-        defer sim_arena.deinit();
+        const sim_arena = self.sim_arena;
+        _ = sim_arena.reset(.retain_capacity);
 
         while (worklist.items.len > 0) {
             const bid = worklist.items[worklist.items.len - 1];
@@ -3978,6 +4017,10 @@ pub const Decompiler = struct {
                     .opcode = inst.opcode.name(),
                 };
             };
+            try self.flushPendingPrint(inst.opcode, stmts, stmts_allocator);
+            if (try self.handlePrintOp(sim, inst, stmts, stmts_allocator)) {
+                continue;
+            }
             if (inst.opcode == .IMPORT_NAME) {
                 if (try self.tryDecompileImportFromGroup(sim, instructions, i, stmts, stmts_allocator)) |end_idx| {
                     i = end_idx;
@@ -4493,58 +4536,22 @@ pub const Decompiler = struct {
                     try self.handlePopTopStmt(sim, block, stmts, stmts_allocator);
                 },
                 .YIELD_VALUE => {
-                    try sim.simulate(inst);
-                    if (self.version.lt(2, 5)) {
-                        if (sim.stack.pop()) |val| {
-                            switch (val) {
-                                .expr => |e| {
-                                    if (self.makeExprStmt(e)) |stmt| {
-                                        try stmts.append(stmts_allocator, stmt);
-                                    } else |err| {
-                                        if (err != error.SkipStatement) return err;
-                                    }
-                                },
-                                else => {
-                                    var tmp = val;
-                                    tmp.deinit(sim.allocator, sim.stack_alloc);
-                                },
-                            }
+                    if (self.version.lt(2, 5) and sim.comp_builder == null) {
+                        const value = try sim.stack.popExpr();
+                        const a = self.arena.allocator();
+                        const expr = try a.create(Expr);
+                        expr.* = .{ .yield_expr = .{ .value = value } };
+                        if (self.makeExprStmt(expr)) |stmt| {
+                            try stmts.append(stmts_allocator, stmt);
+                        } else |err| {
+                            if (err != error.SkipStatement) return err;
                         }
+                    } else {
+                        try sim.simulate(inst);
                     }
                 },
                 .END_FOR, .POP_ITER => {
                     // Loop cleanup opcodes - skip in non-loop context
-                },
-                .PRINT_ITEM => {
-                    // Collect print item - will be emitted with PRINT_NEWLINE
-                    const val = try sim.stack.popExpr();
-                    try self.print_items.append(self.allocator, val);
-                },
-                .PRINT_NEWLINE => {
-                    // Emit print statement with collected items
-                    const stmt = try self.makePrintStmt(null, true);
-                    try stmts.append(stmts_allocator, stmt);
-                },
-                .PRINT_ITEM_TO => {
-                    // Stack: [..., file, value, file] after ROT_TWO
-                    // Pop file (TOS), then value (TOS1)
-                    const file = try sim.stack.popExpr();
-                    const val = try sim.stack.popExpr();
-                    // Save file for PRINT_NEWLINE_TO (arena-allocated, no manual free)
-                    if (self.print_dest == null) {
-                        self.print_dest = file;
-                    }
-                    // Duplicate file refs are fine - arena will free all
-                    try self.print_items.append(self.allocator, val);
-                },
-                .PRINT_NEWLINE_TO => {
-                    // Pop file (it's still on stack after last PRINT_ITEM_TO or just loaded)
-                    const file = try sim.stack.popExpr();
-                    // Use saved dest if available (from PRINT_ITEM_TO), otherwise use popped file
-                    const dest = self.print_dest orelse file;
-                    self.print_dest = null;
-                    const stmt = try self.makePrintStmt(dest, true);
-                    try stmts.append(stmts_allocator, stmt);
                 },
                 .EXEC_STMT,
                 .RAISE_VARARGS,
@@ -4791,7 +4798,7 @@ pub const Decompiler = struct {
         try self.ensurePostDom();
         const idom = self.postdom_idom orelse return false;
         const total: u32 = @intCast(n + 1);
-        return postdomDominatesIdom(idom, total, @intCast(n), post, node);
+        return cfg_mod.postDominatesIdom(idom, total, @intCast(n), post, node);
     }
 
     fn ensurePostDom(self: *Decompiler) DecompileError!void {
@@ -4861,142 +4868,7 @@ pub const Decompiler = struct {
             self.allocator.free(preds);
         }
 
-        return try computePostDomIdomFrom(self.allocator, succs, preds, exit_id);
-    }
-
-    fn computePostDomIdomFrom(
-        allocator: Allocator,
-        succs: []const []const u32,
-        preds: []const []const u32,
-        entry: u32,
-    ) DecompileError![]u32 {
-        const total: u32 = @intCast(succs.len);
-        const count: usize = @intCast(total);
-        const undef = std.math.maxInt(u32);
-
-        var idom = try allocator.alloc(u32, count);
-        @memset(idom, undef);
-
-        const rpo = try computePostDomRpo(allocator, succs, entry);
-        defer allocator.free(rpo);
-
-        if (rpo.len == 0) {
-            for (0..count) |i| {
-                idom[i] = @intCast(i);
-            }
-            return idom;
-        }
-
-        var rpo_index = try allocator.alloc(u32, count);
-        defer allocator.free(rpo_index);
-        @memset(rpo_index, undef);
-        for (rpo, 0..) |node, idx| {
-            rpo_index[@intCast(node)] = @intCast(idx);
-        }
-
-        idom[@intCast(rpo[0])] = rpo[0];
-
-        var changed = true;
-        while (changed) {
-            changed = false;
-            for (rpo[1..]) |node| {
-                const node_idx: usize = @intCast(node);
-                var new_idom: ?u32 = null;
-
-                for (preds[node_idx]) |pred| {
-                    if (idom[@intCast(pred)] == undef) continue;
-                    if (new_idom == null) {
-                        new_idom = pred;
-                    } else {
-                        new_idom = postdomIntersectIdom(idom, rpo_index, pred, new_idom.?);
-                    }
-                }
-
-                if (new_idom == null) continue;
-                if (idom[node_idx] != new_idom.?) {
-                    idom[node_idx] = new_idom.?;
-                    changed = true;
-                }
-            }
-        }
-
-        for (idom, 0..) |*dom, i| {
-            if (dom.* == undef) {
-                dom.* = @intCast(i);
-            }
-        }
-
-        return idom;
-    }
-
-    fn computePostDomRpo(
-        allocator: Allocator,
-        succs: []const []const u32,
-        entry: u32,
-    ) DecompileError![]u32 {
-        if (entry >= succs.len) return &.{};
-        var visited = try std.DynamicBitSet.initEmpty(allocator, succs.len);
-        defer visited.deinit();
-
-        var postorder: std.ArrayListUnmanaged(u32) = .{};
-        errdefer postorder.deinit(allocator);
-
-        var stack: std.ArrayListUnmanaged(struct { node: u32, next_idx: usize }) = .{};
-        defer stack.deinit(allocator);
-
-        visited.set(@intCast(entry));
-        try stack.append(allocator, .{ .node = entry, .next_idx = 0 });
-
-        while (stack.items.len > 0) {
-            var frame = &stack.items[stack.items.len - 1];
-            const node = frame.node;
-            if (frame.next_idx < succs[@intCast(node)].len) {
-                const next = succs[@intCast(node)][frame.next_idx];
-                frame.next_idx += 1;
-                if (next >= succs.len) continue;
-                if (!visited.isSet(@intCast(next))) {
-                    visited.set(@intCast(next));
-                    try stack.append(allocator, .{ .node = next, .next_idx = 0 });
-                }
-            } else {
-                try postorder.append(allocator, node);
-                _ = stack.pop();
-            }
-        }
-
-        const rpo = try postorder.toOwnedSlice(allocator);
-        std.mem.reverse(u32, rpo);
-        return rpo;
-    }
-
-    fn postdomIntersectIdom(idom: []const u32, rpo_index: []const u32, a: u32, b: u32) u32 {
-        var finger1 = a;
-        var finger2 = b;
-        while (finger1 != finger2) {
-            while (rpo_index[@intCast(finger1)] > rpo_index[@intCast(finger2)]) {
-                finger1 = idom[@intCast(finger1)];
-            }
-            while (rpo_index[@intCast(finger2)] > rpo_index[@intCast(finger1)]) {
-                finger2 = idom[@intCast(finger2)];
-            }
-        }
-        return finger1;
-    }
-
-    fn postdomDominatesIdom(idom: []const u32, num_blocks: u32, entry: u32, a: u32, b: u32) bool {
-        if (a >= num_blocks or b >= num_blocks) return false;
-        if (a == b) return true;
-        const b_idx: usize = @intCast(b);
-        if (b != entry and idom[b_idx] == b) return false;
-
-        var current = b;
-        while (current != entry) {
-            const parent = idom[@intCast(current)];
-            if (parent == a) return true;
-            if (parent == current) break;
-            current = parent;
-        }
-        return a == entry;
+        return try cfg_mod.postIdomFrom(self.allocator, succs, preds, exit_id);
     }
 
     const TerminalResult = struct {
@@ -7099,10 +6971,10 @@ pub const Decompiler = struct {
 
     fn blockNeedsPredecessorSeed(self: *Decompiler, block: *const BasicBlock) bool {
         if (block.instructions.len == 0) return false;
-        var arena = std.heap.ArenaAllocator.init(self.base_alloc);
-        defer arena.deinit();
+        const seed_arena = self.seed_arena;
+        _ = seed_arena.reset(.retain_capacity);
 
-        var sim = self.initSim(arena.allocator(), arena.allocator(), self.code, self.version);
+        var sim = self.initSim(seed_arena.allocator(), seed_arena.allocator(), self.code, self.version);
         defer sim.deinit();
         sim.lenient = true;
         sim.flow_mode = true;
@@ -7673,6 +7545,7 @@ pub const Decompiler = struct {
     ) DecompileError!void {
         if (block_id >= self.cfg.blocks.len) return;
         const block = &self.cfg.blocks[block_id];
+        const base_len = stmts.items.len;
 
         var sim = self.initSim(self.arena.allocator(), self.arena.allocator(), self.code, self.version);
         defer sim.deinit();
@@ -7740,6 +7613,39 @@ pub const Decompiler = struct {
         }
 
         try self.processBlockWithSimAndSkip(block, &sim, stmts, stmts_allocator, skip_first);
+        try self.appendPhiAssignmentsForBlockEnd(block, stmts, stmts_allocator, base_len);
+    }
+
+    fn appendPhiAssignmentsForBlockEnd(
+        self: *Decompiler,
+        block: *const BasicBlock,
+        stmts: *std.ArrayListUnmanaged(*Stmt),
+        stmts_allocator: Allocator,
+        base_len: usize,
+    ) DecompileError!void {
+        if (self.phi_by_block.count() == 0) return;
+
+        var normal_target: ?u32 = null;
+        for (block.successors) |edge| {
+            switch (edge.edge_type) {
+                .exception => continue,
+                .conditional_true, .conditional_false, .loop_back => return,
+                .normal => {
+                    if (normal_target != null) return;
+                    normal_target = edge.target;
+                },
+            }
+        }
+        const succ = normal_target orelse return;
+        if (self.phi_merge_ok) |set| {
+            if (set.isSet(@intCast(succ))) return;
+        }
+
+        const tail = stmts.items[base_len..];
+        if (self.bodyEndsTerminal(tail)) return;
+        const assigns = try self.phiAssignmentsForEdge(block.id, succ);
+        if (assigns.len == 0) return;
+        try stmts.appendSlice(stmts_allocator, assigns);
     }
 
     const ChainResult = struct {
@@ -11333,8 +11239,23 @@ pub const Decompiler = struct {
         if (self.version.gte(3, 11)) {
             return try self.decompileTry311(pattern, handler_blocks.items);
         }
-
         const scratch = try self.getTryScratch(self.cfg.blocks.len);
+        var handler_final: std.ArrayListUnmanaged(bool) = .{};
+        defer handler_final.deinit(self.allocator);
+        if (handler_blocks.items.len > 0) {
+            try handler_final.ensureTotalCapacity(self.allocator, handler_blocks.items.len);
+        }
+        var has_finally = false;
+        var except_count: usize = 0;
+        for (handler_blocks.items) |hid| {
+            const is_finally = try self.isFinallyHandler(hid, scratch);
+            try handler_final.append(self.allocator, is_finally);
+            if (is_finally) {
+                has_finally = true;
+            } else {
+                except_count += 1;
+            }
+        }
         var handler_set = &scratch.handler_set;
         handler_set.reset();
         for (handler_blocks.items) |hid| {
@@ -11365,13 +11286,6 @@ pub const Decompiler = struct {
             }
         }
 
-        var has_finally = false;
-        for (handler_blocks.items) |hid| {
-            if (try self.isFinallyHandler(hid, scratch)) {
-                has_finally = true;
-                break;
-            }
-        }
         var try_break = false;
         if (loop_header) |header_id| {
             for (protected_set.list.items) |bid| {
@@ -11403,7 +11317,7 @@ pub const Decompiler = struct {
                 if (handler_set.isSet(edge.target)) continue;
                 var candidate = edge.target;
                 if (candidate < handler_start) {
-                    const resolved = self.resolveJumpOnlyBlock(candidate);
+                    const resolved = self.resolveJumpOnlyBlockNoCleanup(candidate);
                     if (resolved > handler_start) {
                         candidate = resolved;
                     } else if (loop_header) |header_id| {
@@ -11484,6 +11398,15 @@ pub const Decompiler = struct {
                 }
             }
         }
+        if (self.trace_decisions and self.trace_file != null) {
+            const ev = .{
+                .kind = "try_join",
+                .block = pattern.try_block,
+                .post_try_entry = post_try_entry,
+                .join_block = join_block,
+            };
+            try self.writeTrace(ev);
+        }
 
         var pattern_exit = pattern.exit_block;
         if (pattern_exit) |exit| {
@@ -11533,7 +11456,7 @@ pub const Decompiler = struct {
         var handler_tail_start: ?u32 = null;
         for (handler_blocks.items, 0..) |hid, idx| {
             if (hid >= self.cfg.blocks.len) continue;
-            if (try self.isFinallyHandler(hid, scratch)) continue;
+            if (handler_final.items[idx]) continue;
             var handler_end = blk: {
                 const next_handler = if (idx + 1 < handler_blocks.items.len)
                     handler_blocks.items[idx + 1]
@@ -11638,11 +11561,6 @@ pub const Decompiler = struct {
             }
         }
 
-        var except_count: usize = 0;
-        for (handler_blocks.items) |hid| {
-            if (!try self.isFinallyHandler(hid, scratch)) except_count += 1;
-        }
-
         var loop_exit: ?u32 = null;
         if (loop_header) |header_id| {
             if (header_id < self.cfg.blocks.len) {
@@ -11666,14 +11584,6 @@ pub const Decompiler = struct {
             }
             break :blk null;
         };
-
-        // Don't emit else if all handlers are truly terminal (return/raise in handler-owned
-        // blocks, or break to loop exit). Check even if pattern detected else_block.
-        if (else_start != null and pattern.else_block == null) {
-            if (try self.analyzer.allHandlerBlocksTerminal(handler_blocks.items, loop_exit)) {
-                else_start = null;
-            }
-        }
 
         if (has_finally and except_count == 0) {
             else_start = null;
@@ -11732,7 +11642,7 @@ pub const Decompiler = struct {
         else
             null;
 
-        const finally_start: ?u32 = effective_finally_block orelse blk: {
+        var finally_start: ?u32 = effective_finally_block orelse blk: {
             if (has_finally) {
                 const candidate = join_block orelse post_try_entry;
                 // Validate that finally_start is not inside the protected try region
@@ -11746,6 +11656,13 @@ pub const Decompiler = struct {
             }
             break :blk null;
         };
+        if (has_finally and except_count == 0) {
+            if (post_try_entry) |entry| {
+                if (entry < handler_start and !protected_set.isSet(entry) and !handler_set.isSet(entry)) {
+                    finally_start = entry;
+                }
+            }
+        }
 
         var try_end: u32 = handler_start;
         if (else_start) |start| {
@@ -11966,7 +11883,19 @@ pub const Decompiler = struct {
         }
         if (finally_start) |final_start| {
             if (handler_start > final_start and handler_start < final_end) {
-                final_end = handler_start;
+                var include_handler = false;
+                if (has_finally and handler_blocks.items.len > 0 and handler_blocks.items[0] == handler_start and handler_final.items.len > 0 and handler_final.items[0]) {
+                    include_handler = try self.reachableNoExceptionAllowHandlers(
+                        final_start,
+                        handler_start,
+                        &scratch.normal_reach,
+                        &scratch.queue,
+                        allow_loop_back,
+                    );
+                }
+                if (!include_handler) {
+                    final_end = handler_start;
+                }
             }
         }
 
@@ -11979,7 +11908,7 @@ pub const Decompiler = struct {
                 }
             }
             if (init_stack.len > 0) {
-                break :blk try self.decompileStructuredRangeWithStack(start, final_end, init_stack);
+                break :blk try self.decompileStructuredRangeWithStackAllowHandlers(start, final_end, init_stack);
             }
             var exc_stack: [3]StackValue = undefined;
             for (&exc_stack) |*slot| {
@@ -11987,8 +11916,17 @@ pub const Decompiler = struct {
                 placeholder.* = .{ .name = .{ .id = "__exception__", .ctx = .load } };
                 slot.* = .{ .expr = placeholder };
             }
-            break :blk try self.decompileStructuredRangeWithStack(start, final_end, &exc_stack);
+            break :blk try self.decompileStructuredRangeWithStackAllowHandlers(start, final_end, &exc_stack);
         } else &[_]*Stmt{};
+        if (self.trace_decisions and self.trace_file != null) {
+            const ev = .{
+                .kind = "try_final",
+                .block = pattern.try_block,
+                .finally_start = finally_start,
+                .final_len = final_body.len,
+            };
+            try self.writeTrace(ev);
+        }
 
         if (final_body.len > 0 and final_body[final_body.len - 1].* == .return_stmt) {
             var try_term = false;
@@ -11997,8 +11935,8 @@ pub const Decompiler = struct {
             }
             if (!try_term) {
                 var finally_has_return = false;
-                for (handler_blocks.items) |hid| {
-                    if (!try self.isFinallyHandler(hid, scratch)) continue;
+                for (handler_blocks.items, 0..) |hid, idx| {
+                    if (!handler_final.items[idx]) continue;
                     if (try self.finallyHandlerHasReturn(hid, handler_set, scratch)) {
                         finally_has_return = true;
                         break;
@@ -12088,22 +12026,24 @@ pub const Decompiler = struct {
             }
         }
 
-        var handler_nodes = try a.alloc(ast.ExceptHandler, except_count);
-        var handler_count: usize = 0;
+        var handler_nodes: std.ArrayListUnmanaged(ast.ExceptHandler) = .{};
         errdefer {
-            for (handler_nodes[0..handler_count]) |*h| {
+            for (handler_nodes.items) |*h| {
                 if (h.type) |t| {
                     t.deinit(a);
                     a.destroy(t);
                 }
                 if (h.body.len > 0) a.free(h.body);
             }
-            a.free(handler_nodes);
+            handler_nodes.deinit(a);
+        }
+        if (except_count > 0) {
+            try handler_nodes.ensureTotalCapacity(a, except_count);
         }
 
         var seen_bare = false;
         for (handler_blocks.items, 0..) |hid, idx| {
-            if (try self.isFinallyHandler(hid, scratch)) continue;
+            if (handler_final.items[idx]) continue;
             const has_next_handler = idx + 1 < handler_blocks.items.len;
             const next_handler = if (has_next_handler) handler_blocks.items[idx + 1] else null;
             var handler_end = blk: {
@@ -12203,6 +12143,17 @@ pub const Decompiler = struct {
                 }
                 const reach_end = max_block + 1;
                 if (reach_end < body_end) body_end = reach_end;
+            }
+            if (self.trace_decisions and self.trace_file != null) {
+                const ev = .{
+                    .kind = "try_handler",
+                    .try_block = pattern.try_block,
+                    .handler = hid,
+                    .body_block = info.body_block,
+                    .body_end = body_end,
+                    .skip = info.skip,
+                };
+                try self.writeTrace(ev);
             }
             var body = try self.decompileHandlerBody(info.body_block, body_end, info.skip_first_store, info.skip);
             if (body.len == 0 and (info.skip_first_store or info.skip > 0)) {
@@ -12319,19 +12270,18 @@ pub const Decompiler = struct {
             }
             if (is_bare) seen_bare = true;
 
-            handler_nodes[handler_count] = .{
+            try handler_nodes.append(a, .{
                 .type = info.exc_type,
                 .name = handler_name,
                 .body = body,
-            };
-            handler_count += 1;
+            });
         }
 
         if (try_body.len == 1 and try_body[0].* == .return_stmt) {
             const ret_val = try_body[0].return_stmt.value;
             if (ret_val) |rv| {
                 if (rv.* == .call) {
-                    for (handler_nodes[0..handler_count]) |*h| {
+                    for (handler_nodes.items) |*h| {
                         if (h.body.len == 0) continue;
                         const first = h.body[0];
                         if (first.* != .expr_stmt) continue;
@@ -12343,7 +12293,7 @@ pub const Decompiler = struct {
                 }
             }
         }
-        for (handler_nodes[0..handler_count]) |*h| {
+        for (handler_nodes.items) |*h| {
             if (h.body.len < 2) continue;
             const last = h.body[h.body.len - 1];
             if (!Decompiler.isReturnNone(last)) continue;
@@ -12352,7 +12302,7 @@ pub const Decompiler = struct {
                 h.body = h.body[0 .. h.body.len - 1];
             }
         }
-        for (handler_nodes[0..handler_count]) |*h| {
+        for (handler_nodes.items) |*h| {
             var body = h.body;
             var i: usize = 0;
             while (i + 1 < body.len) : (i += 1) {
@@ -12380,7 +12330,7 @@ pub const Decompiler = struct {
                 h.body = body;
             }
         }
-        for (handler_nodes[0..handler_count]) |*h| {
+        for (handler_nodes.items) |*h| {
             if (try self.rewriteHandlerContinueTail(h.body)) |new_body| {
                 h.body = new_body;
             }
@@ -12408,7 +12358,7 @@ pub const Decompiler = struct {
             }
         }
 
-        const handlers_slice = handler_nodes[0..handler_count];
+        const handlers_slice = handler_nodes.items;
         const stmt = try a.create(Stmt);
         stmt.* = .{
             .try_stmt = .{
@@ -16131,6 +16081,14 @@ pub const Decompiler = struct {
             return error.InvalidBlock;
         }
 
+        if (self.try_scratch == null) {
+            _ = try self.getTryScratch(self.cfg.blocks.len);
+        }
+        const scratch = &self.try_scratch.?;
+        if (scratch.handler_end.get(body_block)) |cached| {
+            return cached;
+        }
+
         try self.cond_seen.ensureSize(self.allocator, self.cfg.blocks.len);
         self.cond_seen.reset();
         self.cond_stack.clearRetainingCapacity();
@@ -16179,8 +16137,16 @@ pub const Decompiler = struct {
             }
         }
 
-        if (best_pop) |pop_id| return pop_id + 1;
-        if (best_any) |pop_id| return pop_id + 1;
+        if (best_pop) |pop_id| {
+            const end = pop_id + 1;
+            try scratch.handler_end.put(self.allocator, body_block, end);
+            return end;
+        }
+        if (best_any) |pop_id| {
+            const end = pop_id + 1;
+            try scratch.handler_end.put(self.allocator, body_block, end);
+            return end;
+        }
 
         if (self.last_error_ctx == null) {
             self.last_error_ctx = .{
@@ -17575,6 +17541,39 @@ pub const Decompiler = struct {
         }
     }
 
+    fn reachableNoExceptionAllowHandlers(
+        self: *Decompiler,
+        start: u32,
+        target: u32,
+        visited: *GenSet,
+        queue: *std.ArrayListUnmanaged(u32),
+        allow_loop_back: bool,
+    ) DecompileError!bool {
+        visited.reset();
+        queue.clearRetainingCapacity();
+
+        if (start >= self.cfg.blocks.len or target >= self.cfg.blocks.len) return false;
+        try visited.set(self.allocator, start);
+        try queue.append(self.allocator, start);
+
+        while (queue.items.len > 0) {
+            const node = queue.items[queue.items.len - 1];
+            queue.items.len -= 1;
+            if (node == target) return true;
+            const block = &self.cfg.blocks[node];
+            for (block.successors) |edge| {
+                if (edge.edge_type == .exception) continue;
+                if (!allow_loop_back and edge.edge_type == .loop_back) continue;
+                if (edge.target >= self.cfg.blocks.len) continue;
+                if (!visited.isSet(edge.target)) {
+                    try visited.set(self.allocator, edge.target);
+                    try queue.append(self.allocator, edge.target);
+                }
+            }
+        }
+        return false;
+    }
+
     fn isFinallyHandler(self: *Decompiler, handler_block: u32, scratch: *TryScratch) DecompileError!bool {
         if (handler_block >= self.cfg.blocks.len) return false;
         const block = &self.cfg.blocks[handler_block];
@@ -18687,6 +18686,28 @@ pub const Decompiler = struct {
         return cur;
     }
 
+    fn resolveJumpOnlyBlockNoCleanup(self: *Decompiler, block_id: u32) u32 {
+        var cur = block_id;
+        var steps: usize = 0;
+        while (cur < self.cfg.blocks.len and steps < 8) {
+            const blk = &self.cfg.blocks[cur];
+            const insts = blk.instructions;
+            if (insts.len != 1) break;
+            const inst = insts[0];
+            if (inst.opcode != .JUMP_FORWARD and inst.opcode != .JUMP_ABSOLUTE) break;
+            if (inst.jumpTarget(self.cfg.version)) |target_offset| {
+                if (self.cfg.blockAtOffset(target_offset)) |target_id| {
+                    if (target_id == cur) break;
+                    cur = target_id;
+                    steps += 1;
+                    continue;
+                }
+            }
+            break;
+        }
+        return cur;
+    }
+
     pub fn blockIsCleanupOnly(self: *Decompiler, block: *const cfg_mod.BasicBlock) bool {
         _ = self;
         for (block.instructions) |inst| {
@@ -19649,10 +19670,14 @@ pub const Decompiler = struct {
             // Loop target consumes the iteration value from the stack.
             try sim.stack.push(.unknown);
         }
-        if (seed.len == 0 and seed_pop.*) {
+        var suppress_pop = seed_pop.*;
+        seed_pop.* = false;
+        if (!suppress_pop and self.hasLegacyCondPop(block_id, block)) {
+            suppress_pop = true;
+        }
+        if (suppress_pop and sim.stack.len() == 0) {
             // Legacy JUMP_IF_* leaves the condition on stack for a leading POP_TOP.
             try sim.stack.push(.unknown);
-            seed_pop.* = false;
         }
         const has_inline = self.hasInlinePend(block_id);
         if (has_inline) {
@@ -19701,6 +19726,16 @@ pub const Decompiler = struct {
                     .opcode = inst.opcode.name(),
                 };
             };
+            try self.flushPendingPrint(inst.opcode, stmts, a);
+            if (try self.handlePrintOp(&sim, inst, stmts, a)) {
+                continue;
+            }
+            if (inst.opcode == .POP_TOP and suppress_pop) {
+                const val = sim.stack.pop() orelse return error.StackUnderflow;
+                val.deinit(sim.allocator, sim.stack_alloc);
+                suppress_pop = false;
+                continue;
+            }
             if (inst.opcode == .IMPORT_NAME) {
                 if (try self.tryDecompileImportFromGroup(&sim, instructions, idx, stmts, a)) |end_idx| {
                     idx = end_idx;
@@ -19894,6 +19929,20 @@ pub const Decompiler = struct {
                 },
                 .POP_TOP => {
                     try self.handlePopTopStmt(&sim, block, stmts, a);
+                },
+                .YIELD_VALUE => {
+                    if (self.version.lt(2, 5) and sim.comp_builder == null) {
+                        const value = try sim.stack.popExpr();
+                        const expr = try a.create(Expr);
+                        expr.* = .{ .yield_expr = .{ .value = value } };
+                        if (self.makeExprStmt(expr)) |stmt| {
+                            try stmts.append(a, stmt);
+                        } else |err| {
+                            if (err != error.SkipStatement) return err;
+                        }
+                    } else {
+                        try sim.simulate(inst);
+                    }
                 },
                 .EXEC_STMT,
                 .RAISE_VARARGS,
@@ -23386,6 +23435,121 @@ pub const Decompiler = struct {
         return stmt;
     }
 
+    fn isPrintBoundary(op: Opcode) bool {
+        return switch (op) {
+            .SET_LINENO,
+            .STORE_NAME,
+            .STORE_FAST,
+            .STORE_GLOBAL,
+            .STORE_DEREF,
+            .STORE_ATTR,
+            .STORE_SUBSCR,
+            .STORE_SLICE,
+            .STORE_SLICE_0,
+            .STORE_SLICE_1,
+            .STORE_SLICE_2,
+            .STORE_SLICE_3,
+            .DELETE_NAME,
+            .DELETE_FAST,
+            .DELETE_GLOBAL,
+            .DELETE_DEREF,
+            .DELETE_ATTR,
+            .DELETE_SUBSCR,
+            .DELETE_SLICE_0,
+            .DELETE_SLICE_1,
+            .DELETE_SLICE_2,
+            .DELETE_SLICE_3,
+            .UNPACK_SEQUENCE,
+            .UNPACK_EX,
+            .RETURN_VALUE,
+            .RETURN_CONST,
+            .RAISE_VARARGS,
+            .POP_TOP,
+            .EXEC_STMT,
+            .POP_BLOCK,
+            .BREAK_LOOP,
+            .CONTINUE_LOOP,
+            .JUMP_FORWARD,
+            .JUMP_BACKWARD,
+            .JUMP_BACKWARD_NO_INTERRUPT,
+            .JUMP_ABSOLUTE,
+            => true,
+            else => false,
+        };
+    }
+
+    fn hasLegacyCondPop(self: *const Decompiler, block_id: u32, block: *const BasicBlock) bool {
+        _ = block_id;
+        if (block.instructions.len == 0) return false;
+        if (block.instructions[0].opcode != .POP_TOP) return false;
+        for (block.predecessors) |pred_id| {
+            if (pred_id >= self.cfg.blocks.len) continue;
+            const pred = &self.cfg.blocks[pred_id];
+            const term = pred.terminator() orelse continue;
+            if (term.opcode == .JUMP_IF_FALSE or term.opcode == .JUMP_IF_TRUE) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    fn flushPendingPrint(
+        self: *Decompiler,
+        op: Opcode,
+        stmts: *std.ArrayListUnmanaged(*Stmt),
+        alloc: Allocator,
+    ) DecompileError!void {
+        if (self.print_items.items.len == 0) return;
+        switch (op) {
+            .PRINT_ITEM, .PRINT_NEWLINE, .PRINT_ITEM_TO, .PRINT_NEWLINE_TO => return,
+            else => {},
+        }
+        if (!isPrintBoundary(op)) return;
+        const dest = self.print_dest;
+        self.print_dest = null;
+        const stmt = try self.makePrintStmt(dest, false);
+        try stmts.append(alloc, stmt);
+    }
+
+    fn handlePrintOp(
+        self: *Decompiler,
+        sim: *SimContext,
+        inst: decoder.Instruction,
+        stmts: *std.ArrayListUnmanaged(*Stmt),
+        alloc: Allocator,
+    ) DecompileError!bool {
+        switch (inst.opcode) {
+            .PRINT_ITEM => {
+                const val = try sim.stack.popExpr();
+                try self.print_items.append(self.allocator, val);
+                return true;
+            },
+            .PRINT_NEWLINE => {
+                const stmt = try self.makePrintStmt(null, true);
+                try stmts.append(alloc, stmt);
+                return true;
+            },
+            .PRINT_ITEM_TO => {
+                const file = try sim.stack.popExpr();
+                const val = try sim.stack.popExpr();
+                if (self.print_dest == null) {
+                    self.print_dest = file;
+                }
+                try self.print_items.append(self.allocator, val);
+                return true;
+            },
+            .PRINT_NEWLINE_TO => {
+                const file = try sim.stack.popExpr();
+                const dest = self.print_dest orelse file;
+                self.print_dest = null;
+                const stmt = try self.makePrintStmt(dest, true);
+                try stmts.append(alloc, stmt);
+                return true;
+            },
+            else => return false,
+        }
+    }
+
     /// Create an expression statement.
     fn makeExprStmt(self: *Decompiler, value: *Expr) DecompileError!*Stmt {
         // Suppress placeholders from appearing as statements
@@ -23547,9 +23711,13 @@ pub const Decompiler = struct {
         return false;
     }
 
+    fn isModuleName(name: []const u8) bool {
+        return name.len == 0 or std.mem.eql(u8, name, "<module>") or std.mem.eql(u8, name, "?");
+    }
+
     /// Check if this is module-level code.
     fn isModuleLevel(self: *const Decompiler) bool {
-        return std.mem.eql(u8, self.code.name, "<module>");
+        return isModuleName(self.code.name);
     }
 
 };
@@ -23604,6 +23772,10 @@ pub fn decompileToSourceWithOptions(
     err_writer: ?std.fs.File,
     opts: DecompileOptions,
 ) !void {
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
     var target = code;
     if (opts.focus) |path| {
         target = findCodeByPath(code, path) catch |err| {
@@ -23622,16 +23794,16 @@ pub fn decompileToSourceWithOptions(
     var use_opts = opts;
     use_opts.focus = null;
     // Handle module-level code
-    if (std.mem.eql(u8, target.name, "<module>")) {
-        var pipe = DecompPipeline.init(allocator, target, version, use_opts, .module);
+    if (Decompiler.isModuleName(target.name)) {
+        var pipe = DecompPipeline.init(a, target, version, use_opts, .module);
         defer pipe.deinit();
         try pipe.ensureRewrite(err_writer);
         const effective_stmts = pipe.stmts orelse &.{};
 
         if (effective_stmts.len == 0) return;
 
-        var cg = codegen.Writer.init(allocator);
-        defer cg.deinit(allocator);
+        var cg = codegen.Writer.init(a);
+        defer cg.deinit(a);
 
         var seen_body = false;
         for (effective_stmts) |stmt| {
@@ -23642,21 +23814,19 @@ pub fn decompileToSourceWithOptions(
             } else if (is_future) {
                 continue;
             }
-            try cg.writeStmt(allocator, stmt);
+            try cg.writeStmt(a, stmt);
         }
 
-        const output = try cg.getOutput(allocator);
-        defer allocator.free(output);
+        const output = try cg.getOutput(a);
         if (use_opts.align_defs) {
-            const aligned = try alignDefLines(allocator, target, output);
-            defer allocator.free(aligned);
+            const aligned = try alignDefLines(a, target, output);
             try writer.writeAll(aligned);
         } else {
             try writer.writeAll(output);
         }
         return;
     }
-    try decompileFunctionToSource(allocator, target, version, writer, 0, use_opts);
+    try decompileFunctionToSource(a, target, version, writer, 0, use_opts);
 }
 
 /// Decompile a function and write to writer.
@@ -24697,6 +24867,20 @@ test "while loop decompile frees allocations" {
     const allocator = testing.allocator;
 
     try expectDecompileFixture(allocator, "refs/pycdc/tests/compiled/while_loop.2.6.pyc");
+}
+
+test "list comprehension decompile frees allocations" {
+    const testing = std.testing;
+    const allocator = testing.allocator;
+
+    try expectDecompileFixture(allocator, "refs/pycdc/tests/compiled/test_listComprehensions.2.7.pyc");
+}
+
+test "loops2 decompile frees allocations" {
+    const testing = std.testing;
+    const allocator = testing.allocator;
+
+    try expectDecompileFixture(allocator, "refs/pycdc/tests/compiled/test_loops2.2.2.pyc");
 }
 
 test "py_compile decompile 3.14" {
