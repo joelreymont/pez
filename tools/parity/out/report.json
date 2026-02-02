@@ -1,0 +1,41 @@
+{
+  "counts": {
+    "total": 1,
+    "required": 1,
+    "pez_ok": 1,
+    "pycdc_ok": 0,
+    "uncompyle6_ok": 1,
+    "decompyle3_ok": 0,
+    "mismatch": 0
+  },
+  "files": [
+    {
+      "file": "/tmp/parity_corpus/loop_try_continue.3.9.pyc",
+      "version": "3.9",
+      "required": true,
+      "pez": {
+        "ok": true,
+        "rc": 0
+      },
+      "pycdc": {
+        "ok": false,
+        "rc": -11
+      },
+      "uncompyle6": {
+        "ok": true,
+        "rc": 0
+      },
+      "decompyle3": {
+        "ok": false,
+        "rc": 2
+      },
+      "mismatch": false,
+      "stderr": {
+        "pez": "",
+        "pycdc": "Unsupported opcode: RERAISE (99)\n",
+        "uncompyle6": "\n# Unsupported bytecode in file /tmp/parity_corpus/loop_try_continue.3.9.pyc\n# Unsupported Python version, 3.9.0, for decompilation\n",
+        "decompyle3": "/private/tmp/decompyle3-venv-312/lib/python3.12/site-packages/click/core.py:1223: UserWarning: The parameter --version is used more than once. Remove its duplicate as parameters should be unique.\n  parser = self.make_parser(ctx)\n/private/tmp/decompyle3-venv-312/lib/python3.12/site-packages/click/core.py:1216: UserWarning: The parameter --version is used more than once. Remove its duplicate as parameters should be unique.\n  self.parse_args(ctx, args)\n/private/tmp/decompyle3-venv-312/lib/python3.12/site-packages/click/core.py:1032: UserWarning: The parameter --version is used more than once. Remove its duplicate as parameters should be unique.\n  pieces = self.collect_usage_pieces(ctx)\nUsage: decompyle3 [OPTIONS] FILES...\nTry 'decompyle3 --help' for help.\n\nError: Invalid value for '--output' / '-o': Path '-' does not exist.\n"
+      }
+    }
+  ]
+}

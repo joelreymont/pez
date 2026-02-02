@@ -17,6 +17,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--pez", required=True, help="Path to pez binary")
     p.add_argument("--pycdc", required=True, help="Path to pycdc binary")
     p.add_argument("--uncompyle6", required=True, help="Path to uncompyle6 executable")
+    p.add_argument("--decompyle3", required=True, help="Path to decompyle3 executable")
     p.add_argument("--timeout", type=int, default=30, help="Timeout seconds per tool")
     return p.parse_args()
 
@@ -75,6 +76,7 @@ def main() -> None:
     pez = Path(args.pez)
     pycdc = Path(args.pycdc)
     uncompyle6_bin = Path(args.uncompyle6)
+    decompyle3_bin = Path(args.decompyle3)
 
     if not pez.exists():
         die(f"Missing pez binary: {pez}")
@@ -82,6 +84,8 @@ def main() -> None:
         die(f"Missing pycdc binary: {pycdc}")
     if not uncompyle6_bin.exists():
         die(f"Missing uncompyle6 executable: {uncompyle6_bin}")
+    if not decompyle3_bin.exists():
+        die(f"Missing decompyle3 executable: {decompyle3_bin}")
 
     files = discover_pyc_files(corpus_dirs)
 
@@ -92,6 +96,7 @@ def main() -> None:
         "pez_ok": 0,
         "pycdc_ok": 0,
         "uncompyle6_ok": 0,
+        "decompyle3_ok": 0,
         "mismatch": 0,
     }
 
@@ -104,13 +109,16 @@ def main() -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             uncomp_cmd = [str(uncompyle6_bin), "-o", tmpdir, str(path)]
             uncomp_rc, uncomp_out, uncomp_err = run_cmd(uncomp_cmd, args.timeout)
+        decompyle3_cmd = [str(decompyle3_bin), "-o", "-", str(path)]
 
         pez_rc, pez_out, pez_err = run_cmd(pez_cmd, args.timeout)
         pycdc_rc, pycdc_out, pycdc_err = run_cmd(pycdc_cmd, args.timeout)
+        decompyle3_rc, decompyle3_out, decompyle3_err = run_cmd(decompyle3_cmd, args.timeout)
         pez_ok = pez_rc == 0
         pycdc_ok = pycdc_rc == 0
         uncomp_ok = uncomp_rc == 0
-        required = pycdc_ok or uncomp_ok
+        decompyle3_ok = decompyle3_rc == 0
+        required = pycdc_ok or uncomp_ok or decompyle3_ok
         mismatch = required and not pez_ok
 
         if pez_ok:
@@ -119,6 +127,8 @@ def main() -> None:
             counts["pycdc_ok"] += 1
         if uncomp_ok:
             counts["uncompyle6_ok"] += 1
+        if decompyle3_ok:
+            counts["decompyle3_ok"] += 1
         if required:
             counts["required"] += 1
         if mismatch:
@@ -132,11 +142,13 @@ def main() -> None:
                 "pez": {"ok": pez_ok, "rc": pez_rc},
                 "pycdc": {"ok": pycdc_ok, "rc": pycdc_rc},
                 "uncompyle6": {"ok": uncomp_ok, "rc": uncomp_rc},
+                "decompyle3": {"ok": decompyle3_ok, "rc": decompyle3_rc},
                 "mismatch": mismatch,
                 "stderr": {
                     "pez": (pez_err or "")[:2000],
                     "pycdc": (pycdc_err or "")[:2000],
                     "uncompyle6": (uncomp_err or "")[:2000],
+                    "decompyle3": (decompyle3_err or "")[:2000],
                 },
             }
         )
@@ -156,23 +168,25 @@ def main() -> None:
     md_lines.append(f"pez ok: {counts['pez_ok']}")
     md_lines.append(f"pycdc ok: {counts['pycdc_ok']}")
     md_lines.append(f"uncompyle6 ok: {counts['uncompyle6_ok']}")
+    md_lines.append(f"decompyle3 ok: {counts['decompyle3_ok']}")
     md_lines.append(f"mismatch: {counts['mismatch']}")
     md_lines.append("")
     md_lines.append("## Mismatches")
     md_lines.append("")
-    md_lines.append("| File | Version | pez | pycdc | uncompyle6 |")
-    md_lines.append("| --- | --- | --- | --- | --- |")
+    md_lines.append("| File | Version | pez | pycdc | uncompyle6 | decompyle3 |")
+    md_lines.append("| --- | --- | --- | --- | --- | --- |")
 
     for r in results:
         if not r["mismatch"]:
             continue
         md_lines.append(
-            "| {file} | {version} | {pez} | {pycdc} | {uncompyle6} |".format(
+            "| {file} | {version} | {pez} | {pycdc} | {uncompyle6} | {decompyle3} |".format(
                 file=r["file"],
                 version=r["version"],
                 pez="ok" if r["pez"]["ok"] else "fail",
                 pycdc="ok" if r["pycdc"]["ok"] else "fail",
                 uncompyle6="ok" if r["uncompyle6"]["ok"] else "fail",
+                decompyle3="ok" if r["decompyle3"]["ok"] else "fail",
             )
         )
 

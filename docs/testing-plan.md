@@ -53,6 +53,7 @@ zcheck Features to Use
 
 External Cross-checks
 ---------------------
+- Parity harness (`tools/parity/run.sh`) runs pez against pycdc, uncompyle6, and decompyle3.
 - decompyle3:
   - Clone: `gh repo clone rocky/python-decompile3 /tmp/python-decompile3`
   - Repo: `/tmp/python-decompile3` (keep in sync via `gh repo sync`)
