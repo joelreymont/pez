@@ -92,6 +92,37 @@ test "snapshot loop exit reaches header 3.9" {
     );
 }
 
+test "snapshot while in for 3.9" {
+    try runSnapshot(@src(), "test/corpus/loop_while_in_for.3.9.pyc",
+        \\[]u8
+        \\  "def loop_while_in_for(items):
+        \\    out = []
+        \\    for name, values in items.items():
+        \\        while values:
+        \\            out.append(values.pop(0))
+        \\    return out
+        \\"
+    );
+}
+
+test "snapshot for body listcomp 3.9" {
+    try runSnapshot(@src(), "test/corpus/for_body_listcomp.3.9.pyc",
+        \\[]u8
+        \\  "import re
+        \\def for_body_listcomp(actions, s):
+        \\    result = []
+        \\    for i in range(len(actions), 0, -1):
+        \\        actions_slice = actions[:i]
+        \\        pattern = ''.join([str(x) for x in actions_slice])
+        \\        match = re.match(pattern, s)
+        \\        if match is not None:
+        \\            result.extend([len(x) for x in match.groups()])
+        \\            break
+        \\    return result
+        \\"
+    );
+}
+
 test "snapshot relative import 3.9" {
     try runSnapshot(@src(), "test/corpus/relative_import.3.9.pyc",
         \\[]u8

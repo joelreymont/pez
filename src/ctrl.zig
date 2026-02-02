@@ -1494,6 +1494,7 @@ pub const Analyzer = struct {
             // Start with direct predecessors (skip loop_back edges)
             for (block.predecessors) |pred_id| {
                 if (pred_id >= self.cfg.blocks.len) continue;
+                if (self.inLoop(pred_id, block_id)) continue;
                 const pred = &self.cfg.blocks[pred_id];
                 var is_loop_back = false;
                 for (pred.successors) |edge| {
@@ -1526,6 +1527,7 @@ pub const Analyzer = struct {
                 // Add predecessors to worklist (only normal flow)
                 for (cur.predecessors) |pred_id| {
                     if (pred_id >= self.cfg.blocks.len) continue;
+                    if (self.inLoop(pred_id, block_id)) continue;
                     const pred = &self.cfg.blocks[pred_id];
                     var is_loop_back = false;
                     for (pred.successors) |edge| {

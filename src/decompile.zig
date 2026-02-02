@@ -4534,7 +4534,7 @@ pub const Decompiler = struct {
                     }
                 },
                 .POP_TOP => {
-                    try self.handlePopTopStmt(sim, block, stmts, stmts_allocator);
+                    try self.handlePopTopStmt(sim, block, stmts, stmts_allocator, i);
                 },
                 .YIELD_VALUE => {
                     if (self.version.lt(2, 5) and sim.comp_builder == null) {
@@ -10548,6 +10548,9 @@ pub const Decompiler = struct {
         const exit_is_continue = if (pattern.exit_block < self.cfg.blocks.len) blk: {
             if (try self.continuesToHeader(pattern.exit_block, pattern.header_block, null)) {
                 break :blk true;
+            }
+            if (!self.analyzer.inLoop(pattern.exit_block, pattern.header_block)) {
+                break :blk false;
             }
             try self.cond_seen.ensureSize(self.allocator, self.cfg.blocks.len);
             break :blk try self.reachableNoExceptionAllowHandlers(
@@ -18197,8 +18200,26 @@ pub const Decompiler = struct {
             }
         }
         if (get_iter_idx == null or get_iter_idx.? == 0) return;
+        var pre_end: ?usize = null;
+        var sim = self.initSim(self.arena.allocator(), self.arena.allocator(), self.code, self.version);
+        defer sim.deinit();
+        if (pattern.setup_block < self.stack_in.len) {
+            if (self.stack_in[pattern.setup_block]) |entry| {
+                for (entry) |val| {
+                    const cloned = try sim.cloneStackValue(val);
+                    try sim.stack.push(cloned);
+                }
+            }
+        }
+        for (setup.instructions[0..get_iter_idx.?], 0..) |inst, idx| {
+            try sim.simulate(inst);
+            if (sim.stack.len() == 0) {
+                pre_end = idx + 1;
+            }
+        }
+        if (pre_end == null or pre_end.? == 0) return;
         var prelude_block = setup.*;
-        prelude_block.instructions = setup.instructions[0..get_iter_idx.?];
+        prelude_block.instructions = setup.instructions[0..pre_end.?];
 
         var tmp: std.ArrayListUnmanaged(*Stmt) = .{};
         defer tmp.deinit(self.arena.allocator());
@@ -18281,7 +18302,6 @@ pub const Decompiler = struct {
     }
 
     fn isForSetupInLoop(self: *Decompiler, block_id: u32, loop_header: u32) bool {
-        _ = loop_header;
         if (block_id >= self.cfg.blocks.len) return false;
         const blk = &self.cfg.blocks[block_id];
         var has_iter = false;
@@ -18296,6 +18316,7 @@ pub const Decompiler = struct {
             if (edge.edge_type == .exception) continue;
             const succ_id = edge.target;
             if (succ_id >= self.cfg.blocks.len) continue;
+            if (succ_id == loop_header) continue;
             const succ = &self.cfg.blocks[succ_id];
             const term = succ.terminator() orelse continue;
             if (term.opcode == .FOR_ITER or term.opcode == .FOR_LOOP) return true;
@@ -20458,7 +20479,7 @@ pub const Decompiler = struct {
                     }
                 },
                 .POP_TOP => {
-                    try self.handlePopTopStmt(&sim, block, stmts, a);
+                    try self.handlePopTopStmt(&sim, block, stmts, a, idx);
                 },
                 .YIELD_VALUE => {
                     if (self.version.lt(2, 5) and sim.comp_builder == null) {
@@ -20507,8 +20528,17 @@ pub const Decompiler = struct {
         block: *const cfg_mod.BasicBlock,
         stmts: *std.ArrayListUnmanaged(*Stmt),
         stmts_allocator: Allocator,
+        inst_idx: usize,
     ) DecompileError!void {
         if (sim.stack.len() == 0) {
+            return;
+        }
+        if (inst_idx + 1 < block.instructions.len and
+            block.instructions[inst_idx + 1].isUnconditionalJump() and
+            inst_idx > 0 and block.instructions[inst_idx - 1].opcode == .POP_TOP)
+        {
+            const cleanup = sim.stack.pop().?;
+            cleanup.deinit(sim.allocator, sim.stack_alloc);
             return;
         }
         if (block.instructions.len > 0 and block.instructions[0].opcode == .POP_TOP) {
@@ -20814,7 +20844,7 @@ pub const Decompiler = struct {
                     try self.emitStoreSlice(&sim, stmts, stmts_allocator);
                 },
                 .POP_TOP => {
-                    try self.handlePopTopStmt(&sim, block, stmts, stmts_allocator);
+                    try self.handlePopTopStmt(&sim, block, stmts, stmts_allocator, idx);
                 },
                 else => {
                     try sim.simulate(inst);
@@ -22033,9 +22063,10 @@ pub const Decompiler = struct {
                 block_idx += 1;
                 continue;
             }
-            if (!self.analyzer.inLoop(block_idx, loop_header) and
-                !(reach_header != null and reach_header.?.isSet(@intCast(block_idx))))
-            {
+            const in_reach = reach_header != null and
+                reach_header.?.isSet(@intCast(block_idx)) and
+                self.dom.dominates(loop_header, block_idx);
+            if (!self.analyzer.inLoop(block_idx, loop_header) and !in_reach) {
                 block_idx += 1;
                 continue;
             }
