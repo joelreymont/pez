@@ -419,6 +419,16 @@ test "snapshot if or term 3.9" {
     );
 }
 
+test "snapshot or chain compare 3.9" {
+    try runSnapshot(@src(), "test/corpus/ishex.3.9.pyc",
+        \\[]u8
+        \\  "def ishex(c):
+        \\    assert isinstance(c, bytes)
+        \\    return b'0' <= c <= b'9' or b'a' <= c <= b'f' or b'A' <= c <= b'F'
+        \\"
+    );
+}
+
 test "snapshot if elif else raise 3.9" {
     try runSnapshot(@src(), "test/corpus/if_elif_else_raise.3.9.pyc",
         \\[]u8
@@ -558,8 +568,7 @@ test "snapshot doctest eq 3.9" {
         \\            return NotImplemented
         \\        elif self.source == other.source and self.want == other.want:
         \\            return self.lineno == other.lineno and self.indent == other.indent and self.options == other.options and self.exc_msg == other.exc_msg
-        \\        else:
-        \\            return False
+        \\        return False
         \\"
     );
 }
@@ -717,8 +726,7 @@ test "snapshot if return fallthrough 3.9" {
         \\  "def f(x):
         \\    if x:
         \\        return 1
-        \\    else:
-        \\        return 2
+        \\    return 2
         \\"
     );
 }
