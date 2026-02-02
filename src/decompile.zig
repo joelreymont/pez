@@ -924,6 +924,43 @@ pub const Decompiler = struct {
         return true;
     }
 
+    fn isWalrusStore(insts: []const decoder.Instruction, idx: usize) bool {
+        if (idx == 0 or idx >= insts.len) return false;
+        const inst = insts[idx];
+        switch (inst.opcode) {
+            .STORE_NAME, .STORE_FAST, .STORE_GLOBAL, .STORE_DEREF => {},
+            else => return false,
+        }
+        const prev = insts[idx - 1];
+        if (prev.opcode != .COPY or prev.arg != 1) return false;
+        const next_idx = idx + 1;
+        if (next_idx >= insts.len) return false;
+        const next_op = insts[next_idx].opcode;
+        return switch (next_op) {
+            .DUP_TOP, .COPY, .STORE_NAME, .STORE_FAST, .STORE_GLOBAL, .STORE_DEREF => false,
+            .COMPARE_OP, .CONTAINS_OP, .IS_OP,
+            .TO_BOOL, .POP_JUMP_IF_TRUE, .POP_JUMP_IF_FALSE,
+            .POP_JUMP_IF_NONE, .POP_JUMP_IF_NOT_NONE,
+            .POP_JUMP_FORWARD_IF_TRUE, .POP_JUMP_FORWARD_IF_FALSE,
+            .POP_JUMP_FORWARD_IF_NONE, .POP_JUMP_FORWARD_IF_NOT_NONE,
+            .LOAD_SMALL_INT, .LOAD_CONST, .LOAD_FAST, .LOAD_FAST_BORROW,
+            .LOAD_NAME, .LOAD_GLOBAL, .BINARY_OP,
+            => true,
+            else => false,
+        };
+    }
+
+    fn condBlockHasStmt(block: *const BasicBlock) bool {
+        const insts = block.instructions;
+        for (insts, 0..) |inst, idx| {
+            if (ctrl.Analyzer.isConditionalJump(undefined, inst.opcode)) return false;
+            if (inst.opcode == .NOT_TAKEN or inst.opcode == .CACHE) continue;
+            if (isWalrusStore(insts, idx)) continue;
+            if (isStatementOpcode(inst.opcode)) return true;
+        }
+        return false;
+    }
+
     fn condBlockHasPrelude(block: *const BasicBlock) bool {
         for (block.instructions) |inst| {
             if (ctrl.Analyzer.isConditionalJump(undefined, inst.opcode)) return false;
@@ -4337,63 +4374,35 @@ pub const Decompiler = struct {
                         }
                     }
 
-                    if (prev_was_dup) {
-                        // Check for walrus operator FIRST: COPY 1 followed by STORE_* with value used later
-                        // Pattern: expr on stack, COPY 1 duplicates it, STORE_* stores the copy
-                        // The original expr remains and is used in comparison/condition
-                        const prev_inst: ?decoder.Instruction = if (abs_idx > 0) block.instructions[abs_idx - 1] else null;
-                        const is_copy_1 = if (prev_inst) |pi| pi.opcode == .COPY and pi.arg == 1 else false;
-                        if (is_copy_1) {
-                            // Check if next instruction uses the stack value (not another DUP/STORE)
-                            const next_idx = i + 1;
-                            var is_walrus = false;
-                            if (next_idx < instructions.len) {
-                                const next_op = instructions[next_idx].opcode;
-                                // Walrus if next instruction consumes the value for comparison, bool conversion, etc.
-                                // NOT walrus if next is DUP/COPY/STORE (that's chain assignment)
-                                is_walrus = switch (next_op) {
-                                    .DUP_TOP, .COPY, .STORE_NAME, .STORE_FAST, .STORE_GLOBAL, .STORE_DEREF => false,
-                                    .COMPARE_OP, .CONTAINS_OP, .IS_OP,
-                                    .TO_BOOL, .POP_JUMP_IF_TRUE, .POP_JUMP_IF_FALSE,
-                                    .POP_JUMP_IF_NONE, .POP_JUMP_IF_NOT_NONE,
-                                    .POP_JUMP_FORWARD_IF_TRUE, .POP_JUMP_FORWARD_IF_FALSE,
-                                    .POP_JUMP_FORWARD_IF_NONE, .POP_JUMP_FORWARD_IF_NOT_NONE,
-                                    .LOAD_SMALL_INT, .LOAD_CONST, .LOAD_FAST, .LOAD_FAST_BORROW,
-                                    .LOAD_NAME, .LOAD_GLOBAL, .BINARY_OP,
-                                    => true,
-                                    else => false,
-                                };
+                    if (prev_was_dup and isWalrusStore(block.instructions, abs_idx)) {
+                        // Pop the copied value (what STORE_* would consume)
+                        const copied = sim.stack.pop() orelse return error.StackUnderflow;
+                        const val_expr = switch (copied) {
+                            .expr => |e| e,
+                            else => blk: {
+                                copied.deinit(sim.allocator, sim.stack_alloc);
+                                break :blk null;
+                            },
+                        };
+
+                        if (val_expr) |expr| {
+                            // Create named_expr: (name := expr)
+                            const arena = self.arena.allocator();
+                            const target = try self.makeName(name, .store);
+                            const named = try arena.create(Expr);
+                            named.* = .{ .named_expr = .{ .target = target, .value = expr } };
+
+                            // Replace the original on stack with the named_expr
+                            // Pop the original (which is now TOS after we popped the copy)
+                            if (sim.stack.pop()) |orig| {
+                                orig.deinit(sim.allocator, sim.stack_alloc);
                             }
-
-                            if (is_walrus) {
-                                // Pop the copied value (what STORE_* would consume)
-                                const copied = sim.stack.pop() orelse return error.StackUnderflow;
-                                const val_expr = switch (copied) {
-                                    .expr => |e| e,
-                                    else => blk: {
-                                        copied.deinit(sim.allocator, sim.stack_alloc);
-                                        break :blk null;
-                                    },
-                                };
-
-                                if (val_expr) |expr| {
-                                    // Create named_expr: (name := expr)
-                                    const arena = self.arena.allocator();
-                                    const target = try self.makeName(name, .store);
-                                    const named = try arena.create(Expr);
-                                    named.* = .{ .named_expr = .{ .target = target, .value = expr } };
-
-                                    // Replace the original on stack with the named_expr
-                                    // Pop the original (which is now TOS after we popped the copy)
-                                    if (sim.stack.pop()) |orig| {
-                                        orig.deinit(sim.allocator, sim.stack_alloc);
-                                    }
-                                    try sim.stack.push(.{ .expr = named });
-                                    continue;
-                                }
-                            }
+                            try sim.stack.push(.{ .expr = named });
+                            continue;
                         }
+                    }
 
+                    if (prev_was_dup) {
                         // Not walrus - try chain assignment
                         var chain_idx = abs_idx;
                         if (try self.tryHandleChainAssignStore(sim, block.instructions, &chain_idx, name, stmts, stmts_allocator)) {
@@ -8373,52 +8382,28 @@ pub const Decompiler = struct {
             if (ctrl.Analyzer.isConditionalJump(undefined, inst.opcode)) break;
 
             // Detect walrus operator: COPY 1 followed by STORE_*
-            if (inst.opcode == .STORE_NAME or inst.opcode == .STORE_FAST or
-                inst.opcode == .STORE_GLOBAL or inst.opcode == .STORE_DEREF)
-            {
-                if (inst_idx > 0 and insts[inst_idx - 1].opcode == .COPY and insts[inst_idx - 1].arg == 1) {
-                    const next_idx = inst_idx + 1;
-                    var is_walrus = false;
-                    if (next_idx < insts.len) {
-                        const next_op = insts[next_idx].opcode;
-                        is_walrus = switch (next_op) {
-                            .DUP_TOP, .COPY, .STORE_NAME, .STORE_FAST, .STORE_GLOBAL, .STORE_DEREF => false,
-                            .COMPARE_OP, .CONTAINS_OP, .IS_OP,
-                            .TO_BOOL, .POP_JUMP_IF_TRUE, .POP_JUMP_IF_FALSE,
-                            .POP_JUMP_IF_NONE, .POP_JUMP_IF_NOT_NONE,
-                            .POP_JUMP_FORWARD_IF_TRUE, .POP_JUMP_FORWARD_IF_FALSE,
-                            .POP_JUMP_FORWARD_IF_NONE, .POP_JUMP_FORWARD_IF_NOT_NONE,
-                            .LOAD_SMALL_INT, .LOAD_CONST, .LOAD_FAST, .LOAD_FAST_BORROW,
-                            .LOAD_NAME, .LOAD_GLOBAL, .BINARY_OP,
-                            => true,
-                            else => false,
-                        };
-                    }
+            if (isWalrusStore(insts, inst_idx)) {
+                const copied = sim.stack.pop() orelse return error.StackUnderflow;
+                if (copied == .expr) {
+                    const expr = copied.expr;
+                    const name = switch (inst.opcode) {
+                        .STORE_FAST => sim.getLocal(inst.arg) orelse "__unknown__",
+                        .STORE_NAME, .STORE_GLOBAL => sim.getName(inst.arg) orelse "__unknown__",
+                        .STORE_DEREF => sim.getDeref(inst.arg) orelse "__unknown__",
+                        else => "__unknown__",
+                    };
+                    const arena = self.arena.allocator();
+                    const target = try self.makeName(name, .store);
+                    const named = try arena.create(Expr);
+                    named.* = .{ .named_expr = .{ .target = target, .value = expr } };
 
-                    if (is_walrus) {
-                        const copied = sim.stack.pop() orelse return error.StackUnderflow;
-                        if (copied == .expr) {
-                            const expr = copied.expr;
-                            const name = switch (inst.opcode) {
-                                .STORE_FAST => sim.getLocal(inst.arg) orelse "__unknown__",
-                                .STORE_NAME, .STORE_GLOBAL => sim.getName(inst.arg) orelse "__unknown__",
-                                .STORE_DEREF => sim.getDeref(inst.arg) orelse "__unknown__",
-                                else => "__unknown__",
-                            };
-                            const arena = self.arena.allocator();
-                            const target = try self.makeName(name, .store);
-                            const named = try arena.create(Expr);
-                            named.* = .{ .named_expr = .{ .target = target, .value = expr } };
-
-                            if (sim.stack.pop()) |orig| {
-                                orig.deinit(sim.allocator, sim.stack_alloc);
-                            }
-                            try sim.stack.push(.{ .expr = named });
-                            continue;
-                        } else {
-                            copied.deinit(sim.allocator, sim.stack_alloc);
-                        }
+                    if (sim.stack.pop()) |orig| {
+                        orig.deinit(sim.allocator, sim.stack_alloc);
                     }
+                    try sim.stack.push(.{ .expr = named });
+                    continue;
+                } else {
+                    copied.deinit(sim.allocator, sim.stack_alloc);
                 }
             }
 
@@ -8448,6 +8433,20 @@ pub const Decompiler = struct {
                             then_block = else_block.?;
                             else_block = tmp;
                             invert_true_jump = true;
+                        }
+                    }
+                }
+            }
+        }
+        if (is_elif) {
+            if (else_block) |else_id| {
+                if (else_id < self.cfg.blocks.len) {
+                    const else_blk = &self.cfg.blocks[else_id];
+                    if (else_blk.terminator()) |else_term| {
+                        if (ctrl.Analyzer.isConditionalJump(undefined, else_term.opcode) and
+                            condBlockHasStmt(else_blk))
+                        {
+                            is_elif = false;
                         }
                     }
                 }
@@ -9855,7 +9854,15 @@ pub const Decompiler = struct {
             then_consumed = consumed_before;
             then_body_decompiled = true;
         }
+        const saved_if_next_then = self.if_next;
         var then_body = try self.decompileBranchRange(then_block, then_end, then_vals, skip);
+        if (self.if_next) |next| {
+            if (next >= then_block and next <= then_end) {
+                self.if_next = saved_if_next_then;
+            }
+        } else if (saved_if_next_then != null) {
+            self.if_next = saved_if_next_then;
+        }
         const a = self.arena.allocator();
         if (!self.bodyEndsTerminal(then_body)) {
             var appended_term_succ = false;
@@ -10154,8 +10161,12 @@ pub const Decompiler = struct {
                 else_body_decompiled = true;
             }
             const result = try self.decompileBranchRange(else_start_val, else_end_val, else_vals, skip);
-            // Restore if_next if it was set by outer merge detection
-            if (saved_if_next != null and self.if_next == null) {
+            // Restore if_next if nested decompile set a local fallthrough
+            if (self.if_next) |next| {
+                if (next >= else_start_val and next <= else_end_val) {
+                    self.if_next = saved_if_next;
+                }
+            } else if (saved_if_next != null) {
                 self.if_next = saved_if_next;
             }
             break :blk result;
@@ -10765,53 +10776,29 @@ pub const Decompiler = struct {
             if (inst.opcode == .COMPARE_OP and first_cmp_idx == null) first_cmp_idx = inst_idx;
 
             // Detect walrus operator: COPY 1 followed by STORE_*
-            if (inst.opcode == .STORE_NAME or inst.opcode == .STORE_FAST or
-                inst.opcode == .STORE_GLOBAL or inst.opcode == .STORE_DEREF)
-            {
-                if (inst_idx > 0 and insts[inst_idx - 1].opcode == .COPY and insts[inst_idx - 1].arg == 1) {
-                    const next_idx = inst_idx + 1;
-                    var is_walrus = false;
-                    if (next_idx < insts.len) {
-                        const next_op = insts[next_idx].opcode;
-                        is_walrus = switch (next_op) {
-                            .DUP_TOP, .COPY, .STORE_NAME, .STORE_FAST, .STORE_GLOBAL, .STORE_DEREF => false,
-                            .COMPARE_OP, .CONTAINS_OP, .IS_OP,
-                            .TO_BOOL, .POP_JUMP_IF_TRUE, .POP_JUMP_IF_FALSE,
-                            .POP_JUMP_IF_NONE, .POP_JUMP_IF_NOT_NONE,
-                            .POP_JUMP_FORWARD_IF_TRUE, .POP_JUMP_FORWARD_IF_FALSE,
-                            .POP_JUMP_FORWARD_IF_NONE, .POP_JUMP_FORWARD_IF_NOT_NONE,
-                            .LOAD_SMALL_INT, .LOAD_CONST, .LOAD_FAST, .LOAD_FAST_BORROW,
-                            .LOAD_NAME, .LOAD_GLOBAL, .BINARY_OP,
-                            => true,
-                            else => false,
-                        };
-                    }
+            if (isWalrusStore(insts, inst_idx)) {
+                const copied = sim.stack.pop() orelse return error.StackUnderflow;
+                if (copied == .expr) {
+                    const expr = copied.expr;
+                    const name = switch (inst.opcode) {
+                        .STORE_FAST => sim.getLocal(inst.arg) orelse "__unknown__",
+                        .STORE_NAME, .STORE_GLOBAL => sim.getName(inst.arg) orelse "__unknown__",
+                        .STORE_DEREF => sim.getDeref(inst.arg) orelse "__unknown__",
+                        else => "__unknown__",
+                    };
+                    const arena = self.arena.allocator();
+                    const target = try self.makeName(name, .store);
+                    const named = try arena.create(Expr);
+                    named.* = .{ .named_expr = .{ .target = target, .value = expr } };
 
-                    if (is_walrus) {
-                        const copied = sim.stack.pop() orelse return error.StackUnderflow;
-                        if (copied == .expr) {
-                            const expr = copied.expr;
-                            const name = switch (inst.opcode) {
-                                .STORE_FAST => sim.getLocal(inst.arg) orelse "__unknown__",
-                                .STORE_NAME, .STORE_GLOBAL => sim.getName(inst.arg) orelse "__unknown__",
-                                .STORE_DEREF => sim.getDeref(inst.arg) orelse "__unknown__",
-                                else => "__unknown__",
-                            };
-                            const arena = self.arena.allocator();
-                            const target = try self.makeName(name, .store);
-                            const named = try arena.create(Expr);
-                            named.* = .{ .named_expr = .{ .target = target, .value = expr } };
-
-                            if (sim.stack.pop()) |orig| {
-                                orig.deinit(sim.allocator, sim.stack_alloc);
-                            }
-                            try sim.stack.push(.{ .expr = named });
-                            cond_idx = inst_idx + 1;
-                            continue;
-                        } else {
-                            copied.deinit(sim.allocator, sim.stack_alloc);
-                        }
+                    if (sim.stack.pop()) |orig| {
+                        orig.deinit(sim.allocator, sim.stack_alloc);
                     }
+                    try sim.stack.push(.{ .expr = named });
+                    cond_idx = inst_idx + 1;
+                    continue;
+                } else {
+                    copied.deinit(sim.allocator, sim.stack_alloc);
                 }
             }
 
@@ -21142,48 +21129,27 @@ pub const Decompiler = struct {
                         }
                     }
                     // Check for walrus operator: COPY 1 followed by STORE_* with value used later
-                    const prev_was_copy_1 = idx > 0 and instructions[idx - 1].opcode == .COPY and instructions[idx - 1].arg == 1;
-                    if (prev_was_copy_1) {
-                        const next_idx = idx + 1;
-                        var is_walrus = false;
-                        if (next_idx < instructions.len) {
-                            const next_op = instructions[next_idx].opcode;
-                            is_walrus = switch (next_op) {
-                                .DUP_TOP, .COPY, .STORE_NAME, .STORE_FAST, .STORE_GLOBAL, .STORE_DEREF => false,
-                                .COMPARE_OP, .CONTAINS_OP, .IS_OP,
-                                .TO_BOOL, .POP_JUMP_IF_TRUE, .POP_JUMP_IF_FALSE,
-                                .POP_JUMP_IF_NONE, .POP_JUMP_IF_NOT_NONE,
-                                .POP_JUMP_FORWARD_IF_TRUE, .POP_JUMP_FORWARD_IF_FALSE,
-                                .POP_JUMP_FORWARD_IF_NONE, .POP_JUMP_FORWARD_IF_NOT_NONE,
-                                .LOAD_SMALL_INT, .LOAD_CONST, .LOAD_FAST, .LOAD_FAST_BORROW,
-                                .LOAD_NAME, .LOAD_GLOBAL, .BINARY_OP,
-                                => true,
-                                else => false,
-                            };
-                        }
+                    if (isWalrusStore(instructions, idx)) {
+                        const copied = sim.stack.pop() orelse return error.StackUnderflow;
+                        const val_expr = switch (copied) {
+                            .expr => |e| e,
+                            else => blk: {
+                                copied.deinit(sim.allocator, sim.stack_alloc);
+                                break :blk null;
+                            },
+                        };
 
-                        if (is_walrus) {
-                            const copied = sim.stack.pop() orelse return error.StackUnderflow;
-                            const val_expr = switch (copied) {
-                                .expr => |e| e,
-                                else => blk: {
-                                    copied.deinit(sim.allocator, sim.stack_alloc);
-                                    break :blk null;
-                                },
-                            };
+                        if (val_expr) |expr| {
+                            const arena = self.arena.allocator();
+                            const target = try self.makeName(name, .store);
+                            const named = try arena.create(Expr);
+                            named.* = .{ .named_expr = .{ .target = target, .value = expr } };
 
-                            if (val_expr) |expr| {
-                                const arena = self.arena.allocator();
-                                const target = try self.makeName(name, .store);
-                                const named = try arena.create(Expr);
-                                named.* = .{ .named_expr = .{ .target = target, .value = expr } };
-
-                                if (sim.stack.pop()) |orig| {
-                                    orig.deinit(sim.allocator, sim.stack_alloc);
-                                }
-                                try sim.stack.push(.{ .expr = named });
-                                continue;
+                            if (sim.stack.pop()) |orig| {
+                                orig.deinit(sim.allocator, sim.stack_alloc);
                             }
+                            try sim.stack.push(.{ .expr = named });
+                            continue;
                         }
                     }
 

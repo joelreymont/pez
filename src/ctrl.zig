@@ -1292,6 +1292,16 @@ pub const Analyzer = struct {
                 }
             }
         }
+        if (is_elif) {
+            if (then_id < self.cfg.blocks.len) {
+                const then_blk = &self.cfg.blocks[then_id];
+                if (then_blk.terminator()) |then_term| {
+                    if (self.isConditionalJump(then_term.opcode) and hasStmtPrelude(then_blk)) {
+                        is_elif = false;
+                    }
+                }
+            }
+        }
         if (is_elif and merge != null and merge.? == then_id) {
             merge = null;
         }
