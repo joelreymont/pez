@@ -10407,21 +10407,12 @@ pub const Decompiler = struct {
         return self.decompileStructuredRange(start_block, limit);
     }
 
-    /// Decompile a while loop pattern.
-    fn decompileWhile(self: *Decompiler, pattern: ctrl.WhilePattern) DecompileError!?*Stmt {
-        self.loop_next = null;
-        const header = &self.cfg.blocks[pattern.header_block];
-        var body_true = true;
-        for (header.successors) |edge| {
-            if (edge.target == pattern.body_block) {
-                if (edge.edge_type == .conditional_false) {
-                    body_true = false;
-                }
-                break;
-            }
-        }
+    const CondInfo = struct {
+        expr: *Expr,
+        cond_idx: usize,
+    };
 
-        // Get the condition expression
+    fn conditionFromHeader(self: *Decompiler, header: *const cfg_mod.BasicBlock) DecompileError!CondInfo {
         var sim = self.initSim(self.arena.allocator(), self.arena.allocator(), self.code, self.version);
         defer sim.deinit();
 
@@ -10487,18 +10478,59 @@ pub const Decompiler = struct {
             cond_idx = inst_idx + 1;
         }
 
-        var condition = try sim.stack.popExpr();
+        const condition = try sim.stack.popExpr();
+        return .{ .expr = condition, .cond_idx = cond_idx };
+    }
+
+    /// Decompile a while loop pattern.
+    fn decompileWhile(self: *Decompiler, pattern: ctrl.WhilePattern) DecompileError!?*Stmt {
+        self.loop_next = null;
+        const header = &self.cfg.blocks[pattern.header_block];
+        var body_true = true;
+        for (header.successors) |edge| {
+            if (edge.target == pattern.body_block) {
+                if (edge.edge_type == .conditional_false) {
+                    body_true = false;
+                }
+                break;
+            }
+        }
+
+        const cond_info = try self.conditionFromHeader(header);
+        var condition = cond_info.expr;
+        const orig_condition = condition;
+        var cond_idx: usize = cond_info.cond_idx;
 
         var body_block_id = pattern.body_block;
         var ignore_header_while = false;
-        const exit_in_loop = self.analyzer.inLoop(pattern.exit_block, pattern.header_block);
-        const exit_is_continue = exit_in_loop or self.blockLeadsToHeader(pattern.exit_block, pattern.header_block);
+        var guard_loop = false;
+        const exit_is_continue = self.blockLeadsToHeader(pattern.exit_block, pattern.header_block);
         if (exit_is_continue) {
             const a = self.arena.allocator();
             condition = try ast.makeConstant(a, .true_);
             body_block_id = pattern.header_block;
             ignore_header_while = true;
             cond_idx = 0;
+            if (pattern.body_block != pattern.header_block and !condBlockHasPrelude(header)) {
+                const body_blk = &self.cfg.blocks[pattern.body_block];
+                var non_exc: usize = 0;
+                var only_header = true;
+                var has_back = false;
+                for (body_blk.successors) |edge| {
+                    if (edge.edge_type == .exception) continue;
+                    non_exc += 1;
+                    if (edge.target != pattern.header_block) {
+                        only_header = false;
+                    }
+                    if (edge.target == pattern.header_block and edge.edge_type == .loop_back) {
+                        has_back = true;
+                    }
+                }
+                if (non_exc > 0 and only_header and has_back) {
+                    guard_loop = true;
+                    body_block_id = pattern.exit_block;
+                }
+            }
         }
         if (!exit_is_continue) {
             var alt_id: ?u32 = null;
@@ -10576,6 +10608,37 @@ pub const Decompiler = struct {
         var visited = try std.DynamicBitSet.initEmpty(self.allocator, self.cfg.blocks.len);
         defer visited.deinit();
 
+        const a = self.arena.allocator();
+        var guard_while: ?*Stmt = null;
+        if (guard_loop) {
+            var guard_skip_store = false;
+            var guard_seed_pop = false;
+            const guard_body = try self.decompileLoopBody(
+                pattern.body_block,
+                pattern.header_block,
+                &guard_skip_store,
+                &guard_seed_pop,
+                &visited,
+                pattern.exit_block,
+                0,
+                false,
+            );
+            const guard_cond = if (body_true)
+                orig_condition
+            else
+                try self.invertConditionExpr(orig_condition);
+            const gw = try a.create(Stmt);
+            gw.* = .{
+                .while_stmt = .{
+                    .condition = guard_cond,
+                    .body = guard_body,
+                    .else_body = &.{},
+                },
+            };
+            guard_while = gw;
+            visited.set(pattern.header_block);
+        }
+
         var skip_first = false;
         const term = header.terminator();
         const legacy_cond = if (term) |t| t.opcode == .JUMP_IF_FALSE or t.opcode == .JUMP_IF_TRUE else false;
@@ -10620,7 +10683,6 @@ pub const Decompiler = struct {
                 if (ifs.body.len == 1 and ifs.body[0].* == .raise_stmt and
                     ifs.else_body.len == 1 and !self.stmtIsTerminal(ifs.else_body[0]))
                 {
-                    const a = self.arena.allocator();
                     const new_body = try a.alloc(*Stmt, body.len + 1);
                     std.mem.copyForwards(*Stmt, new_body[0..body.len], body);
                     new_body[body.len] = ifs.else_body[0];
@@ -10630,7 +10692,6 @@ pub const Decompiler = struct {
             }
         }
 
-        const a = self.arena.allocator();
         var header_stmts: std.ArrayListUnmanaged(*Stmt) = .{};
         errdefer header_stmts.deinit(a);
         var skip_first_store = false;
@@ -10850,6 +10911,15 @@ pub const Decompiler = struct {
                 std.mem.copyForwards(*Stmt, new_body[header_stmts.items.len + 1 ..], body);
             }
             final_condition = true_expr;
+            final_body = new_body;
+        }
+
+        if (guard_while) |gw| {
+            const new_body = try a.alloc(*Stmt, final_body.len + 1);
+            new_body[0] = gw;
+            if (final_body.len > 0) {
+                std.mem.copyForwards(*Stmt, new_body[1..], final_body);
+            }
             final_body = new_body;
         }
 
@@ -18851,6 +18921,19 @@ pub const Decompiler = struct {
         return false;
     }
 
+    fn isLoopBackBody(self: *Decompiler, block_id: u32, loop_header: u32) bool {
+        if (block_id >= self.cfg.blocks.len) return false;
+        const blk = &self.cfg.blocks[block_id];
+        if (!self.hasLoopBackEdge(blk, loop_header)) return false;
+        var has_non_exc = false;
+        for (blk.successors) |edge| {
+            if (edge.edge_type == .exception) continue;
+            has_non_exc = true;
+            if (edge.target != loop_header) return false;
+        }
+        return has_non_exc;
+    }
+
     fn markLoopVisited(self: *Decompiler, header_id: u32, visited: *std.DynamicBitSet) void {
         if (self.analyzer.loopSet(header_id)) |body| {
             visited.setUnion(body.*);
@@ -21656,6 +21739,8 @@ pub const Decompiler = struct {
         var block_idx = start_block;
         var loop_end_offset: ?u32 = null;
         var loop_end_block: ?u32 = null;
+        var reach_header: ?std.DynamicBitSet = null;
+        defer if (reach_header) |*set| set.deinit();
         const start_offset: u32 = if (start_block < self.cfg.blocks.len)
             self.cfg.blocks[start_block].start_offset
         else
@@ -21669,6 +21754,38 @@ pub const Decompiler = struct {
             for (header.successors) |edge| {
                 if (edge.edge_type == .conditional_false and edge.target < self.cfg.blocks.len) {
                     if (!self.analyzer.inLoop(edge.target, loop_header)) {
+                        if (reach_header == null) {
+                            var reach = try std.DynamicBitSet.initEmpty(self.allocator, self.cfg.blocks.len);
+                            var stack: std.ArrayListUnmanaged(u32) = .{};
+                            defer stack.deinit(self.allocator);
+                            reach.set(loop_header);
+                            try stack.append(self.allocator, loop_header);
+                            while (stack.items.len > 0) {
+                                const cur = stack.pop() orelse break;
+                                if (cur >= self.cfg.blocks.len) continue;
+                                const cur_blk = &self.cfg.blocks[cur];
+                                for (cur_blk.predecessors) |pred_id| {
+                                    if (pred_id >= self.cfg.blocks.len) continue;
+                                    var has_edge = false;
+                                    for (self.cfg.blocks[pred_id].successors) |pred_edge| {
+                                        if (pred_edge.edge_type == .exception) continue;
+                                        if (pred_edge.target == cur) {
+                                            has_edge = true;
+                                            break;
+                                        }
+                                    }
+                                    if (!has_edge) continue;
+                                    if (!reach.isSet(@intCast(pred_id))) {
+                                        reach.set(@intCast(pred_id));
+                                        try stack.append(self.allocator, pred_id);
+                                    }
+                                }
+                            }
+                            reach_header = reach;
+                        }
+                        if (reach_header) |reach| {
+                            if (reach.isSet(@intCast(edge.target))) continue;
+                        }
                         const end_off = self.cfg.blocks[edge.target].start_offset;
                         if (end_off > start_offset) {
                             loop_end_offset = end_off;
@@ -21696,7 +21813,9 @@ pub const Decompiler = struct {
                 block_idx += 1;
                 continue;
             }
-            if (!self.analyzer.inLoop(block_idx, loop_header)) {
+            if (!self.analyzer.inLoop(block_idx, loop_header) and
+                !(reach_header != null and reach_header.?.isSet(@intCast(block_idx))))
+            {
                 block_idx += 1;
                 continue;
             }
@@ -21790,6 +21909,52 @@ pub const Decompiler = struct {
             switch (pattern) {
                 .if_stmt => |p| {
                     try self.processPartialBlock(block, &stmts, a, skip_first_store, null);
+
+                    if (block_idx == loop_header) {
+                        if (p.else_block) |else_id| {
+                            const then_id = p.then_block;
+                            const then_loop = self.isLoopBackBody(then_id, loop_header);
+                            const else_loop = self.isLoopBackBody(else_id, loop_header);
+                            if (then_loop != else_loop) {
+                                const body_id = if (then_loop) then_id else else_id;
+                                const exit_id = if (then_loop) else_id else then_id;
+                                if (self.analyzer.inLoop(exit_id, loop_header)) {
+                                    const cond_info = try self.conditionFromHeader(block);
+                                    var cond = cond_info.expr;
+                                    if (!then_loop) {
+                                        cond = try self.invertConditionExpr(cond);
+                                    }
+                                    var inner: std.ArrayListUnmanaged(*Stmt) = .{};
+                                    errdefer inner.deinit(a);
+                                    var inner_skip = false;
+                                    var inner_seed = false;
+                                    try self.processBlockStatements(
+                                        body_id,
+                                        &self.cfg.blocks[body_id],
+                                        &inner,
+                                        &inner_skip,
+                                        &inner_seed,
+                                        true,
+                                        loop_header,
+                                        0,
+                                    );
+                                    const inner_body = try inner.toOwnedSlice(a);
+                                    const inner_stmt = try a.create(Stmt);
+                                    inner_stmt.* = .{ .while_stmt = .{
+                                        .condition = cond,
+                                        .body = inner_body,
+                                        .else_body = &.{},
+                                    } };
+                                    try stmts.append(a, inner_stmt);
+                                    try self.consumed.set(self.allocator, block_idx);
+                                    try self.consumed.set(self.allocator, body_id);
+                                    visited.set(body_id);
+                                    block_idx = exit_id;
+                                    continue;
+                                }
+                            }
+                        }
+                    }
 
                     const parts = try self.loopIfParts(p, loop_header, visited, stop_block) orelse {
                         block_idx += 1;
@@ -22094,7 +22259,56 @@ pub const Decompiler = struct {
                         skip_body,
                     );
                     try self.consumed.set(self.allocator, block_idx);
-                    if (has_back_edge) break;
+                    var back_edge_tail = false;
+                    if (has_back_edge) {
+                        if (reach_header == null) {
+                            var reach = try std.DynamicBitSet.initEmpty(self.allocator, self.cfg.blocks.len);
+                            var stack: std.ArrayListUnmanaged(u32) = .{};
+                            defer stack.deinit(self.allocator);
+                            reach.set(loop_header);
+                            try stack.append(self.allocator, loop_header);
+                            while (stack.items.len > 0) {
+                                const cur = stack.pop() orelse break;
+                                if (cur >= self.cfg.blocks.len) continue;
+                                const cur_blk = &self.cfg.blocks[cur];
+                                for (cur_blk.predecessors) |pred_id| {
+                                    if (pred_id >= self.cfg.blocks.len) continue;
+                                    var has_edge = false;
+                                    for (self.cfg.blocks[pred_id].successors) |pred_edge| {
+                                        if (pred_edge.edge_type == .exception) continue;
+                                        if (pred_edge.target == cur) {
+                                            has_edge = true;
+                                            break;
+                                        }
+                                    }
+                                    if (!has_edge) continue;
+                                    if (!reach.isSet(@intCast(pred_id))) {
+                                        reach.set(@intCast(pred_id));
+                                        try stack.append(self.allocator, pred_id);
+                                    }
+                                }
+                            }
+                            reach_header = reach;
+                        }
+                        var is_tail = true;
+                        if (reach_header) |reach| {
+                            const off = block.start_offset;
+                            var i: u32 = 0;
+                            while (i < self.cfg.blocks.len) : (i += 1) {
+                                if (i == loop_header) continue;
+                                if (!reach.isSet(@intCast(i))) continue;
+                                if (self.cfg.blocks[i].predecessors.len == 0) continue;
+                                if (self.cfg.blocks[i].start_offset > off) {
+                                    is_tail = false;
+                                    break;
+                                }
+                            }
+                        } else {
+                            is_tail = self.isLoopTailBack(block_idx, loop_header);
+                        }
+                        back_edge_tail = is_tail;
+                        if (back_edge_tail) break;
+                    }
 
                     // Move to next block
                     if (block.successors.len == 0) break;
@@ -22113,6 +22327,10 @@ pub const Decompiler = struct {
                         }
                         if (next_id == loop_header) break;
                         block_idx = next_id;
+                        continue;
+                    }
+                    if (has_back_edge and !back_edge_tail) {
+                        block_idx += 1;
                         continue;
                     }
                     break;
