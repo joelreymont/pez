@@ -109,11 +109,14 @@ def main() -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             uncomp_cmd = [str(uncompyle6_bin), "-o", tmpdir, str(path)]
             uncomp_rc, uncomp_out, uncomp_err = run_cmd(uncomp_cmd, args.timeout)
-        decompyle3_cmd = [str(decompyle3_bin), "-o", "-", str(path)]
+        with tempfile.TemporaryDirectory() as tmpdir:
+            decompyle3_cmd = [str(decompyle3_bin), "-o", tmpdir, str(path)]
+            decompyle3_rc, decompyle3_out, decompyle3_err = run_cmd(
+                decompyle3_cmd, args.timeout
+            )
 
         pez_rc, pez_out, pez_err = run_cmd(pez_cmd, args.timeout)
         pycdc_rc, pycdc_out, pycdc_err = run_cmd(pycdc_cmd, args.timeout)
-        decompyle3_rc, decompyle3_out, decompyle3_err = run_cmd(decompyle3_cmd, args.timeout)
         pez_ok = pez_rc == 0
         pycdc_ok = pycdc_rc == 0
         uncomp_ok = uncomp_rc == 0

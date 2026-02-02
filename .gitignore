@@ -19,6 +19,7 @@ Thumbs.db
 # Temporary files
 /tmp/
 __pycache__/
+tools/parity/out/
 
 # Dot tool state
 .beads/
