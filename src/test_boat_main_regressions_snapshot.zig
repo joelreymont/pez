@@ -137,6 +137,23 @@ test "snapshot if merge nested 3.9" {
     );
 }
 
+test "snapshot if guard prelude 3.9" {
+    try runSnapshot(@src(), "test/corpus/if_guard_prelude.3.9.pyc",
+        \\[]u8
+        \\  "def if_guard_prelude(obj):
+        \\    if not obj:
+        \\        if obj is None:
+        \\            return None
+        \\        return 0
+        \\    else:
+        \\        n = len(obj)
+        \\        if n <= 3:
+        \\            return n
+        \\        return n + 1
+        \\"
+    );
+}
+
 test "snapshot loop exit reaches header 3.9" {
     try runSnapshot(@src(), "test/corpus/loop_exit_reaches_header.3.9.pyc",
         \\[]u8
