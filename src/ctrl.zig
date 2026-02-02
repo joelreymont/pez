@@ -1246,6 +1246,10 @@ pub const Analyzer = struct {
         };
     }
 
+    pub fn detectIfOnly(self: *Analyzer, block_id: u32) !?IfPattern {
+        return self.detectIfPattern(block_id);
+    }
+
     /// Detect while loop pattern.
     fn detectWhilePattern(self: *Analyzer, block_id: u32, in_loop_context: bool) ?WhilePattern {
         const block = &self.cfg.blocks[block_id];

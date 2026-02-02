@@ -134,3 +134,26 @@ test "snapshot pycdc guard continue 3.9" {
         \\"
     ).expectEqual(output);
 }
+
+test "snapshot pycdc loop try header 3.9" {
+    const allocator = testing.allocator;
+    const output = try tu.renderPycFile(allocator, "test/corpus/loop_try_header.3.9.pyc", false);
+    defer allocator.free(output);
+
+    const oh = OhSnap{};
+    try oh.snap(@src(),
+        \\[]u8
+        \\  "import time
+        \\def f(cond, sock, addr):
+        \\    while True:
+        \\        try:
+        \\            if cond:
+        \\                sock.sendto(b'a', addr)
+        \\            else:
+        \\                sock.sendto(b'b', addr)
+        \\            time.sleep(1)
+        \\        except Exception as e:
+        \\            time.sleep(1)
+        \\"
+    ).expectEqual(output);
+}

@@ -273,6 +273,7 @@ test "snapshot loop guard try continue 3.9" {
         \\            if not data:
         \\                continue
         \\            sock.send(data)
+        \\            continue
         \\        except Exception as e:
         \\            print(e)
         \\            time.sleep(1)

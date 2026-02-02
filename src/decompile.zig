@@ -10486,7 +10486,8 @@ pub const Decompiler = struct {
 
         var body_block_id = pattern.body_block;
         var ignore_header_while = false;
-        const exit_is_continue = self.blockLeadsToHeader(pattern.exit_block, pattern.header_block);
+        const exit_in_loop = self.analyzer.inLoop(pattern.exit_block, pattern.header_block);
+        const exit_is_continue = exit_in_loop or self.blockLeadsToHeader(pattern.exit_block, pattern.header_block);
         if (exit_is_continue) {
             const a = self.arena.allocator();
             condition = try ast.makeConstant(a, .true_);
@@ -16790,10 +16791,23 @@ pub const Decompiler = struct {
                 }
             }
 
-            const pattern = if (loop_header != null)
+            var pattern = if (loop_header != null)
                 try self.analyzer.detectPatternNoTryInLoop(start)
             else
                 try self.analyzer.detectPatternNoTry(start);
+            if (pattern == .while_loop and loop_header != null) {
+                const header_id = loop_header.?;
+                if (pattern.while_loop.header_block == header_id and start == header_id) {
+                    if (try self.analyzer.detectIfOnly(start)) |if_pat| {
+                        const then_in = self.analyzer.inLoop(if_pat.then_block, header_id);
+                        const else_in = if_pat.else_block != null and
+                            self.analyzer.inLoop(if_pat.else_block.?, header_id);
+                        if (then_in and else_in) {
+                            pattern = .{ .if_stmt = if_pat };
+                        }
+                    }
+                }
+            }
             if (pattern == .if_stmt) {
                 var if_pat = pattern.if_stmt;
                 if (if_pat.else_block == null) {
