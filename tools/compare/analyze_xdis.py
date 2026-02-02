@@ -7,7 +7,7 @@ import os
 import sys
 from collections import Counter, defaultdict
 
-from xdis import load, op_imports
+from xdis import load
 from xdis.bytecode import Bytecode
 
 
@@ -472,7 +472,8 @@ def load_code(pyc: str):
     if not force_marshal:
         try:
             res = load.load_module(pyc)
-            return res[0], res[3]
+            impl = res[4] if len(res) > 4 else None
+            return res[0], res[3], impl
         except Exception as exc:
             err = exc
     try:
@@ -483,7 +484,7 @@ def load_code(pyc: str):
             f.read(12)
             code = marshal.load(f)
         ver = (sys.version_info.major, sys.version_info.minor, 0)
-        return ver, code
+        return ver, code, None
     except Exception:
         if err:
             raise err
@@ -492,8 +493,10 @@ def load_code(pyc: str):
 
 def main():
     pyc = sys.argv[1]
-    ver, code = load_code(pyc)
-    opc = op_imports.get_opcode_module(ver)
+    from lib import get_opc
+
+    ver, code, impl = load_code(pyc)
+    opc = get_opc(ver, impl)
     out = []
     walk(code, opc, code.co_name, out)
     print(json.dumps({"version": list(ver), "units": out, "filename": code.co_filename}))

@@ -55,10 +55,10 @@ def main() -> None:
     ensure_xdis(args)
 
     import analyze_xdis as ax
-    from xdis import op_imports
+    from lib import get_opc
     from xdis.bytecode import Bytecode
 
-    orig_ver, orig_code = ax.load_code(args.orig)
+    orig_ver, orig_code, orig_impl = ax.load_code(args.orig)
     orig_ver_list = list(orig_ver)
 
     if args.list:
@@ -84,15 +84,15 @@ def main() -> None:
     compiled_pyc = tmpdir / "compiled.pyc"
     compile_source(py, Path(args.src), compiled_pyc, args.timeout, orig_code.co_filename)
 
-    comp_ver, comp_code = ax.load_code(str(compiled_pyc))
+    comp_ver, comp_code, comp_impl = ax.load_code(str(compiled_pyc))
     comp_ver_list = list(comp_ver)
     comp_match, comp_matches = find_code_by_path(comp_code, orig_path, idx)
     if not comp_match:
         raise SystemExit(f"missing compiled path: {orig_path}")
     comp_path, comp_unit = comp_match
 
-    orig_opc = op_imports.get_opcode_module(orig_ver)
-    comp_opc = op_imports.get_opcode_module(comp_ver)
+    orig_opc = get_opc(orig_ver, orig_impl)
+    comp_opc = get_opc(comp_ver, comp_impl)
 
     orig_instrs = list(Bytecode(orig_unit, orig_opc))
     comp_instrs = list(Bytecode(comp_unit, comp_opc))

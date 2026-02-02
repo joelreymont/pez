@@ -23,8 +23,9 @@ def run_cmd(cmd, timeout: int) -> subprocess.CompletedProcess:
 def norm_argrepr(argrepr: str) -> str:
     if not argrepr:
         return argrepr
-    if argrepr.startswith("<code object"):
-        return _CODE_ADDR_RE.sub("0x?", argrepr)
+    if "code object" in argrepr:
+        text = _CODE_ADDR_RE.sub("0x?", argrepr)
+        return re.sub(r", line \d+", ", line ?", text)
     return argrepr
 
 
@@ -127,6 +128,19 @@ def compile_source(py: str, src: Path, out_pyc: Path, timeout: int, dfile: Optio
     if proc.returncode != 0:
         sys.stderr.write(proc.stderr)
         raise SystemExit(proc.returncode)
+
+
+def get_opc(ver, impl=None):
+    from xdis import op_imports
+
+    try:
+        return op_imports.get_opcode_module(ver)
+    except TypeError:
+        if impl is None:
+            from xdis.version_info import PythonImplementation
+
+            impl = PythonImplementation.CPYTHON
+        return op_imports.get_opcode_module(ver, impl)
 
 
 def collect_paths(code) -> list[str]:

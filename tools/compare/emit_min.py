@@ -8,7 +8,7 @@ import tempfile
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from lib import compile_source, find_code_by_path, norm_argrepr, pick_xdis_python, select_compile_python
+from lib import compile_source, find_code_by_path, norm_argrepr, pick_xdis_python, select_compile_python, get_opc
 
 
 def parse_args() -> argparse.Namespace:
@@ -100,17 +100,16 @@ def same_unit(
     timeout: int,
 ) -> bool:
     import analyze_xdis as ax
-    from xdis import op_imports
     from xdis.bytecode import Bytecode
 
     tmpdir = Path(tempfile.mkdtemp(prefix="pez-emit-min-"))
     compiled_pyc = tmpdir / "compiled.pyc"
     try:
         compile_source(py, src_path, compiled_pyc, timeout, orig_code.co_filename)
-        comp_ver, comp_code = ax.load_code(str(compiled_pyc))
+        comp_ver, comp_code, comp_impl = ax.load_code(str(compiled_pyc))
         if list(comp_ver) != list(orig_ver):
             return False
-        comp_opc = op_imports.get_opcode_module(comp_ver)
+        comp_opc = get_opc(comp_ver, comp_impl)
         orig_match, _ = find_code_by_path(orig_code, path, index)
         if not orig_match:
             return False
@@ -202,8 +201,8 @@ def main() -> None:
     if not src.exists():
         raise SystemExit(f"missing: {src}")
 
-    orig_ver, orig_code = ax.load_code(str(orig))
-    orig_opc = ax.op_imports.get_opcode_module(orig_ver)
+    orig_ver, orig_code, orig_impl = ax.load_code(str(orig))
+    orig_opc = get_opc(orig_ver, orig_impl)
     orig_ver_list = list(orig_ver)
     py = select_compile_python(args.py, tuple(orig_ver_list[:2]), args.timeout)
     idx = args.index if args.index >= 0 else None
