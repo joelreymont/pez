@@ -244,6 +244,12 @@ pub const Analyzer = struct {
     try_cache: []?TryPattern,
     /// Blocks with try pattern computed.
     try_cache_checked: std.DynamicBitSet,
+    /// Scratch visited set for single-pass traversals.
+    scratch_seen: std.DynamicBitSet,
+    /// Secondary scratch visited set for nested traversals.
+    scratch_aux: std.DynamicBitSet,
+    /// Scratch queue for single-pass traversals.
+    scratch_queue: std.ArrayListUnmanaged(u32) = .{},
     /// Enclosing loop headers per block.
     enclosing_loops: []std.ArrayListUnmanaged(u32),
     /// Per-block cached flags for pattern detection.
@@ -258,6 +264,8 @@ pub const Analyzer = struct {
         const try_cache = try allocator.alloc(?TryPattern, cfg_ptr.blocks.len);
         @memset(try_cache, null);
         const try_cache_checked = try std.DynamicBitSet.initEmpty(allocator, cfg_ptr.blocks.len);
+        const scratch_seen = try std.DynamicBitSet.initEmpty(allocator, cfg_ptr.blocks.len);
+        const scratch_aux = try std.DynamicBitSet.initEmpty(allocator, cfg_ptr.blocks.len);
         const enclosing_loops = try allocator.alloc(std.ArrayListUnmanaged(u32), cfg_ptr.blocks.len);
         @memset(enclosing_loops, .{});
         errdefer {
@@ -281,6 +289,9 @@ pub const Analyzer = struct {
             .processed = processed,
             .try_cache = try_cache,
             .try_cache_checked = try_cache_checked,
+            .scratch_seen = scratch_seen,
+            .scratch_aux = scratch_aux,
+            .scratch_queue = .{},
             .enclosing_loops = enclosing_loops,
             .block_flags = block_flags,
             .loop_regions = std.AutoHashMap(u32, std.DynamicBitSet).init(allocator),
@@ -304,6 +315,9 @@ pub const Analyzer = struct {
         }
         if (self.try_cache.len > 0) self.allocator.free(self.try_cache);
         self.try_cache_checked.deinit();
+        self.scratch_seen.deinit();
+        self.scratch_aux.deinit();
+        self.scratch_queue.deinit(self.allocator);
         for (self.enclosing_loops) |*list| {
             list.deinit(self.allocator);
         }
@@ -314,6 +328,24 @@ pub const Analyzer = struct {
             bitset.deinit();
         }
         self.loop_regions.deinit();
+    }
+
+    fn resetScratch(self: *Analyzer, set: *std.DynamicBitSet) *std.DynamicBitSet {
+        set.setRangeValue(.{ .start = 0, .end = self.cfg.blocks.len }, false);
+        return set;
+    }
+
+    fn scratchSeen(self: *Analyzer) *std.DynamicBitSet {
+        return self.resetScratch(&self.scratch_seen);
+    }
+
+    fn scratchAux(self: *Analyzer) *std.DynamicBitSet {
+        return self.resetScratch(&self.scratch_aux);
+    }
+
+    fn scratchQueue(self: *Analyzer) *std.ArrayListUnmanaged(u32) {
+        self.scratch_queue.items.len = 0;
+        return &self.scratch_queue;
     }
 
     fn populateEnclosingLoops(self: *Analyzer) !void {
@@ -1210,10 +1242,8 @@ pub const Analyzer = struct {
                     {
                         // If else branch can reach then-block, it's not an elif chain.
                         var reaches_then = false;
-                        var seen = try std.DynamicBitSet.initEmpty(self.allocator, self.cfg.blocks.len);
-                        defer seen.deinit();
-                        var queue: std.ArrayListUnmanaged(u32) = .{};
-                        defer queue.deinit(self.allocator);
+                        var seen = self.scratchSeen();
+                        var queue = self.scratchQueue();
                         try queue.append(self.allocator, else_id);
                         while (queue.items.len > 0 and !reaches_then) {
                             const bid = queue.items[queue.items.len - 1];
@@ -1461,10 +1491,8 @@ pub const Analyzer = struct {
     fn reachesHeader(self: *Analyzer, start: u32, header: u32) !bool {
         if (start >= self.cfg.blocks.len) return false;
         if (start == header) return true;
-        var seen = try std.DynamicBitSet.initEmpty(self.allocator, self.cfg.blocks.len);
-        defer seen.deinit();
-        var queue: std.ArrayListUnmanaged(u32) = .{};
-        defer queue.deinit(self.allocator);
+        var seen = self.scratchSeen();
+        var queue = self.scratchQueue();
         try queue.append(self.allocator, start);
         seen.set(start);
         while (queue.items.len > 0) {
@@ -1742,10 +1770,8 @@ pub const Analyzer = struct {
         }
         if (!self.cfg.version.gte(3, 11) and handler_targets.items.len > 1) {
             const first_handler = handler_targets.items[0];
-            var reachable = try std.DynamicBitSet.initEmpty(self.allocator, self.cfg.blocks.len);
-            defer reachable.deinit();
-            var queue: std.ArrayListUnmanaged(u32) = .{};
-            defer queue.deinit(self.allocator);
+            var reachable = self.scratchSeen();
+            var queue = self.scratchQueue();
             try queue.append(self.allocator, first_handler);
             while (queue.items.len > 0) {
                 const bid = queue.items[queue.items.len - 1];
@@ -1944,10 +1970,8 @@ pub const Analyzer = struct {
         if (handlers.len == 0) return false;
         if (target >= self.cfg.blocks.len) return false;
 
-        var seen = try std.DynamicBitSet.initEmpty(self.allocator, self.cfg.blocks.len);
-        defer seen.deinit();
-        var queue: std.ArrayListUnmanaged(u32) = .{};
-        defer queue.deinit(self.allocator);
+        var seen = self.scratchSeen();
+        var queue = self.scratchQueue();
 
         for (handlers) |h| {
             if (h.handler_block < self.cfg.blocks.len) {
@@ -1988,10 +2012,8 @@ pub const Analyzer = struct {
             if (inst.opcode == .RERAISE or inst.opcode == .END_FINALLY) return true;
         }
 
-        var seen = try std.DynamicBitSet.initEmpty(self.allocator, self.cfg.blocks.len);
-        defer seen.deinit();
-        var queue: std.ArrayListUnmanaged(u32) = .{};
-        defer queue.deinit(self.allocator);
+        var seen = self.scratchSeen();
+        var queue = self.scratchQueue();
         try queue.append(self.allocator, handler_block);
 
         while (queue.items.len > 0) {
@@ -2034,15 +2056,12 @@ pub const Analyzer = struct {
     fn handlerIsTerminal(self: *Analyzer, start: u32, exit_block: ?u32) !bool {
         if (start >= self.cfg.blocks.len) return true;
 
-        var seen = try std.DynamicBitSet.initEmpty(self.allocator, self.cfg.blocks.len);
-        defer seen.deinit();
-        var queue: std.ArrayListUnmanaged(u32) = .{};
-        defer queue.deinit(self.allocator);
+        var seen = self.scratchSeen();
+        var queue = self.scratchQueue();
         try queue.append(self.allocator, start);
 
         // Collect handler-reachable blocks
-        var handler_blocks = try std.DynamicBitSet.initEmpty(self.allocator, self.cfg.blocks.len);
-        defer handler_blocks.deinit();
+        var handler_blocks = self.scratchAux();
 
         while (queue.items.len > 0) {
             const bid = queue.items[queue.items.len - 1];
@@ -3176,10 +3195,8 @@ pub const Analyzer = struct {
 
     fn reachesBlock(self: *Analyzer, start: u32, target: u32, cond_off: u32) !bool {
         if (start >= self.cfg.blocks.len or target >= self.cfg.blocks.len) return false;
-        var seen = try std.DynamicBitSet.initEmpty(self.allocator, self.cfg.blocks.len);
-        defer seen.deinit();
-        var stack: std.ArrayListUnmanaged(u32) = .{};
-        defer stack.deinit(self.allocator);
+        var seen = self.scratchSeen();
+        var stack = self.scratchQueue();
         try stack.append(self.allocator, start);
         while (stack.items.len > 0) {
             const bid = stack.items[stack.items.len - 1];
