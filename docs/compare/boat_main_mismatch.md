@@ -30,23 +30,23 @@ python3 tools/compare/compare_dir.py \
 
 ## Summary (from /private/tmp/pez_compare_boat.json)
 - total: 342
-- exact: 146
-- close: 42
+- exact: 144
+- close: 44
 - mismatch: 146
 - error: 0
 - missing_src: 8
 
 ## Worst semantic mismatches (min_semantic_score)
-- PYZ-00.pyz_extracted/difflib.pyc (min=0.025)
+- PYZ-00.pyz_extracted/cameraController.pyc (min=0.0444)
 - PYZ-00.pyz_extracted/argparse.pyc (min=0.05)
 - PYZ-00.pyz_extracted/doctest.pyc (min=0.074)
 - PYZ-00.pyz_extracted/quopri.pyc (min=0.0848)
 - PYZ-00.pyz_extracted/datetime.pyc (min=0.0973)
 - PYZ-00.pyz_extracted/telebot/__init__.pyc (min=0.1)
 - PYZ-00.pyz_extracted/bdb.pyc (min=0.1143)
+- PYZ-00.pyz_extracted/aiortc/rtcrtpsender.pyc (min=0.1143)
 - PYZ-00.pyz_extracted/piexif/_dump.pyc (min=0.12)
 - PYZ-00.pyz_extracted/inspect.pyc (min=0.1253)
-- PYZ-00.pyz_extracted/subprocess.pyc (min=0.1254)
 
 ## Notes
 - Detailed per-file reports: /private/tmp/pez_compare_boat_reports
