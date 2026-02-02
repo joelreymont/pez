@@ -397,6 +397,8 @@ pub const Decompiler = struct {
     phi_by_block: std.AutoHashMapUnmanaged(u32, std.ArrayListUnmanaged(u32)) = .{},
     /// Phi incoming expressions keyed by (pred, succ, slot).
     phi_incoming: std.AutoHashMapUnmanaged(PhiIncomingKey, *Expr) = .{},
+    /// Phi incoming keys indexed by succ for fast removal.
+    phi_incoming_by_succ: std.AutoHashMapUnmanaged(u32, std.ArrayListUnmanaged(PhiIncomingKey)) = .{},
     /// Phi temp counter.
     phi_counter: u32 = 0,
     /// Blocks eligible for phi merges (if-chain merge ends).
@@ -413,6 +415,10 @@ pub const Decompiler = struct {
     try_scratch: ?TryScratch = null,
     /// Scratch reachability set for conditional analysis.
     cond_seen: GenSet,
+    /// Scratch in-stack bitset for condition chain folding.
+    cond_chain_seen: std.DynamicBitSet,
+    /// Scratch memo for condition chain folding.
+    cond_chain_memo: std.AutoHashMapUnmanaged(u32, *Expr) = .{},
     /// Scratch DFS stack for conditional reachability.
     cond_stack: std.ArrayListUnmanaged(u32),
     /// Blocks already emitted into statements.
@@ -641,6 +647,7 @@ pub const Decompiler = struct {
             .stack_in = &.{},
             .range_in_progress = undefined,
             .cond_seen = undefined,
+            .cond_chain_seen = undefined,
             .cond_stack = .{},
             .consumed = undefined,
             .clone_sim = undefined,
@@ -705,6 +712,10 @@ pub const Decompiler = struct {
         errdefer cond_seen.deinit(a);
         decomp.cond_seen = cond_seen;
 
+        var cond_chain_seen = try std.DynamicBitSet.initEmpty(a, cfg.blocks.len);
+        errdefer cond_chain_seen.deinit();
+        decomp.cond_chain_seen = cond_chain_seen;
+
         var consumed = try GenSet.init(a, cfg.blocks.len);
         errdefer consumed.deinit(a);
         decomp.consumed = consumed;
@@ -751,6 +762,11 @@ pub const Decompiler = struct {
         }
         self.phi_by_block.deinit(self.allocator);
         self.phi_slots.deinit(self.allocator);
+        var incoming_lists = self.phi_incoming_by_succ.valueIterator();
+        while (incoming_lists.next()) |list| {
+            list.deinit(self.allocator);
+        }
+        self.phi_incoming_by_succ.deinit(self.allocator);
         self.phi_incoming.deinit(self.allocator);
         if (self.phi_merge_ok) |*set| {
             set.deinit();
@@ -768,6 +784,8 @@ pub const Decompiler = struct {
             scratch.deinit(self.allocator);
         }
         self.cond_seen.deinit(self.allocator);
+        self.cond_chain_seen.deinit();
+        self.cond_chain_memo.deinit(self.allocator);
         self.cond_stack.deinit(self.allocator);
         self.consumed.deinit(self.allocator);
         self.statements.deinit(self.allocator);
@@ -2185,16 +2203,12 @@ pub const Decompiler = struct {
         for (slots.items) |slot_idx| {
             _ = self.phi_slots.remove(.{ .block = block_id, .slot = slot_idx });
         }
-        var remove_keys: std.ArrayListUnmanaged(PhiIncomingKey) = .{};
-        defer remove_keys.deinit(self.allocator);
-        var it = self.phi_incoming.iterator();
-        while (it.next()) |entry| {
-            if (entry.key_ptr.succ == block_id) {
-                try remove_keys.append(self.allocator, entry.key_ptr.*);
+        if (self.phi_incoming_by_succ.fetchRemove(block_id)) |entry| {
+            var keys = entry.value;
+            for (keys.items) |key| {
+                _ = self.phi_incoming.remove(key);
             }
-        }
-        for (remove_keys.items) |key| {
-            _ = self.phi_incoming.remove(key);
+            keys.deinit(self.allocator);
         }
     }
 
@@ -2611,6 +2625,7 @@ pub const Decompiler = struct {
     fn runStackSSA(
         self: *Decompiler,
         worklist: *std.ArrayListUnmanaged(u32),
+        in_worklist: *std.DynamicBitSet,
         clone_sim: *SimContext,
         update_counts: ?[]u32,
         sim_arena: *std.heap.ArenaAllocator,
@@ -2622,6 +2637,7 @@ pub const Decompiler = struct {
             iterations += 1;
             const bid = worklist.items[worklist.items.len - 1];
             worklist.items.len -= 1;
+            in_worklist.unset(bid);
             if (iterations > max_iterations) {
                 if (self.last_error_ctx == null) {
                     const offset = if (bid < self.cfg.blocks.len)
@@ -2745,7 +2761,10 @@ pub const Decompiler = struct {
                         };
                         try self.writeTrace(ev);
                     }
-                    try worklist.append(self.allocator, succ);
+                    if (!in_worklist.isSet(succ)) {
+                        try worklist.append(self.allocator, succ);
+                        in_worklist.set(succ);
+                    }
                 }
             }
         }
@@ -2754,6 +2773,7 @@ pub const Decompiler = struct {
     fn runStackFlow(
         self: *Decompiler,
         worklist: *std.ArrayListUnmanaged(u32),
+        in_worklist: *std.DynamicBitSet,
         clone_sim: *SimContext,
         update_counts: ?[]u32,
         sim_arena: *std.heap.ArenaAllocator,
@@ -2765,6 +2785,7 @@ pub const Decompiler = struct {
             iterations += 1;
             const bid = worklist.items[worklist.items.len - 1];
             worklist.items.len -= 1;
+            in_worklist.unset(bid);
             if (iterations > max_iterations) {
                 if (self.last_error_ctx == null) {
                     const offset = if (bid < self.cfg.blocks.len)
@@ -2890,7 +2911,10 @@ pub const Decompiler = struct {
                         };
                         try self.writeTrace(ev);
                     }
-                    try worklist.append(self.allocator, succ);
+                    if (!in_worklist.isSet(succ)) {
+                        try worklist.append(self.allocator, succ);
+                        in_worklist.set(succ);
+                    }
                 }
             }
         }
@@ -2919,6 +2943,8 @@ pub const Decompiler = struct {
 
         var worklist: std.ArrayListUnmanaged(u32) = .{};
         defer worklist.deinit(self.allocator);
+        var in_worklist = try std.DynamicBitSet.initEmpty(self.allocator, block_count);
+        defer in_worklist.deinit();
 
         var update_counts: ?[]u32 = null;
         if (self.trace_stackflow) {
@@ -2939,6 +2965,7 @@ pub const Decompiler = struct {
             self.stack_in[0] = &.{};
         }
         try worklist.append(self.allocator, 0);
+        in_worklist.set(0);
 
         var clone_sim = self.initSim(self.arena.allocator(), self.arena.allocator(), self.code, self.version);
         defer clone_sim.deinit();
@@ -2946,7 +2973,7 @@ pub const Decompiler = struct {
         const flow_arena = self.flow_arena;
         _ = flow_arena.reset(.retain_capacity);
         try self.initPhiMergeOk();
-        try self.runStackSSA(&worklist, &clone_sim, update_counts, flow_arena);
+        try self.runStackSSA(&worklist, &in_worklist, &clone_sim, update_counts, flow_arena);
 
         if (self.cfg.exception_entries.len > 0) {
             var exc_iters: usize = 0;
@@ -3005,13 +3032,16 @@ pub const Decompiler = struct {
                             };
                             try self.writeTrace(ev);
                         }
-                        try worklist.append(self.allocator, hid);
+                        if (!in_worklist.isSet(hid)) {
+                            try worklist.append(self.allocator, hid);
+                            in_worklist.set(hid);
+                        }
                         changed = true;
                     }
                 }
 
                 if (worklist.items.len > 0) {
-                    try self.runStackSSA(&worklist, &clone_sim, update_counts, flow_arena);
+                    try self.runStackSSA(&worklist, &in_worklist, &clone_sim, update_counts, flow_arena);
                 }
             }
         }
@@ -3035,11 +3065,14 @@ pub const Decompiler = struct {
                 };
                 try self.writeTrace(ev);
             }
-            try worklist.append(self.allocator, bid);
+            if (!in_worklist.isSet(bid)) {
+                try worklist.append(self.allocator, bid);
+                in_worklist.set(bid);
+            }
             seeded_loose = true;
         }
         if (seeded_loose and worklist.items.len > 0) {
-            try self.runStackSSA(&worklist, &clone_sim, update_counts, flow_arena);
+            try self.runStackSSA(&worklist, &in_worklist, &clone_sim, update_counts, flow_arena);
         }
         try self.collectPhiIncoming();
     }
@@ -3047,6 +3080,11 @@ pub const Decompiler = struct {
     fn collectPhiIncoming(self: *Decompiler) DecompileError!void {
         if (self.phi_by_block.count() == 0) return;
         self.phi_incoming.clearRetainingCapacity();
+        var incoming_lists = self.phi_incoming_by_succ.valueIterator();
+        while (incoming_lists.next()) |list| {
+            list.deinit(self.allocator);
+        }
+        self.phi_incoming_by_succ.clearRetainingCapacity();
 
         const sim_arena = self.sim_arena;
         _ = sim_arena.reset(.retain_capacity);
@@ -3119,11 +3157,17 @@ pub const Decompiler = struct {
                     const idx: usize = @intCast(slot_idx);
                     const val = if (idx < incoming.len) incoming[idx] else .unknown;
                     const expr = try self.stackValueToPhiExpr(val);
-                    try self.phi_incoming.put(self.allocator, .{
+                    const key = PhiIncomingKey{
                         .pred = bid,
                         .succ = succ,
                         .slot = slot_idx,
-                    }, expr);
+                    };
+                    try self.phi_incoming.put(self.allocator, key, expr);
+                    const list = try self.phi_incoming_by_succ.getOrPut(self.allocator, succ);
+                    if (!list.found_existing) {
+                        list.value_ptr.* = .{};
+                    }
+                    try list.value_ptr.append(self.allocator, key);
                 }
             }
         }
@@ -9019,10 +9063,10 @@ pub const Decompiler = struct {
                                 cur = t_id.?;
                             }
                             if (progressed and final_then != then_block) {
-                                var in_stack = try std.DynamicBitSet.initEmpty(self.allocator, self.cfg.blocks.len);
-                                defer in_stack.deinit();
-                                var memo: std.AutoHashMapUnmanaged(u32, *Expr) = .{};
-                                defer memo.deinit(self.allocator);
+                                self.cond_chain_seen.setRangeValue(.{ .start = 0, .end = self.cfg.blocks.len }, false);
+                                self.cond_chain_memo.clearRetainingCapacity();
+                                const in_stack = &self.cond_chain_seen;
+                                const memo = &self.cond_chain_memo;
                                 if (try self.buildCondTree(
                                     pattern.condition_block,
                                     pattern.condition_block,
@@ -9032,8 +9076,8 @@ pub const Decompiler = struct {
                                     base_vals,
                                     null,
                                     null,
-                                    &in_stack,
-                                    &memo,
+                                    in_stack,
+                                    memo,
                                 )) |expr| {
                                     condition = expr;
                                     then_block = final_then;
@@ -25724,12 +25768,15 @@ test "runStackSSA hard-fails iteration cap" {
     defer worklist.deinit(allocator);
     const block_count: u32 = @intCast(decompiler.cfg.blocks.len);
     try testing.expect(block_count > 0);
+    var in_worklist = try std.DynamicBitSet.initEmpty(allocator, block_count);
+    defer in_worklist.deinit();
     const max_iterations: usize = @as(usize, block_count) * 100;
     try worklist.ensureTotalCapacity(allocator, max_iterations + 1);
     var i: usize = 0;
     while (i < max_iterations + 1) : (i += 1) {
         try worklist.append(allocator, 0);
     }
+    in_worklist.set(0);
 
     var clone_sim = decompiler.initSim(decompiler.arena.allocator(), decompiler.arena.allocator(), code, version);
     defer clone_sim.deinit();
@@ -25737,7 +25784,7 @@ test "runStackSSA hard-fails iteration cap" {
     var flow_arena = std.heap.ArenaAllocator.init(allocator);
     defer flow_arena.deinit();
 
-    try testing.expectError(error.InvalidStackDepth, decompiler.runStackSSA(&worklist, &clone_sim, null, &flow_arena));
+    try testing.expectError(error.InvalidStackDepth, decompiler.runStackSSA(&worklist, &in_worklist, &clone_sim, null, &flow_arena));
     try testing.expect(decompiler.last_error_ctx != null);
     const ctx = decompiler.last_error_ctx.?;
     try testing.expectEqualStrings("stackflow_iter_limit", ctx.opcode);
