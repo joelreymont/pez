@@ -66,6 +66,45 @@ pub const BasicBlock = struct {
     }
 };
 
+pub fn blockIsCleanupOnly(block: *const BasicBlock) bool {
+    for (block.instructions) |inst| {
+        switch (inst.opcode) {
+            .POP_BLOCK, .POP_TOP, .POP_EXCEPT, .END_FINALLY, .END_FOR, .NOP => {},
+            else => return false,
+        }
+    }
+    return true;
+}
+
+pub fn jumpTargetIfJumpOnly(cfg: *const CFG, block_id: u32, allow_pop: bool) ?u32 {
+    if (block_id >= cfg.blocks.len) return null;
+    const blk = &cfg.blocks[block_id];
+    if (blk.instructions.len == 0) {
+        var next: ?u32 = null;
+        for (blk.successors) |edge| {
+            if (edge.edge_type != .normal) continue;
+            if (next != null) return null;
+            next = edge.target;
+        }
+        return next;
+    }
+    var jump_inst: ?Instruction = null;
+    for (blk.instructions) |inst| {
+        switch (inst.opcode) {
+            .NOT_TAKEN, .CACHE, .POP_BLOCK, .POP_EXCEPT, .END_FINALLY, .END_FOR, .NOP => continue,
+            .POP_TOP => if (allow_pop) continue else return null,
+            .JUMP_FORWARD, .JUMP_BACKWARD, .JUMP_BACKWARD_NO_INTERRUPT, .JUMP_ABSOLUTE => {
+                if (jump_inst != null) return null;
+                jump_inst = inst;
+            },
+            else => return null,
+        }
+    }
+    const inst = jump_inst orelse return null;
+    const target_off = inst.jumpTarget(cfg.version) orelse return null;
+    return cfg.blockAtOffset(target_off);
+}
+
 /// Control flow graph for a code object.
 pub const CFG = struct {
     allocator: Allocator,

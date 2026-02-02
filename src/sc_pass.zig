@@ -986,6 +986,31 @@ pub fn Methods(comptime Self: type, comptime Err: type) type {
                     try values_list.append(self.allocator, expr);
                     break;
                 }
+                if (pattern.kind == .or_pop) {
+                    var has_prelude = false;
+                    for (blk.instructions[skip..]) |inst| {
+                        if (ctrl.Analyzer.isConditionalJump(undefined, inst.opcode)) break;
+                        if (inst.opcode == .NOT_TAKEN or inst.opcode == .CACHE) continue;
+                        has_prelude = true;
+                        break;
+                    }
+                    if (!has_prelude) {
+                        var t_id: ?u32 = null;
+                        var f_id: ?u32 = null;
+                        for (blk.successors) |edge| {
+                            if (edge.edge_type == .conditional_true or edge.edge_type == .normal) {
+                                t_id = edge.target;
+                            } else if (edge.edge_type == .conditional_false) {
+                                f_id = edge.target;
+                            }
+                        }
+                        if (t_id == null or f_id == null) return error.InvalidBlock;
+                        const cont_id = if (pattern.is_and) t_id.? else f_id.?;
+                        cur_block = cont_id;
+                        if (cur_block == final_merge) break;
+                        continue;
+                    }
+                }
 
                 const expr = (try simulateBoolOpCondExpr(self, cur_block, base_vals, skip, pattern.kind)) orelse {
                     return error.InvalidBlock;
@@ -1094,10 +1119,21 @@ pub fn Methods(comptime Self: type, comptime Err: type) type {
             const true_blk = &self.cfg.blocks[t_id.?];
             const false_blk = &self.cfg.blocks[f_id.?];
 
-            const merge_true = singleNormalSucc(true_blk) orelse return null;
-            const merge_false = singleNormalSucc(false_blk) orelse return null;
-            if (merge_true != merge_false) return null;
-            var merge_block = merge_true;
+            const merge_true = singleNormalSucc(true_blk);
+            const merge_false = singleNormalSucc(false_blk);
+            var merge_block: u32 = undefined;
+            if (merge_true != null and merge_false != null) {
+                if (merge_true.? != merge_false.?) return null;
+                merge_block = merge_true.?;
+            } else if (merge_true == null and merge_false != null) {
+                if (!self.isTerminalBlock(t_id.?)) return null;
+                merge_block = merge_false.?;
+            } else if (merge_false == null and merge_true != null) {
+                if (!self.isTerminalBlock(f_id.?)) return null;
+                merge_block = merge_true.?;
+            } else {
+                return null;
+            }
 
             var wrap_not = false;
             if (merge_block < self.cfg.blocks.len) {

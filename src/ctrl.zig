@@ -947,7 +947,7 @@ pub const Analyzer = struct {
 
         // Check for COPY, TO_BOOL, POP_JUMP pattern at end of block
         const insts = block.instructions;
-        if (insts.len < 2) return null;
+        if (insts.len == 0) return null;
 
         const term = block.terminator() orelse return null;
 
@@ -1116,6 +1116,21 @@ pub const Analyzer = struct {
         return false;
     }
 
+    fn elifPredOk(self: *Analyzer, cond_id: u32, else_id: u32, else_jump: ?u32) bool {
+        if (else_id >= self.cfg.blocks.len) return false;
+        const else_blk = &self.cfg.blocks[else_id];
+        if (else_blk.predecessors.len == 1 and else_blk.predecessors[0] == cond_id) return true;
+        if (else_jump) |jid| {
+            if (jid >= self.cfg.blocks.len) return false;
+            if (else_blk.predecessors.len != 1 or else_blk.predecessors[0] != jid) return false;
+            const jump_blk = &self.cfg.blocks[jid];
+            if (jump_blk.predecessors.len != 1 or jump_blk.predecessors[0] != cond_id) return false;
+            if (cfg_mod.jumpTargetIfJumpOnly(self.cfg, jid, true) != else_id) return false;
+            return true;
+        }
+        return false;
+    }
+
     /// Detect if/elif/else pattern.
     fn detectIfPattern(self: *Analyzer, block_id: u32) !?IfPattern {
         const block = &self.cfg.blocks[block_id];
@@ -1166,6 +1181,14 @@ pub const Analyzer = struct {
             }
         }
 
+        var else_jump: ?u32 = null;
+        if (else_block) |else_id| {
+            if (cfg_mod.jumpTargetIfJumpOnly(self.cfg, else_id, true)) |target| {
+                else_jump = else_id;
+                else_block = target;
+            }
+        }
+
         const then_id = then_block orelse return null;
         const then_terminal = self.isTerminalBlock(then_id);
 
@@ -1183,7 +1206,7 @@ pub const Analyzer = struct {
                         else_term.opcode == .JUMP_IF_TRUE_OR_POP;
                     if (self.isConditionalJump(else_term.opcode) and !is_boolop_jump and !hasStmtPrelude(else_blk) and
                         !self.hasTrySetup(else_blk) and
-                        else_blk.predecessors.len == 1 and else_blk.predecessors[0] == block_id)
+                        self.elifPredOk(block_id, else_id, else_jump))
                     {
                         // If else branch can reach then-block, it's not an elif chain.
                         var reaches_then = false;
@@ -1227,7 +1250,7 @@ pub const Analyzer = struct {
                             else_term.opcode == .JUMP_IF_TRUE_OR_POP;
                         if (self.isConditionalJump(else_term.opcode) and !is_boolop_jump and !hasStmtPrelude(else_blk) and
                             !self.hasTrySetup(else_blk) and
-                            else_blk.predecessors.len == 1 and else_blk.predecessors[0] == block_id)
+                            self.elifPredOk(block_id, else_id, else_jump))
                         {
                             const cond_off = self.cfg.blocks[block_id].start_offset;
                             if (else_blk.start_offset > cond_off) {
