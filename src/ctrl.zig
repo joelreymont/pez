@@ -3088,15 +3088,90 @@ pub const Analyzer = struct {
     fn findMergePoint(self: *Analyzer, cond_block: u32, then_block: u32, else_block: ?u32) !?u32 {
         const else_id = else_block orelse return null;
         if (then_block >= self.cfg.blocks.len or else_id >= self.cfg.blocks.len) return null;
-        const merge = self.postdom.merge(then_block, else_id) orelse return null;
-        if (merge >= self.cfg.blocks.len) return null;
         const cond_off = if (cond_block < self.cfg.blocks.len)
             self.cfg.blocks[cond_block].start_offset
         else
             0;
-        if (self.cfg.blocks[merge].start_offset <= cond_off) return null;
-        if (self.cfg.blocks[merge].is_loop_header) return null;
-        return merge;
+        if (self.postdom.merge(then_block, else_id)) |merge| {
+            if (merge >= self.cfg.blocks.len) return null;
+            if (self.cfg.blocks[merge].start_offset <= cond_off) return null;
+            if (self.cfg.blocks[merge].is_loop_header) return null;
+            return merge;
+        }
+
+        const is_uncond = struct {
+            fn check(op: Opcode) bool {
+                return op == .JUMP_FORWARD or op == .JUMP_ABSOLUTE or op == .JUMP_BACKWARD or op == .JUMP_BACKWARD_NO_INTERRUPT;
+            }
+        }.check;
+
+        if (self.cfg.blocks[then_block].terminator()) |term| {
+            if (is_uncond(term.opcode)) {
+                if (term.jumpTarget(self.cfg.version)) |target_off| {
+                    if (self.cfg.blockAtOffset(target_off)) |cand| {
+                        if (cand < self.cfg.blocks.len and self.cfg.blocks[cand].start_offset > cond_off and !self.cfg.blocks[cand].is_loop_header) {
+                            if (try self.reachesBlock(else_id, cand, cond_off)) return cand;
+                        }
+                    }
+                }
+            }
+        }
+
+        if (self.cfg.blocks[else_id].terminator()) |term| {
+            if (is_uncond(term.opcode)) {
+                if (term.jumpTarget(self.cfg.version)) |target_off| {
+                    if (self.cfg.blockAtOffset(target_off)) |cand| {
+                        if (cand < self.cfg.blocks.len and self.cfg.blocks[cand].start_offset > cond_off and !self.cfg.blocks[cand].is_loop_header) {
+                            if (try self.reachesBlock(then_block, cand, cond_off)) return cand;
+                        }
+                    }
+                }
+            }
+        }
+
+        const exit_set = struct {
+            fn build(self_: *Analyzer, entry: u32, cond_off_: u32) !std.DynamicBitSet {
+                var exits = try std.DynamicBitSet.initEmpty(self_.allocator, self_.cfg.blocks.len);
+                if (entry >= self_.cfg.blocks.len) return exits;
+                var i: u32 = 0;
+                while (i < self_.cfg.blocks.len) : (i += 1) {
+                    if (!self_.dom.dominates(entry, i)) continue;
+                    const blk = &self_.cfg.blocks[i];
+                    if (blk.start_offset <= cond_off_) continue;
+                    for (blk.successors) |edge| {
+                        if (edge.edge_type == .exception or edge.edge_type == .loop_back) continue;
+                        const next = edge.target;
+                        if (next >= self_.cfg.blocks.len) continue;
+                        if (self_.cfg.blocks[next].start_offset <= cond_off_) continue;
+                        if (!self_.dom.dominates(entry, next)) {
+                            exits.set(next);
+                        }
+                    }
+                }
+                return exits;
+            }
+        };
+
+        var then_exits = try exit_set.build(self, then_block, cond_off);
+        defer then_exits.deinit();
+        var else_exits = try exit_set.build(self, else_id, cond_off);
+        defer else_exits.deinit();
+        var best_id: ?u32 = null;
+        var best_off: u32 = 0;
+        var i: u32 = 0;
+        while (i < self.cfg.blocks.len) : (i += 1) {
+            if (!then_exits.isSet(i) or !else_exits.isSet(i)) continue;
+            const blk = &self.cfg.blocks[i];
+            if (blk.start_offset <= cond_off) continue;
+            if (blk.is_loop_header) continue;
+            const off = blk.start_offset;
+            if (best_id == null or off < best_off or (off == best_off and i < best_id.?)) {
+                best_id = i;
+                best_off = off;
+            }
+        }
+        if (best_id) |id| return id;
+        return null;
     }
 
     fn reachesBlock(self: *Analyzer, start: u32, target: u32, cond_off: u32) !bool {

@@ -90,6 +90,21 @@ test "snapshot loop chain compare 3.9" {
     );
 }
 
+test "snapshot loop del prelude 3.9" {
+    try runSnapshot(@src(), "test/corpus/loop_del_prelude.3.9.pyc",
+        \\[]u8
+        \\  "flag = True
+        \\dbm = 0
+        \\for dim in (1, 2):
+        \\    dbm += dim
+        \\del dbm
+        \\del dim
+        \\if flag:
+        \\    pass
+        \\"
+    );
+}
+
 test "snapshot loop guard while 3.9" {
     try runSnapshot(@src(), "test/corpus/guard_loop_while.3.9.pyc",
         \\[]u8
@@ -102,6 +117,22 @@ test "snapshot loop guard while 3.9" {
         \\        if s.startswith('X'):
         \\            return None
         \\        yield s
+        \\"
+    );
+}
+
+test "snapshot if merge nested 3.9" {
+    try runSnapshot(@src(), "test/corpus/if_merge_nested.3.9.pyc",
+        \\[]u8
+        \\  "def merge_if_nested(x):
+        \\    if isinstance(x, float):
+        \\        if x > 0:
+        \\            x = int(x)
+        \\        else:
+        \\            x = int(-x)
+        \\    else:
+        \\        x = x
+        \\    return x
         \\"
     );
 }
@@ -1031,6 +1062,45 @@ test "snapshot guard raise 3.9" {
         \\    if x is None:
         \\        raise ValueError('x')
         \\    return x
+        \\"
+    );
+}
+
+test "snapshot if else guard merge 3.9" {
+    try runSnapshot(@src(), "test/corpus/if_else_guard_merge.3.9.pyc",
+        \\[]u8
+        \\  "def if_else_guard_merge(x):
+        \\    if x:
+        \\        a = 1
+        \\    else:
+        \\        a = 2
+        \\        if a < 0:
+        \\            raise ValueError('bad')
+        \\    b = 3
+        \\    return a + b
+        \\"
+    );
+}
+
+test "snapshot try for else handler 3.9" {
+    try runSnapshot(@src(), "test/corpus/try_for_else_handler.3.9.pyc",
+        \\[]u8
+        \\  "cache = {}
+        \\hooks = []
+        \\def get_importer(path_item):
+        \\    try:
+        \\        importer = cache[path_item]
+        \\    except KeyError:
+        \\        for hook in hooks:
+        \\            try:
+        \\                importer = hook(path_item)
+        \\                cache.setdefault(path_item, importer)
+        \\                break
+        \\            except ImportError:
+        \\                pass
+        \\        else:
+        \\            importer = None
+        \\    return importer
         \\"
     );
 }

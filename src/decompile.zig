@@ -2675,8 +2675,7 @@ pub const Decompiler = struct {
             }
             if (simulate_failed) continue;
 
-            const exit = try self.cloneStackValuesArena(clone_sim, sim.stack.items.items);
-            defer if (exit.len > 0) self.allocator.free(exit);
+            const exit = sim.stack.items.items;
             const term = block.terminator();
             for (block.successors) |edge| {
                 const succ = edge.target;
@@ -2820,8 +2819,7 @@ pub const Decompiler = struct {
             }
             if (simulate_failed) continue;
 
-            const exit = try self.cloneStackValuesArenaFlow(clone_sim, sim.stack.items.items);
-            defer if (exit.len > 0) self.allocator.free(exit);
+            const exit = sim.stack.items.items;
             const term = block.terminator();
             for (block.successors) |edge| {
                 const succ = edge.target;
@@ -10409,7 +10407,17 @@ pub const Decompiler = struct {
         if (else_block) |else_id| {
             const resolved_then = self.resolveJumpOnlyBlock(then_block);
             const then_is_raise = resolved_then < self.cfg.blocks.len and self.isRaiseBlock(resolved_then);
-            if (!force_else and !is_elif and then_is_raise and else_body.len > 0) {
+            var has_norm = false;
+            if (then_block < self.cfg.blocks.len) {
+                for (self.cfg.blocks[then_block].successors) |edge| {
+                    if (edge.edge_type != .exception) {
+                        has_norm = true;
+                        break;
+                    }
+                }
+            }
+            const allow_guard = !force_else or (then_is_raise and !has_norm);
+            if (allow_guard and !is_elif and then_is_raise and else_body.len > 0) {
                 if (term) |t| {
                     if (self.elseIsJumpTarget(t.opcode)) {
                         else_body = &[_]*Stmt{};
@@ -12206,6 +12214,9 @@ pub const Decompiler = struct {
                     }
                 }
                 if (!has_pop_except) continue;
+                if (!try self.postDominates(scan_block, info.body_block)) {
+                    continue;
+                }
                 if (scan_blk.terminator()) |term| {
                     if (term.isUnconditionalJump()) {
                         if (term.jumpTarget(self.cfg.version)) |toff| {
@@ -21204,6 +21215,21 @@ pub const Decompiler = struct {
                 .STORE_SLICE => {
                     try self.emitStoreSlice(&sim, stmts, stmts_allocator);
                 },
+                .DELETE_NAME,
+                .DELETE_FAST,
+                .DELETE_GLOBAL,
+                .DELETE_DEREF,
+                .DELETE_ATTR,
+                .DELETE_SUBSCR,
+                .DELETE_SLICE_0,
+                .DELETE_SLICE_1,
+                .DELETE_SLICE_2,
+                .DELETE_SLICE_3,
+                => {
+                    if (try self.tryEmitStatement(inst, &sim, block.id, idx)) |stmt| {
+                        try stmts.append(stmts_allocator, stmt);
+                    }
+                },
                 .POP_TOP => {
                     try self.handlePopTopStmt(&sim, block, stmts, stmts_allocator, idx);
                 },
@@ -25591,8 +25617,11 @@ fn alignDefLines(allocator: Allocator, code: *const pyc.Code, src: []const u8) A
 // ============================================================================
 
 fn expectDecompileFixture(allocator: Allocator, path: []const u8) !void {
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
     var module: pyc.Module = undefined;
-    module.init(allocator);
+    module.init(a);
     defer module.deinit();
     try module.loadFromFile(path);
 
@@ -25603,7 +25632,7 @@ fn expectDecompileFixture(allocator: Allocator, path: []const u8) !void {
     var out: std.ArrayListUnmanaged(u8) = .{};
     defer out.deinit(allocator);
 
-    try decompileToSource(allocator, code, version, out.writer(allocator));
+    try decompileToSource(a, code, version, out.writer(allocator));
     try std.testing.expect(out.items.len > 0);
 }
 
