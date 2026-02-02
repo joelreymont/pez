@@ -262,6 +262,23 @@ test "snapshot loop guard continue 3.9" {
     );
 }
 
+test "snapshot loop guard cont body 3.9" {
+    try runSnapshot(@src(), "test/corpus/loop_guard_cont_body.3.9.pyc",
+        \\[]u8
+        \\  "import time
+        \\def f(flag, sock):
+        \\    while True:
+        \\        if flag():
+        \\            time.sleep(30)
+        \\            continue
+        \\        try:
+        \\            sock.recv(1)
+        \\        except Exception:
+        \\            return None
+        \\"
+    );
+}
+
 test "snapshot loop guard try continue 3.9" {
     try runSnapshot(@src(), "test/corpus/loop_guard_try_continue.3.9.pyc",
         \\[]u8

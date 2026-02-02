@@ -1180,6 +1180,7 @@ pub const Analyzer = struct {
                 const else_blk = &self.cfg.blocks[else_id];
                 if (else_blk.terminator()) |else_term| {
                     if (self.isConditionalJump(else_term.opcode) and !hasStmtPrelude(else_blk) and
+                        !self.hasTrySetup(else_blk) and
                         else_blk.predecessors.len == 1 and else_blk.predecessors[0] == block_id)
                     {
                         // If else branch can reach then-block, it's not an elif chain.
@@ -1221,6 +1222,7 @@ pub const Analyzer = struct {
                     const else_blk = &self.cfg.blocks[else_id];
                     if (else_blk.terminator()) |else_term| {
                         if (self.isConditionalJump(else_term.opcode) and !hasStmtPrelude(else_blk) and
+                            !self.hasTrySetup(else_blk) and
                             else_blk.predecessors.len == 1 and else_blk.predecessors[0] == block_id)
                         {
                             const cond_off = self.cfg.blocks[block_id].start_offset;

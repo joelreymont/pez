@@ -5353,6 +5353,11 @@ pub const Decompiler = struct {
             const cur = stmts[i];
             if (cur.* == .if_stmt) {
                 const ifs = cur.if_stmt;
+                if (ifs.no_merge) {
+                    try out.append(allocator, cur);
+                    i += 1;
+                    continue;
+                }
                 if (ifs.else_body.len == 0 and ifs.body.len >= 2) {
                     const last_then = ifs.body[ifs.body.len - 1];
                     if (last_then.* == .continue_stmt and i + 1 < stmts.len) {
@@ -16955,10 +16960,40 @@ pub const Decompiler = struct {
                         if (vis_ptr) |v| {
                             const stop_block = if (end < self.cfg.blocks.len) end else null;
                             if (try self.loopIfParts(if_pat, header, v, stop_block)) |parts| {
+                                const then_direct = self.blockDirectJumpToHeader(parts.then_block, header);
+                                const else_direct = if (parts.else_block) |else_id|
+                                    self.blockDirectJumpToHeader(else_id, header)
+                                else
+                                    false;
+                                if (parts.else_block != null and parts.then_body.len > 0 and parts.else_body.len > 0 and then_direct != else_direct) {
+                                    const guard_is_then = then_direct;
+                                    const else_is_jump_target = self.elseIsJumpTarget(parts.cond_op);
+                                    const guard_taken = if (guard_is_then) !else_is_jump_target else else_is_jump_target;
+                                    const guard_cond = try self.guardCondForBranch(parts.condition, parts.cond_op, guard_taken);
+                                    var guard_body = if (guard_is_then) parts.then_body else parts.else_body;
+                                    if (!self.bodyEndsLoopTerminal(guard_body)) {
+                                        const cont = try self.makeContinue();
+                                        const next_body = try a.alloc(*Stmt, guard_body.len + 1);
+                                        std.mem.copyForwards(*Stmt, next_body[0..guard_body.len], guard_body);
+                                        next_body[guard_body.len] = cont;
+                                        guard_body = next_body;
+                                    }
+                                    const if_stmt = try a.create(Stmt);
+                                    if_stmt.* = .{ .if_stmt = .{
+                                        .condition = guard_cond,
+                                        .body = guard_body,
+                                        .else_body = &.{},
+                                    } };
+                                    if (guard_body.len > 0 and guard_body[guard_body.len - 1].* == .continue_stmt) {
+                                        if_stmt.if_stmt.no_merge = true;
+                                    }
+                                    stmt = if_stmt;
+                                    guard_then = if (guard_is_then) parts.else_body else parts.then_body;
+                                } else {
                                 var use_else_cont = parts.else_is_continuation;
                                 if (use_else_cont and parts.else_body.len > 0) {
                                     const only_cont = parts.else_body.len == 1 and parts.else_body[0].* == .continue_stmt;
-                                    if (!only_cont) {
+                                    if (!only_cont and !self.bodyEndsLoopTerminal(parts.then_body)) {
                                         use_else_cont = false;
                                     }
                                 }
@@ -17004,6 +17039,9 @@ pub const Decompiler = struct {
                                             .body = guard_body,
                                             .else_body = &.{},
                                         } };
+                                        if (guard_body.len > 0 and guard_body[guard_body.len - 1].* == .continue_stmt) {
+                                            guard_stmt.if_stmt.no_merge = true;
+                                        }
                                         stmt = guard_stmt;
                                         guard_then = parts.then_body;
                                     }
@@ -17014,6 +17052,9 @@ pub const Decompiler = struct {
                                         .body = parts.then_body,
                                         .else_body = &.{},
                                     } };
+                                    if (parts.then_body.len > 0 and parts.then_body[parts.then_body.len - 1].* == .continue_stmt) {
+                                        if_stmt.if_stmt.no_merge = true;
+                                    }
                                     stmt = if_stmt;
                                     guard_then = parts.else_body;
                                 } else {
@@ -17032,6 +17073,7 @@ pub const Decompiler = struct {
                                             self.if_next = else_id;
                                         }
                                     }
+                                }
                                 }
                             }
                         }
@@ -19243,6 +19285,16 @@ pub const Decompiler = struct {
         return false;
     }
 
+    fn blockDirectJumpToHeader(self: *Decompiler, block_id: u32, loop_header: u32) bool {
+        if (block_id >= self.cfg.blocks.len) return false;
+        const blk = &self.cfg.blocks[block_id];
+        const term = blk.terminator() orelse return false;
+        if (!term.isUnconditionalJump()) return false;
+        const target_off = term.jumpTarget(self.cfg.version) orelse return false;
+        const target_id = self.cfg.blockAtOffset(target_off) orelse return false;
+        return target_id == loop_header;
+    }
+
     fn handlerIsContinue(self: *Decompiler, start: u32, end: u32, loop_header: u32) bool {
         var bid = start;
         while (bid < end and bid < self.cfg.blocks.len) : (bid += 1) {
@@ -21434,12 +21486,11 @@ pub const Decompiler = struct {
         if (else_block) |else_id| {
             then_reaches_else = try self.reachesBlockNoBack(then_block, else_id, pattern.condition_block);
         }
-        if (!else_is_continuation and else_block != null and then_leads and !else_leads and !then_reaches_else) {
+        if (!else_is_continuation and else_block != null and then_leads and !then_reaches_else) {
             else_is_continuation = true;
         }
         if (then_leads and else_block != null and else_is_continuation and !then_reaches_else) {
-            const else_empty = else_body.len == 0 or self.bodyEndsLoopTerminal(else_body);
-            if (else_empty and (then_body.len == 0 or !self.bodyEndsLoopTerminal(then_body))) {
+            if (then_body.len == 0 or !self.bodyEndsLoopTerminal(then_body)) {
                 const cont = try self.makeContinue();
                 const body = try a.alloc(*Stmt, then_body.len + 1);
                 if (then_body.len > 0) {
@@ -21458,10 +21509,7 @@ pub const Decompiler = struct {
                 else_body = body;
             }
         }
-        if (then_leads and else_leads and then_body.len > 0 and else_body.len > 0) {
-            else_is_continuation = false;
-        }
-        if (else_is_continuation and then_body.len > 0 and else_body.len > 0) {
+        if (!then_leads and else_leads and then_body.len > 0 and else_body.len > 0) {
             else_is_continuation = false;
         }
         if (merge_block != null and merge_block != pattern.merge_block) {
@@ -21735,13 +21783,21 @@ pub const Decompiler = struct {
             }
             var pattern = try self.analyzer.detectPatternInLoop(block_idx);
             if (block_idx == start_block and pattern == .while_loop and pattern.while_loop.header_block == loop_header) {
-                if (skip_first > 0 or ignore_header_while) {
+                if (ignore_header_while) {
+                    if (try self.analyzer.detectIfOnly(block_idx)) |if_pat| {
+                        pattern = .{ .if_stmt = if_pat };
+                    } else {
+                        pattern = .unknown;
+                    }
+                } else if (skip_first > 0) {
                     pattern = .unknown;
                 }
             }
-            if (pattern == .unknown and !block.is_exception_handler and self.analyzer.hasExceptionEdge(block)) {
+            if (!block.is_exception_handler and self.analyzer.hasExceptionEdge(block)) {
                 if (try self.analyzer.detectTryPatternAt(block_idx)) |tp| {
-                    pattern = .{ .try_stmt = tp };
+                    if (tp.try_block == block_idx) {
+                        pattern = .{ .try_stmt = tp };
+                    }
                 }
             }
 
@@ -21796,6 +21852,7 @@ pub const Decompiler = struct {
                                 .body = parts.then_body,
                                 .else_body = &.{},
                             } };
+                            if_stmt.if_stmt.no_merge = true;
                             try stmts.append(a, if_stmt);
                             try stmts.appendSlice(a, parts.else_body);
                             if (try self.nextLoopBlockAfterIf(p, loop_header, block_idx, stop_block)) |next_id| {
@@ -21806,16 +21863,7 @@ pub const Decompiler = struct {
                         }
                     }
 
-                    const else_cont = if (parts.else_is_continuation and parts.else_block != null) blk: {
-                        const else_id = parts.else_block.?;
-                        if (self.resolveJumpOnlyBlock(else_id) == loop_header or
-                            self.loopBlockLeadsToContinue(else_id, loop_header) or
-                            self.blockLeadsToHeader(else_id, loop_header))
-                        {
-                            break :blk true;
-                        }
-                        break :blk false;
-                    } else false;
+                    const else_cont = parts.else_is_continuation and parts.else_block != null;
                     const then_guard = parts.then_leads and parts.else_block != null and !parts.else_leads;
                     var consumed_else = false;
                     if (parts.else_block) |else_id| {
@@ -21842,6 +21890,9 @@ pub const Decompiler = struct {
                             .body = parts.then_body,
                             .else_body = &.{},
                         } };
+                        if (parts.then_body.len > 0 and parts.then_body[parts.then_body.len - 1].* == .continue_stmt) {
+                            if_stmt.if_stmt.no_merge = true;
+                        }
                         try stmts.append(a, if_stmt);
                         if (parts.else_body.len > 0) {
                             try stmts.appendSlice(a, parts.else_body);
@@ -21859,6 +21910,7 @@ pub const Decompiler = struct {
                                 .body = parts.else_body,
                                 .else_body = &.{},
                             } };
+                            if_stmt.if_stmt.no_merge = true;
                             try stmts.append(a, if_stmt);
                             consumed_else = true;
                         } else if (self.bodyEndsTerminal(parts.then_body) and parts.else_body.len > 0) {
@@ -21868,6 +21920,9 @@ pub const Decompiler = struct {
                                 .body = parts.then_body,
                                 .else_body = &.{},
                             } };
+                            if (parts.then_body.len > 0 and parts.then_body[parts.then_body.len - 1].* == .continue_stmt) {
+                                if_stmt.if_stmt.no_merge = true;
+                            }
                             try stmts.append(a, if_stmt);
                             try stmts.appendSlice(a, parts.else_body);
                             consumed_else = true;
@@ -21917,6 +21972,9 @@ pub const Decompiler = struct {
                                     .body = guard_body,
                                     .else_body = &.{},
                                 } };
+                                if (guard_body.len > 0 and guard_body[guard_body.len - 1].* == .continue_stmt) {
+                                    guard_stmt.if_stmt.no_merge = true;
+                                }
                                 try stmts.append(a, guard_stmt);
                             }
                             if (!emitted_then_if and parts.then_body.len > 0) {
