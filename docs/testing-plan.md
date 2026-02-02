@@ -55,6 +55,7 @@ External Cross-checks
 ---------------------
 - decompyle3:
   - Clone: `gh repo clone rocky/python-decompile3 /tmp/python-decompile3`
+  - Repo: `/tmp/python-decompile3` (keep in sync via `gh repo sync`)
   - Local snapshot (subset for quick diffs): `refs/python-decompile3/`
   - Venv (py3.12): `/opt/homebrew/bin/python3.12 -m venv /tmp/decompyle3-venv-312`
   - xdis (pre-opcode reorg, compatible with decompyle3): `/tmp/decompyle3-venv-312/bin/pip install git+https://github.com/rocky/python-xdis.git@f19046be089a515f2041a14a696774e82851d3c5`
