@@ -46,7 +46,7 @@ def main() -> None:
     counts = {"total": 0, "ok": 0, "error": 0}
 
     processed = 0
-    for pyc in orig_root.rglob("*.pyc"):
+    for pyc in sorted(orig_root.rglob("*.pyc")):
         rel = pyc.relative_to(orig_root)
         out_path = out_root / rel
         out_path = out_path.with_suffix(".py")

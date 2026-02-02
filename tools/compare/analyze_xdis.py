@@ -231,6 +231,24 @@ def stack_delta(opc, opname: str, arg: int) -> int:
 
 
 def normalize_instructions(instrs):
+    def synth_load_const(template, value):
+        if hasattr(template, "_replace"):
+            try:
+                return template._replace(opname="LOAD_CONST", arg=0, argval=value, argrepr=repr(value))
+            except Exception:
+                pass
+        return type(
+            "SynthInst",
+            (),
+            {
+                "opname": "LOAD_CONST",
+                "arg": 0,
+                "argval": value,
+                "argrepr": repr(value),
+                "offset": getattr(template, "offset", 0),
+            },
+        )()
+
     out = []
     i = 0
     while i < len(instrs):
@@ -241,6 +259,18 @@ def normalize_instructions(instrs):
         if ins.opname == "PUSH_NULL":
             i += 1
             continue
+        if ins.opname == "LOAD_CONST":
+            j = i
+            consts = []
+            while j < len(instrs) and instrs[j].opname == "LOAD_CONST":
+                consts.append(instrs[j].argval)
+                j += 1
+            if j < len(instrs):
+                next_ins = instrs[j]
+                if next_ins.opname == "BUILD_TUPLE" and next_ins.arg == len(consts) and len(consts) > 0:
+                    out.append(synth_load_const(ins, tuple(consts)))
+                    i = j + 1
+                    continue
         out.append(ins)
         i += 1
     return out
