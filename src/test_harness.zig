@@ -469,9 +469,7 @@ test "get base name from pyc filename" {
 
 test "run pycdc test suite" {
     const allocator = std.testing.allocator;
-    var buf: [4096]u8 = undefined;
-    var stream = std.io.fixedBufferStream(&buf);
-    const stats = try runAllTests(allocator, "refs/pycdc/tests/compiled", stream.writer());
+    const stats = try runAllTests(allocator, "refs/pycdc/tests/compiled", std.io.null_writer);
     _ = stats;
     // Just ensure it runs without crashing
 }

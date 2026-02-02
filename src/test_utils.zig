@@ -35,15 +35,21 @@ pub fn renderExprWithNewline(allocator: Allocator, expr: *const stack.Expr) ![]c
 }
 
 pub fn renderModule(allocator: Allocator, code: *const pyc.Code, version: Version) ![]const u8 {
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
     var out: std.ArrayList(u8) = .{};
     errdefer out.deinit(allocator);
-    try decompile.decompileToSource(allocator, code, version, out.writer(allocator));
+    try decompile.decompileToSource(a, code, version, out.writer(allocator));
     return out.toOwnedSlice(allocator);
 }
 
 pub fn renderPycFile(allocator: Allocator, path: []const u8, align_defs: bool) ![]u8 {
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
     var module: pyc.Module = undefined;
-    module.init(allocator);
+    module.init(a);
     defer module.deinit();
     try module.loadFromFile(path);
 
@@ -53,7 +59,7 @@ pub fn renderPycFile(allocator: Allocator, path: []const u8, align_defs: bool) !
     var output: std.ArrayList(u8) = .{};
     errdefer output.deinit(allocator);
     const opts = decompile.DecompileOptions{ .align_defs = align_defs };
-    try decompile.decompileToSourceWithOptions(allocator, code, version, output.writer(allocator), null, opts);
+    try decompile.decompileToSourceWithOptions(a, code, version, output.writer(allocator), null, opts);
     return output.toOwnedSlice(allocator);
 }
 
