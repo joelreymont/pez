@@ -1782,6 +1782,16 @@ pub const Analyzer = struct {
 
         const handlers = try self.allocator.dupe(HandlerInfo, handler_list.items);
 
+        var has_final = false;
+        var has_except = false;
+        for (handler_list.items) |handler| {
+            if (try self.handlerIsFinally(handler.handler_block)) {
+                has_final = true;
+            } else {
+                has_except = true;
+            }
+        }
+
         // Detect else and finally blocks
         var else_block: ?u32 = null;
         var finally_block: ?u32 = null;
@@ -1789,12 +1799,12 @@ pub const Analyzer = struct {
             else_block = try self.detectElseBlock311(block_id, handler_list.items, exit_block);
             finally_block = try self.detectFinallyBlock311(block_id, handler_list.items, else_block, exit_block);
         } else {
-            if (has_setup_except) {
+            if (has_except) {
                 else_block = try self.detectElseBlockLegacy(block_id, handler_list.items, exit_block);
             } else {
                 else_block = null;
             }
-            if (has_setup_finally) {
+            if (has_final) {
                 finally_block = setup_finally_target orelse
                     try self.detectFinallyBlockLegacy(block_id, handler_list.items, else_block, exit_block);
             } else {
@@ -1823,6 +1833,24 @@ pub const Analyzer = struct {
             }
         }
         return false;
+    }
+
+    pub fn hasExceptionHandlerOpcodes(block: *const BasicBlock) bool {
+        var has_dup = false;
+        var has_exc_cmp = false;
+        var has_jump = false;
+        for (block.instructions) |inst| {
+            switch (inst.opcode) {
+                .PUSH_EXC_INFO, .CHECK_EXC_MATCH, .JUMP_IF_NOT_EXC_MATCH => return true,
+                .DUP_TOP => has_dup = true,
+                .COMPARE_OP => {
+                    if (inst.arg == 10) has_exc_cmp = true;
+                },
+                .JUMP_IF_FALSE, .POP_JUMP_IF_FALSE => has_jump = true,
+                else => {},
+            }
+        }
+        return has_dup and has_exc_cmp and has_jump;
     }
 
     fn jumpOnlyTarget(self: *const Analyzer, block_id: u32) ?u32 {
@@ -1915,6 +1943,46 @@ pub const Analyzer = struct {
             }
         }
 
+        return false;
+    }
+
+    fn handlerIsFinally(self: *Analyzer, handler_block: u32) !bool {
+        if (handler_block >= self.cfg.blocks.len) return false;
+        const block = &self.cfg.blocks[handler_block];
+        if (hasExceptionHandlerOpcodes(block)) return false;
+        for (block.instructions) |inst| {
+            if (inst.opcode == .CHECK_EXC_MATCH) return false;
+            if (inst.opcode == .COMPARE_OP and inst.arg == 10) return false;
+            if (inst.opcode == .POP_EXCEPT) return false;
+        }
+        for (block.instructions) |inst| {
+            if (inst.opcode == .RERAISE or inst.opcode == .END_FINALLY) return true;
+        }
+
+        var seen = try std.DynamicBitSet.initEmpty(self.allocator, self.cfg.blocks.len);
+        defer seen.deinit();
+        var queue: std.ArrayListUnmanaged(u32) = .{};
+        defer queue.deinit(self.allocator);
+        try queue.append(self.allocator, handler_block);
+
+        while (queue.items.len > 0) {
+            const bid = queue.items[queue.items.len - 1];
+            queue.items.len -= 1;
+            if (bid >= self.cfg.blocks.len) continue;
+            if (seen.isSet(bid)) continue;
+            seen.set(bid);
+            const blk = &self.cfg.blocks[bid];
+            for (blk.instructions) |inst| {
+                if (inst.opcode == .RERAISE or inst.opcode == .END_FINALLY) return true;
+            }
+            for (blk.successors) |edge| {
+                if (edge.edge_type == .exception or edge.edge_type == .loop_back) continue;
+                if (edge.target >= self.cfg.blocks.len) continue;
+                if (!seen.isSet(edge.target)) {
+                    try queue.append(self.allocator, edge.target);
+                }
+            }
+        }
         return false;
     }
 

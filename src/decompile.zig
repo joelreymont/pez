@@ -7390,7 +7390,7 @@ pub const Decompiler = struct {
                         }
                     }
                     // Skip exception handler blocks - they're decompiled as part of try/except
-                    if (block.is_exception_handler or self.hasExceptionHandlerOpcodes(block)) {
+                    if (block.is_exception_handler or ctrl.Analyzer.hasExceptionHandlerOpcodes(block)) {
                         block_idx += 1;
                         continue;
                     }
@@ -11583,6 +11583,7 @@ pub const Decompiler = struct {
         );
 
         var join_block: ?u32 = null;
+        var join_term: ?u32 = null;
         if (post_try_entry) |entry| {
             try self.collectReachableNoExceptionInto(
                 entry,
@@ -11594,13 +11595,14 @@ pub const Decompiler = struct {
             );
             for (scratch.normal_reach.list.items) |bid| {
                 if (handler_reach.isSet(bid)) {
-                    // Skip blocks ending with terminal instructions (return/raise)
+                    // Prefer non-terminal join blocks; keep terminal as fallback.
                     if (bid < self.cfg.blocks.len) {
                         const blk = &self.cfg.blocks[bid];
                         if (blk.terminator()) |term| {
                             if (term.opcode == .RETURN_VALUE or term.opcode == .RETURN_CONST or
                                 term.opcode == .RAISE_VARARGS or term.opcode == .RERAISE)
                             {
+                                if (join_term == null) join_term = bid;
                                 continue;
                             }
                         }
@@ -11609,6 +11611,9 @@ pub const Decompiler = struct {
                     break;
                 }
             }
+        }
+        if (join_block == null and join_term != null) {
+            join_block = join_term;
         }
         if (self.trace_decisions and self.trace_file != null) {
             const ev = .{
@@ -17839,7 +17844,7 @@ pub const Decompiler = struct {
     fn isFinallyHandler(self: *Decompiler, handler_block: u32, scratch: *TryScratch) DecompileError!bool {
         if (handler_block >= self.cfg.blocks.len) return false;
         const block = &self.cfg.blocks[handler_block];
-        if (self.hasExceptionHandlerOpcodes(block)) return false;
+        if (ctrl.Analyzer.hasExceptionHandlerOpcodes(block)) return false;
         for (block.instructions) |inst| {
             if (inst.opcode == .CHECK_EXC_MATCH) return false;
             if (inst.opcode == .COMPARE_OP and inst.arg == 10) return false;
@@ -17910,25 +17915,6 @@ pub const Decompiler = struct {
         return false;
     }
 
-    fn hasExceptionHandlerOpcodes(self: *Decompiler, block: *const BasicBlock) bool {
-        _ = self;
-        var has_dup = false;
-        var has_exc_cmp = false;
-        var has_jump = false;
-        for (block.instructions) |inst| {
-            switch (inst.opcode) {
-                .PUSH_EXC_INFO, .CHECK_EXC_MATCH, .JUMP_IF_NOT_EXC_MATCH => return true,
-                .DUP_TOP => has_dup = true,
-                .COMPARE_OP => {
-                    if (inst.arg == 10) has_exc_cmp = true;
-                },
-                .JUMP_IF_FALSE, .POP_JUMP_IF_FALSE => has_jump = true,
-                else => {},
-            }
-        }
-        return has_dup and has_exc_cmp and has_jump;
-    }
-
     fn hasExceptionSuccessor(self: *Decompiler, block: *const BasicBlock) bool {
         _ = self;
         for (block.successors) |edge| {
@@ -17959,11 +17945,11 @@ pub const Decompiler = struct {
 
     fn needsExceptionSeed(self: *Decompiler, block_id: u32, block: *const BasicBlock) bool {
         _ = block_id;
-        if (block.is_exception_handler or self.hasExceptionHandlerOpcodes(block)) return true;
+        if (block.is_exception_handler or ctrl.Analyzer.hasExceptionHandlerOpcodes(block)) return true;
         for (block.predecessors) |pred_id| {
             if (pred_id >= self.cfg.blocks.len) continue;
             const pred = &self.cfg.blocks[pred_id];
-            if (pred.is_exception_handler or self.hasExceptionHandlerOpcodes(pred)) return true;
+            if (pred.is_exception_handler or ctrl.Analyzer.hasExceptionHandlerOpcodes(pred)) return true;
         }
         return false;
     }
@@ -17983,7 +17969,7 @@ pub const Decompiler = struct {
         for (block.instructions) |inst| {
             if (inst.opcode == .WITH_EXCEPT_START) return self.withExcSeedCount();
         }
-        if (block.is_exception_handler or self.hasExceptionHandlerOpcodes(block)) {
+        if (block.is_exception_handler or ctrl.Analyzer.hasExceptionHandlerOpcodes(block)) {
             return self.excHandlerSeedCount();
         }
         return 0;

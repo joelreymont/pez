@@ -673,6 +673,23 @@ test "snapshot try import star 3.9" {
     );
 }
 
+test "snapshot try except else after 3.9" {
+    try runSnapshot(@src(), "test/corpus/try_except_else_after.3.9.pyc",
+        \\[]u8
+        \\  "try:
+        \\    import _hashlib as _hashopenssl
+        \\except ImportError:
+        \\    _hashopenssl = None
+        \\    _openssl_md_meths = None
+        \\    from _operator import _compare_digest as compare_digest
+        \\else:
+        \\    _openssl_md_meths = frozenset(_hashopenssl.openssl_md_meth_names)
+        \\    compare_digest = _hashopenssl.compare_digest
+        \\import hashlib as _hashlib
+        \\"
+    );
+}
+
 test "snapshot try bool and 3.9" {
     try runSnapshot(@src(), "test/corpus/try_bool_and.3.9.pyc",
         \\[]u8
