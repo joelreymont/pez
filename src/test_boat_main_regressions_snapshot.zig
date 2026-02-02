@@ -79,6 +79,17 @@ test "snapshot loop guard ret 3.9" {
     );
 }
 
+test "snapshot loop chain compare 3.9" {
+    try runSnapshot(@src(), "test/corpus/loop_chain_compare.3.9.pyc",
+        \\[]u8
+        \\  "def loop_chain_compare(segments):
+        \\    while b'\xff\xe0' <= segments[1][0:2] <= b'\xff\xef':
+        \\        segments.pop(1)
+        \\    return b''.join(segments)
+        \\"
+    );
+}
+
 test "snapshot loop guard while 3.9" {
     try runSnapshot(@src(), "test/corpus/guard_loop_while.3.9.pyc",
         \\[]u8

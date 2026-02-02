@@ -10693,9 +10693,24 @@ pub const Decompiler = struct {
         var cond_idx: usize = header.instructions.len;
         const insts = header.instructions;
         var inst_idx: usize = 0;
+        var first_jump_idx: ?usize = null;
+        var last_jump_idx: ?usize = null;
+        var saw_dup = false;
+        var saw_rot = false;
+        var first_cmp_idx: ?usize = null;
         while (inst_idx < insts.len) : (inst_idx += 1) {
             const inst = insts[inst_idx];
-            if (ctrl.Analyzer.isConditionalJump(undefined, inst.opcode)) break;
+            if (ctrl.Analyzer.isConditionalJump(undefined, inst.opcode)) {
+                if (first_jump_idx == null) {
+                    first_jump_idx = inst_idx;
+                }
+                last_jump_idx = inst_idx;
+                break;
+            }
+
+            if (inst.opcode == .DUP_TOP) saw_dup = true;
+            if (inst.opcode == .ROT_THREE or inst.opcode == .ROT_TWO) saw_rot = true;
+            if (inst.opcode == .COMPARE_OP and first_cmp_idx == null) first_cmp_idx = inst_idx;
 
             // Detect walrus operator: COPY 1 followed by STORE_*
             if (inst.opcode == .STORE_NAME or inst.opcode == .STORE_FAST or
@@ -10752,7 +10767,98 @@ pub const Decompiler = struct {
             cond_idx = inst_idx + 1;
         }
 
-        const condition = try sim.stack.popExpr();
+        var condition = try sim.stack.popExpr();
+
+        if (first_jump_idx) |jump_idx| {
+            cond_idx = jump_idx + 1;
+        }
+
+        if (condition.* == .compare and saw_dup and saw_rot and first_cmp_idx != null and first_jump_idx != null) {
+            const first_cmp = condition.compare;
+            if (first_cmp.ops.len == 1 and first_cmp.comparators.len == 1) {
+                var ops_list: std.ArrayListUnmanaged(ast.CmpOp) = .{};
+                var comps_list: std.ArrayListUnmanaged(*Expr) = .{};
+                defer {
+                    ops_list.deinit(self.allocator);
+                    comps_list.deinit(self.allocator);
+                }
+
+                try ops_list.append(self.allocator, first_cmp.ops[0]);
+                try comps_list.append(self.allocator, first_cmp.comparators[0]);
+                const left = first_cmp.left;
+                var current_mid = first_cmp.comparators[0];
+                var scan_idx = first_jump_idx.? + 1;
+                var chain_jump_idx = first_jump_idx.?;
+                var added = false;
+
+                while (scan_idx < insts.len) {
+                    var cmp_idx: ?usize = null;
+                    var jump_idx2: ?usize = null;
+                    var i = scan_idx;
+                    while (i < insts.len) : (i += 1) {
+                        const op = insts[i].opcode;
+                        if (op == .NOT_TAKEN or op == .CACHE) continue;
+                        if (cmp_idx == null and op == .COMPARE_OP) {
+                            cmp_idx = i;
+                            continue;
+                        }
+                        if (cmp_idx != null and ctrl.Analyzer.isConditionalJump(undefined, op)) {
+                            jump_idx2 = i;
+                            break;
+                        }
+                        if (cmp_idx == null and ctrl.Analyzer.isConditionalJump(undefined, op)) {
+                            break;
+                        }
+                    }
+                    if (cmp_idx == null or jump_idx2 == null) break;
+
+                    var sim2 = self.initSim(self.arena.allocator(), self.arena.allocator(), self.code, self.version);
+                    defer sim2.deinit();
+                    if (header.id < self.stack_in.len) {
+                        if (self.stack_in[header.id]) |entry| {
+                            for (entry) |val| {
+                                const cloned = try sim2.cloneStackValue(val);
+                                try sim2.stack.push(cloned);
+                            }
+                        }
+                    }
+                    try sim2.stack.push(.{ .expr = current_mid });
+                    var j: usize = scan_idx;
+                    while (j <= cmp_idx.?) : (j += 1) {
+                        const inst = insts[j];
+                        if (inst.opcode == .NOT_TAKEN or inst.opcode == .CACHE) continue;
+                        if (ctrl.Analyzer.isConditionalJump(undefined, inst.opcode)) break;
+                        try sim2.simulate(inst);
+                    }
+                    const cmp_expr = try sim2.stack.popExpr();
+                    if (cmp_expr.* != .compare) break;
+                    if (cmp_expr.compare.ops.len != 1 or cmp_expr.compare.comparators.len != 1) break;
+                    if (!ast.exprEqual(current_mid, cmp_expr.compare.left)) break;
+
+                    try ops_list.append(self.allocator, cmp_expr.compare.ops[0]);
+                    try comps_list.append(self.allocator, cmp_expr.compare.comparators[0]);
+                    current_mid = cmp_expr.compare.comparators[0];
+                    chain_jump_idx = jump_idx2.?;
+                    added = true;
+                    scan_idx = jump_idx2.? + 1;
+                }
+
+                if (added) {
+                    const a = self.arena.allocator();
+                    const ops = try a.dupe(ast.CmpOp, ops_list.items);
+                    const comps = try a.dupe(*Expr, comps_list.items);
+                    const chain_expr = try a.create(Expr);
+                    chain_expr.* = .{ .compare = .{
+                        .left = left,
+                        .ops = ops,
+                        .comparators = comps,
+                    } };
+                    condition = chain_expr;
+                    cond_idx = chain_jump_idx + 1;
+                }
+            }
+        }
+
         return .{ .expr = condition, .cond_idx = cond_idx };
     }
 
@@ -10866,15 +10972,35 @@ pub const Decompiler = struct {
                 const guard = body_pattern.if_stmt;
                 if (guard.condition_block == body_block_id and guard.else_block != null) {
                     const else_id = guard.else_block.?;
+                    const exit_resolved = if (pattern.exit_block < self.cfg.blocks.len)
+                        self.resolveJumpOnlyBlock(pattern.exit_block)
+                    else
+                        pattern.exit_block;
                     const merge_is_then = guard.merge_block != null and
                         (guard.merge_block.? == guard.then_block or guard.merge_block.? == pattern.header_block);
-                    const else_is_exit = else_id == pattern.exit_block;
-                    const merge_is_exit = guard.merge_block != null and guard.merge_block.? == pattern.exit_block;
+                    const else_is_exit = else_id == pattern.exit_block or else_id == exit_resolved;
+                    const merge_is_exit = guard.merge_block != null and
+                        (guard.merge_block.? == pattern.exit_block or guard.merge_block.? == exit_resolved);
                     const then_in_loop = self.analyzer.inLoop(guard.then_block, pattern.header_block);
                     const can_merge = (merge_is_then or merge_is_exit or (guard.merge_block == null and else_is_exit)) and then_in_loop;
                     if (can_merge and else_is_exit) {
                         var guard_sim = self.initSim(self.arena.allocator(), self.arena.allocator(), self.code, self.version);
                         defer guard_sim.deinit();
+                        if (guard.condition_block < self.stack_in.len) {
+                            if (self.stack_in[guard.condition_block]) |entry| {
+                                for (entry) |val| {
+                                    const cloned = try guard_sim.cloneStackValue(val);
+                                    try guard_sim.stack.push(cloned);
+                                }
+                            }
+                        }
+                        if (guard_sim.stack.len() == 0 and
+                            condition.* == .compare and
+                            condition.compare.ops.len == 1 and
+                            condition.compare.comparators.len == 1)
+                        {
+                            try guard_sim.stack.push(.{ .expr = condition.compare.comparators[0] });
+                        }
                         const guard_block = &self.cfg.blocks[guard.condition_block];
                         for (guard_block.instructions) |inst| {
                             if (ctrl.Analyzer.isConditionalJump(undefined, inst.opcode)) break;
@@ -10882,13 +11008,38 @@ pub const Decompiler = struct {
                         }
                         const guard_cond = try guard_sim.stack.popExpr();
                         const a = self.arena.allocator();
-                        const values = try a.alloc(*Expr, 2);
-                        values[0] = condition;
-                        values[1] = guard_cond;
-                        const combined = try a.create(Expr);
-                        combined.* = .{ .bool_op = .{ .op = .and_, .values = values } };
-                        condition = combined;
-                        body_block_id = guard.then_block;
+                        if (condition.* == .compare and guard_cond.* == .compare and
+                            condition.compare.ops.len == 1 and condition.compare.comparators.len == 1 and
+                            guard_cond.compare.ops.len == 1 and guard_cond.compare.comparators.len == 1 and
+                            ast.exprEqual(condition.compare.comparators[0], guard_cond.compare.left))
+                        {
+                            const ops = try a.alloc(ast.CmpOp, 2);
+                            const comparators = try a.alloc(*Expr, 2);
+                            ops[0] = condition.compare.ops[0];
+                            ops[1] = guard_cond.compare.ops[0];
+                            comparators[0] = condition.compare.comparators[0];
+                            comparators[1] = guard_cond.compare.comparators[0];
+                            const chain_expr = try a.create(Expr);
+                            chain_expr.* = .{ .compare = .{
+                                .left = condition.compare.left,
+                                .ops = ops,
+                                .comparators = comparators,
+                            } };
+                            condition = chain_expr;
+                        } else {
+                            const values = try a.alloc(*Expr, 2);
+                            values[0] = condition;
+                            values[1] = guard_cond;
+                            const combined = try a.create(Expr);
+                            combined.* = .{ .bool_op = .{ .op = .and_, .values = values } };
+                            condition = combined;
+                        }
+                        const resolved_then = self.resolveJumpOnlyBlock(guard.then_block);
+                        if (self.analyzer.inLoop(resolved_then, pattern.header_block)) {
+                            body_block_id = resolved_then;
+                        } else {
+                            body_block_id = guard.then_block;
+                        }
                     }
                 }
             }
