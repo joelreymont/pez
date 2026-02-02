@@ -315,7 +315,10 @@ pub const ObjectType = enum(u8) {
     pub fn fromByte(byte: u8) error{InvalidObjectType}!ObjectType {
         // Strip FLAG_REF before matching
         const type_byte = byte & ~FLAG_REF;
-        const obj = std.meta.intToEnum(ObjectType, type_byte) catch return error.InvalidObjectType;
+        const obj = if (std.meta.intToEnum(ObjectType, type_byte)) |value|
+            value
+        else |_|
+            return error.InvalidObjectType;
         if (obj == .TYPE_UNKNOWN) return error.InvalidObjectType;
         return obj;
     }
