@@ -59,6 +59,26 @@ test "snapshot loop guard 3.9" {
     );
 }
 
+test "snapshot loop guard ret 3.9" {
+    try runSnapshot(@src(), "test/corpus/loop_guard_ret.3.9.pyc",
+        \\[]u8
+        \\  "import sys
+        \\class Bdb:
+        \\    def _set_stopinfo(self, *args, **kwargs):
+        \\        pass
+        \\    def set_continue(self):
+        \\        self._set_stopinfo(self.botframe, None, -1)
+        \\        if self.breaks:
+        \\            return None
+        \\        sys.settrace(None)
+        \\        frame = sys._getframe().f_back
+        \\        while frame and frame is not self.botframe:
+        \\            del frame.f_trace
+        \\            frame = frame.f_back
+        \\"
+    );
+}
+
 test "snapshot loop guard while 3.9" {
     try runSnapshot(@src(), "test/corpus/guard_loop_while.3.9.pyc",
         \\[]u8

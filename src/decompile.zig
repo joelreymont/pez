@@ -8540,6 +8540,8 @@ pub const Decompiler = struct {
             }
         }
         var prefer_false_body = false;
+        var else_body_moved = false;
+        var then_body_dropped = false;
         if (folded_chain) {
             if (else_block) |else_id| {
                 const merge = try self.commonMerge(then_block, else_id, pattern.condition_block);
@@ -8560,6 +8562,8 @@ pub const Decompiler = struct {
                         try self.emitDecisionTrace(pattern.condition_block, "if_invert_empty_then_chain", condition);
                         then_body = else_body;
                         else_body = &[_]*Stmt{};
+                        else_body_moved = true;
+                        then_body_dropped = true;
                     }
                     if (cond_true_jump == true and else_body.len == 1 and else_body[0].* == .raise_stmt and then_body.len > 0 and self.if_tail == null) {
                         condition = try self.invertConditionExpr(condition);
@@ -8568,6 +8572,7 @@ pub const Decompiler = struct {
                         else_body = &[_]*Stmt{};
                         self.if_tail = then_body;
                         then_body = guard_body;
+                        else_body_moved = true;
                     }
                     const stmt = try a.create(Stmt);
                     stmt.* = .{ .if_stmt = .{
@@ -9788,6 +9793,26 @@ pub const Decompiler = struct {
             }
             break :blk try self.branchEnd(then_block, null);
         };
+        var then_reach: ?std.DynamicBitSet = null;
+        var then_consumed: ?std.DynamicBitSet = null;
+        var then_body_decompiled = false;
+        defer {
+            if (then_reach) |*reach| reach.deinit();
+            if (then_consumed) |*consumed| consumed.deinit();
+        }
+        if (then_block < then_end) {
+            var reach = try self.reachableInRange(then_block, then_end, null);
+            var consumed_before = try std.DynamicBitSet.initEmpty(self.allocator, self.cfg.blocks.len);
+            var it = reach.iterator(.{});
+            while (it.next()) |idx| {
+                if (self.consumed.isSet(@intCast(idx))) {
+                    consumed_before.set(@intCast(idx));
+                }
+            }
+            then_reach = reach;
+            then_consumed = consumed_before;
+            then_body_decompiled = true;
+        }
         var then_body = try self.decompileBranchRange(then_block, then_end, then_vals, skip);
         const a = self.arena.allocator();
         if (!self.bodyEndsTerminal(then_body)) {
@@ -9965,6 +9990,13 @@ pub const Decompiler = struct {
         // Decompile the else body
         var else_start: ?u32 = null;
         var else_end: ?u32 = null;
+        var else_reach: ?std.DynamicBitSet = null;
+        var else_consumed: ?std.DynamicBitSet = null;
+        var else_body_decompiled = false;
+        defer {
+            if (else_reach) |*reach| reach.deinit();
+            if (else_consumed) |*consumed| consumed.deinit();
+        }
         var else_body = if (else_block) |else_id| blk: {
             // Check if else is an elif
             if (is_elif) {
@@ -10066,6 +10098,19 @@ pub const Decompiler = struct {
             else_end = else_end_val;
             // Save if_next - nested if processing may clear it
             const saved_if_next = self.if_next;
+            if (else_start_val < else_end_val) {
+                var reach = try self.reachableInRange(else_start_val, else_end_val, null);
+                var consumed_before = try std.DynamicBitSet.initEmpty(self.allocator, self.cfg.blocks.len);
+                var it = reach.iterator(.{});
+                while (it.next()) |idx| {
+                    if (self.consumed.isSet(@intCast(idx))) {
+                        consumed_before.set(@intCast(idx));
+                    }
+                }
+                else_reach = reach;
+                else_consumed = consumed_before;
+                else_body_decompiled = true;
+            }
             const result = try self.decompileBranchRange(else_start_val, else_end_val, else_vals, skip);
             // Restore if_next if it was set by outer merge detection
             if (saved_if_next != null and self.if_next == null) {
@@ -10177,6 +10222,7 @@ pub const Decompiler = struct {
             {
                 self.if_tail = else_body;
                 else_body = &[_]*Stmt{};
+                else_body_moved = true;
                 no_merge = true;
                 self.if_next = null;
             }
@@ -10187,6 +10233,7 @@ pub const Decompiler = struct {
             if (cond_is_or and self.bodyEndsTerminal(then_body) and else_starts_nonterm) {
                 self.if_tail = else_body;
                 else_body = &[_]*Stmt{};
+                else_body_moved = true;
                 no_merge = true;
                 self.if_next = null;
             }
@@ -10411,6 +10458,8 @@ pub const Decompiler = struct {
             try self.emitDecisionTrace(pattern.condition_block, "if_invert_terminal_then_merge", condition);
             then_body = else_body;
             else_body = &[_]*Stmt{};
+            else_body_moved = true;
+            then_body_dropped = true;
             if (self.if_next == null) {
                 self.if_next = then_block;
             }
@@ -10423,6 +10472,7 @@ pub const Decompiler = struct {
             else_body = &[_]*Stmt{};
             self.if_tail = then_body;
             then_body = guard_body;
+            else_body_moved = true;
             // Clear if_next since the following code is handled via if_tail
             self.if_next = null;
         }
@@ -10454,6 +10504,7 @@ pub const Decompiler = struct {
                             if (self.elseIsJumpTarget(t.opcode)) {
                                 self.if_tail = else_body;
                                 else_body = &[_]*Stmt{};
+                                else_body_moved = true;
                                 no_merge = true;
                                 self.if_next = null;
                                 try self.emitDecisionTrace(pattern.condition_block, "if_guard_raise_fallthrough", condition);
@@ -10483,6 +10534,7 @@ pub const Decompiler = struct {
         {
             self.if_tail = else_body;
             else_body = &[_]*Stmt{};
+            else_body_moved = true;
             no_merge = true;
             self.if_next = null;
         }
@@ -10512,6 +10564,7 @@ pub const Decompiler = struct {
             try self.emitDecisionTrace(pattern.condition_block, "if_tail_return_pair", condition);
             self.if_tail = else_body;
             else_body = &[_]*Stmt{};
+            else_body_moved = true;
             no_merge = true;
             self.if_next = null;
         }
@@ -10526,6 +10579,39 @@ pub const Decompiler = struct {
             if (merge_block) |merge_id| {
                 if (merge_id > pattern.condition_block and merge_id < self.cfg.blocks.len) {
                     self.if_next = merge_id;
+                }
+            }
+        }
+
+        if (else_body_decompiled and !else_body_moved and else_body.len == 0) {
+            if (self.if_next) |next| {
+                if (else_reach) |reach| {
+                    if (next < self.cfg.blocks.len and reach.isSet(@intCast(next))) {
+                        if (else_consumed) |consumed_before| {
+                            var it = reach.iterator(.{});
+                            while (it.next()) |idx| {
+                                if (!consumed_before.isSet(@intCast(idx))) {
+                                    self.consumed.unset(@intCast(idx));
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        if (then_body_decompiled and then_body_dropped) {
+            if (self.if_next) |next| {
+                if (then_reach) |reach| {
+                    if (next < self.cfg.blocks.len and reach.isSet(@intCast(next))) {
+                        if (then_consumed) |consumed_before| {
+                            var it = reach.iterator(.{});
+                            while (it.next()) |idx| {
+                                if (!consumed_before.isSet(@intCast(idx))) {
+                                    self.consumed.unset(@intCast(idx));
+                                }
+                            }
+                        }
+                    }
                 }
             }
         }
