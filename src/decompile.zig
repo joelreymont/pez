@@ -1779,6 +1779,36 @@ pub const Decompiler = struct {
         try self.consumed.set(self.allocator, block_id);
     }
 
+    pub fn markBoolOpChain(
+        self: *Decompiler,
+        start_block: u32,
+        final_merge: u32,
+        is_and: bool,
+    ) DecompileError!void {
+        var seen = try std.DynamicBitSet.initEmpty(self.allocator, self.cfg.blocks.len);
+        defer seen.deinit();
+
+        var cur = start_block;
+        while (cur < self.cfg.blocks.len and !seen.isSet(cur)) {
+            seen.set(cur);
+            try self.markConsumed(cur);
+            if (cur == final_merge) break;
+
+            const blk = &self.cfg.blocks[cur];
+            var t_id: ?u32 = null;
+            var f_id: ?u32 = null;
+            for (blk.successors) |edge| {
+                if (edge.edge_type == .conditional_true or edge.edge_type == .normal) {
+                    t_id = edge.target;
+                } else if (edge.edge_type == .conditional_false) {
+                    f_id = edge.target;
+                }
+            }
+            if (t_id == null or f_id == null) break;
+            cur = if (is_and) t_id.? else f_id.?;
+        }
+    }
+
     fn isDocstringStmt(stmt: *const Stmt) bool {
         return switch (stmt.*) {
             .expr_stmt => |e| e.value.* == .constant and e.value.constant == .string,

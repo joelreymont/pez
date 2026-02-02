@@ -757,7 +757,7 @@ pub fn Methods(comptime Self: type, comptime Err: type) type {
             skip_first_store_param: bool,
         ) DecompileError!?u32 {
             const pattern = self.analyzer.detectBoolOp(block_id) orelse return null;
-            if (pattern.second_block >= limit or pattern.merge_block >= limit) {
+            if (pattern.second_block >= limit or pattern.merge_block > limit) {
                 return null;
             }
 
@@ -863,11 +863,7 @@ pub fn Methods(comptime Self: type, comptime Err: type) type {
                 bool_expr = bool_result.expr;
                 final_merge = bool_result.merge_block;
             }
-            try self.markConsumed(pattern.condition_block);
-            try self.markConsumed(pattern.second_block);
-            if (chain_used and pattern.merge_block != final_merge) {
-                try self.markConsumed(pattern.merge_block);
-            }
+            try self.markBoolOpChain(pattern.condition_block, final_merge, pattern.is_and);
 
             // Process merge block with the bool expression on stack
             const merge_block = &self.cfg.blocks[final_merge];

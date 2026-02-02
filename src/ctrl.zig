@@ -1179,7 +1179,9 @@ pub const Analyzer = struct {
             if (merge_id == null or merge_id.? != else_id) {
                 const else_blk = &self.cfg.blocks[else_id];
                 if (else_blk.terminator()) |else_term| {
-                    if (self.isConditionalJump(else_term.opcode) and !hasStmtPrelude(else_blk) and
+                    const is_boolop_jump = else_term.opcode == .JUMP_IF_FALSE_OR_POP or
+                        else_term.opcode == .JUMP_IF_TRUE_OR_POP;
+                    if (self.isConditionalJump(else_term.opcode) and !is_boolop_jump and !hasStmtPrelude(else_blk) and
                         !self.hasTrySetup(else_blk) and
                         else_blk.predecessors.len == 1 and else_blk.predecessors[0] == block_id)
                     {
@@ -1221,7 +1223,9 @@ pub const Analyzer = struct {
                 if (merge != null and merge.? == else_id) {
                     const else_blk = &self.cfg.blocks[else_id];
                     if (else_blk.terminator()) |else_term| {
-                        if (self.isConditionalJump(else_term.opcode) and !hasStmtPrelude(else_blk) and
+                        const is_boolop_jump = else_term.opcode == .JUMP_IF_FALSE_OR_POP or
+                            else_term.opcode == .JUMP_IF_TRUE_OR_POP;
+                        if (self.isConditionalJump(else_term.opcode) and !is_boolop_jump and !hasStmtPrelude(else_blk) and
                             !self.hasTrySetup(else_blk) and
                             else_blk.predecessors.len == 1 and else_blk.predecessors[0] == block_id)
                         {
