@@ -14,10 +14,14 @@ const debug_dump = @import("debug_dump.zig");
 pub fn main() !void {
     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
     defer _ = gpa.deinit();
-    const allocator = gpa.allocator();
+    const gpa_alloc = gpa.allocator();
 
-    const args = try std.process.argsAlloc(allocator);
-    defer std.process.argsFree(allocator, args);
+    const args = try std.process.argsAlloc(gpa_alloc);
+    defer std.process.argsFree(gpa_alloc, args);
+
+    var arena = std.heap.ArenaAllocator.init(gpa_alloc);
+    defer arena.deinit();
+    const allocator = arena.allocator();
 
     // Set up stdout/stderr with buffers
     var stdout_buf: [4096]u8 = undefined;
