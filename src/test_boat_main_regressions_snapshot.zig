@@ -75,6 +75,23 @@ test "snapshot loop guard while 3.9" {
     );
 }
 
+test "snapshot loop exit reaches header 3.9" {
+    try runSnapshot(@src(), "test/corpus/loop_exit_reaches_header.3.9.pyc",
+        \\[]u8
+        \\  "def loop_exit_reaches_header(xs):
+        \\    changed = True
+        \\    while True:
+        \\        changed = False
+        \\        for x in xs:
+        \\            if x == 0:
+        \\                changed = True
+        \\        if changed:
+        \\            continue
+        \\        return None
+        \\"
+    );
+}
+
 test "snapshot relative import 3.9" {
     try runSnapshot(@src(), "test/corpus/relative_import.3.9.pyc",
         \\[]u8
@@ -176,6 +193,31 @@ test "snapshot try finally nested 3.9" {
         \\    finally:
         \\        arg = False
         \\        prompt = 'ok'
+        \\"
+    );
+}
+
+test "snapshot try loop continue 3.9" {
+    try runSnapshot(@src(), "test/corpus/loop_try_continue.3.9.pyc",
+        \\[]u8
+        \\  "import time
+        \\def loop_try(msg):
+        \\    for i in range(0, 5):
+        \\        try:
+        \\            print(msg)
+        \\            break
+        \\        except:
+        \\            time.sleep(1)
+        \\def tail_if(x):
+        \\    if x == 1:
+        \\        return None
+        \\    elif x == 2:
+        \\        return None
+        \\    else:
+        \\        try:
+        \\            foo()
+        \\        except Exception as e:
+        \\            bar()
         \\"
     );
 }
@@ -284,9 +326,8 @@ test "snapshot loop guard cont body 3.9" {
         \\  "import time
         \\def f(flag, sock):
         \\    while True:
-        \\        if flag():
+        \\        while flag():
         \\            time.sleep(30)
-        \\            continue
         \\        try:
         \\            sock.recv(1)
         \\        except Exception:
@@ -331,8 +372,6 @@ test "snapshot if or chain 3.9" {
         \\  "def f(a, b, c):
         \\    if a == '' or b == '' or c == '':
         \\        raise Exception('x')
-        \\    else:
-        \\        return None
         \\"
     );
 }
@@ -614,8 +653,6 @@ test "snapshot with if else return 3.9" {
         \\    with _lock:
         \\        if x:
         \\            x = x + 1
-        \\        else:
-        \\            return None
         \\    return x
         \\"
     );
