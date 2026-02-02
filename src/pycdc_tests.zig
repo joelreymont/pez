@@ -53,8 +53,12 @@ test "parse pyc version from filename" {
 }
 
 fn decompilePycFile(allocator: std.mem.Allocator, path: []const u8) ![]const u8 {
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
     var module: pyc.Module = undefined;
-    module.init(allocator);
+    module.init(a);
     defer module.deinit();
     try module.loadFromFile(path);
     const version = module.version();
@@ -63,7 +67,7 @@ fn decompilePycFile(allocator: std.mem.Allocator, path: []const u8) ![]const u8 
     var out: std.ArrayList(u8) = .{};
     errdefer out.deinit(allocator);
 
-    try decompile.decompileToSource(allocator, code, version, out.writer(allocator));
+    try decompile.decompileToSource(a, code, version, out.writer(allocator));
     return out.toOwnedSlice(allocator);
 }
 
