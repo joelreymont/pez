@@ -9208,6 +9208,7 @@ pub const Decompiler = struct {
         }
 
         var inverted = swapped_true_jump;
+        var guard_block: ?u32 = null;
         if (cond_tree_applied) {
             if (else_block) |else_id| {
                 if (try self.condChainAllTrueJumps(pattern.condition_block, else_id)) {
@@ -9396,6 +9397,7 @@ pub const Decompiler = struct {
                             is_elif = false;
                             inverted = true;
                             self.if_next = guard_next;
+                            guard_block = resolved_else;
                             if (resolved_else != else_id) {
                                 try self.consumed.set(self.allocator, else_id);
                             }
@@ -9432,6 +9434,7 @@ pub const Decompiler = struct {
                             is_elif = false;
                             inverted = true;
                             self.if_next = guard_next;
+                            guard_block = resolved_else;
                         }
                     }
                 }
@@ -9468,6 +9471,7 @@ pub const Decompiler = struct {
                             is_elif = false;
                             inverted = true;
                             self.if_next = guard_next;
+                            guard_block = resolved_else;
                             if (resolved_else != else_id) {
                                 try self.consumed.set(self.allocator, else_id);
                             }
@@ -10315,6 +10319,20 @@ pub const Decompiler = struct {
                             else_body = assigns;
                         }
                     }
+                }
+            }
+        }
+
+        if (guard_block) |bid| {
+            if (bid < self.cfg.blocks.len) {
+                try self.consumed.set(self.allocator, bid);
+            }
+        }
+
+        if (self.if_next == null and self.if_tail == null and else_block == null) {
+            if (merge_block) |merge_id| {
+                if (merge_id > pattern.condition_block and merge_id < self.cfg.blocks.len) {
+                    self.if_next = merge_id;
                 }
             }
         }

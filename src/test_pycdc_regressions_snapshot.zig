@@ -114,3 +114,23 @@ test "snapshot pycdc guard raise loop 3.9" {
         \\"
     ).expectEqual(output);
 }
+
+test "snapshot pycdc guard continue 3.9" {
+    const allocator = testing.allocator;
+    const output = try tu.renderPycFile(allocator, "test/corpus/if_guard_continue.3.9.pyc", false);
+    defer allocator.free(output);
+
+    const oh = OhSnap{};
+    try oh.snap(@src(),
+        \\[]u8
+        \\  "def f(func):
+        \\    is_duck = False
+        \\    if not isfunction(func):
+        \\        if not _signature_is_functionlike(func):
+        \\            raise TypeError('bad')
+        \\        is_duck = True
+        \\    x = 3
+        \\    return (is_duck, x)
+        \\"
+    ).expectEqual(output);
+}
