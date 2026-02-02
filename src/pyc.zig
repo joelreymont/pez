@@ -139,6 +139,10 @@ pub const BigInt = struct {
         _: std.fmt.FormatOptions,
         writer: anytype,
     ) !void {
+        return self.formatAlloc(std.heap.page_allocator, writer);
+    }
+
+    pub fn formatAlloc(self: BigInt, allocator: Allocator, writer: anytype) !void {
         // Try to print as decimal if it fits in i128
         if (self.toI128()) |val| {
             try writer.print("{d}", .{val});
@@ -149,9 +153,35 @@ pub const BigInt = struct {
         if (self.negative) try writer.writeByte('-');
         try writer.writeAll("0x");
 
+        const push = struct {
+            fn do(
+                allocator_: Allocator,
+                use_inline: *bool,
+                buf: []u32,
+                inline_len: *usize,
+                list: *std.ArrayListUnmanaged(u32),
+                val: u32,
+            ) !void {
+                if (use_inline.*) {
+                    if (inline_len.* < buf.len) {
+                        buf[inline_len.*] = val;
+                        inline_len.* += 1;
+                        return;
+                    }
+                    use_inline.* = false;
+                    try list.ensureTotalCapacity(allocator_, inline_len.* + 1);
+                    try list.appendSlice(allocator_, buf[0..inline_len.*]);
+                }
+                try list.append(allocator_, val);
+            }
+        }.do;
+
         // Convert 15-bit digits to 32-bit for easier hex output
-        var bits: std.ArrayList(u32) = .{};
-        defer bits.deinit(std.heap.page_allocator);
+        var inline_bits: [32]u32 = undefined;
+        var inline_len: usize = 0;
+        var bits: std.ArrayListUnmanaged(u32) = .{};
+        defer bits.deinit(allocator);
+        var use_inline = true;
 
         var shift: u5 = 0;
         var temp: u32 = 0;
@@ -159,25 +189,27 @@ pub const BigInt = struct {
             temp |= @as(u32, digit) << shift;
             shift += BigInt.DIGIT_BITS;
             if (shift >= 32) {
-                try bits.append(std.heap.page_allocator, temp);
+                try push(allocator, &use_inline, inline_bits[0..], &inline_len, &bits, temp);
                 shift -= 32;
                 temp = @as(u32, digit) >> (BigInt.DIGIT_BITS - shift);
             }
         }
-        if (temp != 0 or bits.items.len == 0) {
-            try bits.append(std.heap.page_allocator, temp);
+        const cur_len = if (use_inline) inline_len else bits.items.len;
+        if (temp != 0 or cur_len == 0) {
+            try push(allocator, &use_inline, inline_bits[0..], &inline_len, &bits, temp);
         }
 
         // Print from most significant to least
         var first = true;
-        var i = bits.items.len;
+        const out_bits = if (use_inline) inline_bits[0..inline_len] else bits.items;
+        var i = out_bits.len;
         while (i > 0) {
             i -= 1;
             if (first) {
-                try writer.print("{X}", .{bits.items[i]});
+                try writer.print("{X}", .{out_bits[i]});
                 first = false;
             } else {
-                try writer.print("{X:0>8}", .{bits.items[i]});
+                try writer.print("{X:0>8}", .{out_bits[i]});
             }
         }
     }

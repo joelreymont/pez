@@ -463,7 +463,7 @@ pub const Writer = struct {
             .int => |v| try self.writeFmt(allocator, "{d}", .{v}),
             .big_int => |v| {
                 const out = self.output.writer(allocator);
-                try v.format("", .{}, out);
+                try v.formatAlloc(allocator, out);
             },
             .float => |v| try self.writeFloatLiteral(allocator, v),
             .complex => |v| {
