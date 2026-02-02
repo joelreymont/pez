@@ -518,6 +518,14 @@ test "snapshot lambda boolop 3.9" {
     );
 }
 
+test "snapshot lambda defaults 3.9" {
+    try runSnapshot(@src(), "test/corpus/lambda_defaults.3.9.pyc",
+        \\[]u8
+        \\  "f = lambda d = b'': d
+        \\"
+    );
+}
+
 test "snapshot aug assign targets 3.9" {
     try runSnapshot(@src(), "test/corpus/aug_assign_targets.3.9.pyc",
         \\[]u8

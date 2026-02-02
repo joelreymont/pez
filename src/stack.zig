@@ -4445,7 +4445,7 @@ pub const SimContext = struct {
                                 return;
                             }
                             if (std.mem.eql(u8, code.name, "<lambda>")) {
-                                const expr = try buildLambdaExpr(self.allocator, code, self.version);
+                                const expr = try buildLambdaExpr(self.allocator, code, self.version, defaults, kw_defaults);
                                 try self.stack.push(.{ .expr = expr });
                                 return;
                             }
@@ -4530,7 +4530,7 @@ pub const SimContext = struct {
                             return;
                         }
                         if (std.mem.eql(u8, code.name, "<lambda>")) {
-                            const expr = try buildLambdaExpr(self.allocator, code, self.version);
+                            const expr = try buildLambdaExpr(self.allocator, code, self.version, defaults, kw_defaults);
                             try self.stack.push(.{ .expr = expr });
                             return;
                         }
@@ -4625,7 +4625,7 @@ pub const SimContext = struct {
                             return;
                         }
                         if (std.mem.eql(u8, code.name, "<lambda>")) {
-                            const expr = try buildLambdaExpr(self.allocator, code, self.version);
+                            const expr = try buildLambdaExpr(self.allocator, code, self.version, defaults, &.{});
                             try self.stack.push(.{ .expr = expr });
                             return;
                         }
@@ -7002,7 +7002,13 @@ fn compKindFromName(name: []const u8) ?CompKind {
     return null;
 }
 
-pub fn buildLambdaExpr(allocator: Allocator, code: *const pyc.Code, version: Version) SimError!*Expr {
+pub fn buildLambdaExpr(
+    allocator: Allocator,
+    code: *const pyc.Code,
+    version: Version,
+    defaults: []const *Expr,
+    kw_defaults: []const ?*Expr,
+) SimError!*Expr {
     var ctx = SimContext.init(allocator, allocator, code, version);
     defer ctx.deinit();
     ctx.enable_ifexp = true;
@@ -7066,7 +7072,7 @@ pub fn buildLambdaExpr(allocator: Allocator, code: *const pyc.Code, version: Ver
         allocator.destroy(body);
     }
 
-    const args = try signature.extractFunctionSignature(allocator, code, null, &.{}, &.{}, &.{});
+    const args = try signature.extractFunctionSignature(allocator, code, null, defaults, kw_defaults, &.{});
     errdefer {
         args.deinit(allocator);
         allocator.destroy(args);

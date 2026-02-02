@@ -24110,7 +24110,7 @@ fn decompileFunctionToSource(
 
     // Check for lambda
     if (codegen.isLambda(code)) {
-        const lambda_expr = try stack_mod.buildLambdaExpr(allocator, code, version);
+        const lambda_expr = try stack_mod.buildLambdaExpr(allocator, code, version, &.{}, &.{});
         defer {
             lambda_expr.deinit(allocator);
             allocator.destroy(lambda_expr);
