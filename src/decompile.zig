@@ -9866,6 +9866,37 @@ pub const Decompiler = struct {
             }
         }
 
+        // `if cond: <tail> else: <work>; <tail>` where the "then" branch is just the merge
+        // block (common in `if not (a and b): ...` guards). Emit as a guard to avoid an
+        // explicit `else` that would introduce an extra jump.
+        if (!is_elif and merge_block != null and else_block != null and merge_block.? == then_block) {
+            const else_id = else_block.?;
+            if (else_id < self.cfg.blocks.len) {
+                const else_blk = &self.cfg.blocks[else_id];
+                // Avoid rewriting to `if not cond: pass` for trivial pass/cleanup-only blocks.
+                if (else_blk.instructions.len > 0 and
+                    !self.blockIsCleanupOnly(else_blk) and
+                    self.resolveJumpOnlyBlock(else_id) != then_block)
+                {
+                    const resolved_then = self.resolveJumpOnlyBlock(then_block);
+                    if (resolved_then < self.cfg.blocks.len and self.isTerminalBlock(resolved_then)) {
+                        if (try self.reachesBlockNoBack(else_id, then_block, pattern.condition_block)) {
+                            then_block = else_id;
+                            else_block = null;
+                            condition = try self.invertConditionExpr(condition);
+                            if (cond_true_jump != null) {
+                                cond_true_jump = !cond_true_jump.?;
+                            }
+                            if (self.if_next == null) {
+                                self.if_next = merge_block.?;
+                            }
+                            try self.emitDecisionTrace(pattern.condition_block, "if_guard_merge_then", condition);
+                        }
+                    }
+                }
+            }
+        }
+
         // If one branch is a terminal block that the other branch reaches, treat it as a
         // shared tail (merge) rather than an else/then body. This preserves parity for
         // common-tail return blocks (e.g. argument-normalization before a single return).
@@ -10607,6 +10638,33 @@ pub const Decompiler = struct {
                 if (!else_is_elif) {
                     else_body = &[_]*Stmt{};
                     self.if_next = else_id;
+                }
+            }
+        }
+
+        if (!is_elif and else_body.len > 0) {
+            const then_is_pass = then_body.len == 0 or (then_body.len == 1 and then_body[0].* == .pass);
+            const else_is_if = else_body.len == 1 and else_body[0].* == .if_stmt;
+            const then_has_uncond_jump = blk: {
+                if (then_block >= self.cfg.blocks.len) break :blk false;
+                const t = self.cfg.blocks[then_block].terminator() orelse break :blk false;
+                break :blk t.isUnconditionalJump();
+            };
+            const then_jump_to_terminal = blk: {
+                const tgt = cfg_mod.jumpTargetIfJumpOnly(self.cfg, then_block, false) orelse break :blk false;
+                const resolved = self.resolveJumpOnlyBlock(tgt);
+                break :blk resolved < self.cfg.blocks.len and self.isTerminalBlock(resolved);
+            };
+            if (then_is_pass and !else_is_if and cond_true_jump == true and (!then_has_uncond_jump or then_jump_to_terminal)) {
+                condition = try self.invertConditionExpr(condition);
+                try self.emitDecisionTrace(pattern.condition_block, "if_invert_pass_then", condition);
+                then_body = else_body;
+                else_body = &[_]*Stmt{};
+                else_block = null;
+                else_body_moved = true;
+                then_body_dropped = true;
+                if (self.if_next == null) {
+                    self.if_next = then_block;
                 }
             }
         }
