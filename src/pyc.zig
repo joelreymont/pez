@@ -329,6 +329,8 @@ pub const ObjectType = enum(u8) {
     TYPE_LIST = '[',
     TYPE_DICT = '{',
     TYPE_CODE = 'c',
+    // Python 1.0-1.2 used an uppercase tag for code objects.
+    TYPE_CODE_OLD = 'C',
     TYPE_UNICODE = 'u',
     TYPE_UNKNOWN = '?',
     TYPE_SET = '<',
@@ -363,7 +365,16 @@ pub const ObjectType = enum(u8) {
     /// These types require pre-allocation in the refs table before parsing children.
     pub fn hasChildren(self: ObjectType) bool {
         return switch (self) {
-            .TYPE_TUPLE, .TYPE_SMALL_TUPLE, .TYPE_LIST, .TYPE_SET, .TYPE_FROZENSET, .TYPE_DICT, .TYPE_CODE, .TYPE_SLICE => true,
+            .TYPE_TUPLE,
+            .TYPE_SMALL_TUPLE,
+            .TYPE_LIST,
+            .TYPE_SET,
+            .TYPE_FROZENSET,
+            .TYPE_DICT,
+            .TYPE_CODE,
+            .TYPE_CODE_OLD,
+            .TYPE_SLICE,
+            => true,
             else => false,
         };
     }
@@ -877,7 +888,7 @@ pub const Module = struct {
         const add_ref = ObjectType.hasRef(type_byte);
 
         // Reserve slot in refs BEFORE parsing children (they may reference this object)
-        const ref_idx: ?usize = if (add_ref and obj_type == .TYPE_CODE) blk: {
+        const ref_idx: ?usize = if (add_ref and (obj_type == .TYPE_CODE or obj_type == .TYPE_CODE_OLD)) blk: {
             const idx = self.refs.items.len;
             try self.refs.append(self.allocator, .none); // Placeholder
             break :blk idx;
@@ -885,6 +896,7 @@ pub const Module = struct {
 
         const code: ?*Code = switch (obj_type) {
             .TYPE_CODE => try self.readCode(reader),
+            .TYPE_CODE_OLD => try self.readCode(reader),
             else => null,
         };
 
@@ -1029,9 +1041,9 @@ pub const Module = struct {
             code.nlocals = try reader.readU16();
             code.flags = try reader.readU16();
         } else {
-            // Python 1.0-1.2: no argcount
-            code.nlocals = try reader.readU16();
-            code.flags = try reader.readU16();
+            // Python 1.0-1.2: no argcount/nlocals/flags in marshal format
+            code.nlocals = 0;
+            code.flags = 0;
         }
 
         // Read bytecode
@@ -1204,16 +1216,18 @@ pub const Module = struct {
             if (ref_idx >= self.refs.items.len) return error.InvalidRef;
             const ref_obj = self.refs.items[ref_idx];
             if (ref_obj == .none) return error.InvalidRef; // Placeholder - should not be referenced
-            if (ref_obj != .tuple) return error.InvalidObjectType;
-            // Convert tuple of Objects to array of strings
-            const tuple = ref_obj.tuple;
-            const strings = try self.allocator.alloc([]const u8, tuple.len);
+            const seq: []const Object = switch (ref_obj) {
+                .tuple => |t| t,
+                .list => |l| l,
+                else => return error.InvalidObjectType,
+            };
+            const strings = try self.allocator.alloc([]const u8, seq.len);
             var initialized: usize = 0;
             errdefer {
                 for (strings[0..initialized]) |s| self.allocator.free(s);
                 self.allocator.free(strings);
             }
-            for (tuple, 0..) |obj, i| {
+            for (seq, 0..) |obj, i| {
                 switch (obj) {
                     .string => |s| {
                         strings[i] = try self.allocator.dupe(u8, s);
@@ -1231,6 +1245,7 @@ pub const Module = struct {
         const count: usize = switch (obj_type) {
             .TYPE_TUPLE => try reader.readU32(),
             .TYPE_SMALL_TUPLE => try reader.readByte(),
+            .TYPE_LIST => try reader.readU32(),
             else => return error.InvalidObjectType,
         };
 
@@ -1259,7 +1274,10 @@ pub const Module = struct {
             for (strings, 0..) |s, i| {
                 objs[i] = .{ .string = try self.allocator.dupe(u8, s) };
             }
-            self.refs.items[idx] = .{ .tuple = objs };
+            self.refs.items[idx] = switch (obj_type) {
+                .TYPE_LIST => .{ .list = objs },
+                else => .{ .tuple = objs },
+            };
         }
 
         return strings;
@@ -1276,11 +1294,13 @@ pub const Module = struct {
             if (ref_idx >= self.refs.items.len) return error.InvalidRef;
             const ref_obj = self.refs.items[ref_idx];
             if (ref_obj == .none) return error.InvalidRef; // Placeholder - should not be referenced
-            if (ref_obj != .tuple) return error.InvalidObjectType;
-            // Clone the tuple
-            const tuple = ref_obj.tuple;
-            const objects = try self.allocator.alloc(Object, tuple.len);
-            for (tuple, 0..) |obj, i| {
+            const seq: []const Object = switch (ref_obj) {
+                .tuple => |t| t,
+                .list => |l| l,
+                else => return error.InvalidObjectType,
+            };
+            const objects = try self.allocator.alloc(Object, seq.len);
+            for (seq, 0..) |obj, i| {
                 objects[i] = try obj.clone(self.allocator);
             }
             return objects;
@@ -1289,6 +1309,7 @@ pub const Module = struct {
         const count: usize = switch (obj_type) {
             .TYPE_TUPLE => try reader.readU32(),
             .TYPE_SMALL_TUPLE => try reader.readByte(),
+            .TYPE_LIST => try reader.readU32(),
             else => return error.InvalidObjectType,
         };
 
@@ -1317,7 +1338,10 @@ pub const Module = struct {
             for (objects, 0..) |obj, i| {
                 ref_objs[i] = try obj.clone(self.allocator);
             }
-            self.refs.items[idx] = .{ .tuple = ref_objs };
+            self.refs.items[idx] = switch (obj_type) {
+                .TYPE_LIST => .{ .list = ref_objs },
+                else => .{ .tuple = ref_objs },
+            };
         }
 
         return objects;

@@ -5562,6 +5562,7 @@ pub fn getOpcodeTable(ver: Version) []const ?Opcode {
     if (ver.gte(2, 1)) return &opcode_table_2_1;
     if (ver.gte(2, 0)) return &opcode_table_2_0;
     if (ver.gte(1, 5)) return &opcode_table_1_5;
+    if (ver.gte(1, 0)) return &opcode_table_1_5;
     std.debug.panic("unsupported Python version {d}.{d}", .{ ver.major, ver.minor });
 }
 
