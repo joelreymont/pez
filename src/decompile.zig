@@ -20440,6 +20440,9 @@ pub const Decompiler = struct {
             }
         }
 
+        if (body_block_id < self.cfg.blocks.len) {
+            try self.stripLoopTargetAssigns(&self.cfg.blocks[body_block_id], &stmts);
+        }
         return stmts.toOwnedSlice(a);
     }
 
@@ -26647,6 +26650,67 @@ test "decompiler init" {
     try testing.expectEqual(@as(usize, 0), decompiler.cfg.blocks.len);
     try testing.expectEqual(@as(usize, 0), decompiler.statements.items.len);
     try testing.expectEqual(@as(usize, 0), decompiler.print_items.items.len);
+}
+
+test "strip loop target assigns removes ellipsis placeholders" {
+    const testing = std.testing;
+    const allocator = testing.allocator;
+    const version = Version.init(3, 12);
+
+    const varnames = try allocator.alloc([]const u8, 10);
+    defer {
+        for (varnames) |name| allocator.free(name);
+        allocator.free(varnames);
+    }
+    for (varnames, 0..) |*slot, idx| {
+        const name = try std.fmt.allocPrint(allocator, "v{}", .{idx});
+        slot.* = name;
+    }
+
+    var code = pyc.Code{
+        .allocator = allocator,
+        .name = "loop",
+        .code = &.{},
+        .varnames = varnames,
+    };
+
+    var decompiler = try Decompiler.init(allocator, &code, version);
+    defer decompiler.deinit();
+
+    var insts: [10]decoder.Instruction = undefined;
+    var i: usize = 0;
+    while (i < insts.len) : (i += 1) {
+        insts[i] = .{
+            .opcode = .STORE_FAST,
+            .arg = @intCast(i),
+            .offset = @intCast(i * 2),
+            .size = 2,
+            .cache_entries = 0,
+        };
+    }
+
+    const block = cfg_mod.BasicBlock{
+        .id = 0,
+        .start_offset = 0,
+        .end_offset = @intCast(insts.len * 2),
+        .instructions = &insts,
+        .successors = &.{},
+        .predecessors = &.{},
+        .is_exception_handler = false,
+        .is_loop_header = false,
+    };
+
+    var stmts: std.ArrayListUnmanaged(*Stmt) = .{};
+    defer stmts.deinit(allocator);
+    for (varnames) |name| {
+        const target = try decompiler.makeName(name, .store);
+        const placeholder = try ast.makeConstant(decompiler.arena.allocator(), .ellipsis);
+        const stmt = try decompiler.makeAssign(target, placeholder);
+        try stmts.append(allocator, stmt);
+    }
+
+    try decompiler.stripLoopTargetAssigns(&block, &stmts);
+    try testing.expectEqual(@as(usize, 0), stmts.items.len);
 }
 
 test "takeDecorators drains list" {
