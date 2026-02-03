@@ -46,3 +46,10 @@ python3 tools/compare/compare_dir.py \
 ## Notes
 - Detailed per-file reports: /tmp/pez_boat_main_compare_reports_full_xdis39
 - Use xdis under python3.9 for this dataset; python3.12+xdis fails to load some stdlib pyc.
+
+## Locate mismatch (top files)
+- zipfile.pyc (<module>._ZipWriteFile.close): idx 5, orig EXTENDED_ARG 256 @off 10 blk 2, comp SETUP_FINALLY to 102 @off 10 blk 2
+- aioice/stun.pyc (<module>): idx 0, orig SETUP_ANNOTATIONS @off 0 blk 0, comp LOAD_NAME ATTRIBUTES @off 0 blk 0
+- datetime.pyc (<module>.time.__hash__): idx 4, orig POP_JUMP_IF_FALSE to 210 @off 8 blk 0, comp POP_JUMP_IF_FALSE to 34 @off 8 blk 0
+- shlex.pyc (<module>.split): idx 26, orig POP_JUMP_IF_TRUE to 60 @off 52 blk 2, comp POP_JUMP_IF_FALSE to 62 @off 52 blk 2
+- getopt.pyc (<module>.getopt): idx 18, orig LOAD_FAST args @off 36 blk 3, comp LOAD_CONST None @off 36 blk 3
