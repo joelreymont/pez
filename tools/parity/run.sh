@@ -86,7 +86,11 @@ fi
 if [[ -z "${DECOMPYLE3_BIN:-}" ]]; then
   DECOMPYLE3_DIR="/tmp/python-decompile3"
   if [[ ! -d "$DECOMPYLE3_DIR" ]]; then
-    gh repo clone rocky/python-decompile3 "$DECOMPYLE3_DIR"
+    if [[ -d "$ROOT_DIR/refs/python-decompile3" ]]; then
+      DECOMPYLE3_DIR="$ROOT_DIR/refs/python-decompile3"
+    else
+      gh repo clone rocky/python-decompile3 "$DECOMPYLE3_DIR"
+    fi
   fi
 
   pybin=$(pick_py || true)
