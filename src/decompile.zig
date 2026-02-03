@@ -810,6 +810,7 @@ pub const Decompiler = struct {
         protected_set: GenSet,
         handler_reach: GenSet,
         normal_reach: GenSet,
+        entry_reach: GenSet,
         queue: std.ArrayListUnmanaged(u32),
         handler_end: std.AutoHashMapUnmanaged(u32, u32),
 
@@ -819,6 +820,7 @@ pub const Decompiler = struct {
                 .protected_set = try GenSet.init(allocator, bit_len),
                 .handler_reach = try GenSet.init(allocator, bit_len),
                 .normal_reach = try GenSet.init(allocator, bit_len),
+                .entry_reach = try GenSet.init(allocator, bit_len),
                 .queue = .{},
                 .handler_end = .{},
             };
@@ -829,6 +831,7 @@ pub const Decompiler = struct {
             try self.protected_set.ensureSize(allocator, bit_len);
             try self.handler_reach.ensureSize(allocator, bit_len);
             try self.normal_reach.ensureSize(allocator, bit_len);
+            try self.entry_reach.ensureSize(allocator, bit_len);
             if (bit_len > self.queue.capacity) {
                 try self.queue.ensureTotalCapacity(allocator, bit_len);
             }
@@ -842,6 +845,7 @@ pub const Decompiler = struct {
             self.protected_set.deinit(allocator);
             self.handler_reach.deinit(allocator);
             self.normal_reach.deinit(allocator);
+            self.entry_reach.deinit(allocator);
             self.queue.deinit(allocator);
             self.handler_end.deinit(allocator);
         }
@@ -12837,7 +12841,19 @@ pub const Decompiler = struct {
             }
         }
 
-        var handler_tail_start: ?u32 = null;
+        const handler_len = handler_blocks.items.len;
+        var handler_scan_end = try self.allocator.alloc(u32, handler_len);
+        defer self.allocator.free(handler_scan_end);
+        var handler_pop = try self.allocator.alloc(?u32, handler_len);
+        defer self.allocator.free(handler_pop);
+        var handler_pop_dom = try self.allocator.alloc(bool, handler_len);
+        defer self.allocator.free(handler_pop_dom);
+        @memset(handler_scan_end, @intCast(self.cfg.blocks.len));
+        for (handler_pop, 0..) |*slot, idx| {
+            slot.* = null;
+            handler_pop_dom[idx] = false;
+        }
+
         for (handler_blocks.items, 0..) |hid, idx| {
             if (hid >= self.cfg.blocks.len) continue;
             if (handler_final.items[idx]) continue;
@@ -12852,6 +12868,7 @@ pub const Decompiler = struct {
             if (handler_end <= info.body_block) {
                 handler_end = @intCast(self.cfg.blocks.len);
             }
+            handler_scan_end[idx] = handler_end;
             var scan_block = info.body_block;
             while (scan_block < handler_end and scan_block < self.cfg.blocks.len) : (scan_block += 1) {
                 const scan_blk = &self.cfg.blocks[scan_block];
@@ -12863,23 +12880,31 @@ pub const Decompiler = struct {
                     }
                 }
                 if (!has_pop_except) continue;
-                if (!try self.postDominates(scan_block, info.body_block)) {
-                    continue;
-                }
-                if (scan_blk.terminator()) |term| {
-                    if (term.isUnconditionalJump()) {
-                        if (term.jumpTarget(self.cfg.version)) |toff| {
-                            if (self.cfg.blockAtOffset(toff)) |tid| {
-                                if (!handler_set.isSet(tid) and !protected_set.isSet(tid)) {
-                                    if (handler_tail_start == null or tid < handler_tail_start.?) {
-                                        handler_tail_start = tid;
-                                    }
+                handler_pop[idx] = scan_block;
+                handler_pop_dom[idx] = try self.postDominates(scan_block, info.body_block);
+                break;
+            }
+        }
+
+        var handler_tail_start: ?u32 = null;
+        for (handler_blocks.items, 0..) |hid, idx| {
+            if (hid >= self.cfg.blocks.len) continue;
+            if (handler_final.items[idx]) continue;
+            const pop_block = handler_pop[idx] orelse continue;
+            if (!handler_pop_dom[idx]) continue;
+            const scan_blk = &self.cfg.blocks[pop_block];
+            if (scan_blk.terminator()) |term| {
+                if (term.isUnconditionalJump()) {
+                    if (term.jumpTarget(self.cfg.version)) |toff| {
+                        if (self.cfg.blockAtOffset(toff)) |tid| {
+                            if (!handler_set.isSet(tid) and !protected_set.isSet(tid)) {
+                                if (handler_tail_start == null or tid < handler_tail_start.?) {
+                                    handler_tail_start = tid;
                                 }
                             }
                         }
                     }
                 }
-                break;
             }
         }
 
@@ -13429,6 +13454,19 @@ pub const Decompiler = struct {
         }
 
         var seen_bare = false;
+        var entry_reach_ready = false;
+        if (post_try_entry) |entry| {
+            scratch.entry_reach.reset();
+            try self.collectReachableNoExceptionInto(
+                entry,
+                handler_set,
+                &scratch.entry_reach,
+                &scratch.queue,
+                false,
+                allow_loop_back,
+            );
+            entry_reach_ready = true;
+        }
         for (handler_blocks.items, 0..) |hid, idx| {
             if (handler_final.items[idx]) continue;
             const has_next_handler = idx + 1 < handler_blocks.items.len;
@@ -13463,56 +13501,54 @@ pub const Decompiler = struct {
                 }
             }
             var body_end = handler_end;
-            var scan_block = info.body_block;
-            while (scan_block < body_end and scan_block < self.cfg.blocks.len) {
-                const scan_blk = &self.cfg.blocks[scan_block];
-                var found_pop_except = false;
-                for (scan_blk.instructions) |inst| {
-                    if (inst.opcode == .POP_EXCEPT) {
-                        found_pop_except = true;
-                        break;
+            var pop_block = handler_pop[idx];
+            var pop_dom = handler_pop_dom[idx];
+            if (pop_block == null and handler_end > handler_scan_end[idx]) {
+                var scan_block = handler_scan_end[idx];
+                while (scan_block < handler_end and scan_block < self.cfg.blocks.len) : (scan_block += 1) {
+                    const scan_blk = &self.cfg.blocks[scan_block];
+                    var found_pop_except = false;
+                    for (scan_blk.instructions) |inst| {
+                        if (inst.opcode == .POP_EXCEPT) {
+                            found_pop_except = true;
+                            break;
+                        }
                     }
+                    if (!found_pop_except) continue;
+                    pop_block = scan_block;
+                    pop_dom = try self.postDominates(scan_block, info.body_block);
+                    break;
                 }
-                if (found_pop_except) {
+            }
+            if (pop_block) |pb| {
+                if (pb < handler_end) {
+                    const scan_blk = &self.cfg.blocks[pb];
+                    var jump_out = false;
                     if (scan_blk.terminator()) |term| {
                         if (term.isUnconditionalJump()) {
                             if (term.jumpTarget(self.cfg.version)) |toff| {
                                 if (self.cfg.blockAtOffset(toff)) |tid| {
                                     const resolved = self.resolveJumpOnlyBlock(tid);
                                     if (resolved < info.body_block or resolved >= handler_end) {
-                                        body_end = scan_block + 1;
-                                        break;
+                                        jump_out = true;
                                     }
                                 }
                             }
                         }
                     }
-                    if (scan_blk.predecessors.len == 0 or scan_blk.is_exception_handler or
-                        try self.postDominates(scan_block, info.body_block))
-                    {
-                        body_end = scan_block + 1;
+                    if (jump_out or scan_blk.predecessors.len == 0 or scan_blk.is_exception_handler or pop_dom) {
+                        body_end = pb + 1;
                     }
-                    break;
                 }
-                scan_block += 1;
             }
             if (join_block) |join| {
                 if (join > info.body_block and join < body_end) {
                     body_end = join;
                 }
-            } else if (post_try_entry) |entry| {
-                scratch.normal_reach.reset();
-                try self.collectReachableNoExceptionInto(
-                    entry,
-                    handler_set,
-                    &scratch.normal_reach,
-                    &scratch.queue,
-                    false,
-                    allow_loop_back,
-                );
+            } else if (post_try_entry != null) {
                 var scan_norm = info.body_block + 1;
                 while (scan_norm < body_end and scan_norm < self.cfg.blocks.len) : (scan_norm += 1) {
-                    if (scratch.normal_reach.isSet(scan_norm)) {
+                    if (entry_reach_ready and scratch.entry_reach.isSet(scan_norm)) {
                         body_end = scan_norm;
                         break;
                     }
