@@ -78,7 +78,7 @@ pub fn Methods(comptime Self: type, comptime Err: type) type {
             }
 
             for (block.instructions) |inst| {
-                if (ctrl.Analyzer.isConditionalJump(undefined, inst.opcode)) break;
+                if (ctrl.Analyzer.isCondJump(inst.opcode)) break;
                 if (Self.isStatementOpcode(inst.opcode)) return null;
                 self.simOpt(&sim, inst) catch |err| switch (err) {
                     error.PatternNoMatch => return null,
@@ -109,7 +109,7 @@ pub fn Methods(comptime Self: type, comptime Err: type) type {
             }
 
             for (block.instructions[skip..]) |inst| {
-                if (ctrl.Analyzer.isConditionalJump(undefined, inst.opcode)) break;
+                if (ctrl.Analyzer.isCondJump(inst.opcode)) break;
                 if (inst.isUnconditionalJump()) break;
                 if (Self.isStatementOpcode(inst.opcode)) break;
                 self.simOpt(&sim, inst) catch |err| switch (err) {
@@ -146,12 +146,12 @@ pub fn Methods(comptime Self: type, comptime Err: type) type {
                     if (idx + 2 < block.instructions.len and
                         inst.opcode == .COPY and inst.arg == 1 and
                         block.instructions[idx + 1].opcode == .TO_BOOL and
-                        ctrl.Analyzer.isConditionalJump(undefined, block.instructions[idx + 2].opcode))
+                        ctrl.Analyzer.isCondJump(block.instructions[idx + 2].opcode))
                     {
                         break;
                     }
                 }
-                if (ctrl.Analyzer.isConditionalJump(undefined, inst.opcode)) break;
+                if (ctrl.Analyzer.isCondJump(inst.opcode)) break;
                 if (Self.isStatementOpcode(inst.opcode)) return null;
                 self.simOpt(&sim, inst) catch |err| switch (err) {
                     error.PatternNoMatch => return null,
@@ -175,7 +175,7 @@ pub fn Methods(comptime Self: type, comptime Err: type) type {
             var has_dup = false;
             var has_rot = false;
             for (block.instructions[skip..]) |inst| {
-                if (ctrl.Analyzer.isConditionalJump(undefined, inst.opcode)) break;
+                if (ctrl.Analyzer.isCondJump(inst.opcode)) break;
                 if (inst.opcode == .DUP_TOP) has_dup = true;
                 if (inst.opcode == .ROT_THREE or inst.opcode == .ROT_TWO) has_rot = true;
             }
@@ -277,7 +277,7 @@ pub fn Methods(comptime Self: type, comptime Err: type) type {
 
             var stop_idx: usize = cond_block.instructions.len;
             for (cond_block.instructions, 0..) |inst, i| {
-                if (ctrl.Analyzer.isConditionalJump(undefined, inst.opcode)) {
+                if (ctrl.Analyzer.isCondJump(inst.opcode)) {
                     stop_idx = i;
                     break;
                 }
@@ -422,7 +422,7 @@ pub fn Methods(comptime Self: type, comptime Err: type) type {
 
                 const blk = &self.cfg.blocks[cur];
                 const term = blk.terminator() orelse continue;
-                if (!ctrl.Analyzer.isConditionalJump(undefined, term.opcode)) continue;
+                if (!ctrl.Analyzer.isCondJump(term.opcode)) continue;
                 for (blk.successors) |edge| {
                     if (edge.edge_type == .exception) continue;
                     try stack.append(self.allocator, edge.target);
@@ -710,7 +710,7 @@ pub fn Methods(comptime Self: type, comptime Err: type) type {
 
             const merge_block = &self.cfg.blocks[pattern.merge_block];
             if (merge_block.terminator()) |mt| {
-                if (ctrl.Analyzer.isConditionalJump(undefined, mt.opcode)) {
+                if (ctrl.Analyzer.isCondJump(mt.opcode)) {
                     try self.setStackEntryWithExpr(pattern.merge_block, base_vals, or_expr, &base_owned);
                     return pattern.merge_block;
                 }
@@ -765,7 +765,7 @@ pub fn Methods(comptime Self: type, comptime Err: type) type {
             const jump_idx = blk: {
                 var idx: ?usize = null;
                 for (cond_block.instructions, 0..) |inst, i| {
-                    if (ctrl.Analyzer.isConditionalJump(undefined, inst.opcode)) {
+                    if (ctrl.Analyzer.isCondJump(inst.opcode)) {
                         idx = i;
                         break;
                     }
@@ -802,11 +802,11 @@ pub fn Methods(comptime Self: type, comptime Err: type) type {
                     if (i + 3 >= cond_block.instructions.len) break;
                     if (inst.opcode == .COPY and
                         cond_block.instructions[i + 1].opcode == .TO_BOOL and
-                        ctrl.Analyzer.isConditionalJump(undefined, cond_block.instructions[i + 2].opcode))
+                        ctrl.Analyzer.isCondJump(cond_block.instructions[i + 2].opcode))
                     {
                         break;
                     }
-                    if (ctrl.Analyzer.isConditionalJump(undefined, inst.opcode)) break;
+                    if (ctrl.Analyzer.isCondJump(inst.opcode)) break;
                     cond_sim.simulate(inst) catch |err| {
                         if (self.isSoftSimErr(err)) return error.PatternNoMatch;
                         return err;
@@ -815,7 +815,7 @@ pub fn Methods(comptime Self: type, comptime Err: type) type {
             } else {
                 // Simulate condition block up to conditional jump
                 for (cond_block.instructions) |inst| {
-                    if (ctrl.Analyzer.isConditionalJump(undefined, inst.opcode)) break;
+                    if (ctrl.Analyzer.isCondJump(inst.opcode)) break;
                     cond_sim.simulate(inst) catch |err| {
                         if (self.isSoftSimErr(err)) return error.PatternNoMatch;
                         return err;
@@ -868,7 +868,7 @@ pub fn Methods(comptime Self: type, comptime Err: type) type {
             // Process merge block with the bool expression on stack
             const merge_block = &self.cfg.blocks[final_merge];
             if (merge_block.terminator()) |mt| {
-                if (ctrl.Analyzer.isConditionalJump(undefined, mt.opcode)) {
+                if (ctrl.Analyzer.isCondJump(mt.opcode)) {
                     try self.setStackEntryWithExpr(final_merge, base_vals, bool_expr, &base_owned);
                     return final_merge;
                 }
@@ -978,7 +978,7 @@ pub fn Methods(comptime Self: type, comptime Err: type) type {
                 }
 
                 const term = blk.terminator();
-                const is_cond = if (term) |t| ctrl.Analyzer.isConditionalJump(undefined, t.opcode) else false;
+                const is_cond = if (term) |t| ctrl.Analyzer.isCondJump(t.opcode) else false;
                 if (!is_cond) {
                     const expr = (try simulateValueExprSkip(self, cur_block, base_vals, skip)) orelse {
                         return error.InvalidBlock;
@@ -989,7 +989,7 @@ pub fn Methods(comptime Self: type, comptime Err: type) type {
                 if (pattern.kind == .or_pop) {
                     var has_prelude = false;
                     for (blk.instructions[skip..]) |inst| {
-                        if (ctrl.Analyzer.isConditionalJump(undefined, inst.opcode)) break;
+                        if (ctrl.Analyzer.isCondJump(inst.opcode)) break;
                         if (inst.opcode == .NOT_TAKEN or inst.opcode == .CACHE) continue;
                         has_prelude = true;
                         break;
@@ -1097,7 +1097,7 @@ pub fn Methods(comptime Self: type, comptime Err: type) type {
             var has_rot = false;
             var cmp_idx: ?usize = null;
             for (block.instructions, 0..) |inst, i| {
-                if (ctrl.Analyzer.isConditionalJump(undefined, inst.opcode)) break;
+                if (ctrl.Analyzer.isCondJump(inst.opcode)) break;
                 if (inst.opcode == .DUP_TOP) has_dup = true;
                 if (inst.opcode == .ROT_THREE or inst.opcode == .ROT_TWO) has_rot = true;
                 if (inst.opcode == .COMPARE_OP and cmp_idx == null) cmp_idx = i;
