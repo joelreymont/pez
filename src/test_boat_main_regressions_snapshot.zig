@@ -90,6 +90,16 @@ test "snapshot loop chain compare 3.9" {
     );
 }
 
+test "snapshot lambda ifexp return 3.9" {
+    try runSnapshot(@src(), "test/corpus/lambda_ifexp_return.3.9.pyc",
+        \\[]u8
+        \\  "def make():
+        \\    return object()
+        \\def build(session):
+        \\    return (lambda: session if session else make())()
+        \\"
+    );
+}
 test "snapshot loop del prelude 3.9" {
     try runSnapshot(@src(), "test/corpus/loop_del_prelude.3.9.pyc",
         \\[]u8
@@ -145,11 +155,10 @@ test "snapshot if guard prelude 3.9" {
         \\        if obj is None:
         \\            return None
         \\        return 0
-        \\    else:
-        \\        n = len(obj)
-        \\        if n <= 3:
-        \\            return n
-        \\        return n + 1
+        \\    n = len(obj)
+        \\    if n <= 3:
+        \\        return n
+        \\    return n + 1
         \\"
     );
 }
@@ -161,8 +170,7 @@ test "snapshot if or not 3.9" {
         \\def warn(logger_level = logging.ERROR):
         \\    if not logger_level or logger_level < logging.INFO:
         \\        warning = 'W'
-        \\    else:
-        \\        warning = ''
+        \\    warning = ''
         \\    return warning
         \\"
     );
@@ -349,11 +357,10 @@ test "snapshot try loop continue 3.9" {
         \\        return None
         \\    elif x == 2:
         \\        return None
-        \\    else:
-        \\        try:
-        \\            foo()
-        \\        except Exception as e:
-        \\            bar()
+        \\    try:
+        \\        foo()
+        \\    except Exception as e:
+        \\        bar()
         \\"
     );
 }
@@ -377,6 +384,16 @@ test "snapshot module if prelude 3.9" {
         \\    y = 3
         \\else:
         \\    y = 4
+        \\"
+    );
+}
+
+test "snapshot module global store 3.9" {
+    try runSnapshot(@src(), "test/corpus/module_global_store.3.9.pyc",
+        \\[]u8
+        \\  "global x, y
+        \\x = None
+        \\y = None
         \\"
     );
 }
@@ -681,7 +698,8 @@ test "snapshot doctest eq 3.9" {
 test "snapshot if else tail 3.9" {
     try runSnapshot(@src(), "test/corpus/if_else_tail.3.9.pyc",
         \\[]u8
-        \\  "logfp = None
+        \\  "global logfp
+        \\logfp = None
         \\def dolog(*args):
         \\    pass
         \\def nolog(*args):
@@ -798,7 +816,8 @@ test "snapshot for unpack target 3.9" {
 test "snapshot with body if return 3.9" {
     try runSnapshot(@src(), "test/corpus/with_body_if_return.3.9.pyc",
         \\[]u8
-        \\  "import threading
+        \\  "global _val
+        \\import threading
         \\_lock = threading.RLock()
         \\_val = None
         \\def get_val(x):
@@ -858,8 +877,7 @@ test "snapshot if prelude then if 3.9" {
         \\    x = data[0]
         \\    if x:
         \\        return 1
-        \\    else:
-        \\        return 2
+        \\    return 2
         \\"
     );
 }
@@ -954,6 +972,19 @@ test "snapshot try except raise 3.9" {
     );
 }
 
+test "snapshot try except raise after 3.9" {
+    try runSnapshot(@src(), "test/corpus/try_except_raise_after.3.9.pyc",
+        \\[]u8
+        \\  "def try_except_raise_after(do):
+        \\    try:
+        \\        do()
+        \\    except Exception:
+        \\        raise RuntimeError('boom')
+        \\    print('ok')
+        \\"
+    );
+}
+
 test "snapshot except with fallback 3.9" {
     try runSnapshot(@src(), "test/corpus/except_with_fallback.3.9.pyc",
         \\[]u8
@@ -1009,8 +1040,7 @@ test "snapshot try if after try 3.9" {
         \\            if response.status_code == 200:
         \\                print('File uploaded successfully')
         \\                return True
-        \\            else:
-        \\                print(f'Failed to upload file: {response.status_code} - {response.text}')
+        \\            print(f'Failed to upload file: {response.status_code} - {response.text}')
         \\        except requests.RequestException as e:
         \\            print(f'Request failed: {e}')
         \\        time.sleep(delay)
@@ -1077,7 +1107,7 @@ test "snapshot guard or 3.9" {
     try runSnapshot(@src(), "test/corpus/guard_or.3.9.pyc",
         \\[]u8
         \\  "def guard(a, b):
-        \\    if not (a or b):
+        \\    if not a and not b:
         \\        raise ValueError('x')
         \\    return (a, b)
         \\"

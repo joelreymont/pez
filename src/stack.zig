@@ -7224,7 +7224,37 @@ pub fn buildLambdaExpr(
         _ = try resolveIfExps(allocator, &ctx.stack, &ctx.pending_ifexp, inst.offset);
         switch (inst.opcode) {
             .RETURN_VALUE => {
-                body_expr = try ctx.stack.popExpr();
+                const ret_expr = try ctx.stack.popExpr();
+                if (ctx.enable_ifexp and ctx.pending_ifexp.items.len > 0) {
+                    var idx: ?usize = null;
+                    var i: usize = ctx.pending_ifexp.items.len;
+                    while (i > 0) {
+                        i -= 1;
+                        const item = ctx.pending_ifexp.items[i];
+                        if (item.merge_target == null) {
+                            idx = i;
+                            break;
+                        }
+                    }
+                    if (idx) |pi| {
+                        var item = &ctx.pending_ifexp.items[pi];
+                        if (item.then_expr == null and item.false_target > inst.offset) {
+                            item.then_expr = ret_expr;
+                            continue;
+                        }
+                        if (item.then_expr != null and item.false_target <= inst.offset) {
+                            const if_expr = try makeIfExp(allocator, item.condition, item.then_expr.?, ret_expr);
+                            const len = ctx.pending_ifexp.items.len;
+                            if (pi + 1 < len) {
+                                std.mem.copyForwards(PendingIfExp, ctx.pending_ifexp.items[pi .. len - 1], ctx.pending_ifexp.items[pi + 1 .. len]);
+                            }
+                            ctx.pending_ifexp.items.len -= 1;
+                            body_expr = if_expr;
+                            break;
+                        }
+                    }
+                }
+                body_expr = ret_expr;
                 break;
             },
             .RETURN_CONST => {

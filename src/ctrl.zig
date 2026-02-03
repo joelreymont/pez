@@ -1225,6 +1225,37 @@ pub const Analyzer = struct {
         }
 
         const then_id = then_block orelse return null;
+        var join_merge: ?u32 = null;
+        if (else_block) |else_id| {
+            var join_pred = false;
+            if (else_id < self.cfg.blocks.len and block_id < self.cfg.blocks.len) {
+                const cond_off = self.cfg.blocks[block_id].start_offset;
+                for (self.cfg.blocks[else_id].predecessors) |pred_id| {
+                    if (pred_id == block_id or pred_id >= self.cfg.blocks.len) continue;
+                    const pred_blk = &self.cfg.blocks[pred_id];
+                    if (cfg_mod.jumpTargetIfJumpOnly(self.cfg, pred_id, true) != null) continue;
+                    if (pred_blk.terminator()) |pred_term| {
+                        if (self.isConditionalJump(pred_term.opcode)) continue;
+                    }
+                    var has_edge = false;
+                    for (pred_blk.successors) |edge| {
+                        if (edge.target != else_id) continue;
+                        if (edge.edge_type == .exception or edge.edge_type == .loop_back) continue;
+                        has_edge = true;
+                        break;
+                    }
+                    if (!has_edge) continue;
+                    if (try self.reachesBlock(then_id, pred_id, cond_off)) {
+                        join_pred = true;
+                        break;
+                    }
+                }
+            }
+            if (join_pred) {
+                join_merge = else_id;
+                else_block = null;
+            }
+        }
         const then_terminal = self.isTerminalBlock(then_id);
         const then_is_raise = blk: {
             var tid = then_id;
@@ -1279,6 +1310,9 @@ pub const Analyzer = struct {
 
         // Find merge point - where both branches converge
         var merge = try self.findMergePoint(block_id, then_id, else_block);
+        if (join_merge) |mid| {
+            merge = mid;
+        }
 
         // Check if else block is actually an elif
         var is_elif = false;
