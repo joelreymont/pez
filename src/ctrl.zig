@@ -1823,6 +1823,8 @@ pub const Analyzer = struct {
             if (self.isStopIterHandler(handler_block)) continue;
             // Skip comprehension cleanup handlers (SWAP/POP_TOP/STORE_FAST/RERAISE)
             if (self.isComprehensionCleanupHandler(handler_block)) continue;
+            // Skip internal except* cleanup handlers (LIST_APPEND scaffolding)
+            if (self.isExceptStarCleanupHandler(handler_block)) continue;
             const is_bare = !self.hasExceptionTypeCheck(handler_block);
             try handler_list.append(self.allocator, .{
                 .handler_block = hid,
@@ -2726,6 +2728,43 @@ pub const Analyzer = struct {
         }
 
         return has_store;
+    }
+
+    /// Check if handler is internal except* cleanup scaffolding (PEP 654).
+    ///
+    /// These blocks appear in the exception table but don't correspond to a Python-level
+    /// `except` clause. They typically append raised exceptions to a list and jump.
+    fn isExceptStarCleanupHandler(self: *const Analyzer, block: *const BasicBlock) bool {
+        _ = self;
+        if (block.instructions.len == 0) return false;
+
+        var has_push_exc = false;
+        var has_check = false;
+        var has_list_append = false;
+        var has_pop_except = false;
+        var has_reraise = false;
+        for (block.instructions) |inst| {
+            switch (inst.opcode) {
+                .PUSH_EXC_INFO => has_push_exc = true,
+                .CHECK_EXC_MATCH, .CHECK_EG_MATCH => has_check = true,
+                .LIST_APPEND => has_list_append = true,
+                .POP_EXCEPT => has_pop_except = true,
+                .RERAISE => has_reraise = true,
+                else => {},
+            }
+        }
+        if (has_push_exc or has_check or has_pop_except or has_reraise) return false;
+        if (!has_list_append) return false;
+
+        const last = block.instructions[block.instructions.len - 1].opcode;
+        return switch (last) {
+            .JUMP_FORWARD,
+            .JUMP_ABSOLUTE,
+            .JUMP_BACKWARD,
+            .JUMP_BACKWARD_NO_INTERRUPT,
+            => true,
+            else => false,
+        };
     }
 
     /// Check if handler block has exception type check (CHECK_EXC_MATCH).

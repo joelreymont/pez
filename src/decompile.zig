@@ -4489,6 +4489,41 @@ pub const Decompiler = struct {
 
                     const a = self.arena.allocator();
 
+                    // Dict literal builder (old bytecode): BUILD_MAP 0; DUP_TOP; ...; STORE_SUBSCR; STORE_NAME.
+                    // Old CPython used a stack mutation pattern to build dict literals:
+                    // BUILD_MAP 0; DUP_TOP; <push value/key>; STORE_SUBSCR; ...
+                    // In simulation we clone expressions, so DUP_TOP produces two equivalent dict expressions.
+                    // Fold STORE_SUBSCR into the dict that remains on the stack and discard the duplicate.
+                    if (container.* == .dict) {
+                        if (sim.stack.peek()) |peek| {
+                            if (peek == .expr and peek.expr.* == .dict and ast.exprEqual(peek.expr, container)) {
+                                const dict_expr = peek.expr;
+                                const dict = &dict_expr.dict;
+                                const old_len = dict.values.len;
+                                const new_len = old_len + 1;
+
+                                const new_keys = try a.alloc(?*Expr, new_len);
+                                const new_values = try a.alloc(*Expr, new_len);
+                                if (old_len > 0) {
+                                    @memcpy(new_keys[0..old_len], dict.keys);
+                                    @memcpy(new_values[0..old_len], dict.values);
+                                    a.free(dict.keys);
+                                    a.free(dict.values);
+                                }
+                                new_keys[old_len] = key;
+                                new_values[old_len] = value;
+                                dict.keys = new_keys;
+                                dict.values = new_values;
+
+                                if (container != dict_expr) {
+                                    container.deinit(sim.allocator);
+                                    sim.allocator.destroy(container);
+                                }
+                                continue;
+                            }
+                        }
+                    }
+
                     // Check for variable annotation pattern: __annotations__['varname'] = type
                     if (container.* == .name and std.mem.eql(u8, container.name.id, "__annotations__") and
                         key.* == .constant and key.constant == .string)
@@ -16861,28 +16896,11 @@ pub const Decompiler = struct {
         return try self.rewriteContRaise(merged);
     }
 
-    fn computeHandlerEnd311(self: *Decompiler, body_block: u32) DecompileError!u32 {
-        if (body_block >= self.cfg.blocks.len) {
-            if (self.last_error_ctx == null) {
-                self.last_error_ctx = .{
-                    .code_name = self.code.name,
-                    .block_id = body_block,
-                    .offset = 0,
-                    .opcode = "handler_body_oob",
-                };
-            }
-            return error.InvalidBlock;
-        }
-
-        if (self.try_scratch == null) {
-            _ = try self.getTryScratch(self.cfg.blocks.len);
-        }
-        const scratch = &self.try_scratch.?;
-        if (scratch.handler_end.get(body_block)) |cached| {
-            return cached;
-        }
-
-        try self.cond_seen.ensureSize(self.allocator, self.cfg.blocks.len);
+    fn scanHdlEnd311(
+        self: *Decompiler,
+        body_block: u32,
+        include_exc: bool,
+    ) DecompileError!struct { pop: ?u32, any: ?u32 } {
         self.cond_seen.reset();
         self.cond_stack.clearRetainingCapacity();
         try self.cond_stack.append(self.allocator, body_block);
@@ -16922,7 +16940,7 @@ pub const Decompiler = struct {
             }
 
             for (blk.successors) |edge| {
-                if (edge.edge_type == .exception) continue;
+                if (!include_exc and edge.edge_type == .exception) continue;
                 const next = edge.target;
                 if (!self.cond_seen.isSet(next)) {
                     try self.cond_stack.append(self.allocator, next);
@@ -16930,12 +16948,52 @@ pub const Decompiler = struct {
             }
         }
 
-        if (best_pop) |pop_id| {
+        return .{ .pop = best_pop, .any = best_any };
+    }
+
+    fn computeHandlerEnd311(self: *Decompiler, body_block: u32) DecompileError!u32 {
+        if (body_block >= self.cfg.blocks.len) {
+            if (self.last_error_ctx == null) {
+                self.last_error_ctx = .{
+                    .code_name = self.code.name,
+                    .block_id = body_block,
+                    .offset = 0,
+                    .opcode = "handler_body_oob",
+                };
+            }
+            return error.InvalidBlock;
+        }
+
+        if (self.try_scratch == null) {
+            _ = try self.getTryScratch(self.cfg.blocks.len);
+        }
+        const scratch = &self.try_scratch.?;
+        if (scratch.handler_end.get(body_block)) |cached| {
+            return cached;
+        }
+
+        try self.cond_seen.ensureSize(self.allocator, self.cfg.blocks.len);
+
+        var scan = try self.scanHdlEnd311(body_block, false);
+        if (scan.pop) |pop_id| {
             const end = pop_id + 1;
             try scratch.handler_end.put(self.allocator, body_block, end);
             return end;
         }
-        if (best_any) |pop_id| {
+        if (scan.any) |pop_id| {
+            const end = pop_id + 1;
+            try scratch.handler_end.put(self.allocator, body_block, end);
+            return end;
+        }
+
+        // Some handlers only reach POP_EXCEPT on an exception edge.
+        scan = try self.scanHdlEnd311(body_block, true);
+        if (scan.pop) |pop_id| {
+            const end = pop_id + 1;
+            try scratch.handler_end.put(self.allocator, body_block, end);
+            return end;
+        }
+        if (scan.any) |pop_id| {
             const end = pop_id + 1;
             try scratch.handler_end.put(self.allocator, body_block, end);
             return end;
@@ -16985,6 +17043,7 @@ pub const Decompiler = struct {
 
         // Start with first handler block (has PUSH_EXC_INFO)
         var current_handler: ?u32 = first_handler;
+        var saw_star = false; // any except* handler in this chain
 
         while (current_handler) |hid| {
             if (hid >= self.cfg.blocks.len) break;
@@ -16993,15 +17052,41 @@ pub const Decompiler = struct {
             // Check if this is a valid handler block or finally block
             var has_push_exc = false;
             var has_check_match = false;
+            var has_check_eg = false;
             var has_reraise = false;
             var has_pop_top = false;
             var has_pop_except = false;
             for (handler_block.instructions) |inst| {
                 if (inst.opcode == .PUSH_EXC_INFO) has_push_exc = true;
-                if (inst.opcode == .CHECK_EXC_MATCH) has_check_match = true;
+                if (inst.opcode == .CHECK_EXC_MATCH or inst.opcode == .CHECK_EG_MATCH) has_check_match = true;
+                if (inst.opcode == .CHECK_EG_MATCH) has_check_eg = true;
                 if (inst.opcode == .RERAISE) has_reraise = true;
                 if (inst.opcode == .POP_TOP) has_pop_top = true;
                 if (inst.opcode == .POP_EXCEPT) has_pop_except = true;
+            }
+
+            // POP_TOP-only blocks can be preludes for the next except* clause.
+            if (!has_push_exc and !has_check_match and has_pop_top) {
+                var only_pop = true;
+                for (handler_block.instructions) |inst| {
+                    if (inst.opcode != .POP_TOP and inst.opcode != .NOT_TAKEN) {
+                        only_pop = false;
+                        break;
+                    }
+                }
+                if (only_pop) {
+                    var next_norm: ?u32 = null;
+                    for (handler_block.successors) |edge| {
+                        if (edge.edge_type != .normal) continue;
+                        next_norm = edge.target;
+                        break;
+                    }
+                    if (next_norm) |next| {
+                        current_handler = next;
+                        if (next >= actual_end) actual_end = next + 1;
+                        continue;
+                    }
+                }
             }
             // Stop if we hit a RERAISE-only block (cleanup, not handler)
             if (!has_push_exc and !has_check_match and has_reraise) break;
@@ -17063,6 +17148,12 @@ pub const Decompiler = struct {
             var seen_cond_jump = false;
 
             var is_star = false; // except* vs except
+
+            if (!has_push_exc and has_check_eg) {
+                // Subsequent except* clauses reuse the exception group already on the stack.
+                // Seed a placeholder so CHECK_EG_MATCH can simulate correctly.
+                try sim.stack.push(.unknown);
+            }
 
             for (handler_block.instructions, 0..) |inst, i| {
                 switch (inst.opcode) {
@@ -17249,6 +17340,7 @@ pub const Decompiler = struct {
                 .body = handler_body,
                 .is_star = is_star,
             });
+            saw_star = saw_star or is_star;
 
             // Track the actual end of processed blocks
             if (handler_end_block > actual_end) actual_end = handler_end_block;
@@ -17262,9 +17354,11 @@ pub const Decompiler = struct {
                     const next_block = &self.cfg.blocks[next_blk];
                     // Check if this is another handler (has CHECK_EXC_MATCH or starts with POP_TOP for bare except)
                     var is_handler = false;
+                    var next_has_check = false;
                     for (next_block.instructions) |inst| {
-                        if (inst.opcode == .CHECK_EXC_MATCH) {
+                        if (inst.opcode == .CHECK_EXC_MATCH or inst.opcode == .CHECK_EG_MATCH) {
                             is_handler = true;
+                            next_has_check = true;
                             break;
                         }
                         if (inst.opcode == .RERAISE) {
@@ -17276,8 +17370,27 @@ pub const Decompiler = struct {
                     if (!is_handler and next_block.instructions.len > 0) {
                         const first_op = next_block.instructions[0].opcode;
                         if (first_op == .POP_TOP) {
-                            // This is a bare except handler
-                            is_handler = true;
+                            if (saw_star) {
+                                // except* chains don't have bare except; POP_TOP here is scaffolding.
+                                // Only treat as a handler if its normal successor contains a match check.
+                                var succ_check = false;
+                                for (next_block.successors) |edge| {
+                                    if (edge.edge_type != .normal) continue;
+                                    if (edge.target >= self.cfg.blocks.len) continue;
+                                    const succ = &self.cfg.blocks[edge.target];
+                                    for (succ.instructions) |sinst| {
+                                        if (sinst.opcode == .CHECK_EXC_MATCH or sinst.opcode == .CHECK_EG_MATCH) {
+                                            succ_check = true;
+                                            break;
+                                        }
+                                    }
+                                    break;
+                                }
+                                is_handler = succ_check;
+                            } else if (!next_has_check) {
+                                // This is a bare except handler
+                                is_handler = true;
+                            }
                         }
                     }
                     if (is_handler) {
