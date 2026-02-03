@@ -1105,8 +1105,7 @@ pub const Analyzer = struct {
     }
 
     /// Check if an opcode is a conditional jump.
-    pub fn isConditionalJump(self: *const Analyzer, opcode: Opcode) bool {
-        _ = self;
+    pub fn isCondJump(opcode: Opcode) bool {
         return switch (opcode) {
             .POP_JUMP_IF_TRUE,
             .POP_JUMP_IF_FALSE,
@@ -1130,9 +1129,13 @@ pub const Analyzer = struct {
         };
     }
 
+    pub fn isConditionalJump(_: *const Analyzer, opcode: Opcode) bool {
+        return Analyzer.isCondJump(opcode);
+    }
+
     fn hasStmtPrelude(block: *const BasicBlock) bool {
         for (block.instructions) |inst| {
-            if (Analyzer.isConditionalJump(undefined, inst.opcode)) break;
+            if (Analyzer.isCondJump(inst.opcode)) break;
             const name = inst.opcode.name();
             if (std.mem.startsWith(u8, name, "STORE_") or
                 std.mem.startsWith(u8, name, "DELETE_") or
