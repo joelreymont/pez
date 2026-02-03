@@ -79,6 +79,9 @@ External Cross-checks
   - `/tmp/python-decompile3/test/simple_source`
   - `/tmp/python-decompile3/test/stdlib`
   - `/tmp/python-decompile3/test/test_one`
+- Decompyle3 → pez compare helper:
+  - Decompile: `python3 tools/compare/decompyle3_dir.py --decompyle3 /private/tmp/uncompyle6-venv312/bin/decompyle3 --orig-dir /Users/joel/Work/Shakhed/boat_main_extracted_3.9 --out-dir /tmp/decompyle3_boat_src --timeout 120 --out /tmp/decompyle3_boat_decompile.json`
+  - Compare: `python3 tools/compare/compare_dir.py --orig-dir /Users/joel/Work/Shakhed/boat_main_extracted_3.9 --src-dir /tmp/decompyle3_boat_src --py python3.9 --xdis-python /private/tmp/xdis-venv39/bin/python --timeout 120 --out /tmp/decompyle3_boat_compare.json --report-dir /tmp/decompyle3_boat_compare_reports`
 - Compare pez output against decompyle3 on shared corpora when diagnosing mismatches.
 
 Next Steps
