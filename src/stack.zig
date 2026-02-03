@@ -4473,28 +4473,12 @@ pub const SimContext = struct {
                             const expr = try self.makeName("<function>", .load);
                             try self.stack.push(.{ .expr = expr });
                         },
-                    }
-                    return;
+                }
+                return;
                 }
 
-                // Python 3.3+: pop code object and optional qualname (order varies in practice)
-                if (self.stack.items.items.len == 0) return error.StackUnderflow;
-                const top = self.stack.items.items[self.stack.items.items.len - 1];
-                var code_val: StackValue = .unknown;
-                if (top == .expr and top.expr.* == .constant and top.expr.constant == .string) {
-                    var q = self.stack.pop().?;
-                    q.deinit(self.allocator, self.stack_alloc);
-                    code_val = self.stack.pop() orelse return error.StackUnderflow;
-                } else {
-                    code_val = self.stack.pop() orelse return error.StackUnderflow;
-                    if (self.stack.items.items.len > 0) {
-                        const maybe_q = self.stack.items.items[self.stack.items.items.len - 1];
-                        if (maybe_q == .expr and maybe_q.expr.* == .constant and maybe_q.expr.constant == .string) {
-                            var q = self.stack.pop().?;
-                            q.deinit(self.allocator, self.stack_alloc);
-                        }
-                    }
-                }
+                // Python 3.3+: code object is on stack; for 3.3-3.10 the qualname was already popped above.
+                const code_val = self.stack.pop() orelse return error.StackUnderflow;
                 const code_ptr: ?*const pyc.Code = switch (code_val) {
                     .code_obj => |code| code,
                     else => null,
@@ -5664,7 +5648,21 @@ pub const SimContext = struct {
                 // Pops nothing new, exception info already on stack
             },
 
-            .SETUP_WITH, .SETUP_ASYNC_WITH => {
+            .BEFORE_ASYNC_WITH => {
+                // BEFORE_ASYNC_WITH - pop async context manager, push (__aexit__, __aenter__ awaitable).
+                // The subsequent GET_AWAITABLE/YIELD_FROM will await the __aenter__ result.
+                const ctx = try self.stack.popExpr();
+                ctx.deinit(self.allocator);
+                self.allocator.destroy(ctx);
+
+                // Push exit func placeholder and __aenter__ awaitable placeholder.
+                const exit_expr = try self.makeName("__with_exit__", .load);
+                try self.stack.push(.{ .expr = exit_expr });
+                const enter_expr = try self.makeName("__with_enter__", .load);
+                try self.stack.push(.{ .expr = enter_expr });
+            },
+
+            .SETUP_WITH => {
                 // SETUP_WITH - pop context manager, push (__exit__, __enter__ result)
                 const ctx = try self.stack.popExpr();
                 ctx.deinit(self.allocator);
@@ -5673,6 +5671,12 @@ pub const SimContext = struct {
                 const exit_expr = try self.makeName("__with_exit__", .load);
                 try self.stack.push(.{ .expr = exit_expr });
                 try self.stack.push(.unknown);
+            },
+
+            .SETUP_ASYNC_WITH => {
+                // SETUP_ASYNC_WITH doesn't modify the value stack on the normal path (3.5-3.10).
+                // BEFORE_ASYNC_WITH already pushed (__aexit__, __aenter__ awaitable) and the await
+                // sequence produced the __aenter__ result on stack.
             },
 
             .WITH_EXCEPT_START => {
@@ -6014,11 +6018,10 @@ pub const SimContext = struct {
                 try self.stack.push(.{ .expr = expr });
             },
 
-            // Boolean operations (for short-circuit evaluation)
-            .JUMP_IF_TRUE_OR_POP, .JUMP_IF_FALSE_OR_POP => {
-                // These leave TOS on stack if condition matches, otherwise pop and jump
-                // For simulation, we leave the value on stack (the expr stays)
-            },
+            // Boolean operations (short-circuit evaluation).
+            // Stack effect depends on control flow; leave value on stack and let CFG edges
+            // account for the pop-on-fallthrough behavior.
+            .JUMP_IF_TRUE_OR_POP, .JUMP_IF_FALSE_OR_POP => {},
 
             .JUMP_IF_TRUE, .JUMP_IF_FALSE => {
                 // Python 3.0 only: jump if true/false, value stays on stack
@@ -6606,9 +6609,22 @@ pub const SimContext = struct {
 
             .END_ASYNC_FOR => {
                 // END_ASYNC_FOR - cleanup after async for loop
-                // Pops exception info and async iterator
-                _ = self.stack.pop();
-                _ = self.stack.pop();
+                // Pops (exc_type, exc, tb) + async iterator on legacy versions.
+                const exc_drop: usize = if (self.version.gte(3, 11)) 1 else 3;
+                const total_drop: usize = exc_drop + 1;
+                var i: usize = 0;
+                while (i < total_drop) : (i += 1) {
+                    if (self.stack.pop()) |v| {
+                        if (!self.flow_mode) {
+                            var val = v;
+                            val.deinit(self.allocator, self.stack_alloc);
+                        }
+                    } else if (!(self.lenient or self.flow_mode)) {
+                        return error.StackUnderflow;
+                    } else {
+                        break;
+                    }
+                }
             },
 
             .END_FOR => {
@@ -6832,7 +6848,7 @@ pub const SimContext = struct {
     }
 };
 
-const PendingBoolOp = struct {
+pub const PendingBoolOp = struct {
     target: u32,
     op: ast.BoolOp,
     left: *Expr,
@@ -6980,7 +6996,7 @@ fn captureIfExpThen(
     return true;
 }
 
-fn resolveBoolOps(
+pub fn resolveBoolOps(
     allocator: Allocator,
     stack: *Stack,
     pending: *std.ArrayListUnmanaged(PendingBoolOp),
