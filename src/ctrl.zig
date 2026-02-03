@@ -665,7 +665,7 @@ pub const Analyzer = struct {
         var has_yield = false;
         for (block.instructions) |inst| {
             switch (inst.opcode) {
-                .SETUP_EXCEPT => has_setup = true,
+                .SETUP_EXCEPT, .SETUP_FINALLY => has_setup = true,
                 .GET_ANEXT => has_anext = true,
                 .YIELD_FROM => has_yield = true,
                 else => {},
@@ -1289,7 +1289,8 @@ pub const Analyzer = struct {
                 if (else_blk.terminator()) |else_term| {
                     const is_boolop_jump = else_term.opcode == .JUMP_IF_FALSE_OR_POP or
                         else_term.opcode == .JUMP_IF_TRUE_OR_POP;
-                    if (self.isConditionalJump(else_term.opcode) and !is_boolop_jump and !hasStmtPrelude(else_blk) and
+                    const is_and_or = self.detectAndOr(else_id) != null;
+                    if (self.isConditionalJump(else_term.opcode) and !is_boolop_jump and !is_and_or and !hasStmtPrelude(else_blk) and
                         !self.hasTrySetup(else_blk) and
                         self.elifPredOk(block_id, else_id, else_jump))
                     {

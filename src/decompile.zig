@@ -393,6 +393,8 @@ pub const Decompiler = struct {
     stack_in: []?[]StackValue,
     /// Phi slots for stack merges keyed by (block, slot).
     phi_slots: std.AutoHashMapUnmanaged(PhiKey, PhiSlot) = .{},
+    /// Phi slot key lookup by generated name (e.g. "__phi4").
+    phi_key_by_name: std.StringHashMapUnmanaged(PhiKey) = .{},
     /// Phi slot indices per merge block.
     phi_by_block: std.AutoHashMapUnmanaged(u32, std.ArrayListUnmanaged(u32)) = .{},
     /// Phi incoming expressions keyed by (pred, succ, slot).
@@ -449,7 +451,12 @@ pub const Decompiler = struct {
     const ScPass = sc_pass.Methods(@This(), DecompileError);
     const PhiKey = struct { block: u32, slot: u32 };
     const PhiIncomingKey = struct { pred: u32, succ: u32, slot: u32 };
-    const PhiSlot = struct { name: []const u8, expr: *Expr };
+    const PhiSlot = struct {
+        name: []const u8,
+        expr: *Expr,
+        /// Distinct incoming values observed while computing stack SSA.
+        vals: std.ArrayListUnmanaged(*Expr) = .{},
+    };
 
     fn simulateTernaryBranch(
         self: *Decompiler,
@@ -761,7 +768,12 @@ pub const Decompiler = struct {
             list.deinit(self.allocator);
         }
         self.phi_by_block.deinit(self.allocator);
+        var phi_slot_it = self.phi_slots.valueIterator();
+        while (phi_slot_it.next()) |slot| {
+            slot.vals.deinit(self.allocator);
+        }
         self.phi_slots.deinit(self.allocator);
+        self.phi_key_by_name.deinit(self.allocator);
         var incoming_lists = self.phi_incoming_by_succ.valueIterator();
         while (incoming_lists.next()) |list| {
             list.deinit(self.allocator);
@@ -906,7 +918,7 @@ pub const Decompiler = struct {
 
     fn hasTrySetup(block: *const BasicBlock) bool {
         for (block.instructions) |inst| {
-            if (ctrl.Analyzer.isConditionalJump(undefined, inst.opcode)) break;
+            if (ctrl.Analyzer.isCondJump(inst.opcode)) break;
             if (inst.opcode == .SETUP_FINALLY or inst.opcode == .SETUP_EXCEPT) return true;
         }
         return false;
@@ -917,7 +929,7 @@ pub const Decompiler = struct {
         const blk = &self.cfg.blocks[block_id];
         for (blk.instructions) |inst| {
             if (inst.opcode == .NOT_TAKEN or inst.opcode == .CACHE) continue;
-            if (ctrl.Analyzer.isConditionalJump(undefined, inst.opcode)) return false;
+            if (ctrl.Analyzer.isCondJump(inst.opcode)) return false;
             if (inst.isUnconditionalJump()) return false;
             if (isStatementOpcode(inst.opcode)) return false;
         }
@@ -953,7 +965,7 @@ pub const Decompiler = struct {
     fn condBlockHasStmt(block: *const BasicBlock) bool {
         const insts = block.instructions;
         for (insts, 0..) |inst, idx| {
-            if (ctrl.Analyzer.isConditionalJump(undefined, inst.opcode)) return false;
+            if (ctrl.Analyzer.isCondJump(inst.opcode)) return false;
             if (inst.opcode == .NOT_TAKEN or inst.opcode == .CACHE) continue;
             if (isWalrusStore(insts, idx)) continue;
             if (isStatementOpcode(inst.opcode)) return true;
@@ -963,7 +975,7 @@ pub const Decompiler = struct {
 
     fn condBlockHasPrelude(block: *const BasicBlock) bool {
         for (block.instructions) |inst| {
-            if (ctrl.Analyzer.isConditionalJump(undefined, inst.opcode)) return false;
+            if (ctrl.Analyzer.isCondJump(inst.opcode)) return false;
             if (inst.opcode == .NOT_TAKEN or inst.opcode == .CACHE) continue;
             if (isStatementOpcode(inst.opcode)) return true;
         }
@@ -1032,7 +1044,7 @@ pub const Decompiler = struct {
             seen.set(cur);
             const blk = &self.cfg.blocks[cur];
             const term = blk.terminator() orelse return null;
-            if (!ctrl.Analyzer.isConditionalJump(undefined, term.opcode)) return null;
+            if (!ctrl.Analyzer.isCondJump(term.opcode)) return null;
             if (condBlockHasPrelude(blk)) return null;
             var t_id: ?u32 = null;
             var f_id: ?u32 = null;
@@ -1056,7 +1068,7 @@ pub const Decompiler = struct {
             if (next >= self.cfg.blocks.len) return null;
             const next_blk = &self.cfg.blocks[next];
             const next_term = next_blk.terminator() orelse return next;
-            if (!ctrl.Analyzer.isConditionalJump(undefined, next_term.opcode)) return next;
+            if (!ctrl.Analyzer.isCondJump(next_term.opcode)) return next;
             if (condBlockHasPrelude(next_blk)) return next;
             var next_has_then = false;
             for (next_blk.successors) |edge| {
@@ -1366,6 +1378,11 @@ pub const Decompiler = struct {
         }
         const cond_block = cond_id orelse return null;
 
+        // The condition must dominate the merge. Otherwise the merge can be reached without
+        // evaluating the condition (e.g. shared tails / bypass edges), and recovering a ternary
+        // here is unsound.
+        if (!self.dom.dominates(cond_block, merge_block)) return null;
+
         const cond_blk = &self.cfg.blocks[cond_block];
         const term = cond_blk.terminator() orelse return null;
         if (!self.analyzer.isConditionalJump(term.opcode)) return null;
@@ -1532,7 +1549,7 @@ pub const Decompiler = struct {
             }
         }
         for (self.cfg.blocks[cond_block].instructions) |inst| {
-            if (ctrl.Analyzer.isConditionalJump(undefined, inst.opcode)) break;
+            if (ctrl.Analyzer.isCondJump(inst.opcode)) break;
             cond_sim.simulate(inst) catch |err| {
                 if (self.isSoftSimErr(err)) return error.PatternNoMatch;
                 return err;
@@ -1593,7 +1610,7 @@ pub const Decompiler = struct {
             try self.seedFromPredecessors(cond_block, &cond_sim);
         }
         for (self.cfg.blocks[cond_block].instructions) |inst| {
-            if (ctrl.Analyzer.isConditionalJump(undefined, inst.opcode)) break;
+            if (ctrl.Analyzer.isCondJump(inst.opcode)) break;
             cond_sim.simulate(inst) catch |err| {
                 if (self.isSoftSimErr(err)) return error.PatternNoMatch;
                 return err;
@@ -2238,7 +2255,11 @@ pub const Decompiler = struct {
         var slots = removed.value;
         defer slots.deinit(self.allocator);
         for (slots.items) |slot_idx| {
-            _ = self.phi_slots.remove(.{ .block = block_id, .slot = slot_idx });
+            if (self.phi_slots.fetchRemove(.{ .block = block_id, .slot = slot_idx })) |entry| {
+                var slot = entry.value;
+                slot.vals.deinit(self.allocator);
+                _ = self.phi_key_by_name.remove(slot.name);
+            }
         }
         if (self.phi_incoming_by_succ.fetchRemove(block_id)) |entry| {
             var keys = entry.value;
@@ -2262,6 +2283,7 @@ pub const Decompiler = struct {
         const name = try self.makePhiName();
         const expr = try self.makeRawName(name, .load);
         try self.phi_slots.put(self.allocator, key, .{ .name = name, .expr = expr });
+        try self.phi_key_by_name.put(self.allocator, name, key);
         if (self.phi_by_block.getPtr(block_id)) |list| {
             try list.append(self.allocator, slot_idx);
         } else {
@@ -2270,6 +2292,45 @@ pub const Decompiler = struct {
             try self.phi_by_block.put(self.allocator, block_id, list);
         }
         return expr;
+    }
+
+    fn phiSlotForExpr(self: *Decompiler, expr: *Expr) ?*PhiSlot {
+        return switch (expr.*) {
+            .name => |n| blk: {
+                if (!std.mem.startsWith(u8, n.id, "__phi")) break :blk null;
+                const key = self.phi_key_by_name.get(n.id) orelse break :blk null;
+                break :blk self.phi_slots.getPtr(key);
+            },
+            else => null,
+        };
+    }
+
+    fn phiSlotHasVal(slot: *const PhiSlot, expr: *Expr) bool {
+        for (slot.vals.items) |v| {
+            if (ast.exprEqual(v, expr)) return true;
+        }
+        return false;
+    }
+
+    fn ifExpSubsumes(if_expr: *Expr, other: *Expr) bool {
+        return switch (if_expr.*) {
+            .if_exp => |ie| ast.exprEqual(ie.body, other) or ast.exprEqual(ie.else_body, other),
+            else => false,
+        };
+    }
+
+    fn recordPhiVal(self: *Decompiler, phi_expr: *Expr, val: StackValue, clone_sim: *SimContext) DecompileError!void {
+        const slot = self.phiSlotForExpr(phi_expr) orelse return;
+        if (val != .expr) return;
+        const vexpr = val.expr;
+        if (ast.exprEqual(vexpr, phi_expr)) return;
+        if (phiSlotHasVal(slot, vexpr)) return;
+        const cloned = try clone_sim.cloneStackValue(.{ .expr = vexpr });
+        const cloned_expr = switch (cloned) {
+            .expr => |e| e,
+            else => unreachable,
+        };
+        try slot.vals.append(self.allocator, cloned_expr);
     }
 
     fn stackValueToPhiExpr(self: *Decompiler, value: StackValue) DecompileError!*Expr {
@@ -2508,6 +2569,32 @@ pub const Decompiler = struct {
 
         const max_len = existing_len;
 
+        // If there is only one *normal* predecessor, the incoming stack is uniquely determined.
+        // During fixpoint, that single predecessor's outgoing values may become more precise
+        // (e.g. after introducing a phi slot in an earlier merge). In that case we must allow
+        // the successor's entry to update to the new incoming values rather than collapsing the
+        // slot(s) to `.unknown`.
+        if (!flow_mode) {
+            var pred_count: usize = 0;
+            for (self.cfg.blocks[merge_block].predecessors) |pid| {
+                if (!self.isNormalPred(pid, merge_block)) continue;
+                pred_count += 1;
+                if (pred_count >= 2) break;
+            }
+            if (pred_count == 1) {
+                var differs = false;
+                for (0..max_len) |idx| {
+                    if (!stack_mod.stackValueEqual(existing[idx], incoming[idx])) {
+                        differs = true;
+                        break;
+                    }
+                }
+                if (differs) {
+                    return try self.cloneStackValuesArena(clone_sim, incoming);
+                }
+            }
+        }
+
         if (existing_len == max_len) {
             var unchanged = true;
             for (0..max_len) |idx| {
@@ -2574,12 +2661,60 @@ pub const Decompiler = struct {
                 out[idx] = cur;
                 continue;
             }
+            if (cur == .expr and inc == .expr) {
+                // Allow a recovered if-expression to subsume incoming branch constants. This keeps
+                // stackflow monotone when an upstream merge upgrades from a single branch constant
+                // to an `if ... else ...` expression.
+                if (ifExpSubsumes(cur.expr, inc.expr)) {
+                    out[idx] = cur;
+                    continue;
+                }
+                if (ifExpSubsumes(inc.expr, cur.expr)) {
+                    out[idx] = inc;
+                    if (!stack_mod.stackValueEqual(cur, out[idx])) {
+                        changed = true;
+                    }
+                    continue;
+                }
+                // If one side is already a phi slot, allow the phi to subsume any of its observed
+                // incoming values. This prevents downstream merges from collapsing to `.unknown`
+                // when an upstream merge refines from a constant into a phi slot.
+                if (self.phiSlotForExpr(cur.expr)) |slot| {
+                    if (phiSlotHasVal(slot, inc.expr)) {
+                        out[idx] = cur;
+                        continue;
+                    }
+                }
+                if (self.phiSlotForExpr(inc.expr)) |slot| {
+                    if (phiSlotHasVal(slot, cur.expr)) {
+                        out[idx] = .{ .expr = slot.expr };
+                        if (!stack_mod.stackValueEqual(cur, out[idx])) {
+                            changed = true;
+                        }
+                        continue;
+                    }
+                }
+            }
             if (!can_phi or cur != .expr or inc != .expr) {
                 out[idx] = .unknown;
                 changed = true;
                 continue;
             }
+            // Prefer recovering a real ternary expression at the merge over emitting a phi slot
+            // name for the stack value. This is crucial for expression-only merges used inline
+            // (e.g. BUILD_TUPLE) where we may never emit phi assignments.
+            if (idx + 1 == max_len) {
+                if (try self.tryRecoverTernaryAtMerge(merge_block)) |rec| {
+                    out[idx] = .{ .expr = rec.expr };
+                    if (!stack_mod.stackValueEqual(cur, out[idx])) {
+                        changed = true;
+                    }
+                    continue;
+                }
+            }
             const phi_expr = try self.ensurePhiSlot(merge_block, @intCast(idx));
+            try self.recordPhiVal(phi_expr, cur, clone_sim);
+            try self.recordPhiVal(phi_expr, inc, clone_sim);
             out[idx] = .{ .expr = phi_expr };
             if (!stack_mod.stackValueEqual(cur, out[idx])) {
                 changed = true;
@@ -2635,6 +2770,71 @@ pub const Decompiler = struct {
                 }
                 return err;
             };
+        }
+
+        // For `with`/`async with`, handler entry stacks should not include the `__enter__`/`__aenter__`
+        // result, which is consumed immediately at the beginning of the body (POP_TOP or STORE_*).
+        // Some exception ranges start at the setup block; in that case, simulate the first body
+        // instruction to drop the enter-result before seeding WITH_EXCEPT_START.
+        if (exc_count == self.withExcSeedCount() and sim.stack.items.items.len >= 2) {
+            const is_async = struct {
+                fn check(d: *Decompiler, pat: ctrl.WithPattern) bool {
+                    if (pat.setup_block >= d.cfg.blocks.len) return false;
+                    const setup_blk = &d.cfg.blocks[pat.setup_block];
+                    for (setup_blk.instructions) |inst| {
+                        if (inst.opcode == .SETUP_ASYNC_WITH or inst.opcode == .BEFORE_ASYNC_WITH) return true;
+                    }
+                    return false;
+                }
+            }.check;
+
+            var body_id: ?u32 = null;
+            const start_pat = try self.analyzer.detectPatternNoTry(start_block.id);
+            if (start_pat == .with_stmt and start_pat.with_stmt.cleanup_block == handler.id and is_async(self, start_pat.with_stmt)) {
+                body_id = start_pat.with_stmt.body_block;
+            } else {
+                // Legacy async-with exception ranges start at the SETUP_ASYNC_WITH follower block.
+                // Find the parent WITH pattern to locate its body-block drop.
+                for (start_block.predecessors) |pid| {
+                    if (pid >= self.cfg.blocks.len) continue;
+                    const pred_pat = try self.analyzer.detectPatternNoTry(pid);
+                    if (pred_pat == .with_stmt and pred_pat.with_stmt.cleanup_block == handler.id and is_async(self, pred_pat.with_stmt)) {
+                        body_id = pred_pat.with_stmt.body_block;
+                        break;
+                    }
+                }
+            }
+
+            if (body_id) |bid| {
+                if (bid < self.cfg.blocks.len) {
+                    const body_blk = &self.cfg.blocks[bid];
+                    if (body_blk.instructions.len > 0) {
+                        const inst = body_blk.instructions[0];
+                        switch (inst.opcode) {
+                            .POP_TOP,
+                            .STORE_FAST,
+                            .STORE_NAME,
+                            .STORE_GLOBAL,
+                            .STORE_DEREF,
+                            => try sim.simulate(inst),
+                            else => {},
+                        }
+                    }
+                }
+            } else if (entry.start == start_block.start_offset) {
+                if (start_block.instructions.len > 0 and start_block.instructions[0].offset == entry.start) {
+                    const inst = start_block.instructions[0];
+                    switch (inst.opcode) {
+                        .POP_TOP,
+                        .STORE_FAST,
+                        .STORE_NAME,
+                        .STORE_GLOBAL,
+                        .STORE_DEREF,
+                        => try sim.simulate(inst),
+                        else => {},
+                    }
+                }
+            }
         }
 
         if (expect_depth) |depth| {
@@ -4144,6 +4344,12 @@ pub const Decompiler = struct {
         skip_first: usize,
         skip_first_store_param: bool,
     ) DecompileError!void {
+        if (skip_first == 0) {
+            for (block.instructions) |inst| {
+                if (inst.opcode == .WITH_EXCEPT_START) return;
+            }
+        }
+
         // Check for pending ternary expression from tryDecompileTernaryInto
         // For inline comprehensions (Python 3.12+), we need to skip cleanup ops
         // before pushing the expression: END_FOR, POP_TOP, SWAP, STORE_FAST (loop var restore)
@@ -4162,6 +4368,8 @@ pub const Decompiler = struct {
 
         var chain_targets: std.ArrayListUnmanaged(*Expr) = .{};
         defer chain_targets.deinit(self.allocator);
+        var pending_boolops: std.ArrayListUnmanaged(stack_mod.PendingBoolOp) = .{};
+        defer pending_boolops.deinit(self.allocator);
 
         const instructions = block.instructions[skip_first + extra_skip ..];
         const inst_base = skip_first + extra_skip;
@@ -4170,6 +4378,7 @@ pub const Decompiler = struct {
         var i: usize = 0;
         while (i < instructions.len) : (i += 1) {
             const inst = instructions[i];
+            _ = try stack_mod.resolveBoolOps(sim.allocator, &sim.stack, &pending_boolops, inst.offset);
             // POP_EXCEPT marks handler cleanup; allow trailing ops (e.g. return)
             if (inst.opcode == .POP_EXCEPT) {
                 try sim.simulate(inst);
@@ -4692,6 +4901,11 @@ pub const Decompiler = struct {
                         continue;
                     }
                     var value = try sim.stack.popExpr();
+                    if (self.isPlaceholderExpr(value)) {
+                        if (try self.tryRecoverWithReturnValue(block, inst_base + i)) |recovered| {
+                            value = recovered;
+                        }
+                    }
                     if (value.* == .name and std.mem.eql(u8, value.name.id, "__unknown__")) {
                         const expr = self.tryRecoverBoolOpReturn(block.id, inst_base + i) catch |err| switch (err) {
                             error.PatternNoMatch => null,
@@ -4756,6 +4970,28 @@ pub const Decompiler = struct {
                     if (try self.tryEmitStatement(inst, sim, block.id, skip_first + extra_skip + i)) |stmt| {
                         try stmts.append(stmts_allocator, stmt);
                     }
+                },
+                .JUMP_IF_FALSE_OR_POP, .JUMP_IF_TRUE_OR_POP => {
+                    const target = inst.jumpTarget(self.version) orelse inst.arg;
+                    if (target >= block.start_offset and target < block.end_offset) {
+                        const left = try sim.stack.popExpr();
+                        var chain_compare = false;
+                        if (left.* == .compare and left.compare.comparators.len > 0) {
+                            if (sim.stack.peek()) |val| {
+                                if (val == .expr and ast.exprEqual(val.expr, left.compare.comparators[left.compare.comparators.len - 1])) {
+                                    chain_compare = true;
+                                }
+                            }
+                        }
+                        try pending_boolops.append(self.allocator, .{
+                            .target = target,
+                            .op = if (inst.opcode == .JUMP_IF_FALSE_OR_POP) .and_ else .or_,
+                            .left = left,
+                            .chain_compare = chain_compare,
+                        });
+                        continue;
+                    }
+                    try sim.simulate(inst);
                 },
                 else => {
                     try sim.simulate(inst);
@@ -6330,7 +6566,7 @@ pub const Decompiler = struct {
 
         const block = &self.cfg.blocks[block_id];
         const term = block.terminator() orelse return null;
-        if (!ctrl.Analyzer.isConditionalJump(undefined, term.opcode)) return null;
+        if (!ctrl.Analyzer.isCondJump(term.opcode)) return null;
 
         var expr: *Expr = undefined;
         var extra = false;
@@ -6602,13 +6838,13 @@ pub const Decompiler = struct {
                     if (idx + 2 < block.instructions.len and
                         inst.opcode == .COPY and inst.arg == 1 and
                         block.instructions[idx + 1].opcode == .TO_BOOL and
-                        ctrl.Analyzer.isConditionalJump(undefined, block.instructions[idx + 2].opcode))
+                        ctrl.Analyzer.isCondJump(block.instructions[idx + 2].opcode))
                     {
                         break;
                     }
                 }
             }
-            if (ctrl.Analyzer.isConditionalJump(undefined, inst.opcode)) break;
+            if (ctrl.Analyzer.isCondJump(inst.opcode)) break;
             if (isStatementOpcode(inst.opcode)) return null;
             self.simOpt(&sim, inst) catch |err| switch (err) {
                 error.PatternNoMatch => return null,
@@ -6647,7 +6883,7 @@ pub const Decompiler = struct {
         const then_blk = &self.cfg.blocks[t_id];
         if (condBlockHasPrelude(then_blk)) return null;
         const then_term = then_blk.terminator() orelse return null;
-        if (!ctrl.Analyzer.isConditionalJump(undefined, then_term.opcode)) return null;
+        if (!ctrl.Analyzer.isCondJump(then_term.opcode)) return null;
 
         var t2_id: ?u32 = null;
         var f2_id: ?u32 = null;
@@ -7563,6 +7799,7 @@ pub const Decompiler = struct {
                     block_idx = result.next_block;
                 },
                 .with_stmt => |p| {
+                    try self.emitWithPrelude(p, &self.statements, self.allocator);
                     const result = try self.decompileWith(p);
                     if (result.stmt) |s| {
                         try self.statements.append(self.allocator, s);
@@ -7980,7 +8217,7 @@ pub const Decompiler = struct {
             if (cmp_idx + 3 < blk.instructions.len and
                 blk.instructions[cmp_idx + 1].opcode == .COPY and
                 blk.instructions[cmp_idx + 2].opcode == .TO_BOOL and
-                ctrl.Analyzer.isConditionalJump(undefined, blk.instructions[cmp_idx + 3].opcode))
+                ctrl.Analyzer.isCondJump(blk.instructions[cmp_idx + 3].opcode))
             {
                 // More chain - get the next middle value from stack
                 current_mid = try then_sim.stack.popExpr();
@@ -8053,7 +8290,7 @@ pub const Decompiler = struct {
         const then_blk = &self.cfg.blocks[pattern.then_block];
         if (condBlockHasPrelude(then_blk)) return false;
         const then_term = then_blk.terminator() orelse return false;
-        if (!ctrl.Analyzer.isConditionalJump(undefined, then_term.opcode)) return false;
+        if (!ctrl.Analyzer.isCondJump(then_term.opcode)) return false;
         var t_id: ?u32 = null;
         var f_id: ?u32 = null;
         for (then_blk.successors) |edge| {
@@ -8071,7 +8308,7 @@ pub const Decompiler = struct {
         const mid_clone = try sim.cloneStackValue(mid_val);
         try then_sim.stack.push(mid_clone);
         for (then_blk.instructions) |inst| {
-            if (ctrl.Analyzer.isConditionalJump(undefined, inst.opcode)) break;
+            if (ctrl.Analyzer.isCondJump(inst.opcode)) break;
             try then_sim.simulate(inst);
         }
         const cmp_expr = if (then_sim.stack.popExpr()) |expr| expr else |err| {
@@ -8395,11 +8632,24 @@ pub const Decompiler = struct {
         var sim = self.initSim(self.arena.allocator(), self.arena.allocator(), self.code, self.version);
         defer sim.deinit();
 
+        var seeded = false;
         if (pattern.condition_block < self.stack_in.len) {
             if (self.stack_in[pattern.condition_block]) |entry| {
+                seeded = true;
                 for (entry) |val| {
                     const cloned = try sim.cloneStackValue(val);
                     try sim.stack.push(cloned);
+                }
+            }
+        }
+        if (!seeded) {
+            // If stackflow is missing (or suppressed), handlers still have implicit stack entries.
+            const exc_count = self.exceptionSeedCount(pattern.condition_block, cond_block);
+            if (exc_count > 0) {
+                for (0..exc_count) |_| {
+                    const placeholder = try self.arena.allocator().create(Expr);
+                    placeholder.* = .{ .name = .{ .id = "__exception__", .ctx = .load } };
+                    try sim.stack.push(.{ .expr = placeholder });
                 }
             }
         }
@@ -8409,12 +8659,23 @@ pub const Decompiler = struct {
         const term = cond_block.terminator();
         const legacy_cond = if (term) |t| t.opcode == .JUMP_IF_FALSE or t.opcode == .JUMP_IF_TRUE else false;
 
+        // `skip_cond` instructions were already handled as leading statements by the caller; simulate them
+        // here so the condition stack state matches the bytecode.
+        if (skip_cond > 0) {
+            const prefix_len = @min(skip_cond, cond_block.instructions.len);
+            for (cond_block.instructions[0..prefix_len]) |inst| {
+                if (ctrl.Analyzer.isCondJump(inst.opcode)) break;
+                if (inst.opcode == .JUMP_BACKWARD or inst.opcode == .JUMP_BACKWARD_NO_INTERRUPT) break;
+                try sim.simulate(inst);
+            }
+        }
+
         // Simulate up to but not including the conditional jump, skipping first N instructions
         const insts = cond_block.instructions[skip_cond..];
         var inst_idx: usize = 0;
         while (inst_idx < insts.len) : (inst_idx += 1) {
             const inst = insts[inst_idx];
-            if (ctrl.Analyzer.isConditionalJump(undefined, inst.opcode)) break;
+            if (ctrl.Analyzer.isCondJump(inst.opcode)) break;
 
             // Detect walrus operator: COPY 1 followed by STORE_*
             if (isWalrusStore(insts, inst_idx)) {
@@ -8478,7 +8739,7 @@ pub const Decompiler = struct {
                 if (else_id < self.cfg.blocks.len) {
                     const else_blk = &self.cfg.blocks[else_id];
                     if (else_blk.terminator()) |else_term| {
-                        if (ctrl.Analyzer.isConditionalJump(undefined, else_term.opcode) and
+                        if (ctrl.Analyzer.isCondJump(else_term.opcode) and
                             condBlockHasStmt(else_blk))
                         {
                             is_elif = false;
@@ -8487,7 +8748,7 @@ pub const Decompiler = struct {
                         // successors, it's not an actual elif guard; it's an expression
                         // prelude (e.g. conditional kwarg value) that must be decompiled as
                         // a normal else-branch to preserve semantics/parity.
-                        if (is_elif and ctrl.Analyzer.isConditionalJump(undefined, else_term.opcode)) {
+                        if (is_elif and ctrl.Analyzer.isCondJump(else_term.opcode)) {
                             for (else_blk.successors) |edge| {
                                 if (edge.edge_type == .exception) continue;
                                 const sid = edge.target;
@@ -8587,7 +8848,11 @@ pub const Decompiler = struct {
             if (else_block) |else_id| {
                 const else_pat = try self.analyzer.detectPatternNoTry(else_id);
                 if (else_pat == .if_stmt and else_pat.if_stmt.is_elif) {
-                    force_else = true;
+                    // If the "elif" head is actually an `x and y or z` short-circuit, prefer
+                    // decompiling it as a post-if expression instead of forcing an else/elif chain.
+                    if (self.analyzer.detectAndOr(else_id) == null) {
+                        force_else = true;
+                    }
                 }
             }
         }
@@ -8693,7 +8958,7 @@ pub const Decompiler = struct {
                                 const else_blk = &self.cfg.blocks[else_res];
                                 if (!condBlockHasPrelude(else_blk)) {
                                     if (else_blk.terminator()) |else_term| {
-                                        if (ctrl.Analyzer.isConditionalJump(undefined, else_term.opcode)) {
+                                        if (ctrl.Analyzer.isCondJump(else_term.opcode)) {
                                             var t_id: ?u32 = null;
                                             var f_id: ?u32 = null;
                                             for (else_blk.successors) |edge| {
@@ -8759,7 +9024,7 @@ pub const Decompiler = struct {
                             const then_blk = &self.cfg.blocks[then_block];
                             if (!condBlockHasPrelude(then_blk)) {
                                 if (then_blk.terminator()) |then_term| {
-                                    if (ctrl.Analyzer.isConditionalJump(undefined, then_term.opcode)) {
+                                    if (ctrl.Analyzer.isCondJump(then_term.opcode)) {
                                         var t_id: ?u32 = null;
                                         var f_id: ?u32 = null;
                                         for (then_blk.successors) |edge| {
@@ -8857,7 +9122,7 @@ pub const Decompiler = struct {
                                     const then_blk = &self.cfg.blocks[then_block];
                                     if (!condBlockHasPrelude(then_blk)) {
                                         if (then_blk.terminator()) |then_term| {
-                                            if (ctrl.Analyzer.isConditionalJump(undefined, then_term.opcode)) {
+                                            if (ctrl.Analyzer.isCondJump(then_term.opcode)) {
                                                 var t_id: ?u32 = null;
                                                 var f_id: ?u32 = null;
                                                 for (then_blk.successors) |edge| {
@@ -8906,7 +9171,7 @@ pub const Decompiler = struct {
                         var has_call = false;
                         var has_cmp = false;
                         for (cond_block.instructions) |inst| {
-                            if (ctrl.Analyzer.isConditionalJump(undefined, inst.opcode)) cond_jump_count += 1;
+                            if (ctrl.Analyzer.isCondJump(inst.opcode)) cond_jump_count += 1;
                             switch (inst.opcode) {
                                 .CALL_FUNCTION,
                                 .CALL_METHOD,
@@ -8988,7 +9253,7 @@ pub const Decompiler = struct {
                 const then_blk = &self.cfg.blocks[then_block];
                 if (!condBlockHasPrelude(then_blk)) {
                     if (then_blk.terminator()) |then_term| {
-                        if (ctrl.Analyzer.isConditionalJump(undefined, then_term.opcode)) {
+                        if (ctrl.Analyzer.isCondJump(then_term.opcode)) {
                             var t_id: ?u32 = null;
                             var f_id: ?u32 = null;
                             for (then_blk.successors) |edge| {
@@ -9093,7 +9358,7 @@ pub const Decompiler = struct {
                                 seen.set(cur);
                                 const blk = &self.cfg.blocks[cur];
                                 const blk_term = blk.terminator() orelse break;
-                                if (!ctrl.Analyzer.isConditionalJump(undefined, blk_term.opcode)) break;
+                                if (!ctrl.Analyzer.isCondJump(blk_term.opcode)) break;
                                 if (condBlockHasPrelude(blk)) break;
                                 var t_id: ?u32 = null;
                                 var f_id: ?u32 = null;
@@ -9150,7 +9415,7 @@ pub const Decompiler = struct {
                     const then_blk = &self.cfg.blocks[then_block];
                     if (!condBlockHasPrelude(then_blk)) {
                         if (then_blk.terminator()) |then_term| {
-                            if (ctrl.Analyzer.isConditionalJump(undefined, then_term.opcode)) {
+                            if (ctrl.Analyzer.isCondJump(then_term.opcode)) {
                                 var t_id: ?u32 = null;
                                 var f_id: ?u32 = null;
                                 for (then_blk.successors) |edge| {
@@ -9225,7 +9490,7 @@ pub const Decompiler = struct {
                         const then_blk = &self.cfg.blocks[then_block];
                         if (!condBlockHasPrelude(then_blk)) {
                             if (then_blk.terminator()) |then_term| {
-                                if (ctrl.Analyzer.isConditionalJump(undefined, then_term.opcode)) {
+                                if (ctrl.Analyzer.isCondJump(then_term.opcode)) {
                                     var t_id: ?u32 = null;
                                     var f_id: ?u32 = null;
                                     for (then_blk.successors) |edge| {
@@ -9242,7 +9507,7 @@ pub const Decompiler = struct {
                                             const else_blk = &self.cfg.blocks[else_res];
                                             if (!condBlockHasPrelude(else_blk)) {
                                                 if (else_blk.terminator()) |else_term| {
-                                                    if (ctrl.Analyzer.isConditionalJump(undefined, else_term.opcode)) {
+                                                    if (ctrl.Analyzer.isCondJump(else_term.opcode)) {
                                                         var et_id: ?u32 = null;
                                                         var ef_id: ?u32 = null;
                                                         for (else_blk.successors) |edge| {
@@ -9322,7 +9587,7 @@ pub const Decompiler = struct {
                             const else_blk = &self.cfg.blocks[cur_else];
                             if (condBlockHasPrelude(else_blk)) break;
                             const else_term = else_blk.terminator() orelse break;
-                            if (!ctrl.Analyzer.isConditionalJump(undefined, else_term.opcode)) break;
+                            if (!ctrl.Analyzer.isCondJump(else_term.opcode)) break;
                             var et_id: ?u32 = null;
                             var ef_id: ?u32 = null;
                             for (else_blk.successors) |edge| {
@@ -9387,7 +9652,7 @@ pub const Decompiler = struct {
                 if (else_id < self.cfg.blocks.len) {
                     const else_blk = &self.cfg.blocks[else_id];
                     if (else_blk.terminator()) |else_term| {
-                        if (ctrl.Analyzer.isConditionalJump(undefined, else_term.opcode)) {
+                        if (ctrl.Analyzer.isCondJump(else_term.opcode)) {
                             if (try self.condChainFalseTarget(else_id, then_block)) |fb| {
                                 var in_stack = try std.DynamicBitSet.initEmpty(self.allocator, self.cfg.blocks.len);
                                 defer in_stack.deinit();
@@ -9489,7 +9754,7 @@ pub const Decompiler = struct {
                     const then_blk = &self.cfg.blocks[then_block];
                     if (!condBlockHasPrelude(then_blk)) {
                         if (then_blk.terminator()) |then_term| {
-                            if (ctrl.Analyzer.isConditionalJump(undefined, then_term.opcode)) {
+                            if (ctrl.Analyzer.isCondJump(then_term.opcode)) {
                                 var t_id: ?u32 = null;
                                 var f_id: ?u32 = null;
                                 for (then_blk.successors) |edge| {
@@ -9797,7 +10062,7 @@ pub const Decompiler = struct {
                             const then_blk = &self.cfg.blocks[then_block];
                             if (!condBlockHasPrelude(then_blk)) {
                                 if (then_blk.terminator()) |then_term| {
-                                    if (ctrl.Analyzer.isConditionalJump(undefined, then_term.opcode)) {
+                                    if (ctrl.Analyzer.isCondJump(then_term.opcode)) {
                                         var t_id: ?u32 = null;
                                         var f_id: ?u32 = null;
                                         for (then_blk.successors) |edge| {
@@ -10184,13 +10449,18 @@ pub const Decompiler = struct {
 
                 // The else block is another if statement - recurse
                 // For legacy conditionals, elif block starts with POP_TOP to clean up previous condition
-                const else_pattern = try self.analyzer.detectPattern(else_id);
-                if (else_pattern == .if_stmt) {
-                    const elif_stmt = try self.decompileIfInElifChain(else_pattern.if_stmt, skip);
-                    if (elif_stmt) |s| {
-                        const body = try a.alloc(*Stmt, 1);
-                        body[0] = s;
-                        break :blk body;
+                // If the else path begins with an `x and y or z` pattern, prefer the structured-range
+                // decompiler so it can collapse the boolean chain into a single expression (avoids
+                // leaking phi temps into `elif` chains).
+                if (self.analyzer.detectAndOr(else_id) == null) {
+                    const else_pattern = try self.analyzer.detectPattern(else_id);
+                    if (else_pattern == .if_stmt) {
+                        const elif_stmt = try self.decompileIfInElifChain(else_pattern.if_stmt, skip);
+                        if (elif_stmt) |s| {
+                            const body = try a.alloc(*Stmt, 1);
+                            body[0] = s;
+                            break :blk body;
+                        }
                     }
                 }
                 const merge_before_else = if (merge_block) |merge_id| merge_id < else_id else false;
@@ -10465,7 +10735,7 @@ pub const Decompiler = struct {
                                 }
                                 const blk = &self.cfg.blocks[cur];
                                 if (blk.terminator()) |t| {
-                                    if (ctrl.Analyzer.isConditionalJump(undefined, t.opcode)) {
+                                    if (ctrl.Analyzer.isCondJump(t.opcode)) {
                                         linear = false;
                                         break;
                                     }
@@ -10923,7 +11193,7 @@ pub const Decompiler = struct {
         var first_cmp_idx: ?usize = null;
         while (inst_idx < insts.len) : (inst_idx += 1) {
             const inst = insts[inst_idx];
-            if (ctrl.Analyzer.isConditionalJump(undefined, inst.opcode)) {
+            if (ctrl.Analyzer.isCondJump(inst.opcode)) {
                 if (first_jump_idx == null) {
                     first_jump_idx = inst_idx;
                 }
@@ -11001,11 +11271,11 @@ pub const Decompiler = struct {
                             cmp_idx = i;
                             continue;
                         }
-                        if (cmp_idx != null and ctrl.Analyzer.isConditionalJump(undefined, op)) {
+                        if (cmp_idx != null and ctrl.Analyzer.isCondJump(op)) {
                             jump_idx2 = i;
                             break;
                         }
-                        if (cmp_idx == null and ctrl.Analyzer.isConditionalJump(undefined, op)) {
+                        if (cmp_idx == null and ctrl.Analyzer.isCondJump(op)) {
                             break;
                         }
                     }
@@ -11026,7 +11296,7 @@ pub const Decompiler = struct {
                     while (j <= cmp_idx.?) : (j += 1) {
                         const inst = insts[j];
                         if (inst.opcode == .NOT_TAKEN or inst.opcode == .CACHE) continue;
-                        if (ctrl.Analyzer.isConditionalJump(undefined, inst.opcode)) break;
+                        if (ctrl.Analyzer.isCondJump(inst.opcode)) break;
                         try sim2.simulate(inst);
                     }
                     const cmp_expr = try sim2.stack.popExpr();
@@ -11138,7 +11408,7 @@ pub const Decompiler = struct {
             if (alt_id) |cid| {
                 const alt_blk = &self.cfg.blocks[cid];
                 if (alt_blk.terminator()) |alt_term| {
-                    if (ctrl.Analyzer.isConditionalJump(undefined, alt_term.opcode)) {
+                    if (ctrl.Analyzer.isCondJump(alt_term.opcode)) {
                         var alt_body_taken: ?bool = null;
                         var has_exit = false;
                         for (alt_blk.successors) |edge| {
@@ -11153,7 +11423,7 @@ pub const Decompiler = struct {
                             var alt_sim = self.initSim(self.arena.allocator(), self.arena.allocator(), self.code, self.version);
                             defer alt_sim.deinit();
                             for (alt_blk.instructions) |inst| {
-                                if (ctrl.Analyzer.isConditionalJump(undefined, inst.opcode)) break;
+                                if (ctrl.Analyzer.isCondJump(inst.opcode)) break;
                                 try alt_sim.simulate(inst);
                             }
                             var alt_cond = try alt_sim.stack.popExpr();
@@ -11202,7 +11472,7 @@ pub const Decompiler = struct {
                         }
                         const guard_block = &self.cfg.blocks[guard.condition_block];
                         for (guard_block.instructions) |inst| {
-                            if (ctrl.Analyzer.isConditionalJump(undefined, inst.opcode)) break;
+                            if (ctrl.Analyzer.isCondJump(inst.opcode)) break;
                             try guard_sim.simulate(inst);
                         }
                         const guard_cond = try guard_sim.stack.popExpr();
@@ -11285,7 +11555,7 @@ pub const Decompiler = struct {
         var body_skip: usize = 0;
         if (body_block_id == pattern.header_block and !ignore_header_while) {
             for (header.instructions, 0..) |inst, idx| {
-                if (ctrl.Analyzer.isConditionalJump(undefined, inst.opcode)) {
+                if (ctrl.Analyzer.isCondJump(inst.opcode)) {
                     body_skip = idx + 1;
                     break;
                 }
@@ -11347,7 +11617,7 @@ pub const Decompiler = struct {
             if (should_process and exit_block.predecessors.len == 1 and exit_block.predecessors[0] == pattern.header_block) {
                 var has_cond = false;
                 for (exit_block.instructions) |inst| {
-                    if (ctrl.Analyzer.isConditionalJump(undefined, inst.opcode)) {
+                    if (ctrl.Analyzer.isCondJump(inst.opcode)) {
                         has_cond = true;
                         break;
                     }
@@ -11571,6 +11841,43 @@ pub const Decompiler = struct {
         const body_set = self.analyzer.loopSet(header) orelse return null;
         if (!body_set.isSet(@intCast(header))) return null;
 
+        // Async-for in Python 3.5-3.10 is implemented as an internal loop header feeding a
+        // try/finally (END_ASYNC_FOR) state machine. Prefer emitting an `async for` directly.
+        if (header < self.cfg.blocks.len) {
+            const header_block = &self.cfg.blocks[header];
+            if (header_block.instructions.len == 0) {
+                var succ_norm: ?u32 = null;
+                for (header_block.successors) |edge| {
+                    if (edge.edge_type == .exception) continue;
+                    if (succ_norm != null) {
+                        succ_norm = null;
+                        break;
+                    }
+                    succ_norm = edge.target;
+                }
+                if (succ_norm) |succ_id| {
+                    if (succ_id < self.cfg.blocks.len) {
+                        if (try self.analyzer.detectTryPatternAt(succ_id)) |tp| {
+                            if (try self.tryDecompileAsyncFor(tp)) |res| {
+                                const limit: u32 = @intCast(self.cfg.blocks.len);
+                                const consume_limit = if (self.br_limit) |lim| lim else limit;
+                                var consume_it = body_set.iterator(.{});
+                                while (consume_it.next()) |bit| {
+                                    const bid: u32 = @intCast(bit);
+                                    if (bid >= consume_limit) continue;
+                                    try self.consumed.set(self.allocator, bid);
+                                }
+                                return res;
+                            }
+                            if (tp.handlers_owned) {
+                                self.allocator.free(tp.handlers);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
         var visited = try std.DynamicBitSet.initEmpty(self.allocator, self.cfg.blocks.len);
         defer visited.deinit();
 
@@ -11583,7 +11890,7 @@ pub const Decompiler = struct {
         if (header < self.cfg.blocks.len) {
             const header_block = &self.cfg.blocks[header];
             if (header_block.terminator()) |term| {
-                if (ctrl.Analyzer.isConditionalJump(undefined, term.opcode)) {
+                if (ctrl.Analyzer.isCondJump(term.opcode)) {
                     if (try self.guardBranchToHeader(header_block, term, header, trace_on)) |branch| {
                         var sim = self.initSim(self.arena.allocator(), self.arena.allocator(), self.code, self.version);
                         defer sim.deinit();
@@ -11598,7 +11905,7 @@ pub const Decompiler = struct {
                             }
                         }
                         for (header_block.instructions) |inst| {
-                            if (ctrl.Analyzer.isConditionalJump(undefined, inst.opcode)) break;
+                            if (ctrl.Analyzer.isCondJump(inst.opcode)) break;
                             try sim.simulate(inst);
                         }
                         const cond = try sim.stack.popExpr();
@@ -11811,6 +12118,50 @@ pub const Decompiler = struct {
         next_block: u32,
     };
 
+    fn rewriteNestedAsyncForContinue(self: *Decompiler, body: []const *Stmt, target: *Expr, iter: *Expr) void {
+        for (body) |stmt| {
+            switch (stmt.*) {
+                .if_stmt => |*ifs| {
+                    self.rewriteNestedAsyncForContinue(ifs.body, target, iter);
+                    self.rewriteNestedAsyncForContinue(ifs.else_body, target, iter);
+                },
+                .for_stmt => |*fs| {
+                    const trivial = fs.body.len == 0 or (fs.body.len == 1 and fs.body[0].* == .pass);
+                    if (fs.is_async and fs.else_body.len == 0 and trivial and
+                        ast.exprEqual(fs.target, target) and ast.exprEqual(fs.iter, iter))
+                    {
+                        stmt.* = .continue_stmt;
+                        continue;
+                    }
+                    self.rewriteNestedAsyncForContinue(fs.body, target, iter);
+                    self.rewriteNestedAsyncForContinue(fs.else_body, target, iter);
+                },
+                .while_stmt => |*ws| {
+                    self.rewriteNestedAsyncForContinue(ws.body, target, iter);
+                    self.rewriteNestedAsyncForContinue(ws.else_body, target, iter);
+                },
+                .with_stmt => |*ws| {
+                    self.rewriteNestedAsyncForContinue(ws.body, target, iter);
+                },
+                .try_stmt => |*ts| {
+                    self.rewriteNestedAsyncForContinue(ts.body, target, iter);
+                    for (ts.handlers) |*h| {
+                        self.rewriteNestedAsyncForContinue(h.body, target, iter);
+                    }
+                    self.rewriteNestedAsyncForContinue(ts.else_body, target, iter);
+                    self.rewriteNestedAsyncForContinue(ts.finalbody, target, iter);
+                },
+                .match_stmt => |*ms| {
+                    for (ms.cases) |*c| {
+                        self.rewriteNestedAsyncForContinue(c.body, target, iter);
+                    }
+                },
+                .function_def, .class_def => {},
+                else => {},
+            }
+        }
+    }
+
     fn tryDecompileAsyncFor(self: *Decompiler, pattern: ctrl.TryPattern) DecompileError!?PatternResult {
         if (self.version.lt(3, 5)) return null;
         if (pattern.handlers.len == 0) return null;
@@ -11819,15 +12170,18 @@ pub const Decompiler = struct {
         defer if (handled) self.allocator.free(pattern.handlers);
 
         var handler_id: ?u32 = null;
+        var uses_end_async_for = false;
         for (pattern.handlers) |handler_info| {
             if (handler_info.handler_block >= self.cfg.blocks.len) continue;
             const handler = &self.cfg.blocks[handler_info.handler_block];
 
+            var has_end_async_for = false;
             var has_stop = false;
             var has_cmp = false;
             var has_jump = false;
             for (handler.instructions) |inst| {
                 switch (inst.opcode) {
+                    .END_ASYNC_FOR => has_end_async_for = true,
                     .LOAD_GLOBAL => {
                         if (self.code.names.len > inst.arg) {
                             if (std.mem.eql(u8, self.code.names[inst.arg], "StopAsyncIteration")) {
@@ -11841,6 +12195,11 @@ pub const Decompiler = struct {
                     .POP_JUMP_IF_TRUE, .POP_JUMP_IF_FALSE => has_jump = true,
                     else => {},
                 }
+            }
+            if (has_end_async_for) {
+                handler_id = handler_info.handler_block;
+                uses_end_async_for = true;
+                break;
             }
             if (has_stop and has_cmp and has_jump) {
                 handler_id = handler_info.handler_block;
@@ -11872,7 +12231,7 @@ pub const Decompiler = struct {
             var setup_offset: u32 = 0;
             for (block.instructions) |inst| {
                 if (inst.opcode == .GET_AITER) has_aiter = true;
-                if (inst.opcode == .SETUP_EXCEPT) {
+                if (inst.opcode == .SETUP_EXCEPT or inst.opcode == .SETUP_FINALLY) {
                     has_setup = true;
                     setup_offset = inst.offset;
                 }
@@ -11897,6 +12256,28 @@ pub const Decompiler = struct {
                 }
                 if (aiter_id != null) break;
             }
+            if (aiter_id == null) {
+                // EXTENDED_ARG splitting can separate GET_AITER from SETUP_FINALLY by an
+                // intermediate block, so search one more predecessor hop.
+                for (block.predecessors) |pred_id| {
+                    if (pred_id >= self.cfg.blocks.len) continue;
+                    const pred = &self.cfg.blocks[pred_id];
+                    for (pred.predecessors) |pp_id| {
+                        if (pp_id >= self.cfg.blocks.len) continue;
+                        const pp = &self.cfg.blocks[pp_id];
+                        for (pp.instructions) |inst| {
+                            if (inst.opcode == .GET_AITER) {
+                                setup_id = block_id;
+                                setup_off = setup_offset;
+                                aiter_id = pp_id;
+                                break;
+                            }
+                        }
+                        if (aiter_id != null) break;
+                    }
+                    if (aiter_id != null) break;
+                }
+            }
             if (setup_id != null) break;
         }
         const setup_block_id = setup_id orelse return null;
@@ -11915,6 +12296,7 @@ pub const Decompiler = struct {
 
         const a = self.arena.allocator();
         var target: *Expr = undefined;
+        var target_block_id: u32 = try_id;
         var found_target = false;
         var saw_yield = false;
         var idx: usize = 0;
@@ -11956,25 +12338,128 @@ pub const Decompiler = struct {
                     const name = sim.getLocal(inst.arg) orelse "_";
                     target = try self.makeName(name, .store);
                     found_target = true;
+                    target_block_id = try_id;
                     break;
                 },
                 .STORE_DEREF => {
                     const name = sim.getDeref(inst.arg) orelse "_";
                     target = try self.makeName(name, .store);
                     found_target = true;
+                    target_block_id = try_id;
                     break;
                 },
                 .STORE_NAME, .STORE_GLOBAL => {
                     const name = sim.getName(inst.arg) orelse "_";
                     target = try self.makeName(name, .store);
                     found_target = true;
+                    target_block_id = try_id;
                     break;
                 },
                 else => {},
             }
             if (found_target) break;
         }
+        if (!found_target) {
+            // Python 3.8+ commonly puts the target STORE_* in the successor block after POP_BLOCK.
+            if (try_block.end_offset < self.code.code.len) {
+                if (self.cfg.blockAtOffset(try_block.end_offset)) |next_id| {
+                    const next_blk = &self.cfg.blocks[next_id];
+                    var j: usize = 0;
+                    while (j < next_blk.instructions.len) : (j += 1) {
+                        const inst = next_blk.instructions[j];
+                        switch (inst.opcode) {
+                            .UNPACK_SEQUENCE => {
+                                const count = inst.arg;
+                                if (count == 0) {
+                                    target = try a.create(Expr);
+                                    target.* = .{ .tuple = .{ .elts = &.{}, .ctx = .store } };
+                                    found_target = true;
+                                    target_block_id = next_id;
+                                    break;
+                                }
+                                if (j + count >= next_blk.instructions.len) return null;
+                                const elts = try a.alloc(*Expr, count);
+                                var k: u32 = 0;
+                                while (k < count) : (k += 1) {
+                                    const store_inst = next_blk.instructions[j + 1 + k];
+                                    const name = switch (store_inst.opcode) {
+                                        .STORE_FAST => sim.getLocal(store_inst.arg) orelse "_",
+                                        .STORE_DEREF => sim.getDeref(store_inst.arg) orelse "_",
+                                        .STORE_NAME, .STORE_GLOBAL => sim.getName(store_inst.arg) orelse "_",
+                                        else => return null,
+                                    };
+                                    elts[k] = try self.makeName(name, .store);
+                                }
+                                target = try a.create(Expr);
+                                target.* = .{ .tuple = .{ .elts = elts, .ctx = .store } };
+                                found_target = true;
+                                target_block_id = next_id;
+                                break;
+                            },
+                            .STORE_FAST => {
+                                const name = sim.getLocal(inst.arg) orelse "_";
+                                target = try self.makeName(name, .store);
+                                found_target = true;
+                                target_block_id = next_id;
+                                break;
+                            },
+                            .STORE_DEREF => {
+                                const name = sim.getDeref(inst.arg) orelse "_";
+                                target = try self.makeName(name, .store);
+                                found_target = true;
+                                target_block_id = next_id;
+                                break;
+                            },
+                            .STORE_NAME, .STORE_GLOBAL => {
+                                const name = sim.getName(inst.arg) orelse "_";
+                                target = try self.makeName(name, .store);
+                                found_target = true;
+                                target_block_id = next_id;
+                                break;
+                            },
+                            else => {},
+                        }
+                        if (found_target) break;
+                    }
+                }
+            }
+        }
         if (!found_target) return null;
+
+        if (uses_end_async_for) {
+            const exit_block = pattern.exit_block orelse return null;
+            if (exit_block >= self.cfg.blocks.len) return null;
+            if (target_block_id >= exit_block) return null;
+
+            var init_stack: []const StackValue = &.{};
+            if (target_block_id < self.stack_in.len) {
+                if (self.stack_in[target_block_id]) |entry| {
+                    init_stack = entry;
+                }
+            }
+
+            var body = try self.decompileStructuredRangeWithStack(target_block_id, exit_block, init_stack);
+            if (body.len > 0 and body[0].* == .assign) {
+                const assign = body[0].assign;
+                if (assign.targets.len == 1 and ast.exprEqual(assign.targets[0], target)) {
+                    body = body[1..];
+                }
+            }
+            self.rewriteNestedAsyncForContinue(body, target, iter_expr);
+
+            const stmt = try a.create(Stmt);
+            stmt.* = .{ .for_stmt = .{
+                .target = target,
+                .iter = iter_expr,
+                .body = body,
+                .else_body = &.{},
+                .type_comment = null,
+                .is_async = true,
+            } };
+
+            handled = true;
+            return .{ .stmt = stmt, .next_block = exit_block };
+        }
 
         var body_start_off: ?u32 = null;
         var body_empty = false;
@@ -13342,6 +13827,58 @@ pub const Decompiler = struct {
         return null;
     }
 
+    fn findWithExitCleanupBlock(self: *Decompiler, body_block: u32, cleanup_block: u32) DecompileError!?u32 {
+        if (body_block >= self.cfg.blocks.len) return null;
+        if (cleanup_block >= self.cfg.blocks.len) return null;
+        const cleanup_off = self.cfg.blocks[cleanup_block].start_offset;
+
+        var seen = try std.DynamicBitSet.initEmpty(self.allocator, self.cfg.blocks.len);
+        defer seen.deinit();
+        var queue: std.ArrayListUnmanaged(u32) = .{};
+        defer queue.deinit(self.allocator);
+
+        try queue.append(self.allocator, body_block);
+        seen.set(body_block);
+
+        var best: ?u32 = null;
+        var best_off: u32 = 0;
+
+        var qi: usize = 0;
+        while (qi < queue.items.len) : (qi += 1) {
+            const cur = queue.items[qi];
+            if (cur >= self.cfg.blocks.len) continue;
+            const blk = &self.cfg.blocks[cur];
+
+            if (cur != body_block and self.hasWithExitCleanup(blk)) {
+                var has_exc_to_cleanup = false;
+                for (blk.successors) |edge| {
+                    if (edge.edge_type == .exception and edge.target == cleanup_block) {
+                        has_exc_to_cleanup = true;
+                        break;
+                    }
+                }
+                if (!has_exc_to_cleanup) {
+                    if (best == null or blk.start_offset < best_off) {
+                        best = cur;
+                        best_off = blk.start_offset;
+                    }
+                }
+            }
+
+            for (blk.successors) |edge| {
+                const tgt = edge.target;
+                if (tgt >= self.cfg.blocks.len) continue;
+                // Stay within the with statement region; normal cleanup precedes WITH_EXCEPT_START.
+                if (self.cfg.blocks[tgt].start_offset >= cleanup_off) continue;
+                if (seen.isSet(tgt)) continue;
+                seen.set(tgt);
+                try queue.append(self.allocator, tgt);
+            }
+        }
+
+        return best;
+    }
+
     fn decompileWith(self: *Decompiler, pattern: ctrl.WithPattern) DecompileError!PatternResult {
         const a = self.arena.allocator();
         const setup = &self.cfg.blocks[pattern.setup_block];
@@ -13395,6 +13932,11 @@ pub const Decompiler = struct {
                             optional_vars = try self.makeName(name, .store);
                         }
                     },
+                    .STORE_DEREF => {
+                        if (sim.getDeref(first.arg)) |name| {
+                            optional_vars = try self.makeName(name, .store);
+                        }
+                    },
                     .STORE_NAME, .STORE_GLOBAL => {
                         if (sim.getName(first.arg)) |name| {
                             optional_vars = try self.makeName(name, .store);
@@ -13435,6 +13977,20 @@ pub const Decompiler = struct {
             body_end = pattern.cleanup_block;
             if (body_end <= pattern.body_block) body_end = pattern.exit_block;
             if (body_end <= pattern.body_block) body_end = pattern.body_block + 1;
+            const exit_cleanup = try self.findWithExitCleanupBlock(pattern.body_block, pattern.cleanup_block);
+            if (exit_cleanup) |nb| {
+                if (nb > pattern.body_block and nb < body_end) {
+                    const nb_blk = &self.cfg.blocks[nb];
+                    var has_return = false;
+                    for (nb_blk.instructions) |inst| {
+                        if (inst.opcode == .RETURN_VALUE or inst.opcode == .RETURN_CONST) {
+                            has_return = true;
+                            break;
+                        }
+                    }
+                    if (!has_return) body_end = nb;
+                }
+            }
             if (self.findWithPopNext(pattern.body_block, pattern.cleanup_block)) |nb| {
                 if (nb > pattern.body_block and nb < body_end) {
                     body_end = nb;
@@ -13483,6 +14039,17 @@ pub const Decompiler = struct {
             }
         }
 
+        // Prevent internal with cleanup blocks from being emitted as standalone statements,
+        // especially inside loop traversal.
+        if (pattern.body_block < self.cfg.blocks.len) {
+            if (try self.findWithExitCleanupBlock(pattern.body_block, pattern.cleanup_block)) |cleanup_id| {
+                try self.consumed.set(self.allocator, cleanup_id);
+            }
+        }
+        if (pattern.cleanup_block < self.cfg.blocks.len) {
+            try self.consumed.set(self.allocator, pattern.cleanup_block);
+        }
+
         return .{ .stmt = stmt, .next_block = exit };
     }
 
@@ -13507,6 +14074,27 @@ pub const Decompiler = struct {
             pred_sim.lenient = true;
             pred_sim.stack.allow_underflow = true;
 
+            // Seed stack from stack-flow analysis; many predecessor blocks are not self-contained
+            // (e.g., the merge of a short-circuit boolop feeding SETUP_WITH).
+            if (pred_id < self.stack_in.len) {
+                if (self.stack_in[pred_id]) |entry| {
+                    for (entry) |val| {
+                        const cloned = try pred_sim.cloneStackValue(val);
+                        try pred_sim.stack.push(cloned);
+                    }
+                }
+            }
+            if (pred_sim.stack.len() == 0 and self.needsPredecessorSeed(pred)) {
+                try self.seedFromPredecessors(pred_id, &pred_sim);
+            }
+
+            // Some contexts build the context manager value via a short-circuit boolop inside
+            // the predecessor block (JUMP_IF_*_OR_POP with a target inside the same block).
+            // Linear simulation needs to resolve these so the final CALL_* produces the
+            // context expression that flows into SETUP_WITH.
+            var pending_boolops: std.ArrayListUnmanaged(stack_mod.PendingBoolOp) = .{};
+            defer pending_boolops.deinit(a);
+
             var ok = true;
             for (pred.instructions) |inst| {
                 if (inst.opcode == .NOT_TAKEN) continue;
@@ -13514,6 +14102,71 @@ pub const Decompiler = struct {
                 if (inst.isUnconditionalJump()) {
                     break;
                 }
+
+                _ = stack_mod.resolveBoolOps(a, &pred_sim.stack, &pending_boolops, inst.offset) catch |err| {
+                    if (self.isSoftSimErr(err)) {
+                        ok = false;
+                        break;
+                    }
+                    return err;
+                };
+
+                switch (inst.opcode) {
+                    .JUMP_IF_FALSE_OR_POP => {
+                        const left = pred_sim.stack.popExpr() catch |err| {
+                            if (self.isSoftSimErr(err)) {
+                                ok = false;
+                                break;
+                            }
+                            return err;
+                        };
+                        var chain_compare = false;
+                        if (left.* == .compare and left.compare.comparators.len > 0) {
+                            if (pred_sim.stack.peek()) |val| {
+                                if (val == .expr and ast.exprEqual(val.expr, left.compare.comparators[left.compare.comparators.len - 1])) {
+                                    chain_compare = true;
+                                }
+                            }
+                        }
+                        pending_boolops.append(a, .{
+                            .target = inst.arg,
+                            .op = .and_,
+                            .left = left,
+                            .chain_compare = chain_compare,
+                        }) catch |err| {
+                            if (self.isSoftSimErr(err)) {
+                                ok = false;
+                                break;
+                            }
+                            return err;
+                        };
+                        continue;
+                    },
+                    .JUMP_IF_TRUE_OR_POP => {
+                        const left = pred_sim.stack.popExpr() catch |err| {
+                            if (self.isSoftSimErr(err)) {
+                                ok = false;
+                                break;
+                            }
+                            return err;
+                        };
+                        pending_boolops.append(a, .{
+                            .target = inst.arg,
+                            .op = .or_,
+                            .left = left,
+                            .chain_compare = false,
+                        }) catch |err| {
+                            if (self.isSoftSimErr(err)) {
+                                ok = false;
+                                break;
+                            }
+                            return err;
+                        };
+                        continue;
+                    },
+                    else => {},
+                }
+
                 pred_sim.simulate(inst) catch |err| {
                     if (self.isSoftSimErr(err)) {
                         ok = false;
@@ -13902,7 +14555,7 @@ pub const Decompiler = struct {
         var has_pat_op = false;
         var has_cond = false;
         if (block.terminator()) |term| {
-            has_cond = ctrl.Analyzer.isConditionalJump(undefined, term.opcode);
+            has_cond = ctrl.Analyzer.isCondJump(term.opcode);
         }
         for (block.instructions) |inst| {
             switch (inst.opcode) {
@@ -13935,7 +14588,7 @@ pub const Decompiler = struct {
     fn guardStartInBlock(self: *Decompiler, block: *const cfg_mod.BasicBlock) DecompileError!?GuardStart {
         var has_cond = false;
         if (block.terminator()) |term| {
-            has_cond = ctrl.Analyzer.isConditionalJump(undefined, term.opcode);
+            has_cond = ctrl.Analyzer.isCondJump(term.opcode);
         }
 
         var seen_match = false;
@@ -13988,7 +14641,7 @@ pub const Decompiler = struct {
                         if (seen_literal) break;
                         return .{ .idx = j, .preload = preload };
                     }
-                    if (ctrl.Analyzer.isConditionalJump(undefined, op)) break;
+                    if (ctrl.Analyzer.isCondJump(op)) break;
                 }
                 return null;
             }
@@ -14017,7 +14670,7 @@ pub const Decompiler = struct {
                     if (inst.opcode == .STORE_NAME and op == .LOAD_NAME and block.instructions[j].arg == store_idx) {
                         return .{ .idx = j, .preload = null };
                     }
-                    if (ctrl.Analyzer.isConditionalJump(undefined, op)) break;
+                    if (ctrl.Analyzer.isCondJump(op)) break;
                 }
             }
         }
@@ -14070,7 +14723,7 @@ pub const Decompiler = struct {
                     .COMPARE_OP, .COPY, .LOAD_CONST, .LOAD_SMALL_INT => seen_match2 = true,
                     else => {},
                 }
-                if (ctrl.Analyzer.isConditionalJump(undefined, inst.opcode) and seen_match2) {
+                if (ctrl.Analyzer.isCondJump(inst.opcode) and seen_match2) {
                     first_jump = i;
                     break;
                 }
@@ -14081,7 +14734,7 @@ pub const Decompiler = struct {
                 while (k < block.instructions.len) : (k += 1) {
                     const op = block.instructions[k].opcode;
                     if (op == .NOT_TAKEN or op == .CACHE) continue;
-                    if (ctrl.Analyzer.isConditionalJump(undefined, op)) {
+                    if (ctrl.Analyzer.isCondJump(op)) {
                         has_second = true;
                         break;
                     }
@@ -14296,7 +14949,7 @@ pub const Decompiler = struct {
         const blk = &self.cfg.blocks[block_id];
         var has_return = false;
         for (blk.instructions) |inst| {
-            if (ctrl.Analyzer.isConditionalJump(undefined, inst.opcode)) return false;
+            if (ctrl.Analyzer.isCondJump(inst.opcode)) return false;
             switch (inst.opcode) {
                 .MATCH_SEQUENCE, .MATCH_MAPPING, .MATCH_CLASS, .MATCH_KEYS, .COPY, .STORE_FAST_LOAD_FAST, .STORE_FAST_STORE_FAST => return false,
                 .RETURN_VALUE, .RETURN_CONST => has_return = true,
@@ -14736,7 +15389,7 @@ pub const Decompiler = struct {
             const blk = &self.cfg.blocks[bid];
             const pat = try self.literalPatternFromBlock(blk) orelse break;
             const term = blk.terminator() orelse break;
-            if (!ctrl.Analyzer.isConditionalJump(undefined, term.opcode)) break;
+            if (!ctrl.Analyzer.isCondJump(term.opcode)) break;
 
             const succ_edge = succEdgeForJump(term.opcode);
             const fail_edge = failEdgeForJump(term.opcode);
@@ -15221,7 +15874,7 @@ pub const Decompiler = struct {
             while (k < all_insts.items.len and filled2 < attr_list.len) : (k += 1) {
                 const op = all_insts.items[k].opcode;
                 if (op == .NOT_TAKEN or op == .CACHE or op == .POP_TOP) continue;
-                if (op == .COMPARE_OP or ctrl.Analyzer.isConditionalJump(undefined, op)) continue;
+                if (op == .COMPARE_OP or ctrl.Analyzer.isCondJump(op)) continue;
                 if (op == .STORE_FAST or op == .STORE_NAME) {
                     const name = if (op == .STORE_NAME)
                         self.code.names[all_insts.items[k].arg]
@@ -15353,7 +16006,7 @@ pub const Decompiler = struct {
             for (blk.instructions) |inst| {
                 if (inst.opcode == .NOT_TAKEN or inst.opcode == .CACHE) continue;
                 if (first_op == null) first_op = inst.opcode;
-                if (ctrl.Analyzer.isConditionalJump(undefined, inst.opcode)) {
+                if (ctrl.Analyzer.isCondJump(inst.opcode)) {
                     has_cond = true;
                 }
             }
@@ -15404,7 +16057,7 @@ pub const Decompiler = struct {
             var has_cond_term = false;
             var has_return = false;
             if (blk.terminator()) |term| {
-                has_cond_term = ctrl.Analyzer.isConditionalJump(undefined, term.opcode);
+                has_cond_term = ctrl.Analyzer.isCondJump(term.opcode);
                 if (term.opcode == .RETURN_VALUE or term.opcode == .RETURN_CONST) {
                     has_return = true;
                 }
@@ -15508,7 +16161,7 @@ pub const Decompiler = struct {
             var inline_body = false;
             var seen_jump = false;
             for (final_block.instructions) |inst| {
-                if (ctrl.Analyzer.isConditionalJump(undefined, inst.opcode)) {
+                if (ctrl.Analyzer.isCondJump(inst.opcode)) {
                     seen_jump = true;
                     continue;
                 }
@@ -15607,7 +16260,7 @@ pub const Decompiler = struct {
                 var fallback_start_idx: ?usize = null;
                 var pop_jump_idx: ?usize = null;
                 for (final_block.instructions, 0..) |inst, idx| {
-                    if (ctrl.Analyzer.isConditionalJump(undefined, inst.opcode)) {
+                    if (ctrl.Analyzer.isCondJump(inst.opcode)) {
                         pop_jump_idx = idx;
                         break;
                     }
@@ -15653,7 +16306,7 @@ pub const Decompiler = struct {
                 if (body_start_idx == null) {
                     var found_jump = false;
                     for (final_block.instructions, 0..) |inst, idx| {
-                        if (ctrl.Analyzer.isConditionalJump(undefined, inst.opcode)) {
+                        if (ctrl.Analyzer.isCondJump(inst.opcode)) {
                             found_jump = true;
                             continue;
                         }
@@ -15801,7 +16454,7 @@ pub const Decompiler = struct {
             var seen_jump = false;
             var has_cond_jump = false;
             for (final_block.instructions) |inst| {
-                if (ctrl.Analyzer.isConditionalJump(undefined, inst.opcode)) {
+                if (ctrl.Analyzer.isCondJump(inst.opcode)) {
                     seen_jump = true;
                     has_cond_jump = true;
                     continue;
@@ -15913,7 +16566,7 @@ pub const Decompiler = struct {
                 var jump_idx: ?usize = null;
                 var found_jump = false;
                 for (final_block.instructions, 0..) |inst, idx| {
-                    if (ctrl.Analyzer.isConditionalJump(undefined, inst.opcode)) {
+                    if (ctrl.Analyzer.isCondJump(inst.opcode)) {
                         if (jump_idx == null) jump_idx = idx;
                         found_jump = true;
                         continue;
@@ -16732,6 +17385,21 @@ pub const Decompiler = struct {
                     continue;
                 }
             }
+            if (try self.tryDecompileAndOrInto(block_idx, limit, &stmts, a)) |next_block| {
+                block_idx = next_block;
+                if (block_idx <= prev_idx) {
+                    if (self.last_error_ctx == null) {
+                        self.last_error_ctx = .{
+                            .code_name = self.code.name,
+                            .block_id = prev_idx,
+                            .offset = self.cfg.blocks[prev_idx].start_offset,
+                            .opcode = "and_or_no_progress",
+                        };
+                    }
+                    return error.InvalidBlock;
+                }
+                continue;
+            }
             const pattern = if (skip_try)
                 try self.analyzer.detectPatternNoTry(block_idx)
             else
@@ -16742,7 +17410,7 @@ pub const Decompiler = struct {
                     const cond_block = &self.cfg.blocks[p.condition_block];
                     var last_stmt_idx: ?usize = null;
                     for (cond_block.instructions, 0..) |inst, idx| {
-                        if (ctrl.Analyzer.isConditionalJump(undefined, inst.opcode)) break;
+                        if (ctrl.Analyzer.isCondJump(inst.opcode)) break;
                         if (inst.opcode == .JUMP_BACKWARD or inst.opcode == .JUMP_BACKWARD_NO_INTERRUPT) break;
                         switch (inst.opcode) {
                             .STORE_FAST,
@@ -16892,6 +17560,7 @@ pub const Decompiler = struct {
                     block_idx = result.next_block;
                 },
                 .with_stmt => |p| {
+                    try self.emitWithPrelude(p, &stmts, a);
                     const result = try self.decompileWith(p);
                     if (result.stmt) |s| {
                         try stmts.append(a, s);
@@ -17565,7 +18234,7 @@ pub const Decompiler = struct {
         defer self.br_limit = prev_limit;
         var has_cond = false;
         for (start_block.instructions) |inst| {
-            if (ctrl.Analyzer.isConditionalJump(undefined, inst.opcode)) {
+            if (ctrl.Analyzer.isCondJump(inst.opcode)) {
                 has_cond = true;
                 break;
             }
@@ -17611,7 +18280,7 @@ pub const Decompiler = struct {
                     if (if_pat.condition_block < self.cfg.blocks.len) {
                         const cond_blk = &self.cfg.blocks[if_pat.condition_block];
                         if (cond_blk.terminator()) |t| {
-                            if (ctrl.Analyzer.isConditionalJump(undefined, t.opcode)) {
+                            if (ctrl.Analyzer.isCondJump(t.opcode)) {
                                 var false_id: ?u32 = null;
                                 for (cond_blk.successors) |edge| {
                                     if (edge.edge_type == .conditional_false) {
@@ -17637,7 +18306,7 @@ pub const Decompiler = struct {
                         const then_blk = &self.cfg.blocks[if_pat.then_block];
                         if (!condBlockHasPrelude(then_blk)) {
                             if (then_blk.terminator()) |then_term| {
-                                if (ctrl.Analyzer.isConditionalJump(undefined, then_term.opcode)) {
+                                if (ctrl.Analyzer.isCondJump(then_term.opcode)) {
                                     for (then_blk.successors) |edge| {
                                         if (edge.edge_type == .conditional_false and edge.target == else_id) {
                                             skip_else_merge = true;
@@ -17690,7 +18359,7 @@ pub const Decompiler = struct {
                 }
                 var last_stmt_idx: ?usize = null;
                 for (start_block.instructions, 0..) |inst, idx| {
-                    if (ctrl.Analyzer.isConditionalJump(undefined, inst.opcode)) break;
+                    if (ctrl.Analyzer.isCondJump(inst.opcode)) break;
                     if (inst.opcode == .JUMP_BACKWARD or inst.opcode == .JUMP_BACKWARD_NO_INTERRUPT) break;
                     switch (inst.opcode) {
                         .STORE_FAST,
@@ -18301,40 +18970,12 @@ pub const Decompiler = struct {
                 {
                     has_exc_match = true;
                 }
-                if (inst.opcode == .POP_JUMP_IF_FALSE or inst.opcode == .POP_JUMP_IF_TRUE or
-                    inst.opcode == .JUMP_IF_FALSE or inst.opcode == .JUMP_IF_TRUE)
-                {
+                if (ctrl.Analyzer.isCondJump(inst.opcode)) {
                     has_cond_jump = true;
                 }
             }
             if ((skip == 0 or has_cond_jump) and !has_exc_match) {
-                var exc_stack: [3]StackValue = undefined;
-                for (&exc_stack) |*slot| {
-                    const placeholder = try a.create(Expr);
-                    placeholder.* = .{ .name = .{ .id = "__exception__", .ctx = .load } };
-                    slot.* = .{ .expr = placeholder };
-                }
-                if (self.stack_in.len == 0) {
-                    return try self.decompileStructuredRangeNoTryWithStackAllowHandlers(start, end, &exc_stack);
-                }
-                const limit = @min(end, @as(u32, @intCast(self.stack_in.len)));
-                const count = if (start < limit) limit - start else 0;
-                var saved = try a.alloc(?[]StackValue, count);
-                defer a.free(saved);
-                var idx: u32 = 0;
-                while (idx < count) : (idx += 1) {
-                    const bid = start + idx;
-                    saved[idx] = self.stack_in[bid];
-                    self.stack_in[bid] = null;
-                }
-                defer {
-                    var ridx: u32 = 0;
-                    while (ridx < count) : (ridx += 1) {
-                        const bid = start + ridx;
-                        self.stack_in[bid] = saved[ridx];
-                    }
-                }
-                return try self.decompileStructuredRangeNoTryWithStackAllowHandlers(start, end, &exc_stack);
+                return try self.decompileStructuredRangeNoTryWithStackAllowHandlers(start, end, &.{});
             }
         }
 
@@ -18345,9 +18986,9 @@ pub const Decompiler = struct {
         var chain_targets: std.ArrayListUnmanaged(*Expr) = .{};
         defer chain_targets.deinit(self.allocator);
 
-        // Python pushes (type, value, traceback) on stack when entering handler
-        // Use placeholder exprs so operations like COMPARE_OP work
-        for (0..3) |_| {
+        const exc_seed = self.excHandlerSeedCount();
+        // Seed exception stack placeholders so handler body simulation maintains correct depth.
+        for (0..exc_seed) |_| {
             const placeholder = try a.create(Expr);
             placeholder.* = .{ .name = .{ .id = "__exception__", .ctx = .load } };
             try sim.stack.push(.{ .expr = placeholder });
@@ -18467,8 +19108,8 @@ pub const Decompiler = struct {
         }
 
         if (start + 1 < end) {
-            var exc_stack: [3]StackValue = undefined;
-            for (&exc_stack) |*slot| {
+            const exc_stack = try a.alloc(StackValue, exc_seed);
+            for (exc_stack) |*slot| {
                 const placeholder = try a.create(Expr);
                 placeholder.* = .{ .name = .{ .id = "__exception__", .ctx = .load } };
                 slot.* = .{ .expr = placeholder };
@@ -18480,7 +19121,7 @@ pub const Decompiler = struct {
             if (self.stack_in.len > 0) {
                 const limit = @min(rest_end, @as(u32, @intCast(self.stack_in.len)));
                 if (rest_start < limit) {
-                    const local_entries = try self.computeStackInRange(rest_start, limit, &exc_stack);
+                    const local_entries = try self.computeStackInRange(rest_start, limit, exc_stack);
                     local = local_entries;
                     const count: usize = @intCast(limit - rest_start);
                     const saved_entries = try a.alloc(?[]StackValue, count);
@@ -18513,7 +19154,7 @@ pub const Decompiler = struct {
                 }
             }
 
-            const rest = try self.decompileStructuredRangeNoTryWithStackAllowHandlers(rest_start, rest_end, &exc_stack);
+            const rest = try self.decompileStructuredRangeNoTryWithStackAllowHandlers(rest_start, rest_end, exc_stack);
             try stmts.appendSlice(a, rest);
         }
 
@@ -18536,7 +19177,8 @@ pub const Decompiler = struct {
         sim.lenient = true;
         sim.stack.allow_underflow = true;
 
-        for (0..3) |_| {
+        const exc_seed = self.excHandlerSeedCount();
+        for (0..exc_seed) |_| {
             const placeholder = try a.create(Expr);
             placeholder.* = .{ .name = .{ .id = "__exception__", .ctx = .load } };
             try sim.stack.push(.{ .expr = placeholder });
@@ -18784,6 +19426,8 @@ pub const Decompiler = struct {
     fn excSeedFlow(self: *Decompiler, block: *const BasicBlock) usize {
         for (block.instructions) |inst| {
             if (inst.opcode == .WITH_EXCEPT_START) return self.withExcSeedCount();
+            // END_ASYNC_FOR handlers have a distinct stack layout from generic exception handlers.
+            if (inst.opcode == .END_ASYNC_FOR) return self.asyncForExcSeedCount();
         }
         if (block.is_exception_handler or ctrl.Analyzer.hasExceptionHandlerOpcodes(block)) {
             return self.excHandlerSeedCount();
@@ -18798,11 +19442,91 @@ pub const Decompiler = struct {
         return 3;
     }
 
+    fn asyncForExcSeedCount(self: *Decompiler) usize {
+        if (self.version.major < 3) return 3;
+        if (self.version.gte(3, 11)) return 1;
+        // Python 3.5-3.10 uses the legacy exception triple on stack.
+        return 3;
+    }
+
     fn withExcSeedCount(self: *Decompiler) usize {
         if (self.version.major < 3) return 4;
         if (self.version.gte(3, 11)) return 2;
         if (self.version.gte(3, 9)) return 6;
         return 4;
+    }
+
+    fn emitWithPrelude(
+        self: *Decompiler,
+        pattern: ctrl.WithPattern,
+        stmts: *std.ArrayListUnmanaged(*Stmt),
+        alloc: std.mem.Allocator,
+    ) DecompileError!void {
+        if (pattern.setup_block >= self.cfg.blocks.len) return;
+        const setup = &self.cfg.blocks[pattern.setup_block];
+
+        // Find first with "marker" op that occurs after the context expr is built.
+        var with_idx: ?usize = null;
+        for (setup.instructions, 0..) |inst, idx| {
+            switch (inst.opcode) {
+                .COPY,
+                .LOAD_SPECIAL,
+                .SETUP_WITH,
+                .SETUP_ASYNC_WITH,
+                .BEFORE_WITH,
+                .BEFORE_ASYNC_WITH,
+                => {
+                    with_idx = idx;
+                    break;
+                },
+                else => {},
+            }
+        }
+        if (with_idx == null or with_idx.? == 0) return;
+
+        const a = self.arena.allocator();
+        var sim = self.initSim(a, a, self.code, self.version);
+        defer sim.deinit();
+
+        if (pattern.setup_block < self.stack_in.len) {
+            if (self.stack_in[pattern.setup_block]) |entry| {
+                for (entry) |val| {
+                    const cloned = try sim.cloneStackValue(val);
+                    try sim.stack.push(cloned);
+                }
+            }
+        }
+        const base_depth = sim.stack.len();
+
+        var pre_end: ?usize = null;
+        for (setup.instructions[0..with_idx.?], 0..) |inst, idx| {
+            try sim.simulate(inst);
+            if (sim.stack.len() == base_depth) {
+                pre_end = idx + 1;
+            }
+        }
+        if (pre_end == null or pre_end.? == 0) return;
+
+        var prelude_block = setup.*;
+        prelude_block.instructions = setup.instructions[0..pre_end.?];
+
+        var tmp: std.ArrayListUnmanaged(*Stmt) = .{};
+        defer tmp.deinit(a);
+        var skip_first_store = false;
+        var seed_pop = false;
+        try self.processBlockStatements(
+            pattern.setup_block,
+            &prelude_block,
+            &tmp,
+            &skip_first_store,
+            &seed_pop,
+            false,
+            null,
+            0,
+        );
+        if (tmp.items.len > 0) {
+            try stmts.appendSlice(alloc, tmp.items);
+        }
     }
 
     fn emitForPrelude(
@@ -18860,7 +19584,7 @@ pub const Decompiler = struct {
         }
         if (pred_for_iter) {
             for (prelude_block.instructions) |inst| {
-                if (ctrl.Analyzer.isConditionalJump(undefined, inst.opcode)) break;
+                if (ctrl.Analyzer.isCondJump(inst.opcode)) break;
                 if (inst.opcode == .JUMP_BACKWARD or inst.opcode == .JUMP_BACKWARD_NO_INTERRUPT) break;
                 switch (inst.opcode) {
                     .UNPACK_SEQUENCE,
@@ -19253,7 +19977,7 @@ pub const Decompiler = struct {
         var names: std.ArrayListUnmanaged([]const u8) = .{};
         defer names.deinit(self.arena.allocator());
         for (block.instructions) |inst| {
-            if (ctrl.Analyzer.isConditionalJump(undefined, inst.opcode)) break;
+            if (ctrl.Analyzer.isCondJump(inst.opcode)) break;
             if (inst.opcode == .JUMP_BACKWARD or inst.opcode == .JUMP_BACKWARD_NO_INTERRUPT) break;
             const name: []const u8 = switch (inst.opcode) {
                 .STORE_FAST => if (inst.arg < self.code.varnames.len) self.code.varnames[inst.arg] else "_",
@@ -19366,7 +20090,7 @@ pub const Decompiler = struct {
             var has_loop_target = false;
             if (skip_first_store) {
                 for (block.instructions) |inst| {
-                    if (ctrl.Analyzer.isConditionalJump(undefined, inst.opcode)) break;
+                    if (ctrl.Analyzer.isCondJump(inst.opcode)) break;
                     if (inst.opcode == .JUMP_BACKWARD or inst.opcode == .JUMP_BACKWARD_NO_INTERRUPT) break;
                     switch (inst.opcode) {
                         .UNPACK_SEQUENCE,
@@ -19681,6 +20405,7 @@ pub const Decompiler = struct {
                     continue;
                 },
                 .with_stmt => |p| {
+                    try self.emitWithPrelude(p, &stmts, a);
                     const result = try self.decompileWith(p);
                     if (result.stmt) |s| {
                         try stmts.append(a, s);
@@ -20785,6 +21510,12 @@ pub const Decompiler = struct {
         loop_header: ?u32,
         skip_first: usize,
     ) DecompileError!void {
+        if (skip_first == 0) {
+            for (block.instructions) |inst| {
+                if (inst.opcode == .WITH_EXCEPT_START) return;
+            }
+        }
+
         const a = self.arena.allocator();
         var sim = self.initSim(a, a, self.code, self.version);
         defer sim.deinit();
@@ -20912,7 +21643,7 @@ pub const Decompiler = struct {
                 continue;
             }
             if (loop_header) |header_id| {
-                if (ctrl.Analyzer.isConditionalJump(undefined, inst.opcode)) {
+                if (ctrl.Analyzer.isCondJump(inst.opcode)) {
                     if (block.terminator()) |blk_term| {
                         if (blk_term.offset == inst.offset) {
                             const trace_on = self.trace_loop_guards and self.trace_file != null;
@@ -21147,6 +21878,14 @@ pub const Decompiler = struct {
         if (sim.stack.len() == 0) {
             return;
         }
+        if (self.hasWithExitCleanup(block) and inst_idx > 0) {
+            const prev_op = block.instructions[inst_idx - 1].opcode;
+            if (prev_op == .CALL_FUNCTION or prev_op == .YIELD_FROM) {
+                const cleanup = sim.stack.pop().?;
+                cleanup.deinit(sim.allocator, sim.stack_alloc);
+                return;
+            }
+        }
         if (inst_idx + 1 < block.instructions.len and
             block.instructions[inst_idx + 1].isUnconditionalJump() and
             inst_idx > 0 and block.instructions[inst_idx - 1].opcode == .POP_TOP)
@@ -21244,7 +21983,7 @@ pub const Decompiler = struct {
             }
             const inst = instructions[idx];
             // Stop at control flow instructions
-            if (ctrl.Analyzer.isConditionalJump(undefined, inst.opcode)) break;
+            if (ctrl.Analyzer.isCondJump(inst.opcode)) break;
             if (inst.opcode == .JUMP_BACKWARD or inst.opcode == .JUMP_BACKWARD_NO_INTERRUPT) break;
 
             if (inst.opcode == .IMPORT_NAME) {
@@ -21473,7 +22212,7 @@ pub const Decompiler = struct {
                 if (pred_id >= self.cfg.blocks.len) continue;
                 const pred = &self.cfg.blocks[pred_id];
                 const term = pred.terminator() orelse continue;
-                if (ctrl.Analyzer.isConditionalJump(undefined, term.opcode)) return true;
+                if (ctrl.Analyzer.isCondJump(term.opcode)) return true;
             }
         }
         // Check if predecessor is a for loop header (FOR_ITER terminator)
@@ -21521,7 +22260,7 @@ pub const Decompiler = struct {
         while (idx < instructions.len) : (idx += 1) {
             const inst = instructions[idx];
             if (inst.opcode == .NOT_TAKEN or inst.opcode == .CACHE) continue;
-            if (ctrl.Analyzer.isConditionalJump(undefined, inst.opcode)) {
+            if (ctrl.Analyzer.isCondJump(inst.opcode)) {
                 const cond = try sim.stack.popExpr();
                 if (cond_count < conds.len) {
                     conds[cond_count] = cond;
@@ -21693,7 +22432,7 @@ pub const Decompiler = struct {
 
         var last_stmt_idx: ?usize = null;
         for (cond_block.instructions, 0..) |inst, idx| {
-            if (ctrl.Analyzer.isConditionalJump(undefined, inst.opcode)) break;
+            if (ctrl.Analyzer.isCondJump(inst.opcode)) break;
             if (inst.opcode == .JUMP_BACKWARD or inst.opcode == .JUMP_BACKWARD_NO_INTERRUPT) break;
             switch (inst.opcode) {
                 .STORE_FAST,
@@ -21769,7 +22508,7 @@ pub const Decompiler = struct {
                         const elif_block = &self.cfg.blocks[elif_pat.condition_block];
                         var elif_last: ?usize = null;
                         for (elif_block.instructions, 0..) |inst, idx| {
-                            if (ctrl.Analyzer.isConditionalJump(undefined, inst.opcode)) break;
+                            if (ctrl.Analyzer.isCondJump(inst.opcode)) break;
                             if (inst.opcode == .JUMP_BACKWARD or inst.opcode == .JUMP_BACKWARD_NO_INTERRUPT) break;
                             switch (inst.opcode) {
                                 .STORE_FAST,
@@ -21834,7 +22573,7 @@ pub const Decompiler = struct {
                     if (else_id < self.cfg.blocks.len) {
                         const else_blk = &self.cfg.blocks[else_id];
                         if (else_blk.terminator()) |else_term| {
-                            if (ctrl.Analyzer.isConditionalJump(undefined, else_term.opcode)) {
+                            if (ctrl.Analyzer.isCondJump(else_term.opcode)) {
                                 for (else_blk.successors) |edge| {
                                     if (edge.edge_type == .exception) continue;
                                     if (self.resolveJumpOnlyBlock(edge.target) == loop_header) {
@@ -21875,7 +22614,7 @@ pub const Decompiler = struct {
                     seen.set(cur);
                     const blk = &self.cfg.blocks[cur];
                     const blk_term = blk.terminator() orelse break;
-                    if (!ctrl.Analyzer.isConditionalJump(undefined, blk_term.opcode)) break;
+                    if (!ctrl.Analyzer.isCondJump(blk_term.opcode)) break;
                     if (condBlockHasPrelude(blk)) break;
                     var t_id: ?u32 = null;
                     var f_id: ?u32 = null;
@@ -21946,7 +22685,7 @@ pub const Decompiler = struct {
                             if (bid == pattern.condition_block) continue;
                             const chain_blk = &self.cfg.blocks[bid];
                             const chain_term = chain_blk.terminator() orelse continue;
-                            if (!ctrl.Analyzer.isConditionalJump(undefined, chain_term.opcode)) continue;
+                            if (!ctrl.Analyzer.isCondJump(chain_term.opcode)) continue;
                             try self.consumed.set(self.allocator, bid);
                             visited.set(bid);
                         }
@@ -21968,7 +22707,7 @@ pub const Decompiler = struct {
                         seen_true.set(cur_true);
                         const blk = &self.cfg.blocks[cur_true];
                         const blk_term = blk.terminator() orelse break;
-                        if (!ctrl.Analyzer.isConditionalJump(undefined, blk_term.opcode)) break;
+                        if (!ctrl.Analyzer.isCondJump(blk_term.opcode)) break;
                         if (condBlockHasPrelude(blk)) break;
                         var t_id: ?u32 = null;
                         var f_id: ?u32 = null;
@@ -22019,7 +22758,7 @@ pub const Decompiler = struct {
                 if (else_id < self.cfg.blocks.len) {
                     const else_blk = &self.cfg.blocks[else_id];
                     if (else_blk.terminator()) |else_term| {
-                        if (ctrl.Analyzer.isConditionalJump(undefined, else_term.opcode)) {
+                        if (ctrl.Analyzer.isCondJump(else_term.opcode)) {
                             if (try self.condChainFalseTarget(else_id, then_block)) |fb| {
                                 var in_stack = try std.DynamicBitSet.initEmpty(self.allocator, self.cfg.blocks.len);
                                 defer in_stack.deinit();
@@ -23150,6 +23889,9 @@ pub const Decompiler = struct {
                     continue;
                 },
                 .with_stmt => |p| {
+                    if (!self.consumed.isSet(p.setup_block)) {
+                        try self.emitWithPrelude(p, &stmts, a);
+                    }
                     const result = try self.decompileWith(p);
                     if (result.stmt) |s| {
                         try stmts.append(a, s);
@@ -24997,6 +25739,13 @@ pub const Decompiler = struct {
             if (self.version.gte(3, 14) and (std.mem.eql(u8, value.name.id, "__conditional_annotations__") or
                 std.mem.eql(u8, value.name.id, "__annotate__")))
             {
+                return error.SkipStatement;
+            }
+        }
+        // Suppress legacy exception-match comparisons (COMPARE_OP 10) that can leak out as POP_TOP expr stmts.
+        if (value.* == .compare) {
+            const cmp = value.compare;
+            if (cmp.ops.len == 1 and cmp.comparators.len == 1 and self.isPlaceholderExpr(cmp.left)) {
                 return error.SkipStatement;
             }
         }

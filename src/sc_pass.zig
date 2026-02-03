@@ -659,7 +659,7 @@ pub fn Methods(comptime Self: type, comptime Err: type) type {
             stmts_allocator: Allocator,
         ) DecompileError!?u32 {
             const pattern = self.analyzer.detectAndOr(block_id) orelse return null;
-            if (pattern.true_block >= limit or pattern.false_block >= limit or pattern.merge_block >= limit) {
+            if (pattern.true_block >= limit or pattern.false_block >= limit or pattern.merge_block > limit) {
                 return null;
             }
             if (pattern.merge_block <= block_id) return null;
@@ -707,6 +707,15 @@ pub fn Methods(comptime Self: type, comptime Err: type) type {
 
             const and_expr = try self.makeBoolPair(cond_res.expr, true_expr, .and_);
             const or_expr = try self.makeBoolPair(and_expr, false_expr, .or_);
+
+            // Some callers decompile a half-open range [start, end) where end is the first
+            // block *after* the range. Allow matching `x and y or z` when the merge block is
+            // exactly `limit` by saving the folded expression for the merge block and letting
+            // the outer decompiler handle the terminator (e.g. RETURN_VALUE) outside the range.
+            if (pattern.merge_block == limit) {
+                try self.setStackEntryWithExpr(pattern.merge_block, base_vals, or_expr, &base_owned);
+                return pattern.merge_block;
+            }
 
             const merge_block = &self.cfg.blocks[pattern.merge_block];
             if (merge_block.terminator()) |mt| {
