@@ -9277,11 +9277,17 @@ pub const Decompiler = struct {
                                             then_sim.lenient = true;
                                             then_sim.stack.allow_underflow = true;
                                             if (try self.condExprFromBlock(then_block, &then_sim, t_id.?, f_id.?, 0)) |cond2| {
-                                                const inv = try self.invertConditionExpr(cond2);
-                                                condition = try self.makeBoolPair(condition, inv, .and_);
-                                                then_block = self.resolveJumpOnlyBlock(f_id.?);
-                                                else_block = else_res;
+                                                // This CFG shape is `if (not a) or b:`:
+                                                // - outer false edge -> else_res
+                                                // - inner true edge  -> else_res
+                                                // - inner false edge -> false_res
+                                                // Preserve parity by reconstructing the original short-circuit OR.
+                                                const inv0 = try self.invertConditionExpr(condition);
+                                                condition = try self.makeBoolPair(inv0, cond2, .or_);
+                                                then_block = else_res;
+                                                else_block = false_res;
                                                 cond_chain_then = true;
+                                                try self.emitDecisionTrace(pattern.condition_block, "if_chain_or_not", condition);
                                             }
                                         }
                                     }
@@ -11344,8 +11350,6 @@ pub const Decompiler = struct {
 
         var final_condition = loop_cond;
         var final_body = body;
-        const term_true_jump = if (term) |t| self.isTrueJump(t.opcode) else false;
-        const force_guard = term_true_jump and guard_if == null and header_stmts.items.len == 0 and !condBlockHasPrelude(header);
         if (guard_if) |gs| {
             const true_expr = try ast.makeConstant(a, .true_);
             const new_body = try a.alloc(*Stmt, header_stmts.items.len + 1 + body.len);
@@ -11361,31 +11365,6 @@ pub const Decompiler = struct {
             if (guard_next) |next| {
                 self.loop_next = next;
             }
-        } else if (force_guard) {
-            const true_expr = try ast.makeConstant(a, .true_);
-            const guard_cond = if (body_true)
-                try self.invertConditionExpr(condition)
-            else
-                condition;
-            const loop_stmt = if (exit_to_header)
-                try self.makeContinue()
-            else
-                try self.makeBreak();
-            const break_body = try a.alloc(*Stmt, 1);
-            break_body[0] = loop_stmt;
-            const guard_stmt = try a.create(Stmt);
-            guard_stmt.* = .{ .if_stmt = .{
-                .condition = guard_cond,
-                .body = break_body,
-                .else_body = &.{},
-            } };
-            const new_body = try a.alloc(*Stmt, 1 + body.len);
-            new_body[0] = guard_stmt;
-            if (body.len > 0) {
-                std.mem.copyForwards(*Stmt, new_body[1..], body);
-            }
-            final_condition = true_expr;
-            final_body = new_body;
         } else if (header_stmts.items.len > 0) {
             const true_expr = try ast.makeConstant(a, .true_);
             const guard_cond = if (body_true)

@@ -154,6 +154,32 @@ test "snapshot if guard prelude 3.9" {
     );
 }
 
+test "snapshot if or not 3.9" {
+    try runSnapshot(@src(), "test/corpus/if_or_not.3.9.pyc",
+        \\[]u8
+        \\  "import logging
+        \\def warn(logger_level = logging.ERROR):
+        \\    if not logger_level or logger_level < logging.INFO:
+        \\        warning = 'W'
+        \\    else:
+        \\        warning = ''
+        \\    return warning
+        \\"
+    );
+}
+
+test "snapshot while not call 3.9" {
+    try runSnapshot(@src(), "test/corpus/while_not_call.3.9.pyc",
+        \\[]u8
+        \\  "def while_not_call(ev):
+        \\    out = []
+        \\    while not ev.wait(0):
+        \\        out.append(1)
+        \\    return out
+        \\"
+    );
+}
+
 test "snapshot loop exit reaches header 3.9" {
     try runSnapshot(@src(), "test/corpus/loop_exit_reaches_header.3.9.pyc",
         \\[]u8
