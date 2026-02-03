@@ -748,6 +748,41 @@ pub const SimContext = struct {
         };
     }
 
+    fn isConstObj(obj: pyc.Object) bool {
+        return switch (obj) {
+            .none, .true_val, .false_val, .ellipsis, .int, .float, .complex, .string, .bytes => true,
+            .tuple => |items| {
+                for (items) |item| {
+                    if (!isConstObj(item)) return false;
+                }
+                return true;
+            },
+            else => false,
+        };
+    }
+
+    fn constTupleExprs(self: *SimContext, items: []const ast.Constant) Allocator.Error![]const *Expr {
+        const exprs = try self.allocator.alloc(*Expr, items.len);
+        var count: usize = 0;
+        errdefer {
+            var i: usize = 0;
+            while (i < count) : (i += 1) {
+                exprs[i].deinit(self.allocator);
+                self.allocator.destroy(exprs[i]);
+            }
+            self.allocator.free(exprs);
+        }
+
+        for (items, 0..) |item, idx| {
+            const cloned = try ast.cloneConstant(self.allocator, item);
+            const expr = try ast.makeConstant(self.allocator, cloned);
+            exprs[idx] = expr;
+            count += 1;
+        }
+
+        return exprs;
+    }
+
     const ObjToExprError = Allocator.Error || error{UnsupportedConstant};
 
     fn objectsToExprs(self: *SimContext, items: []const pyc.Object) ObjToExprError![]const *Expr {
@@ -1127,25 +1162,45 @@ pub const SimContext = struct {
             else => return error.InvalidKeywordNames,
         };
 
-        if (expr.* != .tuple) return error.InvalidKeywordNames;
-        const elts = expr.tuple.elts;
-
-        const names = try self.allocator.alloc([]const u8, elts.len);
         var count: usize = 0;
-        errdefer {
-            for (names[0..count]) |name| self.allocator.free(name);
-            self.allocator.free(names);
-        }
+        switch (expr.*) {
+            .tuple => |tup| {
+                const elts = tup.elts;
+                const names = try self.allocator.alloc([]const u8, elts.len);
+                errdefer {
+                    for (names[0..count]) |name| self.allocator.free(name);
+                    self.allocator.free(names);
+                }
 
-        for (elts, 0..) |elt, idx| {
-            if (elt.* != .constant or elt.constant != .string) {
-                return error.InvalidKeywordNames;
-            }
-            names[idx] = try self.allocator.dupe(u8, elt.constant.string);
-            count += 1;
-        }
+                for (elts, 0..) |elt, idx| {
+                    if (elt.* != .constant or elt.constant != .string) {
+                        return error.InvalidKeywordNames;
+                    }
+                    names[idx] = try self.allocator.dupe(u8, elt.constant.string);
+                    count += 1;
+                }
 
-        return names;
+                return names;
+            },
+            .constant => |c| {
+                if (c != .tuple) return error.InvalidKeywordNames;
+                const items = c.tuple;
+                const names = try self.allocator.alloc([]const u8, items.len);
+                errdefer {
+                    for (names[0..count]) |name| self.allocator.free(name);
+                    self.allocator.free(names);
+                }
+
+                for (items, 0..) |item, idx| {
+                    if (item != .string) return error.InvalidKeywordNames;
+                    names[idx] = try self.allocator.dupe(u8, item.string);
+                    count += 1;
+                }
+
+                return names;
+            },
+            else => return error.InvalidKeywordNames,
+        }
     }
 
     fn keywordNameFromValue(self: *SimContext, value: StackValue) SimError![]const u8 {
@@ -2467,8 +2522,18 @@ pub const SimContext = struct {
     fn parseDefaults(self: *SimContext, val: StackValue) SimError![]const *Expr {
         switch (val) {
             .expr => |expr| {
-                if (expr.* == .tuple) {
-                    return expr.tuple.elts;
+                switch (expr.*) {
+                    .tuple => return expr.tuple.elts,
+                    .constant => |c| switch (c) {
+                        .tuple => |items| {
+                            const exprs = try self.constTupleExprs(items);
+                            expr.deinit(self.allocator);
+                            self.allocator.destroy(expr);
+                            return exprs;
+                        },
+                        else => {},
+                    },
+                    else => {},
                 }
                 expr.deinit(self.allocator);
                 self.allocator.destroy(expr);
@@ -2921,8 +2986,14 @@ pub const SimContext = struct {
                             try self.stack.push(.{ .code_obj = code });
                         },
                         else => {
-                            const expr = try self.objToExpr(obj);
-                            try self.stack.push(.{ .expr = expr });
+                            if (isConstObj(obj)) {
+                                const constant = try self.objToConstant(obj);
+                                const expr = try ast.makeConstant(self.allocator, constant);
+                                try self.stack.push(.{ .expr = expr });
+                            } else {
+                                const expr = try self.objToExpr(obj);
+                                try self.stack.push(.{ .expr = expr });
+                            }
                         },
                     }
                 } else {
@@ -4658,8 +4729,26 @@ pub const SimContext = struct {
                 const flag = inst.arg;
                 switch (flag) {
                     1 => { // defaults
-                        if (attr_val == .expr and attr_val.expr.* == .tuple) {
-                            func_val.function_obj.defaults = attr_val.expr.tuple.elts;
+                        if (attr_val == .expr) {
+                            const expr = attr_val.expr;
+                            switch (expr.*) {
+                                .tuple => {
+                                    func_val.function_obj.defaults = expr.tuple.elts;
+                                },
+                                .constant => |c| switch (c) {
+                                    .tuple => |items| {
+                                        func_val.function_obj.defaults = try self.constTupleExprs(items);
+                                        expr.deinit(self.allocator);
+                                        self.allocator.destroy(expr);
+                                    },
+                                    else => {
+                                        attr_val.deinit(self.allocator, self.stack_alloc);
+                                    },
+                                },
+                                else => {
+                                    attr_val.deinit(self.allocator, self.stack_alloc);
+                                },
+                            }
                         } else {
                             attr_val.deinit(self.allocator, self.stack_alloc);
                         }
@@ -5017,15 +5106,32 @@ pub const SimContext = struct {
                 // Extract fromlist tuple if available
                 var fromlist: []const []const u8 = &.{};
                 if (fromlist_val) |fv| {
-                    if (fv == .expr and fv.expr.* == .tuple) {
-                        const tuple_elts = fv.expr.tuple.elts;
-                        var names: std.ArrayListUnmanaged([]const u8) = .{};
-                        for (tuple_elts) |elt| {
-                            if (elt.* == .constant and elt.constant == .string) {
-                                try names.append(self.allocator, elt.constant.string);
-                            }
+                    if (fv == .expr) {
+                        switch (fv.expr.*) {
+                            .tuple => |tup| {
+                                const tuple_elts = tup.elts;
+                                var names: std.ArrayListUnmanaged([]const u8) = .{};
+                                for (tuple_elts) |elt| {
+                                    if (elt.* == .constant and elt.constant == .string) {
+                                        try names.append(self.allocator, elt.constant.string);
+                                    }
+                                }
+                                fromlist = try names.toOwnedSlice(self.allocator);
+                            },
+                            .constant => |c| switch (c) {
+                                .tuple => |items| {
+                                    var names: std.ArrayListUnmanaged([]const u8) = .{};
+                                    for (items) |item| {
+                                        if (item == .string) {
+                                            try names.append(self.allocator, item.string);
+                                        }
+                                    }
+                                    fromlist = try names.toOwnedSlice(self.allocator);
+                                },
+                                else => {},
+                            },
+                            else => {},
                         }
-                        fromlist = try names.toOwnedSlice(self.allocator);
                     }
                 }
 
@@ -6402,30 +6508,79 @@ pub const SimContext = struct {
                 }
                 const list_expr = list_val.expr;
 
-                if (items == .expr and items.expr.* == .tuple) {
+                if (items == .expr) {
                     const tuple_expr = items.expr;
-                    const tuple_elts = tuple_expr.tuple.elts;
-                    tuple_expr.tuple.elts = &.{};
-                    defer {
-                        tuple_expr.deinit(self.allocator);
-                        self.allocator.destroy(tuple_expr);
+                    switch (tuple_expr.*) {
+                        .tuple => |tup| {
+                            const tuple_elts = tup.elts;
+                            tuple_expr.tuple.elts = &.{};
+                            defer {
+                                tuple_expr.deinit(self.allocator);
+                                self.allocator.destroy(tuple_expr);
+                            }
+
+                            if (tuple_elts.len == 0) return;
+
+                            const old_len = list_expr.list.elts.len;
+                            if (old_len == 0) {
+                                list_expr.list.elts = tuple_elts;
+                                return;
+                            }
+
+                            const new_elts = try self.allocator.alloc(*Expr, old_len + tuple_elts.len);
+                            @memcpy(new_elts[0..old_len], list_expr.list.elts);
+                            @memcpy(new_elts[old_len..], tuple_elts);
+                            self.allocator.free(list_expr.list.elts);
+                            if (tuple_elts.len > 0) self.allocator.free(tuple_elts);
+                            list_expr.list.elts = new_elts;
+                            return;
+                        },
+                        .constant => |c| switch (c) {
+                            .tuple => |items_const| {
+                                const tuple_elts = try self.allocator.alloc(*Expr, items_const.len);
+                                var count: usize = 0;
+                                errdefer {
+                                    var i: usize = 0;
+                                    while (i < count) : (i += 1) {
+                                        tuple_elts[i].deinit(self.allocator);
+                                        self.allocator.destroy(tuple_elts[i]);
+                                    }
+                                    self.allocator.free(tuple_elts);
+                                }
+
+                                for (items_const, 0..) |item, idx| {
+                                    const cloned = try ast.cloneConstant(self.allocator, item);
+                                    const expr = try ast.makeConstant(self.allocator, cloned);
+                                    tuple_elts[idx] = expr;
+                                    count += 1;
+                                }
+
+                                tuple_expr.deinit(self.allocator);
+                                self.allocator.destroy(tuple_expr);
+
+                                if (tuple_elts.len == 0) {
+                                    self.allocator.free(tuple_elts);
+                                    return;
+                                }
+
+                                const old_len = list_expr.list.elts.len;
+                                if (old_len == 0) {
+                                    list_expr.list.elts = tuple_elts;
+                                    return;
+                                }
+
+                                const new_elts = try self.allocator.alloc(*Expr, old_len + tuple_elts.len);
+                                @memcpy(new_elts[0..old_len], list_expr.list.elts);
+                                @memcpy(new_elts[old_len..], tuple_elts);
+                                self.allocator.free(list_expr.list.elts);
+                                self.allocator.free(tuple_elts);
+                                list_expr.list.elts = new_elts;
+                                return;
+                            },
+                            else => {},
+                        },
+                        else => {},
                     }
-
-                    if (tuple_elts.len == 0) return;
-
-                    const old_len = list_expr.list.elts.len;
-                    if (old_len == 0) {
-                        list_expr.list.elts = tuple_elts;
-                        return;
-                    }
-
-                    const new_elts = try self.allocator.alloc(*Expr, old_len + tuple_elts.len);
-                    @memcpy(new_elts[0..old_len], list_expr.list.elts);
-                    @memcpy(new_elts[old_len..], tuple_elts);
-                    self.allocator.free(list_expr.list.elts);
-                    if (tuple_elts.len > 0) self.allocator.free(tuple_elts);
-                    list_expr.list.elts = new_elts;
-                    return;
                 }
 
                 const item_expr = switch (items) {
@@ -7894,6 +8049,15 @@ test "stack simulation composite load const" {
     try ctx.simulate(tuple_inst);
     const tuple_val = ctx.stack.pop().?;
     try testing.expect(tuple_val == .expr);
+    try testing.expect(tuple_val.expr.* == .constant);
+    switch (tuple_val.expr.constant) {
+        .tuple => |items| {
+            try testing.expectEqual(@as(usize, 2), items.len);
+            try testing.expect(ast.constantEqual(items[0], .{ .int = 1 }));
+            try testing.expect(ast.constantEqual(items[1], .{ .int = 2 }));
+        },
+        else => try testing.expect(false),
+    }
 
     var tuple_writer = codegen.Writer.init(allocator);
     defer tuple_writer.deinit(allocator);

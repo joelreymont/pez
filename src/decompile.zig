@@ -25309,8 +25309,19 @@ pub const Decompiler = struct {
 
         if (self.version.gte(2, 0)) {
             if (fromlist_val) |fv| {
-                if (fv == .expr and fv.expr.* == .tuple) {
-                    if (fv.expr.tuple.elts.len == 0) return null;
+                if (fv == .expr) {
+                    switch (fv.expr.*) {
+                        .tuple => {
+                            if (fv.expr.tuple.elts.len == 0) return null;
+                        },
+                        .constant => |c| switch (c) {
+                            .tuple => |items| {
+                                if (items.len == 0) return null;
+                            },
+                            else => return null,
+                        },
+                        else => return null,
+                    }
                 } else {
                     return null;
                 }
