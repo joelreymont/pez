@@ -2819,7 +2819,14 @@ pub const SimContext = struct {
             _ = try resolveBoolOps(self.allocator, &nested.stack, &pending, inst.offset);
             _ = try resolveIfExps(self.allocator, &nested.stack, &nested.pending_ifexp, inst.offset);
             switch (inst.opcode) {
-                .RETURN_VALUE, .RETURN_CONST => break,
+                .RETURN_VALUE,
+                .RETURN_CONST,
+                // Loop epilogue that doesn't affect the comprehension AST shape.
+                // Avoid simulating cleanup ops that depend on branch-sensitive stack effects.
+                .END_FOR,
+                .END_ASYNC_FOR,
+                .POP_ITER,
+                => break,
                 .JUMP_IF_FALSE_OR_POP => {
                     const left = try nested.stack.popExpr();
                     var chain_compare = false;
@@ -5670,7 +5677,16 @@ pub const SimContext = struct {
 
             .WITH_EXCEPT_START => {
                 // WITH_EXCEPT_START - call __exit__ with exception details
-                // Stack effect is +1 (result); inputs remain for cleanup path.
+                // In 3.0-3.10 this is effectively net +1 (inputs stay for cleanup).
+                // In 3.11+ an exception-info placeholder is consumed, keeping net 0.
+                if (self.version.gte(3, 11)) {
+                    if (self.stack.pop()) |v| {
+                        var val = v;
+                        val.deinit(self.allocator, self.stack_alloc);
+                    } else if (!(self.lenient or self.flow_mode)) {
+                        return error.StackUnderflow;
+                    }
+                }
                 try self.stack.push(.unknown);
             },
 
@@ -6238,6 +6254,17 @@ pub const SimContext = struct {
                 }
             },
 
+            .CLEANUP_THROW => {
+                // CLEANUP_THROW (3.11+) - cleanup during SEND/await exception path.
+                // Stack effect: -1 (drops an exception/why marker, leaving [awaitable, value] for loop-back).
+                if (self.stack.pop()) |v| {
+                    var val = v;
+                    val.deinit(self.allocator, self.stack_alloc);
+                } else if (!(self.lenient or self.flow_mode)) {
+                    return error.StackUnderflow;
+                }
+            },
+
             // Comprehension opcodes
             .LIST_APPEND => {
                 // LIST_APPEND i - append TOS to list at STACK[-i]
@@ -6602,10 +6629,13 @@ pub const SimContext = struct {
                         }
                     }
                 }
+                // Python 3.14+: END_FOR is a marker; POP_ITER pops the iterator.
+                if (self.version.gte(3, 14)) return;
+                // Python <=3.13: END_FOR cleans up the iterator on loop exit.
                 if (self.stack.pop()) |v| {
                     var val = v;
                     val.deinit(self.allocator, self.stack_alloc);
-                } else {
+                } else if (!(self.lenient or self.flow_mode)) {
                     return error.StackUnderflow;
                 }
             },
