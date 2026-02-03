@@ -17,18 +17,18 @@ python3 tools/compare/compare_dir.py \
   --orig-dir /Users/joel/Work/Shakhed/boat_main_extracted_3.9 \
   --src-dir /tmp/pez_boat_main_src_full \
   --py python3.9 \
-  --xdis-python /private/tmp/uncompyle6-venv312/bin/python \
+  --xdis-python /private/tmp/xdis-venv39/bin/python \
   --timeout 120 \
-  --out /tmp/pez_boat_main_compare_full.json \
-  --report-dir /tmp/pez_boat_main_compare_reports_full
+  --out /tmp/pez_boat_main_compare_full_xdis39.json \
+  --report-dir /tmp/pez_boat_main_compare_reports_full_xdis39
 ```
 
-## Summary (from /tmp/pez_boat_main_compare_full.json)
+## Summary (from /tmp/pez_boat_main_compare_full_xdis39.json)
 - total: 342
 - exact: 155
 - close: 45
-- mismatch: 139
-- error: 3
+- mismatch: 142
+- error: 0
 - missing_src: 0
 
 ## Worst semantic mismatches (min_semantic_score)
@@ -44,8 +44,5 @@ python3 tools/compare/compare_dir.py \
 - PYZ-00.pyz_extracted/aioice/ice.pyc (min=0.1600)
 
 ## Notes
-- Detailed per-file reports: /tmp/pez_boat_main_compare_reports_full
-- xdis load errors (valid pyc; python3.9 `marshal.load` works):
-  - PYZ-00.pyz_extracted/plistlib.pyc
-  - PYZ-00.pyz_extracted/uuid.pyc
-  - PYZ-00.pyz_extracted/_pydecimal.pyc
+- Detailed per-file reports: /tmp/pez_boat_main_compare_reports_full_xdis39
+- Use xdis under python3.9 for this dataset; python3.12+xdis fails to load some stdlib pyc.
