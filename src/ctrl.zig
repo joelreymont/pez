@@ -1223,6 +1223,56 @@ pub const Analyzer = struct {
 
         const then_id = then_block orelse return null;
         const then_terminal = self.isTerminalBlock(then_id);
+        const then_is_raise = blk: {
+            var tid = then_id;
+            if (self.jumpOnlyTarget(tid)) |tgt| tid = tgt;
+            if (tid >= self.cfg.blocks.len) break :blk false;
+            const blk_ = &self.cfg.blocks[tid];
+            for (blk_.instructions) |inst| {
+                if (inst.opcode == .RAISE_VARARGS or inst.opcode == .RERAISE) break :blk true;
+            }
+            break :blk false;
+        };
+
+        const is_skip = struct {
+            fn check(op: Opcode) bool {
+                return switch (op) {
+                    .CACHE, .NOP, .NOT_TAKEN => true,
+                    else => false,
+                };
+            }
+        }.check;
+
+        const is_uncond = struct {
+            fn check(op: Opcode) bool {
+                return op == .JUMP_FORWARD or op == .JUMP_ABSOLUTE or op == .JUMP_BACKWARD or op == .JUMP_BACKWARD_NO_INTERRUPT;
+            }
+        }.check;
+
+        const then_has_gap_jump = struct {
+            fn check(self_: *Analyzer, then_id_: u32, else_id_: u32) bool {
+                if (then_id_ >= self_.cfg.blocks.len or else_id_ >= self_.cfg.blocks.len) return false;
+                var off = self_.cfg.blocks[then_id_].end_offset;
+                while (off < self_.cfg.blocks[self_.cfg.blocks.len - 1].end_offset) {
+                    const bid = self_.cfg.blockAtOffset(off) orelse return false;
+                    if (bid >= self_.cfg.blocks.len) return false;
+                    const blk = &self_.cfg.blocks[bid];
+                    var op: ?Opcode = null;
+                    for (blk.instructions) |inst| {
+                        if (is_skip(inst.opcode)) continue;
+                        op = inst.opcode;
+                        break;
+                    }
+                    if (op == null) {
+                        off = blk.end_offset;
+                        continue;
+                    }
+                    if (bid == else_id_) return false;
+                    return is_uncond(op.?);
+                }
+                return false;
+            }
+        }.check;
 
         // Find merge point - where both branches converge
         var merge = try self.findMergePoint(block_id, then_id, else_block);
@@ -1265,7 +1315,12 @@ pub const Analyzer = struct {
                             }
                         }
                         if (!reaches_then) {
-                            is_elif = true;
+                            // For guard-style `if cond: raise` followed by unrelated control
+                            // flow, treat the else-block as the next statement (not an elif)
+                            // unless the bytecode contains the usual unreachable jump gap.
+                            if (!then_is_raise or then_has_gap_jump(self, then_id, else_id)) {
+                                is_elif = true;
+                            }
                         }
                     }
                 }
