@@ -6933,6 +6933,49 @@ pub const Decompiler = struct {
         expr: *Expr,
     };
 
+    fn handleInlineCompResult(
+        self: *Decompiler,
+        pattern: ctrl.ForPattern,
+        result: InlineCompResult,
+        block_idx: *u32,
+    ) DecompileError!void {
+        if (self.version.gte(3, 14)) {
+            if (result.exit_block < self.stack_in.len) {
+                if (self.stack_in[result.exit_block]) |old| {
+                    if (old.len > 0) self.allocator.free(old);
+                }
+                try self.clearPhiForBlock(result.exit_block);
+                self.stack_in[result.exit_block] = @constCast(result.stack);
+
+                const exit_blk = &self.cfg.blocks[result.exit_block];
+                for (exit_blk.successors) |edge| {
+                    if (edge.edge_type == .exception) continue;
+                    const succ = edge.target;
+                    if (succ >= self.stack_in.len) continue;
+                    if (result.stack.len >= 1) {
+                        const succ_stack = try self.allocator.alloc(StackValue, result.stack.len - 1);
+                        for (result.stack[0 .. result.stack.len - 1], 0..) |val, i| {
+                            succ_stack[i] = val;
+                        }
+                        if (self.stack_in[succ]) |old| {
+                            if (old.len > 0) self.allocator.free(old);
+                        }
+                        try self.clearPhiForBlock(succ);
+                        self.stack_in[succ] = succ_stack;
+                    }
+                }
+            } else {
+                self.deinitStackValues(result.stack);
+            }
+            try self.consumed.set(self.allocator, pattern.setup_block);
+            try self.consumed.set(self.allocator, pattern.header_block);
+            try self.consumed.set(self.allocator, pattern.body_block);
+        } else {
+            self.deinitStackValues(result.stack);
+        }
+        block_idx.* = result.exit_block;
+    }
+
     fn tryDecompileInlineListComp(
         self: *Decompiler,
         pattern: ctrl.ForPattern,
@@ -7718,55 +7761,8 @@ pub const Decompiler = struct {
                 },
                 .for_loop => |p| {
                     if (try self.tryDecompileInlineListComp(p)) |result| {
-                        // Python 3.14+ inline comprehensions need special stack handling
-                        // because of LOAD_FAST_AND_CLEAR / POP_ITER cleanup
-                        if (self.version.gte(3, 14)) {
-                            // Set stack_in for exit block so subsequent processing uses it
-                            if (result.exit_block < self.stack_in.len) {
-                                // Free old entry if any
-                                if (self.stack_in[result.exit_block]) |old| {
-                                    if (old.len > 0) self.allocator.free(old);
-                                }
-                                try self.clearPhiForBlock(result.exit_block);
-                                self.stack_in[result.exit_block] = @constCast(result.stack);
-
-                                // Also set stack for successor block (after POP_ITER consumes iterator)
-                                // Exit block has END_FOR + POP_ITER, which consumes one stack value
-                                const exit_blk = &self.cfg.blocks[result.exit_block];
-                                for (exit_blk.successors) |edge| {
-                                    if (edge.edge_type == .exception) continue;
-                                    const succ = edge.target;
-                                    if (succ >= self.stack_in.len) continue;
-                                    // Stack after POP_ITER: one less element
-                                    if (result.stack.len >= 1) {
-                                        const succ_stack = try self.allocator.alloc(StackValue, result.stack.len - 1);
-                                        for (result.stack[0 .. result.stack.len - 1], 0..) |val, i| {
-                                            succ_stack[i] = val;
-                                        }
-                                        if (self.stack_in[succ]) |old| {
-                                            if (old.len > 0) self.allocator.free(old);
-                                        }
-                                        try self.clearPhiForBlock(succ);
-                                        self.stack_in[succ] = succ_stack;
-                                    }
-                                }
-                            } else {
-                                self.deinitStackValues(result.stack);
-                            }
-                            // Mark comprehension blocks as consumed
-                            try self.consumed.set(self.allocator, p.setup_block);
-                            try self.consumed.set(self.allocator, p.header_block);
-                            try self.consumed.set(self.allocator, p.body_block);
-                            // Continue from exit block - normal processing will use stack_in
-                            block_idx = result.exit_block;
-                            continue;
-                        } else {
-                            // Pre-3.14: comprehension expr is stashed in inline_pend
-                            // Just free the stack and continue from exit block
-                            self.deinitStackValues(result.stack);
-                            block_idx = result.exit_block;
-                            continue;
-                        }
+                        try self.handleInlineCompResult(p, result, &block_idx);
+                        continue;
                     }
                     try self.emitForPrelude(p, &self.statements, self.allocator);
                     const stmt = try self.decompileFor(p);
@@ -17562,8 +17558,7 @@ pub const Decompiler = struct {
                         }
                     }
                     if (try self.tryDecompileInlineListComp(p)) |result| {
-                        self.deinitStackValues(result.stack);
-                        block_idx = result.exit_block;
+                        try self.handleInlineCompResult(p, result, &block_idx);
                         continue;
                     }
                     try self.emitForPrelude(p, &stmts, a);
@@ -20363,8 +20358,7 @@ pub const Decompiler = struct {
                         }
                     }
                     if (try self.tryDecompileInlineListComp(p)) |result| {
-                        self.deinitStackValues(result.stack);
-                        block_idx = result.exit_block;
+                        try self.handleInlineCompResult(p, result, &block_idx);
                         continue;
                     }
                     try self.emitForPrelude(p, &stmts, a);
@@ -23893,8 +23887,7 @@ pub const Decompiler = struct {
                 },
                 .for_loop => |p| {
                     if (try self.tryDecompileInlineListComp(p)) |result| {
-                        self.deinitStackValues(result.stack);
-                        block_idx = result.exit_block;
+                        try self.handleInlineCompResult(p, result, &block_idx);
                         continue;
                     }
                     if (p.setup_block < self.cfg.blocks.len and
