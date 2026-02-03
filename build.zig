@@ -101,4 +101,21 @@ pub fn build(b: *std.Build) void {
     const coverage_run = b.addRunArtifact(coverage_exe);
     const coverage_step = b.step("coverage", "Generate opcode coverage matrix");
     coverage_step.dependOn(&coverage_run.step);
+
+    // Post-dominator benchmark
+    const postdom_mod = b.createModule(.{
+        .root_source_file = b.path("tools/postdom_bench.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    const postdom_exe = b.addExecutable(.{
+        .name = "postdom_bench",
+        .root_module = postdom_mod,
+    });
+    const postdom_run = b.addRunArtifact(postdom_exe);
+    if (b.args) |args| {
+        postdom_run.addArgs(args);
+    }
+    const postdom_step = b.step("postdom-bench", "Benchmark post-dominator computation");
+    postdom_step.dependOn(&postdom_run.step);
 }

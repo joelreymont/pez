@@ -459,61 +459,184 @@ pub fn postIdomFrom(
 ) ![]u32 {
     const total: u32 = @intCast(succs.len);
     const count: usize = @intCast(total);
-    const undef = std.math.maxInt(u32);
 
-    var idom = try allocator.alloc(u32, count);
-    @memset(idom, undef);
+    var idom_nodes = try allocator.alloc(u32, count);
+    errdefer allocator.free(idom_nodes);
+    for (idom_nodes, 0..) |*slot, i| slot.* = @intCast(i);
+    if (count == 0) return idom_nodes;
+    if (entry >= total) return idom_nodes;
 
-    const rpo = try postRpo(allocator, succs, entry);
-    defer allocator.free(rpo);
+    var dfs_idx = try allocator.alloc(u32, count);
+    defer allocator.free(dfs_idx);
+    @memset(dfs_idx, 0);
 
-    if (rpo.len == 0) {
-        for (0..count) |i| {
-            idom[i] = @intCast(i);
+    const no_parent = std.math.maxInt(u32);
+    var parent_node = try allocator.alloc(u32, count);
+    defer allocator.free(parent_node);
+    @memset(parent_node, no_parent);
+
+    var vertex = try allocator.alloc(u32, count + 1);
+    defer allocator.free(vertex);
+
+    var stack: std.ArrayListUnmanaged(struct { node: u32, next_idx: usize }) = .{};
+    defer stack.deinit(allocator);
+    try stack.append(allocator, .{ .node = entry, .next_idx = 0 });
+
+    var time: u32 = 0;
+    while (stack.items.len > 0) {
+        var top = &stack.items[stack.items.len - 1];
+        const node = top.node;
+        const node_idx: usize = @intCast(node);
+        if (dfs_idx[node_idx] == 0) {
+            time += 1;
+            dfs_idx[node_idx] = time;
+            vertex[@intCast(time)] = node;
         }
-        return idom;
-    }
-
-    var rpo_index = try allocator.alloc(u32, count);
-    defer allocator.free(rpo_index);
-    @memset(rpo_index, undef);
-    for (rpo, 0..) |node, idx| {
-        rpo_index[@intCast(node)] = @intCast(idx);
-    }
-
-    idom[@intCast(rpo[0])] = rpo[0];
-
-    var changed = true;
-    while (changed) {
-        changed = false;
-        for (rpo[1..]) |node| {
-            const node_idx: usize = @intCast(node);
-            var new_idom: ?u32 = null;
-
-            for (preds[node_idx]) |pred| {
-                if (idom[@intCast(pred)] == undef) continue;
-                if (new_idom == null) {
-                    new_idom = pred;
-                } else {
-                    new_idom = postIntersectIdom(idom, rpo_index, pred, new_idom.?);
-                }
+        if (top.next_idx < succs[node_idx].len) {
+            const succ = succs[node_idx][top.next_idx];
+            top.next_idx += 1;
+            if (succ >= total) continue;
+            const succ_idx: usize = @intCast(succ);
+            if (dfs_idx[succ_idx] == 0) {
+                parent_node[succ_idx] = node;
+                try stack.append(allocator, .{ .node = succ, .next_idx = 0 });
             }
+        } else {
+            _ = stack.pop();
+        }
+    }
 
-            if (new_idom == null) continue;
-            if (idom[node_idx] != new_idom.?) {
-                idom[node_idx] = new_idom.?;
-                changed = true;
+    if (time == 0) return idom_nodes;
+
+    const n: u32 = time;
+    const n_count: usize = @intCast(n + 1);
+    var semi = try allocator.alloc(u32, n_count);
+    errdefer allocator.free(semi);
+    var ancestor = try allocator.alloc(u32, n_count);
+    errdefer allocator.free(ancestor);
+    var label = try allocator.alloc(u32, n_count);
+    errdefer allocator.free(label);
+    var parent = try allocator.alloc(u32, n_count);
+    errdefer allocator.free(parent);
+    var idom = try allocator.alloc(u32, n_count);
+    errdefer allocator.free(idom);
+
+    var i: u32 = 1;
+    while (i <= n) : (i += 1) {
+        semi[@intCast(i)] = i;
+        ancestor[@intCast(i)] = 0;
+        label[@intCast(i)] = i;
+        parent[@intCast(i)] = 0;
+        idom[@intCast(i)] = 0;
+    }
+
+    i = 2;
+    while (i <= n) : (i += 1) {
+        const node = vertex[@intCast(i)];
+        const pnode = parent_node[@intCast(node)];
+        if (pnode != no_parent) {
+            parent[@intCast(i)] = dfs_idx[@intCast(pnode)];
+        }
+    }
+
+    var bucket = try allocator.alloc(std.ArrayListUnmanaged(u32), n_count);
+    defer {
+        for (bucket) |*lst| lst.deinit(allocator);
+        allocator.free(bucket);
+    }
+    for (bucket) |*lst| lst.* = .{};
+
+    const LtCtx = struct {
+        semi: []u32,
+        ancestor: []u32,
+        label: []u32,
+
+        fn compress(self: *@This(), v: u32) void {
+            const a = self.ancestor[@intCast(v)];
+            if (a == 0) return;
+            const aa = self.ancestor[@intCast(a)];
+            if (aa == 0) return;
+            self.compress(a);
+            if (self.semi[@intCast(self.label[@intCast(a)])] < self.semi[@intCast(self.label[@intCast(v)])]) {
+                self.label[@intCast(v)] = self.label[@intCast(a)];
+            }
+            self.ancestor[@intCast(v)] = aa;
+        }
+
+        fn eval(self: *@This(), v: u32) u32 {
+            if (self.ancestor[@intCast(v)] == 0) return self.label[@intCast(v)];
+            self.compress(v);
+            const a = self.ancestor[@intCast(v)];
+            if (self.semi[@intCast(self.label[@intCast(a)])] < self.semi[@intCast(self.label[@intCast(v)])]) {
+                self.label[@intCast(v)] = self.label[@intCast(a)];
+            }
+            return self.label[@intCast(v)];
+        }
+
+        fn link(self: *@This(), p: u32, v: u32) void {
+            self.ancestor[@intCast(v)] = p;
+        }
+    };
+
+    var ctx = LtCtx{
+        .semi = semi,
+        .ancestor = ancestor,
+        .label = label,
+    };
+
+    var v: u32 = n;
+    while (v > 1) : (v -= 1) {
+        const w = vertex[@intCast(v)];
+        const w_idx: usize = @intCast(w);
+        for (preds[w_idx]) |pred| {
+            if (pred >= total) continue;
+            const pred_idx: u32 = dfs_idx[@intCast(pred)];
+            if (pred_idx == 0) continue;
+            const u = ctx.eval(pred_idx);
+            if (ctx.semi[@intCast(u)] < semi[@intCast(v)]) {
+                semi[@intCast(v)] = ctx.semi[@intCast(u)];
             }
         }
+
+        try bucket[@intCast(semi[@intCast(v)])].append(allocator, v);
+        const p = parent[@intCast(v)];
+        ctx.link(p, v);
+
+        var b_idx: usize = 0;
+        while (b_idx < bucket[@intCast(p)].items.len) : (b_idx += 1) {
+            const wv = bucket[@intCast(p)].items[b_idx];
+            const u = ctx.eval(wv);
+            idom[@intCast(wv)] = if (semi[@intCast(u)] < semi[@intCast(wv)]) u else p;
+        }
+        bucket[@intCast(p)].items.len = 0;
     }
 
-    for (idom, 0..) |*dom, i| {
-        if (dom.* == undef) {
-            dom.* = @intCast(i);
+    idom[1] = 1;
+    i = 2;
+    while (i <= n) : (i += 1) {
+        if (idom[@intCast(i)] != semi[@intCast(i)]) {
+            idom[@intCast(i)] = idom[@intCast(idom[@intCast(i)])];
         }
     }
 
-    return idom;
+    i = 1;
+    while (i <= n) : (i += 1) {
+        const node = vertex[@intCast(i)];
+        if (i == 1) {
+            idom_nodes[@intCast(node)] = node;
+        } else {
+            const dom_idx = idom[@intCast(i)];
+            idom_nodes[@intCast(node)] = vertex[@intCast(dom_idx)];
+        }
+    }
+
+    allocator.free(semi);
+    allocator.free(ancestor);
+    allocator.free(label);
+    allocator.free(parent);
+    allocator.free(idom);
+
+    return idom_nodes;
 }
 
 fn postRpo(
@@ -1422,4 +1545,30 @@ test "exception table varint" {
     const result = readVarint7(&[_]u8{ 0x41, 0x24 }, 0);
     try testing.expectEqual(@as(u32, 100), result.value);
     try testing.expectEqual(@as(usize, 2), result.new_pos);
+}
+
+test "postIdomFrom returns expected idoms" {
+    const testing = std.testing;
+    const allocator = testing.allocator;
+
+    const succs = [_][]const u32{
+        &.{ 1, 2 },
+        &.{ 3 },
+        &.{ 3 },
+        &.{},
+        &.{},
+    };
+    const preds = [_][]const u32{
+        &.{},
+        &.{ 0 },
+        &.{ 0 },
+        &.{ 1, 2 },
+        &.{},
+    };
+
+    const idom = try postIdomFrom(allocator, succs[0..], preds[0..], 0);
+    defer allocator.free(idom);
+
+    const expected = [_]u32{ 0, 0, 0, 0, 4 };
+    try testing.expectEqualSlices(u32, &expected, idom);
 }
