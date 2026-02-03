@@ -53,3 +53,10 @@ python3 tools/compare/compare_dir.py \
 - datetime.pyc (<module>.time.__hash__): idx 4, orig POP_JUMP_IF_FALSE to 210 @off 8 blk 0, comp POP_JUMP_IF_FALSE to 34 @off 8 blk 0
 - shlex.pyc (<module>.split): idx 26, orig POP_JUMP_IF_TRUE to 60 @off 52 blk 2, comp POP_JUMP_IF_FALSE to 62 @off 52 blk 2
 - getopt.pyc (<module>.getopt): idx 18, orig LOAD_FAST args @off 36 blk 3, comp LOAD_CONST None @off 36 blk 3
+
+## Fix targets
+- zipfile.pyc: EXTENDED_ARG vs SETUP_FINALLY in _ZipWriteFile.close @off 10 blk 2
+- aioice/stun.pyc: SETUP_ANNOTATIONS vs LOAD_NAME ATTRIBUTES @off 0 blk 0
+- datetime.pyc: POP_JUMP_IF_FALSE target mismatch in time.__hash__ @off 8 blk 0
+- shlex.pyc: POP_JUMP_IF_TRUE vs POP_JUMP_IF_FALSE in split @off 52 blk 2
+- getopt.pyc: LOAD_FAST args vs LOAD_CONST None in getopt @off 36 blk 3
