@@ -8483,6 +8483,23 @@ pub const Decompiler = struct {
                         {
                             is_elif = false;
                         }
+                        // If the "elif" condition block leaves values on the stack for its
+                        // successors, it's not an actual elif guard; it's an expression
+                        // prelude (e.g. conditional kwarg value) that must be decompiled as
+                        // a normal else-branch to preserve semantics/parity.
+                        if (is_elif and ctrl.Analyzer.isConditionalJump(undefined, else_term.opcode)) {
+                            for (else_blk.successors) |edge| {
+                                if (edge.edge_type == .exception) continue;
+                                const sid = edge.target;
+                                if (sid >= self.stack_in.len) continue;
+                                if (self.stack_in[sid]) |entry| {
+                                    if (entry.len > 0) {
+                                        is_elif = false;
+                                        break;
+                                    }
+                                }
+                            }
+                        }
                     }
                 }
             }
@@ -9849,6 +9866,43 @@ pub const Decompiler = struct {
             }
         }
 
+        // If one branch is a terminal block that the other branch reaches, treat it as a
+        // shared tail (merge) rather than an else/then body. This preserves parity for
+        // common-tail return blocks (e.g. argument-normalization before a single return).
+        if (!is_elif and merge_block == null and else_block != null) {
+            const else_id = else_block.?;
+            const resolved_else = self.resolveJumpOnlyBlock(else_id);
+            if (resolved_else < self.cfg.blocks.len and self.isTerminalBlock(resolved_else)) {
+                if (try self.reachesBlockNoBack(then_block, else_id, pattern.condition_block)) {
+                    merge_block = else_id;
+                    else_block = null;
+                    if (self.if_next == null) {
+                        self.if_next = else_id;
+                    }
+                    try self.emitDecisionTrace(pattern.condition_block, "if_tail_merge_else", condition);
+                }
+            }
+        }
+        if (!is_elif and merge_block == null and else_block != null) {
+            const else_id = else_block.?;
+            const resolved_then = self.resolveJumpOnlyBlock(then_block);
+            if (resolved_then < self.cfg.blocks.len and self.isTerminalBlock(resolved_then)) {
+                if (try self.reachesBlockNoBack(else_id, then_block, pattern.condition_block)) {
+                    merge_block = then_block;
+                    then_block = else_id;
+                    else_block = null;
+                    condition = try self.invertConditionExpr(condition);
+                    if (cond_true_jump != null) {
+                        cond_true_jump = !cond_true_jump.?;
+                    }
+                    if (self.if_next == null) {
+                        self.if_next = merge_block.?;
+                    }
+                    try self.emitDecisionTrace(pattern.condition_block, "if_tail_merge_then", condition);
+                }
+            }
+        }
+
         if (forced_then_end == null and merge_block != null and merge_block.? == then_block) {
             if (else_block) |else_id| {
                 const then_res = self.resolveJumpOnlyBlock(then_block);
@@ -10535,7 +10589,7 @@ pub const Decompiler = struct {
                 else_body = &[_]*Stmt{};
             }
         }
-        if (merge_else and !cond_chain_then) {
+        if (merge_else) {
             if (merge_block) |merge| {
                 self.if_next = merge;
             }
@@ -10558,14 +10612,21 @@ pub const Decompiler = struct {
         }
 
         if (prefer_false_body and else_body.len > 0) {
-            condition = try self.invertConditionExpr(condition);
-            try self.emitDecisionTrace(pattern.condition_block, "if_invert_terminal_then_merge", condition);
-            then_body = else_body;
-            else_body = &[_]*Stmt{};
-            else_body_moved = true;
-            then_body_dropped = true;
-            if (self.if_next == null) {
-                self.if_next = then_block;
+            // Preserve `elif` chains and explicit `return None` guards; inverting tends
+            // to turn them into nested `if not ...` blocks which is worse for parity.
+            const then_is_ret_none = then_body.len == 1 and Decompiler.isReturnNone(then_body[0]) and self.hasTailRetNone();
+            const else_is_ret_none = else_body.len == 1 and Decompiler.isReturnNone(else_body[0]) and self.hasTailRetNone();
+            const else_is_if = else_body.len == 1 and else_body[0].* == .if_stmt;
+            if (!then_is_ret_none and !else_is_ret_none and !else_is_if) {
+                condition = try self.invertConditionExpr(condition);
+                try self.emitDecisionTrace(pattern.condition_block, "if_invert_terminal_then_merge", condition);
+                then_body = else_body;
+                else_body = &[_]*Stmt{};
+                else_body_moved = true;
+                then_body_dropped = true;
+                if (self.if_next == null) {
+                    self.if_next = then_block;
+                }
             }
         }
 
