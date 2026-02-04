@@ -184,7 +184,8 @@ test "snapshot if or not 3.9" {
         \\def warn(logger_level = logging.ERROR):
         \\    if not logger_level or logger_level < logging.INFO:
         \\        warning = 'W'
-        \\    warning = ''
+        \\    else:
+        \\        warning = ''
         \\    return warning
         \\"
     );

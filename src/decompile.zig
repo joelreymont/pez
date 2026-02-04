@@ -282,6 +282,39 @@ const BlockTrace = struct {
     end: u32,
 };
 
+const PatternTrace = struct {
+    kind: []const u8,
+    block: u32,
+    pat: []const u8,
+};
+
+const PatternResultTrace = struct {
+    kind: []const u8,
+    block: u32,
+    pat: []const u8,
+    emitted: bool,
+};
+
+const BranchRangeTrace = struct {
+    kind: []const u8,
+    tag: []const u8,
+    start: u32,
+    end: u32,
+    base_len: u32,
+    skip_first: u32,
+};
+
+const IfCallTrace = struct {
+    kind: []const u8,
+    tag: []const u8,
+    cond: u32,
+    then_block: u32,
+    else_block: ?u32,
+    merge_block: ?u32,
+    skip_cond: u32,
+    in_elif_chain: bool,
+};
+
 const GuardBranch = struct {
     target: u32,
     taken: bool,
@@ -7700,7 +7733,17 @@ pub const Decompiler = struct {
         var end = try self.branchEnd(pattern.then_block, null);
         if (pattern.else_block) |else_id| {
             const else_pattern = try self.analyzer.detectPattern(else_id);
-            const else_is_chain = else_pattern == .if_stmt and else_pattern.if_stmt.is_elif;
+            // Only treat the else target as part of the current `if/elif/...` chain when
+            // it shares the same merge block. Nested `if` statements inside an `else`
+            // body can look like `elif` heads but must not affect the outer chain end.
+            const else_is_chain = blk: {
+                if (else_pattern != .if_stmt) break :blk false;
+                const else_if = else_pattern.if_stmt;
+                if (!else_if.is_elif) break :blk false;
+                const merge = pattern.merge_block orelse break :blk false;
+                const else_merge = else_if.merge_block orelse break :blk false;
+                break :blk else_merge == merge;
+            };
             if (pattern.is_elif or else_is_chain) {
                 const chain_end = if (else_pattern == .if_stmt)
                     try self.findIfChainEnd(else_pattern.if_stmt)
@@ -8016,7 +8059,7 @@ pub const Decompiler = struct {
                 .if_stmt => |p| {
                     var skip_first_store = false;
                     try self.processPartialBlock(&self.cfg.blocks[p.condition_block], &self.statements, self.allocator, &skip_first_store, null);
-                    const stmt = try self.decompileIf(p);
+                    const stmt = try self.decompileIfImplTag(p, 0, false, "top");
                     if (stmt) |s| {
                         try self.statements.append(self.allocator, s);
                         try self.appendIfTail(&self.statements, self.allocator);
@@ -9002,6 +9045,29 @@ pub const Decompiler = struct {
         return self.decompileIfImpl(pattern, skip_cond, true);
     }
 
+    fn decompileIfImplTag(
+        self: *Decompiler,
+        pattern: ctrl.IfPattern,
+        skip_cond: usize,
+        in_elif_chain: bool,
+        comptime tag: []const u8,
+    ) DecompileError!?*Stmt {
+        if (self.trace_blocks and self.trace_file != null) {
+            const ev = IfCallTrace{
+                .kind = "if_call",
+                .tag = tag,
+                .cond = pattern.condition_block,
+                .then_block = pattern.then_block,
+                .else_block = pattern.else_block,
+                .merge_block = pattern.merge_block,
+                .skip_cond = @intCast(skip_cond),
+                .in_elif_chain = in_elif_chain,
+            };
+            try self.writeTrace(ev);
+        }
+        return self.decompileIfImpl(pattern, skip_cond, in_elif_chain);
+    }
+
     /// Decompile an if statement pattern, skipping first N instructions of condition block.
     /// If in_elif_chain is true, this is a nested if inside an elif chain - skip guard optimizations.
     fn decompileIfImpl(self: *Decompiler, pattern: ctrl.IfPattern, skip_cond: usize, in_elif_chain: bool) DecompileError!?*Stmt {
@@ -9288,8 +9354,8 @@ pub const Decompiler = struct {
             if (else_block) |else_id| {
                 const merge = try self.commonMerge(then_block, else_id, pattern.condition_block);
                 const a = self.arena.allocator();
-                var then_body = try self.decompileBranchRange(then_block, merge, &.{}, 0);
-                var else_body = try self.decompileBranchRange(else_id, merge, &.{}, 0);
+                var then_body = try self.decompileBranchRangeTag(then_block, merge, &.{}, 0, "if_fold_then");
+                var else_body = try self.decompileBranchRangeTag(else_id, merge, &.{}, 0, "if_fold_else");
                 const then_is_pass = then_body.len == 1 and then_body[0].* == .pass;
                 const else_is_pass = else_body.len == 1 and else_body[0].* == .pass;
                 if ((then_body.len == 0 or then_is_pass) and (else_body.len == 0 or else_is_pass)) {
@@ -10048,6 +10114,20 @@ pub const Decompiler = struct {
                     else_block = chain.else_block;
                     is_elif = false;
                     cond_tree_applied = true;
+                    if (condition.* == .bool_op and condition.bool_op.op == .or_ and else_block != null and else_block.? < then_block) {
+                        const else_res = self.resolveJumpOnlyBlock(else_block.?);
+                        if (self.isTerminalBlock(else_res)) {
+                            condition = try self.invertConditionExpr(condition);
+                            const guard_next = then_block;
+                            then_block = else_res;
+                            else_block = null;
+                            is_elif = false;
+                            if (self.if_next == null) {
+                                self.if_next = guard_next;
+                            }
+                            try self.emitDecisionTrace(pattern.condition_block, "if_chain_or_guard_else", condition);
+                        }
+                    }
                     try self.emitDecisionTrace(pattern.condition_block, "if_chain_or", condition);
                 }
                 if (!cond_tree_applied and else_id < self.cfg.blocks.len) {
@@ -10412,6 +10492,9 @@ pub const Decompiler = struct {
                 else_block = res.else_block;
                 cond_chain_then = true;
                 try self.emitDecisionTrace(pattern.condition_block, "if_chain_then_inner", condition);
+                if (pattern.else_block == null and merge_block != null and else_block != null and else_block.? == merge_block.?) {
+                    else_block = null;
+                }
             }
         }
         if (!is_elif) {
@@ -10658,14 +10741,10 @@ pub const Decompiler = struct {
             then_body_decompiled = true;
         }
         const saved_if_next_then = self.if_next;
-        var then_body = try self.decompileBranchRange(then_block, then_end, then_vals, skip);
-        if (self.if_next) |next| {
-            if (next >= then_block and next <= then_end) {
-                self.if_next = saved_if_next_then;
-            }
-        } else if (saved_if_next_then != null) {
-            self.if_next = saved_if_next_then;
-        }
+        var then_body = try self.decompileBranchRangeTag(then_block, then_end, then_vals, skip, "if_then");
+        // Nested structured-range decompilation uses `self.if_next` for local control flow.
+        // It must not leak out of the branch; restore the outer value unconditionally.
+        self.if_next = saved_if_next_then;
         const a = self.arena.allocator();
         if (!self.bodyEndsTerminal(then_body)) {
             var appended_term_succ = false;
@@ -10784,7 +10863,37 @@ pub const Decompiler = struct {
                         if (join_pred) break;
                     }
                 }
-                if (join_pred or (try self.reachesBlock(then_block, cur_else, pattern.condition_block))) {
+                const keep_else_chain = blk: {
+                    const merge_id = merge_block orelse break :blk false;
+                    const else_pat = self.analyzer.detectPatternNoTry(cur_else) catch break :blk false;
+                    if (else_pat != .if_stmt) break :blk false;
+                    const else_if = else_pat.if_stmt;
+                    if (else_if.merge_block == null) break :blk false;
+                    break :blk else_if.merge_block.? == merge_id;
+                };
+                const else_is_terminal = cur_else < self.cfg.blocks.len and self.isTerminalBlock(cur_else);
+                // If `then_block` is itself a condition block that can jump directly to
+                // `cur_else`, we're looking at a chained condition (e.g. `A and B`) and
+                // `cur_else` is a real else-path, not the post-if fallthrough/next block.
+                const then_cond_to_else = blk: {
+                    const then_id = pattern.then_block;
+                    if (then_id >= self.cfg.blocks.len) break :blk false;
+                    const then_blk = &self.cfg.blocks[then_id];
+                    if (condBlockHasPrelude(then_blk)) break :blk false;
+                    const then_term = then_blk.terminator() orelse break :blk false;
+                    if (!ctrl.Analyzer.isCondJump(then_term.opcode)) break :blk false;
+                    for (then_blk.successors) |edge| {
+                        if (edge.edge_type == .exception) continue;
+                        if (edge.target != cur_else) continue;
+                        if (edge.edge_type == .conditional_false or edge.edge_type == .conditional_true) {
+                            break :blk true;
+                        }
+                    }
+                    break :blk false;
+                };
+                if (!else_is_terminal and !keep_else_chain and !then_cond_to_else and
+                    (join_pred or (try self.reachesBlock(then_block, cur_else, pattern.condition_block))))
+                {
                     else_block = null;
                     self.if_next = cur_else;
                     if (cur_else < self.cfg.blocks.len) {
@@ -10881,7 +10990,7 @@ pub const Decompiler = struct {
                 if (self.analyzer.detectAndOr(else_id) == null) {
                     const else_pattern = try self.analyzer.detectPattern(else_id);
                     if (else_pattern == .if_stmt) {
-                        const elif_stmt = try self.decompileIfInElifChain(else_pattern.if_stmt, skip);
+                        const elif_stmt = try self.decompileIfImplTag(else_pattern.if_stmt, skip, true, "elif_chain");
                         if (elif_stmt) |s| {
                             const body = try a.alloc(*Stmt, 1);
                             body[0] = s;
@@ -10900,7 +11009,7 @@ pub const Decompiler = struct {
                 else_end = else_end_val;
                 // Save if_next - nested if processing may clear it
                 const saved_if_next_elif = self.if_next;
-                const elif_result = try self.decompileBranchRange(else_id, else_end_val, &.{}, skip);
+                const elif_result = try self.decompileBranchRangeTag(else_id, else_end_val, &.{}, skip, "if_elif_branch");
                 if (saved_if_next_elif != null and self.if_next == null) {
                     self.if_next = saved_if_next_elif;
                 }
@@ -10967,7 +11076,7 @@ pub const Decompiler = struct {
                 }
             }
             else_end = else_end_val;
-            // Save if_next - nested if processing may clear it
+            // Save if_next - nested if processing may change it
             const saved_if_next = self.if_next;
             if (else_start_val < else_end_val) {
                 var reach = try self.reachableInRange(else_start_val, else_end_val, null);
@@ -10982,15 +11091,10 @@ pub const Decompiler = struct {
                 else_consumed = consumed_before;
                 else_body_decompiled = true;
             }
-            const result = try self.decompileBranchRange(else_start_val, else_end_val, else_vals, skip);
-            // Restore if_next if nested decompile set a local fallthrough
-            if (self.if_next) |next| {
-                if (next >= else_start_val and next <= else_end_val) {
-                    self.if_next = saved_if_next;
-                }
-            } else if (saved_if_next != null) {
-                self.if_next = saved_if_next;
-            }
+            const result = try self.decompileBranchRangeTag(else_start_val, else_end_val, else_vals, skip, "if_else");
+            // Nested structured-range decompilation uses `self.if_next` for local control flow.
+            // It must not leak out of the branch; restore the outer value unconditionally.
+            self.if_next = saved_if_next;
             break :blk result;
         } else blk: {
             // No else block - clean up base_vals
@@ -11001,6 +11105,14 @@ pub const Decompiler = struct {
 
         if (!else_body_moved and else_block != null and else_start != null and !force_else and !is_elif and else_body.len > 0) {
             const join_id = else_start.?;
+            const keep_else_chain = blk: {
+                const merge_id = merge_block orelse break :blk false;
+                const else_pat = self.analyzer.detectPatternNoTry(join_id) catch break :blk false;
+                if (else_pat != .if_stmt) break :blk false;
+                const else_if = else_pat.if_stmt;
+                if (else_if.merge_block == null) break :blk false;
+                break :blk else_if.merge_block.? == merge_id;
+            };
             var join_pred = false;
             if (join_id < self.cfg.blocks.len) {
                 for (self.cfg.blocks[join_id].predecessors) |pred_id| {
@@ -11015,7 +11127,28 @@ pub const Decompiler = struct {
                     if (join_pred) break;
                 }
             }
-            if (join_pred) {
+            const join_is_terminal = join_id < self.cfg.blocks.len and self.isTerminalBlock(join_id);
+            var join_from_then = false;
+            if (then_block < self.cfg.blocks.len and join_id < self.cfg.blocks.len) {
+                join_from_then = try self.reachesBlock(then_block, join_id, pattern.condition_block);
+            }
+            const then_cond_to_join = blk: {
+                const then_id = pattern.then_block;
+                if (then_id >= self.cfg.blocks.len) break :blk false;
+                const then_blk = &self.cfg.blocks[then_id];
+                if (condBlockHasPrelude(then_blk)) break :blk false;
+                const then_term = then_blk.terminator() orelse break :blk false;
+                if (!ctrl.Analyzer.isCondJump(then_term.opcode)) break :blk false;
+                for (then_blk.successors) |edge| {
+                    if (edge.edge_type == .exception) continue;
+                    if (edge.target != join_id) continue;
+                    if (edge.edge_type == .conditional_false or edge.edge_type == .conditional_true) {
+                        break :blk true;
+                    }
+                }
+                break :blk false;
+            };
+            if (join_pred and join_from_then and !then_cond_to_join and !keep_else_chain and !join_is_terminal) {
                 else_body = &[_]*Stmt{};
                 else_block = null;
                 no_merge = true;
@@ -11027,7 +11160,7 @@ pub const Decompiler = struct {
         }
 
         if (!else_body_moved and !is_elif and else_block != null and else_body.len > 0 and
-            self.bodyEndsTerminal(then_body))
+            self.bodyEndsTerminal(then_body) and !self.bodyEndsTerminal(else_body))
         {
             if (self.if_next == null) {
                 if (else_start) |sid| {
@@ -11055,10 +11188,35 @@ pub const Decompiler = struct {
         if (else_block) |else_id| {
             if (!force_else and !is_elif and else_body.len > 0) {
                 var join = try self.reachesBlock(then_block, else_id, pattern.condition_block);
-                if (!join and pattern.then_block != then_block) {
+                if (!join and pattern.then_block != then_block and pattern.then_block != else_id) {
                     join = try self.reachesBlock(pattern.then_block, else_id, pattern.condition_block);
                 }
-                if (join) {
+                const keep_else_chain = blk: {
+                    const merge_id = merge_block orelse break :blk false;
+                    const else_pat = self.analyzer.detectPatternNoTry(else_id) catch break :blk false;
+                    if (else_pat != .if_stmt) break :blk false;
+                    const else_if = else_pat.if_stmt;
+                    if (else_if.merge_block == null) break :blk false;
+                    break :blk else_if.merge_block.? == merge_id;
+                };
+                const else_is_terminal = else_id < self.cfg.blocks.len and self.isTerminalBlock(else_id);
+                const then_cond_to_else = blk: {
+                    const then_id = pattern.then_block;
+                    if (then_id >= self.cfg.blocks.len) break :blk false;
+                    const then_blk = &self.cfg.blocks[then_id];
+                    if (condBlockHasPrelude(then_blk)) break :blk false;
+                    const then_term = then_blk.terminator() orelse break :blk false;
+                    if (!ctrl.Analyzer.isCondJump(then_term.opcode)) break :blk false;
+                    for (then_blk.successors) |edge| {
+                        if (edge.edge_type == .exception) continue;
+                        if (edge.target != else_id) continue;
+                        if (edge.edge_type == .conditional_false or edge.edge_type == .conditional_true) {
+                            break :blk true;
+                        }
+                    }
+                    break :blk false;
+                };
+                if (join and !keep_else_chain and !else_is_terminal and !then_cond_to_else) {
                     else_body = &[_]*Stmt{};
                     else_body_moved = true;
                     else_block = null;
@@ -11468,7 +11626,9 @@ pub const Decompiler = struct {
             }
         }
 
-        if (else_body.len > 0 and else_block != null and !force_else and merge_block == null) {
+        const merge_is_exit = merge_block != null and merge_block.? >= self.cfg.blocks.len;
+        const else_is_merge = merge_block != null and else_block != null and merge_block.? == else_block.?;
+        if (else_body.len > 0 and else_block != null and !force_else and (merge_block == null or merge_is_exit or else_is_merge)) {
             const else_is_if = else_body.len == 1 and else_body[0].* == .if_stmt;
             const then_has_uncond_jump = blk: {
                 if (then_block >= self.cfg.blocks.len) break :blk false;
@@ -11482,8 +11642,7 @@ pub const Decompiler = struct {
                 if (cfg_mod.jumpTargetIfJumpOnly(self.cfg, then_block, false) != null) break :blk true;
                 break :blk false;
             };
-            const else_term = try self.branchIsTerminal(else_block.?);
-            if (!else_is_if and !then_has_uncond_jump and try self.branchIsTerminal(then_block) and !else_term) {
+            if (!else_is_if and !then_has_uncond_jump and self.bodyEndsTerminal(then_body)) {
                 try self.emitDecisionTrace(pattern.condition_block, "if_drop_else_terminal_then", condition);
                 const tail_next = else_block.?;
                 else_body = &[_]*Stmt{};
@@ -11589,7 +11748,7 @@ pub const Decompiler = struct {
 
         if (self.if_tail == null and !is_elif and merge_block == null and
             then_body.len == 1 and else_body.len == 1 and
-            then_body[0].* == .return_stmt and else_body[0].* == .return_stmt and !self.hasTailRetNone())
+            then_body[0].* == .return_stmt and else_body[0].* == .return_stmt)
         {
             try self.emitDecisionTrace(pattern.condition_block, "if_tail_return_pair", condition);
             self.if_tail = else_body;
@@ -11613,7 +11772,17 @@ pub const Decompiler = struct {
             }
         }
 
-        if (else_body_decompiled and !else_body_moved and else_body.len == 0) {
+        if (else_block) |else_id| {
+            if (self.if_next != null and self.if_next.? == else_id and
+                else_body.len == 1 and self.stmtIsTerminal(else_body[0]))
+            {
+                else_body = &[_]*Stmt{};
+                else_block = null;
+                else_body_moved = true;
+            }
+        }
+
+        if (else_body_decompiled and else_body.len == 0 and !then_body_dropped) {
             if (self.if_next) |next| {
                 if (else_reach) |reach| {
                     if (next < self.cfg.blocks.len and reach.isSet(@intCast(next))) {
@@ -11656,6 +11825,32 @@ pub const Decompiler = struct {
         stmt.if_stmt.no_merge = no_merge;
 
         return stmt;
+    }
+
+    fn decompileBranchRangeTag(
+        self: *Decompiler,
+        start_block: u32,
+        end_block: ?u32,
+        base_vals: []const StackValue,
+        skip_first: usize,
+        comptime tag: []const u8,
+    ) DecompileError![]const *Stmt {
+        if (self.trace_blocks and self.trace_file != null) {
+            var limit = end_block orelse @as(u32, @intCast(self.cfg.blocks.len));
+            if (self.br_limit) |lim| {
+                if (lim < limit) limit = lim;
+            }
+            const ev = BranchRangeTrace{
+                .kind = "branch_range",
+                .tag = tag,
+                .start = start_block,
+                .end = limit,
+                .base_len = @intCast(base_vals.len),
+                .skip_first = @intCast(skip_first),
+            };
+            try self.writeTrace(ev);
+        }
+        return self.decompileBranchRange(start_block, end_block, base_vals, skip_first);
     }
 
     fn decompileBranchRange(
@@ -13716,7 +13911,7 @@ pub const Decompiler = struct {
                         false,
                     );
                 }
-                break :blk try self.decompileBranchRange(start, else_end, &.{}, 0);
+                break :blk try self.decompileBranchRangeTag(start, else_end, &.{}, 0, "try_else");
             }
             break :blk try self.decompileStructuredRange(start, else_end);
         } else &[_]*Stmt{};
@@ -18014,6 +18209,15 @@ pub const Decompiler = struct {
             else
                 try self.analyzer.detectPattern(block_idx);
 
+            if (self.trace_blocks and self.trace_file != null) {
+                const ev = PatternTrace{
+                    .kind = "pattern",
+                    .block = block_idx,
+                    .pat = @tagName(pattern),
+                };
+                try self.writeTrace(ev);
+            }
+
             switch (pattern) {
                 .if_stmt => |p| {
                     const cond_block = &self.cfg.blocks[p.condition_block];
@@ -18081,10 +18285,7 @@ pub const Decompiler = struct {
                         continue;
                     }
 
-                    const stmt = if (skip_cond > 0)
-                        try self.decompileIfWithSkip(p, skip_cond)
-                    else
-                        try self.decompileIf(p);
+                    const stmt = try self.decompileIfImplTag(p, skip_cond, false, "range");
                     if (stmt) |s| {
                         try stmts.append(a, s);
                         try self.appendIfTail(&stmts, a);
@@ -18140,6 +18341,15 @@ pub const Decompiler = struct {
                     }
                     try self.emitForPrelude(p, &stmts, a);
                     const stmt = try self.decompileFor(p);
+                    if (self.trace_blocks and self.trace_file != null) {
+                        const ev = PatternResultTrace{
+                            .kind = "pattern_result",
+                            .block = block_idx,
+                            .pat = "for_loop",
+                            .emitted = stmt != null,
+                        };
+                        try self.writeTrace(ev);
+                    }
                     if (stmt) |s| {
                         try stmts.append(a, s);
                     }
@@ -19149,10 +19359,7 @@ pub const Decompiler = struct {
                     }
                 }
                 if (stmt == null) {
-                    stmt = if (skip_cond > 0)
-                        try self.decompileIfWithSkip(if_pat, skip_cond)
-                    else
-                        try self.decompileIf(if_pat);
+                    stmt = try self.decompileIfImplTag(if_pat, skip_cond, false, "loop");
                 }
                 if (stmt) |s| {
                     var stmts: std.ArrayListUnmanaged(*Stmt) = .{};
@@ -20566,7 +20773,7 @@ pub const Decompiler = struct {
         var else_body: []const *Stmt = &.{};
         if (pattern.else_block) |else_id| {
             const end_block: ?u32 = if (pattern.exit_block > else_id) pattern.exit_block else null;
-            else_body = try self.decompileBranchRange(else_id, end_block, &.{}, 0);
+            else_body = try self.decompileBranchRangeTag(else_id, end_block, &.{}, 0, "for_else");
         }
         const stmt = try a.create(Stmt);
         stmt.* = .{ .for_stmt = .{
@@ -23671,7 +23878,7 @@ pub const Decompiler = struct {
                     );
                 }
                 const else_end = try self.branchEnd(else_id, null);
-                break :blk try self.decompileBranchRange(else_id, else_end, &.{}, 0);
+                break :blk try self.decompileBranchRangeTag(else_id, else_end, &.{}, 0, "loop_else_cont");
             }
             if (is_elif) {
                 const else_pattern = try self.analyzer.detectPattern(else_id);
