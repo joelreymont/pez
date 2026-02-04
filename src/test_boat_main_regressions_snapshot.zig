@@ -163,6 +163,20 @@ test "snapshot if guard prelude 3.9" {
     );
 }
 
+test "snapshot pickle additems 3.9" {
+    try runSnapshot(@src(), "test/corpus/pickle_additems.3.9.pyc",
+        \\[]u8
+        \\  "def load_additems(items, set_obj):
+        \\    if isinstance(set_obj, set):
+        \\        set_obj.update(items)
+        \\    else:
+        \\        add = set_obj.add
+        \\        for item in items:
+        \\            add(item)
+        \\"
+    );
+}
+
 test "snapshot if or not 3.9" {
     try runSnapshot(@src(), "test/corpus/if_or_not.3.9.pyc",
         \\[]u8

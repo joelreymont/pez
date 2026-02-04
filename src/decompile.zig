@@ -5357,6 +5357,41 @@ pub const Decompiler = struct {
         return true;
     }
 
+    fn branchIsTerminal(self: *Decompiler, start: u32) DecompileError!bool {
+        const n = self.cfg.blocks.len;
+        if (start >= n) return true;
+        const state = try self.allocator.alloc(u8, n);
+        defer self.allocator.free(state);
+        @memset(state, 0);
+        return self.branchIsTerminalRec(start, state);
+    }
+
+    fn branchIsTerminalRec(self: *Decompiler, id: u32, state: []u8) bool {
+        if (id >= self.cfg.blocks.len) return true;
+        switch (state[id]) {
+            1 => return false, // cycle
+            2 => return true,
+            3 => return false,
+            else => {},
+        }
+        if (self.isTerminalBlock(id)) {
+            state[id] = 2;
+            return true;
+        }
+        state[id] = 1;
+        const block = &self.cfg.blocks[id];
+        var ok = true;
+        for (block.successors) |edge| {
+            if (edge.edge_type == .exception) continue;
+            if (!self.branchIsTerminalRec(edge.target, state)) {
+                ok = false;
+                break;
+            }
+        }
+        state[id] = if (ok) 2 else 3;
+        return ok;
+    }
+
     fn postDominates(self: *Decompiler, post: u32, node: u32) DecompileError!bool {
         const n = self.cfg.blocks.len;
         if (post >= n or node >= n) return false;
@@ -10184,7 +10219,7 @@ pub const Decompiler = struct {
                 const resolved_else = self.resolveJumpOnlyBlock(else_id);
                 if (resolved_else < self.cfg.blocks.len and
                     self.isTerminalBlock(resolved_else) and
-                    !self.isTerminalBlock(then_block) and
+                    !(try self.branchIsTerminal(then_block)) and
                     !self.isRaiseBlock(resolved_else) and
                     !self.isAssertRaiseBlock(resolved_else))
                 {
@@ -11411,6 +11446,51 @@ pub const Decompiler = struct {
                 then_body_dropped = true;
                 if (self.if_next == null) {
                     self.if_next = then_block;
+                }
+            }
+        }
+
+        if (else_body.len > 0 and self.if_tail == null and else_block != null and merge_block == null) {
+            const else_is_if = else_body.len == 1 and else_body[0].* == .if_stmt;
+            if (!else_is_if) {
+                const then_term = try self.branchIsTerminal(then_block);
+                const else_term = try self.branchIsTerminal(else_block.?);
+                if (then_term and !else_term) {
+                    try self.emitDecisionTrace(pattern.condition_block, "if_guard_terminal_then_branch", condition);
+                    const guard_next = else_block.?;
+                    else_body = &[_]*Stmt{};
+                    else_block = null;
+                    else_body_moved = true;
+                    if (self.if_next == null) {
+                        self.if_next = guard_next;
+                    }
+                }
+            }
+        }
+
+        if (else_body.len > 0 and else_block != null and !force_else and merge_block == null) {
+            const else_is_if = else_body.len == 1 and else_body[0].* == .if_stmt;
+            const then_has_uncond_jump = blk: {
+                if (then_block >= self.cfg.blocks.len) break :blk false;
+                const blk = &self.cfg.blocks[then_block];
+                if (blk.terminator()) |t| {
+                    if (t.isUnconditionalJump()) break :blk true;
+                }
+                for (blk.instructions) |inst| {
+                    if (inst.isUnconditionalJump()) break :blk true;
+                }
+                if (cfg_mod.jumpTargetIfJumpOnly(self.cfg, then_block, false) != null) break :blk true;
+                break :blk false;
+            };
+            const else_term = try self.branchIsTerminal(else_block.?);
+            if (!else_is_if and !then_has_uncond_jump and try self.branchIsTerminal(then_block) and !else_term) {
+                try self.emitDecisionTrace(pattern.condition_block, "if_drop_else_terminal_then", condition);
+                const tail_next = else_block.?;
+                else_body = &[_]*Stmt{};
+                else_block = null;
+                else_body_moved = true;
+                if (self.if_next == null) {
+                    self.if_next = tail_next;
                 }
             }
         }
