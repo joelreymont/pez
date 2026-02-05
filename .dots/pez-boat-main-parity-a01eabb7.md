@@ -6,7 +6,9 @@ issue-type: task
 created-at: "\"2026-02-05T09:47:22.814382+01:00\""
 ---
 
-Full context: boat_main (py3.9) suite run: /tmp/pez-boatmain-suite7.json. Pez: decompile 329/329 OK; compare exact=164 close=48 mismatch=117 error=0 missing_src=0. Decompyle3: decompile 329/329 OK; compare exact=8 mismatch=321 error=0. Pez internal test suite: PASS (incl. prior failures test_listComprehensions.2.7.pyc invalid-free + test_loops2.2.2.pyc hang).
+Full context: boat_main (py3.9) suite run: /tmp/pez-boatmain-suite9.json. Pez: decompile 329/329 OK; compare exact=165 close=47 mismatch=117 error=0 missing_src=0. Decompyle3: decompile 329/329 OK; compare exact=8 mismatch=321 error=0. Pez internal test suite: PASS (incl. prior failures test_listComprehensions.2.7.pyc invalid-free + test_loops2.2.2.pyc hang).
+
+Current target: picamera2/outputs/fileoutput.pyc (<module>.FileOutput.fileoutput index=1). locate: /tmp/pez-fileoutput-fileoutput1-loc.json
 
 Plan:
 1) Always run `python3 tools/compare/compare_suite.py` on boat_main (and any new corpora) after each fix; keep the latest suite JSON under /tmp for triage.

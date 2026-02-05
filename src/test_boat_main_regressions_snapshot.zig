@@ -191,6 +191,19 @@ test "snapshot if or not 3.9" {
     );
 }
 
+test "snapshot if term raise 3.9" {
+    try runSnapshot(@src(), "test/corpus/if_term_raise.3.9.pyc",
+        \\[]u8
+        \\  "import types
+        \\def set_cb(obj, cb):
+        \\    if isinstance(cb, types.FunctionType) or cb is None:
+        \\        obj.cb = cb
+        \\    else:
+        \\        raise RuntimeError('cb must be None or function')
+        \\"
+    );
+}
+
 test "snapshot and chain or 3.9" {
     try runSnapshot(@src(), "test/corpus/and_chain_or.3.9.pyc",
         \\[]u8

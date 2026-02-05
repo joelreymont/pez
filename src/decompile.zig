@@ -10398,13 +10398,37 @@ pub const Decompiler = struct {
                     !self.isAssertRaiseBlock(resolved_else))
                 {
                     if (!force_else) {
-                        const then_falls_through = self.blockFallsThrough(then_block, resolved_else);
-                        const then_reaches_else = try self.reachesBlock(then_block, resolved_else, pattern.condition_block);
-                        if (!then_falls_through and !then_reaches_else) {
-                            if (term) |t| {
-                                const else_is_jump_target = self.elseIsJumpTarget(t.opcode);
-                                if (!guardInvertsCmp(condition, t.opcode, else_is_jump_target)) {
-                                    condition = try self.guardCondForBranch(condition, t.opcode, else_is_jump_target);
+                        if (condition.* == .bool_op and
+                            (condition.bool_op.op == .or_ or condition.bool_op.op == .and_))
+                        {
+                            // Keep explicit else-raise: guard inversion introduces DeMorgan + layout changes.
+                        } else {
+                        // Guard-style inversion swaps bytecode layout (raise-before-then) and breaks parity when
+                        // CPython laid out `then` before the terminal `else` (the common `if cond: then; else: raise` form).
+                        const resolved_then = self.resolveJumpOnlyBlock(then_block);
+                        if (resolved_then < self.cfg.blocks.len and
+                            self.cfg.blocks[resolved_else].start_offset > self.cfg.blocks[resolved_then].start_offset)
+                        {
+                            // Keep the explicit else-raise shape.
+                        } else {
+                            const then_falls_through = self.blockFallsThrough(then_block, resolved_else);
+                            const then_reaches_else = try self.reachesBlock(then_block, resolved_else, pattern.condition_block);
+                            if (!then_falls_through and !then_reaches_else) {
+                                if (term) |t| {
+                                    const else_is_jump_target = self.elseIsJumpTarget(t.opcode);
+                                    if (!guardInvertsCmp(condition, t.opcode, else_is_jump_target)) {
+                                        condition = try self.guardCondForBranch(condition, t.opcode, else_is_jump_target);
+                                        try self.emitDecisionTrace(pattern.condition_block, "if_guard_terminal_else_direct", condition);
+                                        const guard_next = then_block;
+                                        then_block = resolved_else;
+                                        else_block = null;
+                                        is_elif = false;
+                                        inverted = true;
+                                        self.if_next = guard_next;
+                                        guard_block = resolved_else;
+                                    }
+                                } else if (!cmpInvertible(condition)) {
+                                    condition = try self.invertConditionExpr(condition);
                                     try self.emitDecisionTrace(pattern.condition_block, "if_guard_terminal_else_direct", condition);
                                     const guard_next = then_block;
                                     then_block = resolved_else;
@@ -10414,17 +10438,8 @@ pub const Decompiler = struct {
                                     self.if_next = guard_next;
                                     guard_block = resolved_else;
                                 }
-                            } else if (!cmpInvertible(condition)) {
-                                condition = try self.invertConditionExpr(condition);
-                                try self.emitDecisionTrace(pattern.condition_block, "if_guard_terminal_else_direct", condition);
-                                const guard_next = then_block;
-                                then_block = resolved_else;
-                                else_block = null;
-                                is_elif = false;
-                                inverted = true;
-                                self.if_next = guard_next;
-                                guard_block = resolved_else;
                             }
+                        }
                         }
                     }
                 }
@@ -10445,13 +10460,34 @@ pub const Decompiler = struct {
                     (merge_is_then or merge_block == null))
                 {
                     if (!force_else) {
-                        const then_falls_through = self.blockFallsThrough(then_block, resolved_else);
-                        const then_reaches_else = try self.reachesBlock(then_block, resolved_else, pattern.condition_block);
-                        if (!then_falls_through and !then_reaches_else) {
-                            if (term) |t| {
-                                const else_is_jump_target = self.elseIsJumpTarget(t.opcode);
-                                if (!guardInvertsCmp(condition, t.opcode, else_is_jump_target)) {
-                                    condition = try self.guardCondForBranch(condition, t.opcode, else_is_jump_target);
+                        // Same parity constraint as above: only invert into a guard when the terminal raise block
+                        // is laid out before the non-terminal branch in bytecode.
+                        if (resolved_then < self.cfg.blocks.len and
+                            self.cfg.blocks[resolved_else].start_offset > self.cfg.blocks[resolved_then].start_offset)
+                        {
+                            // Keep the explicit else-raise shape.
+                        } else {
+                            const then_falls_through = self.blockFallsThrough(then_block, resolved_else);
+                            const then_reaches_else = try self.reachesBlock(then_block, resolved_else, pattern.condition_block);
+                            if (!then_falls_through and !then_reaches_else) {
+                                if (term) |t| {
+                                    const else_is_jump_target = self.elseIsJumpTarget(t.opcode);
+                                    if (!guardInvertsCmp(condition, t.opcode, else_is_jump_target)) {
+                                        condition = try self.guardCondForBranch(condition, t.opcode, else_is_jump_target);
+                                        try self.emitDecisionTrace(pattern.condition_block, "if_guard_terminal_then", condition);
+                                        const guard_next = then_block;
+                                        then_block = resolved_else;
+                                        else_block = null;
+                                        is_elif = false;
+                                        inverted = true;
+                                        self.if_next = guard_next;
+                                        guard_block = resolved_else;
+                                        if (resolved_else != else_id) {
+                                            try self.consumed.set(self.allocator, else_id);
+                                        }
+                                    }
+                                } else if (!cmpInvertible(condition)) {
+                                    condition = try self.invertConditionExpr(condition);
                                     try self.emitDecisionTrace(pattern.condition_block, "if_guard_terminal_then", condition);
                                     const guard_next = then_block;
                                     then_block = resolved_else;
@@ -10463,19 +10499,6 @@ pub const Decompiler = struct {
                                     if (resolved_else != else_id) {
                                         try self.consumed.set(self.allocator, else_id);
                                     }
-                                }
-                            } else if (!cmpInvertible(condition)) {
-                                condition = try self.invertConditionExpr(condition);
-                                try self.emitDecisionTrace(pattern.condition_block, "if_guard_terminal_then", condition);
-                                const guard_next = then_block;
-                                then_block = resolved_else;
-                                else_block = null;
-                                is_elif = false;
-                                inverted = true;
-                                self.if_next = guard_next;
-                                guard_block = resolved_else;
-                                if (resolved_else != else_id) {
-                                    try self.consumed.set(self.allocator, else_id);
                                 }
                             }
                         }
