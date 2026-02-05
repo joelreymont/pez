@@ -232,6 +232,21 @@ test "snapshot setup annotations prelude 3.9" {
     );
 }
 
+test "snapshot try finally return 3.9" {
+    try runSnapshot(@src(), "test/corpus/try_finally_return.3.9.pyc",
+        \\[]u8
+        \\  "def side_effect() -> None:
+        \\    pass
+        \\def try_finally_return(x):
+        \\    try:
+        \\        return x + 1
+        \\    finally:
+        \\        if x:
+        \\            side_effect()
+        \\"
+    );
+}
+
 test "snapshot loop merge break 3.9" {
     try runSnapshot(@src(), "test/corpus/loop_merge_break.3.9.pyc",
         \\[]u8

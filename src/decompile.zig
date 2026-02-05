@@ -13659,6 +13659,27 @@ pub const Decompiler = struct {
                 if (cur_off < try_off or cur_off >= handler_off) continue;
                 try protected_set.set(self.allocator, cur);
                 const blk = &self.cfg.blocks[cur];
+                // Stop at the end of the try body: after POP_BLOCK, control is no longer
+                // protected by this handler. Without this, try/finally patterns can pull the
+                // normal-finally cleanup blocks (which are laid out before the handler) into
+                // the protected set and we fail to find the post-try entry.
+                var has_pop_block = false;
+                for (blk.instructions) |inst| {
+                    if (inst.opcode == .POP_BLOCK) {
+                        has_pop_block = true;
+                        break;
+                    }
+                }
+                if (has_pop_block) {
+                    var has_exc_to_handler = false;
+                    for (blk.successors) |edge| {
+                        if (edge.edge_type == .exception and handler_set.isSet(edge.target)) {
+                            has_exc_to_handler = true;
+                            break;
+                        }
+                    }
+                    if (has_exc_to_handler) continue;
+                }
                 for (blk.successors) |edge| {
                     if (edge.edge_type == .exception) continue;
                     if (edge.target >= self.cfg.blocks.len) continue;
