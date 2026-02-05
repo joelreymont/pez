@@ -1,9 +1,11 @@
 ---
 title: Update compare docs to uv
-status: open
+status: closed
 priority: 1
 issue-type: task
-created-at: "2026-02-05T20:10:43.959909+01:00"
+created-at: "\"2026-02-05T20:10:43.959909+01:00\""
+closed-at: "2026-02-05T21:00:53.848156+01:00"
+close-reason: docs updated to uv paths and suite18 counts
 blocks:
   - pez-wire-uv-paths-d4ef838b
 ---

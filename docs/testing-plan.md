@@ -55,33 +55,37 @@ External Cross-checks
 ---------------------
 - Parity harness (`tools/parity/run.sh`) runs pez against pycdc, uncompyle6, and decompyle3.
 - decompyle3:
-  - Clone: `gh repo clone rocky/python-decompile3 /tmp/python-decompile3`
-  - Repo: `/tmp/python-decompile3` (keep in sync via `gh repo sync`)
-  - Local snapshot (subset for quick diffs): `refs/python-decompile3/`
-  - Venv (py3.12): `/opt/homebrew/bin/python3.12 -m venv /tmp/decompyle3-venv-312`
-  - xdis (pre-opcode reorg, compatible with decompyle3): `/tmp/decompyle3-venv-312/bin/pip install git+https://github.com/rocky/python-xdis.git@f19046be089a515f2041a14a696774e82851d3c5`
-  - Install: `/tmp/decompyle3-venv-312/bin/pip install -e /tmp/python-decompile3`
-  - Tests: `PYTHON=/tmp/decompyle3-venv-312/bin/python make -C /tmp/python-decompile3 check-3.12`
+  - Clone: `jj git clone https://github.com/rocky/python-decompile3 refs/python-decompile3`
+  - Repo: `/Users/joel/Work/pez/refs/python-decompile3`
+  - Runtime setup:
+    - `uv python install 3.9`
+    - `uv python install 3.12`
+    - `uv venv -p 3.9 /Users/joel/Work/pez/.uv/py39`
+    - `uv venv -p 3.12 /Users/joel/Work/pez/.uv/py312`
+    - `uv pip install -p /Users/joel/Work/pez/.uv/py39 -e /Users/joel/Work/pez/refs/python-decompile3`
+    - `uv pip install -p /Users/joel/Work/pez/.uv/py39 xdis==6.1.7 spark-parser click configobj`
+    - `uv pip install -p /Users/joel/Work/pez/.uv/py312 uncompyle6 decompyle3 xdis`
+  - Tests: `PYTHON=/Users/joel/Work/pez/.uv/py312/bin/python make -C /Users/joel/Work/pez/refs/python-decompile3 check-3.12`
   - Harness:
-    - `/tmp/python-decompile3/test/test_pythonlib.py`
-    - `/tmp/python-decompile3/test/test_pyenvlib.py`
-    - `/tmp/python-decompile3/test/simple-decompile-code-test.py`
-    - `/tmp/python-decompile3/compile_tests`
+    - `/Users/joel/Work/pez/refs/python-decompile3/test/test_pythonlib.py`
+    - `/Users/joel/Work/pez/refs/python-decompile3/test/test_pyenvlib.py`
+    - `/Users/joel/Work/pez/refs/python-decompile3/test/simple-decompile-code-test.py`
+    - `/Users/joel/Work/pez/refs/python-decompile3/compile_tests`
 - External corpora to compare against decompyle3 (3.x only):
-  - `/tmp/python-decompile3/test/bytecode_3.7`
-  - `/tmp/python-decompile3/test/bytecode_3.7pypy`
-  - `/tmp/python-decompile3/test/bytecode_3.8`
-  - `/tmp/python-decompile3/test/bytecode_3.8pypy`
-  - `/tmp/python-decompile3/test/bytecode_pypy37_run`
-  - `/tmp/python-decompile3/test/bytecode_pypy38_run`
-  - `/tmp/python-decompile3/test/bytecompile-tests`
-  - `/tmp/python-decompile3/test/decompyle`
-  - `/tmp/python-decompile3/test/simple_source`
-  - `/tmp/python-decompile3/test/stdlib`
-  - `/tmp/python-decompile3/test/test_one`
+  - `/Users/joel/Work/pez/refs/python-decompile3/test/bytecode_3.7`
+  - `/Users/joel/Work/pez/refs/python-decompile3/test/bytecode_3.7pypy`
+  - `/Users/joel/Work/pez/refs/python-decompile3/test/bytecode_3.8`
+  - `/Users/joel/Work/pez/refs/python-decompile3/test/bytecode_3.8pypy`
+  - `/Users/joel/Work/pez/refs/python-decompile3/test/bytecode_pypy37_run`
+  - `/Users/joel/Work/pez/refs/python-decompile3/test/bytecode_pypy38_run`
+  - `/Users/joel/Work/pez/refs/python-decompile3/test/bytecompile-tests`
+  - `/Users/joel/Work/pez/refs/python-decompile3/test/decompyle`
+  - `/Users/joel/Work/pez/refs/python-decompile3/test/simple_source`
+  - `/Users/joel/Work/pez/refs/python-decompile3/test/stdlib`
+  - `/Users/joel/Work/pez/refs/python-decompile3/test/test_one`
 - Decompyle3 → pez compare helper:
-  - Decompile: `python3 tools/compare/decompyle3_dir.py --decompyle3 /private/tmp/uncompyle6-venv312/bin/decompyle3 --orig-dir /Users/joel/Work/Shakhed/boat_main_extracted_3.9 --out-dir /tmp/decompyle3_boat_src --timeout 120 --out /tmp/decompyle3_boat_decompile.json`
-  - Compare: `python3 tools/compare/compare_dir.py --orig-dir /Users/joel/Work/Shakhed/boat_main_extracted_3.9 --src-dir /tmp/decompyle3_boat_src --py python3.9 --xdis-python /private/tmp/xdis-venv39/bin/python --timeout 120 --out /tmp/decompyle3_boat_compare.json --report-dir /tmp/decompyle3_boat_compare_reports`
+  - Decompile: `python3 tools/compare/decompyle3_dir.py --decompyle3 /Users/joel/Work/pez/.uv/py39/bin/decompyle3 --orig-dir /Users/joel/Work/Shakhed/boat_main_extracted_3.9/PYZ-00.pyz_extracted --out-dir /tmp/decompyle3_boat_src --timeout 120 --out /tmp/decompyle3_boat_decompile.json`
+  - Compare: `python3 tools/compare/compare_dir.py --orig-dir /Users/joel/Work/Shakhed/boat_main_extracted_3.9/PYZ-00.pyz_extracted --src-dir /tmp/decompyle3_boat_src --py /Users/joel/Work/pez/.uv/py39/bin/python --xdis-python /Users/joel/Work/pez/.uv/py39/bin/python --timeout 120 --out /tmp/decompyle3_boat_compare.json --report-dir /tmp/decompyle3_boat_compare_reports`
 - Compare pez output against decompyle3 on shared corpora when diagnosing mismatches.
 
 Next Steps
