@@ -12184,7 +12184,8 @@ pub const Decompiler = struct {
                         (guard.merge_block.? == pattern.exit_block or guard.merge_block.? == exit_resolved);
                     const then_in_loop = self.analyzer.inLoop(guard.then_block, pattern.header_block);
                     const can_merge = (merge_is_then or merge_is_exit or (guard.merge_block == null and else_is_exit)) and then_in_loop;
-                    if (can_merge and else_is_exit) {
+                    const guard_blk = &self.cfg.blocks[guard.condition_block];
+                    if (can_merge and else_is_exit and !condBlockHasPrelude(guard_blk)) {
                         var guard_sim = self.initSim(self.arena.allocator(), self.arena.allocator(), self.code, self.version);
                         defer guard_sim.deinit();
                         if (guard.condition_block < self.stack_in.len) {
@@ -12202,8 +12203,7 @@ pub const Decompiler = struct {
                         {
                             try guard_sim.stack.push(.{ .expr = condition.compare.comparators[0] });
                         }
-                        const guard_block = &self.cfg.blocks[guard.condition_block];
-                        for (guard_block.instructions) |inst| {
+                        for (guard_blk.instructions) |inst| {
                             if (ctrl.Analyzer.isCondJump(inst.opcode)) break;
                             try guard_sim.simulate(inst);
                         }
@@ -13389,6 +13389,33 @@ pub const Decompiler = struct {
                 }
             }
         }
+        // The exception-edge scan above can miss blocks inside the protected region that contain
+        // no potentially-raising instructions (and thus may have no exception successor edges).
+        // Expand the protected set by walking normal/conditional edges within the try's bytecode
+        // region (from try start to first handler start).
+        if (pattern.try_block < self.cfg.blocks.len and handler_start < self.cfg.blocks.len) {
+            const try_off = self.cfg.blocks[pattern.try_block].start_offset;
+            const handler_off = self.cfg.blocks[handler_start].start_offset;
+            scratch.queue.clearRetainingCapacity();
+            try scratch.queue.append(self.allocator, pattern.try_block);
+            while (scratch.queue.pop()) |cur| {
+                if (cur >= self.cfg.blocks.len) continue;
+                const cur_off = self.cfg.blocks[cur].start_offset;
+                if (cur_off < try_off or cur_off >= handler_off) continue;
+                try protected_set.set(self.allocator, cur);
+                const blk = &self.cfg.blocks[cur];
+                for (blk.successors) |edge| {
+                    if (edge.edge_type == .exception) continue;
+                    if (edge.target >= self.cfg.blocks.len) continue;
+                    if (handler_set.isSet(edge.target)) continue;
+                    const tgt_off = self.cfg.blocks[edge.target].start_offset;
+                    if (tgt_off < try_off or tgt_off >= handler_off) continue;
+                    if (!protected_set.isSet(edge.target)) {
+                        try scratch.queue.append(self.allocator, edge.target);
+                    }
+                }
+            }
+        }
         if (visited) |v| {
             for (protected_set.list.items) |bid| {
                 if (bid < self.cfg.blocks.len) {
@@ -13611,6 +13638,53 @@ pub const Decompiler = struct {
                 handler_pop[idx] = scan_block;
                 handler_pop_dom[idx] = try self.postDominates(scan_block, info.body_block);
                 break;
+            }
+        }
+
+        // For `try/except/else` in loops, a reachability-based join can be polluted by loop-back
+        // edges, causing us to treat the else block as the join. If all handlers jump to a
+        // common POP_EXCEPT successor, prefer that as the join block.
+        if (post_try_entry != null and join_block != null and handler_blocks.items.len > 0) {
+            if (join_block.? == post_try_entry.?) {
+                var join_from_handlers: ?u32 = null;
+                var join_conflict = false;
+                for (handler_pop, 0..) |pop_opt, idx| {
+                    if (handler_final.items[idx]) continue;
+                    if (!handler_pop_dom[idx]) {
+                        join_conflict = true;
+                        break;
+                    }
+                    const pb = pop_opt orelse {
+                        join_conflict = true;
+                        break;
+                    };
+                    if (pb >= self.cfg.blocks.len) continue;
+                    const pop_blk = &self.cfg.blocks[pb];
+                    var succ: ?u32 = null;
+                    var multi = false;
+                    for (pop_blk.successors) |edge| {
+                        if (edge.edge_type == .exception) continue;
+                        if (succ != null) {
+                            multi = true;
+                            break;
+                        }
+                        succ = edge.target;
+                    }
+                    if (multi or succ == null) {
+                        join_conflict = true;
+                        break;
+                    }
+                    const resolved = self.resolveJumpOnlyBlock(succ.?);
+                    if (join_from_handlers == null) {
+                        join_from_handlers = resolved;
+                    } else if (join_from_handlers.? != resolved) {
+                        join_conflict = true;
+                        break;
+                    }
+                }
+                if (!join_conflict and join_from_handlers != null and join_from_handlers.? != join_block.?) {
+                    join_block = join_from_handlers;
+                }
             }
         }
 
@@ -19425,11 +19499,13 @@ pub const Decompiler = struct {
                             }
                         }
                     }
-                    // Calculate the minimum end of both if branches to avoid reprocessing
-                    const then_end = try self.branchEnd(if_pat.then_block, null);
+                    // Calculate the minimum end of both if branches to avoid reprocessing.
+                    // Stop at the merge block when known; the shared tail must be decompiled after
+                    // the `if`, not treated as part of either branch.
+                    const then_end = try self.branchEnd(if_pat.then_block, if_pat.merge_block);
                     var min_next = @min(then_end, end);
                     if (if_pat.else_block) |else_id| {
-                        const else_end = try self.branchEnd(else_id, null);
+                        const else_end = try self.branchEnd(else_id, if_pat.merge_block);
                         min_next = @max(min_next, @min(else_end, end));
                     }
                     if (loop_header) |header| {
@@ -22109,8 +22185,12 @@ pub const Decompiler = struct {
                 .slice = key,
                 .ctx = .store,
             } };
-            const stmt = try self.makeAssign(subscript, annotation);
-            try stmts.append(stmts_allocator, stmt);
+            if (try self.tryMakeAugAssign(sim, subscript, annotation, false)) |stmt| {
+                try stmts.append(stmts_allocator, stmt);
+            } else {
+                const stmt = try self.makeAssign(subscript, annotation);
+                try stmts.append(stmts_allocator, stmt);
+            }
         }
     }
 
@@ -23754,6 +23834,38 @@ pub const Decompiler = struct {
         if (else_is_fallthrough) {
             else_is_continuation = true;
         }
+
+        const loop_exit = blk: {
+            if (loop_header >= self.cfg.blocks.len) break :blk null;
+            const header = &self.cfg.blocks[loop_header];
+            var exit_id: ?u32 = null;
+            for (header.successors) |edge| {
+                if (edge.edge_type == .exception) continue;
+                if (edge.target >= self.cfg.blocks.len) continue;
+                if (self.analyzer.inLoop(edge.target, loop_header)) continue;
+                if (exit_id != null) break :blk null; // multiple exits
+                exit_id = edge.target;
+            }
+            if (exit_id) |id| break :blk self.resolveJumpOnlyBlock(id);
+            break :blk null;
+        };
+        const then_is_loop_exit = loop_exit != null and self.resolveJumpOnlyBlock(then_block) == loop_exit.?;
+        const else_is_loop_exit = loop_exit != null and else_block != null and self.resolveJumpOnlyBlock(else_block.?) == loop_exit.?;
+        if (loop_exit != null) {
+            // Consume jump-only successor blocks that just jump to the loop exit. If they remain
+            // unconsumed, they can later show up as stray unconditional `break` statements.
+            for (cond_block.successors) |edge| {
+                if (edge.edge_type == .exception) continue;
+                if (edge.target >= self.cfg.blocks.len) continue;
+                const tgt = edge.target;
+                if (self.resolveJumpOnlyBlock(tgt) != loop_exit.?) continue;
+                if (self.jumpTargetIfJumpOnly(tgt, true) == null) continue;
+                if (self.cfg.blocks[tgt].predecessors.len == 1 and self.cfg.blocks[tgt].predecessors[0] == pattern.condition_block) {
+                    try self.consumed.set(self.allocator, tgt);
+                    visited.set(tgt);
+                }
+            }
+        }
         // Decompile the then body
         var skip_first = false;
         const then_block_ptr = &self.cfg.blocks[then_block];
@@ -23779,6 +23891,11 @@ pub const Decompiler = struct {
         var then_body: []const *Stmt = &[_]*Stmt{};
         if (then_resolved == loop_header) {
             try self.consumed.set(self.allocator, then_block);
+        } else if (then_is_loop_exit) {
+            const br = try self.makeBreak();
+            const body = try a.alloc(*Stmt, 1);
+            body[0] = br;
+            then_body = body;
         } else {
             then_body = if ((then_exit and !then_in_loop) or then_exit_outside) blk: {
                 var end = scoped_body_stop;
@@ -23837,6 +23954,12 @@ pub const Decompiler = struct {
             var skip = false;
             const else_block_ptr = &self.cfg.blocks[else_id];
             var seed_else = legacy_cond and else_block_ptr.instructions.len > 0 and else_block_ptr.instructions[0].opcode == .POP_TOP;
+            if (else_is_loop_exit) {
+                const br = try self.makeBreak();
+                const body = try a.alloc(*Stmt, 1);
+                body[0] = br;
+                break :blk body;
+            }
             const else_break_tgt = self.loopBreakTarget(else_id, loop_header);
             const else_exit_outside = else_in_loop and self.blockExitsLoop(else_id, loop_header) and !else_to_header;
             const else_exit = else_break_tgt != null or self.isTerminalBlock(else_id) or else_exit_outside;
