@@ -1131,6 +1131,7 @@ pub const Decompiler = struct {
     const CondChainOr = struct {
         expr: *Expr,
         else_block: u32,
+        had_inversion: bool,
     };
 
     fn tryCondChainOr(
@@ -1148,6 +1149,7 @@ pub const Decompiler = struct {
         var expr = first_expr;
         var cur = else_block;
         var progressed = false;
+        var had_inversion = false;
 
         while (true) {
             if (cur >= self.cfg.blocks.len) return null;
@@ -1190,6 +1192,7 @@ pub const Decompiler = struct {
             var use_expr = cond2;
             if (f_id.? == then_block and t_id.? != then_block) {
                 use_expr = try self.invertConditionExpr(cond2);
+                had_inversion = true;
                 next = t_id.?;
             } else if (t_id.? == then_block and f_id.? != then_block) {
                 next = f_id.?;
@@ -1204,7 +1207,7 @@ pub const Decompiler = struct {
 
         if (!progressed) return null;
         if (cur == then_block) return null;
-        return .{ .expr = expr, .else_block = cur };
+        return .{ .expr = expr, .else_block = cur, .had_inversion = had_inversion };
     }
 
     /// Try to emit a statement for the given opcode from the current stack state.
@@ -10397,13 +10400,27 @@ pub const Decompiler = struct {
 
         // Collapse short-circuit condition chains that share the same then-block.
         var cond_tree_applied = false;
+        var cond_chain_or_had_inversion = false;
         if (!guard_or_else_applied) {
             if (else_block) |else_id| {
                 if (try self.tryCondChainOr(condition, else_id, then_block)) |chain| {
                     condition = chain.expr;
                     else_block = chain.else_block;
+                    cond_chain_or_had_inversion = chain.had_inversion;
                     is_elif = false;
                     cond_tree_applied = true;
+                    if (cond_chain_or_had_inversion and else_block != null and else_block.? < then_block) {
+                        const else_res = self.resolveJumpOnlyBlock(else_block.?);
+                        if (else_res < self.cfg.blocks.len and !self.isTerminalBlock(else_res)) {
+                            condition = try self.invertConditionExpr(condition);
+                            const swapped_then = then_block;
+                            then_block = else_res;
+                            else_block = swapped_then;
+                            is_elif = false;
+                            force_else = true;
+                            try self.emitDecisionTrace(pattern.condition_block, "if_chain_or_invert_swap", condition);
+                        }
+                    }
                     if (condition.* == .bool_op and condition.bool_op.op == .or_ and else_block != null and else_block.? < then_block) {
                         const else_res = self.resolveJumpOnlyBlock(else_block.?);
                         if (self.isTerminalBlock(else_res)) {
