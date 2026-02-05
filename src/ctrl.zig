@@ -3253,10 +3253,11 @@ pub const Analyzer = struct {
             self.cfg.blocks[cond_block].start_offset
         else
             0;
+        // Merge can be a loop header when an if/else prelude falls into a loop header.
+        // We already reject headers that are not forward progress via `start_offset <= cond_off`.
         if (self.postdom.merge(then_block, else_id)) |merge| {
             if (merge >= self.cfg.blocks.len) return null;
             if (self.cfg.blocks[merge].start_offset <= cond_off) return null;
-            if (self.cfg.blocks[merge].is_loop_header) return null;
             return merge;
         }
 
@@ -3270,7 +3271,7 @@ pub const Analyzer = struct {
             if (is_uncond(term.opcode)) {
                 if (term.jumpTarget(self.cfg.version)) |target_off| {
                     if (self.cfg.blockAtOffset(target_off)) |cand| {
-                        if (cand < self.cfg.blocks.len and self.cfg.blocks[cand].start_offset > cond_off and !self.cfg.blocks[cand].is_loop_header) {
+                        if (cand < self.cfg.blocks.len and self.cfg.blocks[cand].start_offset > cond_off) {
                             if (try self.reachesBlock(else_id, cand, cond_off)) return cand;
                         }
                     }
@@ -3282,7 +3283,7 @@ pub const Analyzer = struct {
             if (is_uncond(term.opcode)) {
                 if (term.jumpTarget(self.cfg.version)) |target_off| {
                     if (self.cfg.blockAtOffset(target_off)) |cand| {
-                        if (cand < self.cfg.blocks.len and self.cfg.blocks[cand].start_offset > cond_off and !self.cfg.blocks[cand].is_loop_header) {
+                        if (cand < self.cfg.blocks.len and self.cfg.blocks[cand].start_offset > cond_off) {
                             if (try self.reachesBlock(then_block, cand, cond_off)) return cand;
                         }
                     }
@@ -3324,7 +3325,6 @@ pub const Analyzer = struct {
             if (!then_exits.isSet(i) or !else_exits.isSet(i)) continue;
             const blk = &self.cfg.blocks[i];
             if (blk.start_offset <= cond_off) continue;
-            if (blk.is_loop_header) continue;
             const off = blk.start_offset;
             if (best_id == null or off < best_off or (off == best_off and i < best_id.?)) {
                 best_id = i;

@@ -12406,6 +12406,67 @@ pub const Decompiler = struct {
             visited.set(pattern.header_block);
         }
 
+        // Fold chained while-header conditions into `while a and b and c:` when the
+        // compiler emits a linear POP_JUMP_IF_FALSE guard chain that all exits to
+        // the loop exit block. This preserves bytecode shape (e.g. stdlib getopt()).
+        if (!exit_is_continue and body_true and !ignore_header_while) {
+            const exit_resolved = if (pattern.exit_block < self.cfg.blocks.len)
+                self.resolveJumpOnlyBlock(pattern.exit_block)
+            else
+                pattern.exit_block;
+
+            var conds: std.ArrayListUnmanaged(*Expr) = .{};
+            defer conds.deinit(self.allocator);
+            try conds.append(self.allocator, condition);
+
+            var prev_id = pattern.header_block;
+            var cur_id = body_block_id;
+            var progressed = false;
+            while (cur_id < self.cfg.blocks.len) {
+                const blk = &self.cfg.blocks[cur_id];
+                if (blk.predecessors.len != 1 or blk.predecessors[0] != prev_id) break;
+                const blk_term = blk.terminator() orelse break;
+                if (!ctrl.Analyzer.isCondJump(blk_term.opcode)) break;
+                if (!self.isFalseJump(blk_term.opcode)) break;
+                if (condBlockHasPrelude(blk)) break;
+
+                const joff = blk_term.jumpTarget(self.cfg.version) orelse break;
+                const jbid = self.cfg.blockAtOffset(joff) orelse break;
+                if (self.resolveJumpOnlyBlock(jbid) != exit_resolved) break;
+
+                var next_id: ?u32 = null;
+                for (blk.successors) |edge| {
+                    if (edge.edge_type == .exception) continue;
+                    const succ_res = self.resolveJumpOnlyBlock(edge.target);
+                    if (succ_res == exit_resolved) continue;
+                    if (next_id != null) {
+                        next_id = null;
+                        break;
+                    }
+                    next_id = edge.target;
+                }
+                if (next_id == null) break;
+
+                const ci = try self.conditionFromHeader(blk);
+                var cexpr = ci.expr;
+                cexpr = try self.guardCondForBranch(cexpr, blk_term.opcode, jbid == next_id.?);
+                try conds.append(self.allocator, cexpr);
+                visited.set(cur_id);
+
+                progressed = true;
+                prev_id = cur_id;
+                cur_id = next_id.?;
+            }
+
+            if (progressed and conds.items.len > 1) {
+                const values = try a.dupe(*Expr, conds.items);
+                const combined = try a.create(Expr);
+                combined.* = .{ .bool_op = .{ .op = .and_, .values = values } };
+                condition = combined;
+                body_block_id = cur_id;
+            }
+        }
+
         var skip_first = false;
         const term = header.terminator();
         const legacy_cond = if (term) |t| t.opcode == .JUMP_IF_FALSE or t.opcode == .JUMP_IF_TRUE else false;
@@ -12463,6 +12524,7 @@ pub const Decompiler = struct {
         body = try self.foldTailElseBreak(body);
         body = try self.foldTailContinueBreakDeep(body);
         body = try self.foldTailOrBreak(body);
+        body = try self.trimTailContinue(body);
 
         var header_stmts: std.ArrayListUnmanaged(*Stmt) = .{};
         errdefer header_stmts.deinit(a);
@@ -12890,6 +12952,21 @@ pub const Decompiler = struct {
         std.mem.copyForwards(*Stmt, new_body[0 .. body.len - 2], body[0 .. body.len - 2]);
         new_body[body.len - 2] = merged;
         return new_body;
+    }
+
+    fn trimTailContinue(self: *Decompiler, body: []const *Stmt) DecompileError![]const *Stmt {
+        _ = self;
+        if (body.len == 0) return body;
+        const tail = body[body.len - 1];
+        if (tail.* != .if_stmt) return body;
+        const ifs = &tail.if_stmt;
+        if (ifs.body.len > 0 and ifs.body[ifs.body.len - 1].* == .continue_stmt) {
+            ifs.body = ifs.body[0 .. ifs.body.len - 1];
+        }
+        if (ifs.else_body.len > 0 and ifs.else_body[ifs.else_body.len - 1].* == .continue_stmt) {
+            ifs.else_body = ifs.else_body[0 .. ifs.else_body.len - 1];
+        }
+        return body;
     }
 
     fn decompileLoopHeader(self: *Decompiler, header: u32) DecompileError!?PatternResult {
@@ -26250,8 +26327,8 @@ pub const Decompiler = struct {
                     prev_arg = inst.arg;
                 }
 
-                // Python 3.12+: if consts[0] is string but never loaded, it's the docstring
-                if (!has_load_const_0 and self.version.gte(3, 11)) {
+                // Function docstrings live in co_consts[0] and are not loaded by bytecode.
+                if (!has_load_const_0) {
                     is_docstring = true;
                 }
 
