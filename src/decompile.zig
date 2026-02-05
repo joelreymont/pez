@@ -209,6 +209,7 @@ fn rewriteFunctionStmts(decompiler: *Decompiler, stmts: []const *Stmt) Decompile
     out = try decompiler.rewriteLoopGuardElseDeep(a, out);
     out = try decompiler.rewriteWhileHeadReturnDeep(a, out);
     out = try decompiler.rewriteGuardRetDeep(a, out);
+    out = try decompiler.rewriteTryCleanupPairDeep(a, out);
     out = try decompiler.trimTailElseRetNone(out);
     return trimTrailingReturnNone(out);
 }
@@ -223,6 +224,7 @@ fn rewriteModuleStmts(decompiler: *Decompiler, stmts: []const *Stmt) DecompileEr
     out = try decompiler.rewriteLoopGuardElseDeep(a, out);
     out = try decompiler.rewriteWhileHeadReturnDeep(a, out);
     out = try decompiler.rewriteGuardRetDeep(a, out);
+    out = try decompiler.rewriteTryCleanupPairDeep(a, out);
     // Control-flow rewrites can change bytecode parity.
     out = try decompiler.trimPostTerminalCleanupDeep(a, out);
     return out;
@@ -6843,6 +6845,181 @@ pub const Decompiler = struct {
         }
 
         return try self.rewriteGuardRetList(allocator, stmts);
+    }
+
+    fn rewriteTryCleanupPairList(
+        self: *Decompiler,
+        allocator: Allocator,
+        stmts: []const *Stmt,
+    ) DecompileError![]const *Stmt {
+        if (stmts.len < 3) return stmts;
+        var out: std.ArrayListUnmanaged(*Stmt) = .{};
+        errdefer out.deinit(allocator);
+        var changed = false;
+        var i: usize = 0;
+        while (i < stmts.len) {
+            if (i + 2 < stmts.len) {
+                if (self.cleanupPairName(stmts[i + 1 .. i + 3])) |cleanup_name| {
+                    if (self.stmtBindsExceptName(stmts[i], cleanup_name)) {
+                        try out.append(allocator, stmts[i]);
+                        i += 3;
+                        changed = true;
+                        continue;
+                    }
+                }
+            }
+            if (i + 2 < stmts.len and stmts[i].* == .try_stmt) {
+                if (self.cleanupPairName(stmts[i + 1 .. i + 3]) != null) {
+                    try out.append(allocator, stmts[i]);
+                    i += 3;
+                    changed = true;
+                    continue;
+                }
+            }
+            try out.append(allocator, stmts[i]);
+            i += 1;
+        }
+        if (!changed) {
+            out.deinit(allocator);
+            return stmts;
+        }
+        return out.toOwnedSlice(allocator);
+    }
+
+    fn stmtBindsExceptName(self: *Decompiler, stmt: *const Stmt, name: []const u8) bool {
+        switch (stmt.*) {
+            .try_stmt => |ts| {
+                for (ts.handlers) |h| {
+                    if (h.name) |hn| {
+                        if (std.mem.eql(u8, hn, name)) return true;
+                    }
+                    for (h.body) |s| {
+                        if (self.stmtBindsExceptName(s, name)) return true;
+                    }
+                }
+                for (ts.body) |s| {
+                    if (self.stmtBindsExceptName(s, name)) return true;
+                }
+                for (ts.else_body) |s| {
+                    if (self.stmtBindsExceptName(s, name)) return true;
+                }
+                for (ts.finalbody) |s| {
+                    if (self.stmtBindsExceptName(s, name)) return true;
+                }
+                return false;
+            },
+            .while_stmt => |ws| {
+                for (ws.body) |s| {
+                    if (self.stmtBindsExceptName(s, name)) return true;
+                }
+                for (ws.else_body) |s| {
+                    if (self.stmtBindsExceptName(s, name)) return true;
+                }
+                return false;
+            },
+            .for_stmt => |fs| {
+                for (fs.body) |s| {
+                    if (self.stmtBindsExceptName(s, name)) return true;
+                }
+                for (fs.else_body) |s| {
+                    if (self.stmtBindsExceptName(s, name)) return true;
+                }
+                return false;
+            },
+            .if_stmt => |ifs| {
+                for (ifs.body) |s| {
+                    if (self.stmtBindsExceptName(s, name)) return true;
+                }
+                for (ifs.else_body) |s| {
+                    if (self.stmtBindsExceptName(s, name)) return true;
+                }
+                return false;
+            },
+            .with_stmt => |ws| {
+                for (ws.body) |s| {
+                    if (self.stmtBindsExceptName(s, name)) return true;
+                }
+                return false;
+            },
+            .match_stmt => |ms| {
+                for (ms.cases) |c| {
+                    for (c.body) |s| {
+                        if (self.stmtBindsExceptName(s, name)) return true;
+                    }
+                }
+                return false;
+            },
+            .function_def => |fd| {
+                for (fd.body) |s| {
+                    if (self.stmtBindsExceptName(s, name)) return true;
+                }
+                return false;
+            },
+            .class_def => |cd| {
+                for (cd.body) |s| {
+                    if (self.stmtBindsExceptName(s, name)) return true;
+                }
+                return false;
+            },
+            else => return false,
+        }
+    }
+
+    fn rewriteTryCleanupPairDeep(
+        self: *Decompiler,
+        allocator: Allocator,
+        stmts: []const *Stmt,
+    ) DecompileError![]const *Stmt {
+        for (stmts) |stmt| {
+            switch (stmt.*) {
+                .function_def => |*f| {
+                    f.body = try self.rewriteTryCleanupPairDeep(allocator, f.body);
+                },
+                .class_def => |*c| {
+                    c.body = try self.rewriteTryCleanupPairDeep(allocator, c.body);
+                },
+                .for_stmt => |*f| {
+                    f.body = try self.rewriteTryCleanupPairDeep(allocator, f.body);
+                    f.else_body = try self.rewriteTryCleanupPairDeep(allocator, f.else_body);
+                },
+                .while_stmt => |*w| {
+                    w.body = try self.rewriteTryCleanupPairDeep(allocator, w.body);
+                    w.else_body = try self.rewriteTryCleanupPairDeep(allocator, w.else_body);
+                },
+                .if_stmt => |*ifs| {
+                    ifs.body = try self.rewriteTryCleanupPairDeep(allocator, ifs.body);
+                    ifs.else_body = try self.rewriteTryCleanupPairDeep(allocator, ifs.else_body);
+                },
+                .with_stmt => |*w| {
+                    w.body = try self.rewriteTryCleanupPairDeep(allocator, w.body);
+                },
+                .try_stmt => |*t| {
+                    t.body = try self.rewriteTryCleanupPairDeep(allocator, t.body);
+                    t.else_body = try self.rewriteTryCleanupPairDeep(allocator, t.else_body);
+                    t.finalbody = try self.rewriteTryCleanupPairDeep(allocator, t.finalbody);
+                    if (t.handlers.len > 0) {
+                        const handlers = try allocator.alloc(ast.ExceptHandler, t.handlers.len);
+                        for (t.handlers, 0..) |h, hidx| {
+                            handlers[hidx] = h;
+                            handlers[hidx].body = try self.rewriteTryCleanupPairDeep(allocator, h.body);
+                        }
+                        t.handlers = handlers;
+                    }
+                },
+                .match_stmt => |*m| {
+                    if (m.cases.len > 0) {
+                        const cases = try allocator.alloc(ast.MatchCase, m.cases.len);
+                        for (m.cases, 0..) |c, cidx| {
+                            cases[cidx] = c;
+                            cases[cidx].body = try self.rewriteTryCleanupPairDeep(allocator, c.body);
+                        }
+                        m.cases = cases;
+                    }
+                },
+                else => {},
+            }
+        }
+        return try self.rewriteTryCleanupPairList(allocator, stmts);
     }
 
     fn rewriteTerminalElseList(
