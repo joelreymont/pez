@@ -207,6 +207,7 @@ fn rewriteFunctionStmts(decompiler: *Decompiler, stmts: []const *Stmt) Decompile
     var out = stmts;
     out = try decompiler.rewriteRetRaiseDeep(a, out);
     out = try decompiler.rewriteLoopGuardElseDeep(a, out);
+    out = try decompiler.rewriteWhileHeadReturnDeep(a, out);
     out = try decompiler.rewriteGuardRetDeep(a, out);
     out = try decompiler.trimTailElseRetNone(out);
     return trimTrailingReturnNone(out);
@@ -220,6 +221,7 @@ fn rewriteModuleStmts(decompiler: *Decompiler, stmts: []const *Stmt) DecompileEr
     out = try decompiler.mergeImportFromGroupsDeep(a, out);
     out = try decompiler.rewriteRetRaiseDeep(a, out);
     out = try decompiler.rewriteLoopGuardElseDeep(a, out);
+    out = try decompiler.rewriteWhileHeadReturnDeep(a, out);
     out = try decompiler.rewriteGuardRetDeep(a, out);
     // Control-flow rewrites can change bytecode parity.
     out = try decompiler.trimPostTerminalCleanupDeep(a, out);
@@ -11496,7 +11498,7 @@ pub const Decompiler = struct {
                 }
                 break :blk false;
             };
-            if (join_pred and join_from_then and !then_cond_to_join and !keep_else_chain and !join_is_terminal) {
+            if (join_pred and join_from_then and !then_cond_to_join and !keep_else_chain and !join_is_terminal and !cond_chain_then) {
                 else_body = &[_]*Stmt{};
                 else_block = null;
                 no_merge = true;
@@ -11564,7 +11566,7 @@ pub const Decompiler = struct {
                     }
                     break :blk false;
                 };
-                if (join and !keep_else_chain and !else_is_terminal and !then_cond_to_else) {
+                if (join and !keep_else_chain and !else_is_terminal and !then_cond_to_else and !cond_chain_then) {
                     else_body = &[_]*Stmt{};
                     else_body_moved = true;
                     else_block = null;
@@ -12851,9 +12853,7 @@ pub const Decompiler = struct {
         if (pattern.exit_block < self.cfg.blocks.len) {
             const exit_block = &self.cfg.blocks[pattern.exit_block];
             // Process exit block as guard if header has prelude OR exit block has content
-            const exit_terminal = self.isTerminalBlock(pattern.exit_block);
-            const should_process = condBlockHasPrelude(header) or
-                (exitBlockHasContent(exit_block) and (!exit_terminal or !body_true));
+            const should_process = condBlockHasPrelude(header) or exitBlockHasContent(exit_block);
             if (should_process and exit_block.predecessors.len == 1 and exit_block.predecessors[0] == pattern.header_block) {
                 var has_cond = false;
                 for (exit_block.instructions) |inst| {

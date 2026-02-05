@@ -827,12 +827,11 @@ test "snapshot loop guard return 3.9" {
         \\  "def f(data):
         \\    out = []
         \\    i = 0
-        \\    while True:
-        \\        if data[i] == 0:
-        \\            out.append(i)
-        \\            return out
+        \\    while data[i] != 0:
         \\        out.append(data[i])
         \\        i += 1
+        \\    out.append(i)
+        \\    return out
         \\"
     );
 }
@@ -1360,16 +1359,15 @@ test "snapshot while head return 3.9" {
     try runSnapshot(@src(), "test/corpus/while_head_return.3.9.pyc",
         \\[]u8
         \\  "def while_head_return(fields, sparse, buf, read, tell):
-        \\    while True:
-        \\        if len(sparse) >= fields * 2:
-        \\            pos = tell()
-        \\            return (pos, list(zip(sparse[::2], sparse[1::2])))
+        \\    while len(sparse) < fields * 2:
         \\        if b"""
-        \\""" not in buf:
+\\""" not in buf:
         \\            buf += read()
         \\        n, buf = buf.split(b"""
-        \\""", 1)
+\\""", 1)
         \\        sparse.append(int(n))
+        \\    pos = tell()
+        \\    return (pos, list(zip(sparse[::2], sparse[1::2])))
         \\"
     );
 }
