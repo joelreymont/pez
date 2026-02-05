@@ -11001,6 +11001,21 @@ pub const Decompiler = struct {
             }
         }
 
+        // Only render `elif` when the else-head `if` shares our merge. If the else-head merges
+        // earlier, it has an "else tail" that must stay nested under `else:` for parity.
+        if (is_elif and merge_block != null and else_block != null) {
+            const else_id = else_block.?;
+            const else_pat = try self.analyzer.detectPatternNoTry(else_id);
+            if (else_pat != .if_stmt) {
+                is_elif = false;
+            } else {
+                const elif_if = else_pat.if_stmt;
+                if (elif_if.merge_block) |elif_merge| {
+                    if (elif_merge != merge_block.?) is_elif = false;
+                }
+            }
+        }
+
         // Decompile the else body
         var else_start: ?u32 = null;
         var else_end: ?u32 = null;
