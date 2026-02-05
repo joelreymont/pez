@@ -11717,6 +11717,37 @@ pub const Decompiler = struct {
             self.if_next = next;
         }
 
+        const inner_loop: ?u32 = blk: {
+            if (self.loop_depth == 0) break :blk null;
+            const loops = self.analyzer.findEnclosingLoops(pattern.condition_block);
+            if (loops.len == 0) break :blk null;
+            break :blk loops[loops.len - 1];
+        };
+        if (inner_loop) |header_id| {
+            if (self.loopBlockLeadsToBreak(then_block, header_id)) {
+                if (then_body.len == 0 or !self.bodyEndsLoopTerminal(then_body)) {
+                    const br = try self.makeBreak();
+                    const body = try a.alloc(*Stmt, then_body.len + 1);
+                    if (then_body.len > 0) {
+                        std.mem.copyForwards(*Stmt, body[0..then_body.len], then_body);
+                    }
+                    body[then_body.len] = br;
+                    then_body = body;
+                }
+            }
+            if (else_block != null and self.loopBlockLeadsToBreak(else_block.?, header_id)) {
+                if (else_body.len == 0 or !self.bodyEndsLoopTerminal(else_body)) {
+                    const br = try self.makeBreak();
+                    const body = try a.alloc(*Stmt, else_body.len + 1);
+                    if (else_body.len > 0) {
+                        std.mem.copyForwards(*Stmt, body[0..else_body.len], else_body);
+                    }
+                    body[else_body.len] = br;
+                    else_body = body;
+                }
+            }
+        }
+
         if (self.loop_depth > 0 and self.if_tail == null and
             else_body.len == 1 and else_body[0].* == .return_stmt and
             self.bodyEndsTerminal(then_body))
@@ -11744,6 +11775,14 @@ pub const Decompiler = struct {
                     }
                 }
             }
+        }
+
+        if (inner_loop != null and self.if_tail == null and !in_elif_chain and else_body.len > 0 and self.bodyEndsLoopTerminal(then_body)) {
+            self.if_tail = else_body;
+            else_body = &[_]*Stmt{};
+            else_body_moved = true;
+            no_merge = true;
+            self.if_next = null;
         }
 
         if (self.if_tail == null and !is_elif and merge_block == null and
@@ -12065,6 +12104,9 @@ pub const Decompiler = struct {
 
     /// Decompile a while loop pattern.
     fn decompileWhile(self: *Decompiler, pattern: ctrl.WhilePattern) DecompileError!?*Stmt {
+        self.loop_depth += 1;
+        defer self.loop_depth -= 1;
+        if (self.loop_depth > 128) return null;
         self.loop_next = null;
         const header = &self.cfg.blocks[pattern.header_block];
         var body_true = true;
@@ -12333,6 +12375,11 @@ pub const Decompiler = struct {
             }
         }
 
+        body = try self.foldTailContinueGuard(body);
+        body = try self.foldTailElseBreak(body);
+        body = try self.foldTailContinueBreakDeep(body);
+        body = try self.foldTailOrBreak(body);
+
         var header_stmts: std.ArrayListUnmanaged(*Stmt) = .{};
         errdefer header_stmts.deinit(a);
         var skip_first_store = false;
@@ -12567,6 +12614,198 @@ pub const Decompiler = struct {
         }
 
         return stmt;
+    }
+
+    fn foldTailContinueGuard(self: *Decompiler, body: []const *Stmt) DecompileError![]const *Stmt {
+        // Bytecode-exactness: prefer `if not cond: <tail>` over `if cond: continue; <tail>`
+        // when the loop tail is a single `if ...: raise ...` statement. This matches CPython's
+        // more compact jump shape (single POP_JUMP_IF_TRUE to header) for patterns like
+        // serialposix.Serial.write.
+        if (body.len < 2) return body;
+        const cont_stmt = body[body.len - 2];
+        const tail_stmt = body[body.len - 1];
+        if (cont_stmt.* != .if_stmt) return body;
+        if (tail_stmt.* != .if_stmt) return body;
+
+        const cont_if = &cont_stmt.if_stmt;
+        const tail_if = &tail_stmt.if_stmt;
+        if (cont_if.else_body.len != 0) return body;
+        if (cont_if.body.len != 1 or cont_if.body[0].* != .continue_stmt) return body;
+        if (tail_if.else_body.len != 0) return body;
+        if (tail_if.body.len != 1 or tail_if.body[0].* != .raise_stmt) return body;
+
+        cont_if.condition = try self.invertConditionExpr(cont_if.condition);
+        cont_if.body = body[body.len - 1 .. body.len];
+        return body[0 .. body.len - 1];
+    }
+
+    fn condInvertible(self: *Decompiler, expr: *const Expr) bool {
+        _ = self;
+        return switch (expr.*) {
+            .unary_op => expr.unary_op.op == .not_,
+            .bool_op => expr.bool_op.op == .and_ or expr.bool_op.op == .or_,
+            .compare => cmpInvertible(expr),
+            else => false,
+        };
+    }
+
+    fn foldTailElseBreak(self: *Decompiler, body: []const *Stmt) DecompileError![]const *Stmt {
+        // Bytecode-exactness: prefer early-break guards over `if cond: ... else: break` at
+        // the tail of a loop body. CPython tends to emit shorter jump shapes when the `break`
+        // is its own guard statement.
+        if (body.len == 0) return body;
+        const tail = body[body.len - 1];
+        if (tail.* != .if_stmt) return body;
+        const ifs = &tail.if_stmt;
+        if (ifs.body.len == 0) return body;
+        if (ifs.else_body.len != 1 or ifs.else_body[0].* != .break_stmt) return body;
+        if (!self.condInvertible(ifs.condition)) return body;
+
+        const a = self.arena.allocator();
+        const br = ifs.else_body[0];
+
+        const br_body = try a.alloc(*Stmt, 1);
+        br_body[0] = br;
+
+        const guard = try a.create(Stmt);
+        guard.* = .{ .if_stmt = .{
+            .condition = try self.invertConditionExpr(ifs.condition),
+            .body = br_body,
+            .else_body = &.{},
+        } };
+
+        const new_body = try a.alloc(*Stmt, body.len - 1 + 1 + ifs.body.len);
+        std.mem.copyForwards(*Stmt, new_body[0 .. body.len - 1], body[0 .. body.len - 1]);
+        new_body[body.len - 1] = guard;
+        std.mem.copyForwards(*Stmt, new_body[body.len ..], ifs.body);
+        return new_body;
+    }
+
+    fn foldTailContinueBreak(self: *Decompiler, body: []const *Stmt) DecompileError![]const *Stmt {
+        // Bytecode-exactness: prefer `if not cond: break` over `if cond: continue; break`.
+        if (body.len < 2) return body;
+        const cont_stmt = body[body.len - 2];
+        const br_stmt = body[body.len - 1];
+        if (cont_stmt.* != .if_stmt or br_stmt.* != .break_stmt) return body;
+        const ifs = &cont_stmt.if_stmt;
+        if (ifs.else_body.len != 0) return body;
+        if (ifs.body.len != 1 or ifs.body[0].* != .continue_stmt) return body;
+
+        ifs.condition = try self.invertConditionExpr(ifs.condition);
+        ifs.body = body[body.len - 1 .. body.len];
+        return body[0 .. body.len - 1];
+    }
+
+    fn foldTailContinueBreakDeep(self: *Decompiler, body: []const *Stmt) DecompileError![]const *Stmt {
+        const out = try self.foldTailContinueBreak(body);
+        for (out) |stmt| {
+            switch (stmt.*) {
+                .if_stmt => {
+                    const ifs = &stmt.if_stmt;
+                    ifs.body = try self.foldTailContinueBreakDeep(ifs.body);
+                    ifs.else_body = try self.foldTailContinueBreakDeep(ifs.else_body);
+                },
+                .for_stmt => {
+                    const fs = &stmt.for_stmt;
+                    fs.body = try self.foldTailContinueBreakDeep(fs.body);
+                    fs.else_body = try self.foldTailContinueBreakDeep(fs.else_body);
+                },
+                .while_stmt => {
+                    const ws = &stmt.while_stmt;
+                    ws.body = try self.foldTailContinueBreakDeep(ws.body);
+                    ws.else_body = try self.foldTailContinueBreakDeep(ws.else_body);
+                },
+                .with_stmt => {
+                    const ws = &stmt.with_stmt;
+                    ws.body = try self.foldTailContinueBreakDeep(ws.body);
+                },
+                .try_stmt => {
+                    const ts = &stmt.try_stmt;
+                    ts.body = try self.foldTailContinueBreakDeep(ts.body);
+                    ts.else_body = try self.foldTailContinueBreakDeep(ts.else_body);
+                    ts.finalbody = try self.foldTailContinueBreakDeep(ts.finalbody);
+
+                    const hs = @constCast(ts.handlers);
+                    for (hs) |*h| {
+                        h.body = try self.foldTailContinueBreakDeep(h.body);
+                    }
+                },
+                .function_def => {
+                    const fd = &stmt.function_def;
+                    fd.body = try self.foldTailContinueBreakDeep(fd.body);
+                },
+                .class_def => {
+                    const cd = &stmt.class_def;
+                    cd.body = try self.foldTailContinueBreakDeep(cd.body);
+                },
+                else => {},
+            }
+        }
+        return out;
+    }
+
+    fn foldTailOrBreak(self: *Decompiler, body: []const *Stmt) DecompileError![]const *Stmt {
+        // Bytecode-exactness: merge adjacent `if ...: break` guards into a single
+        // `if a or (b and c): break` expression when the RHS is a nested-if chain.
+        if (body.len < 2) return body;
+        const a_stmt = body[body.len - 2];
+        const b_stmt = body[body.len - 1];
+        if (a_stmt.* != .if_stmt) return body;
+        if (b_stmt.* != .if_stmt) return body;
+
+        const a_if = &a_stmt.if_stmt;
+        if (a_if.else_body.len != 0) return body;
+        if (a_if.body.len != 1 or a_if.body[0].* != .break_stmt) return body;
+
+        const a = self.arena.allocator();
+        var conds: std.ArrayListUnmanaged(*Expr) = .{};
+        defer conds.deinit(a);
+
+        var cur: *Stmt = b_stmt;
+        var br: ?*Stmt = null;
+        while (true) {
+            if (cur.* != .if_stmt) break;
+            const ifs = &cur.if_stmt;
+            if (ifs.else_body.len != 0) break;
+            try conds.append(a, ifs.condition);
+            if (ifs.body.len != 1) break;
+            const inner = ifs.body[0];
+            if (inner.* == .break_stmt) {
+                br = inner;
+                break;
+            }
+            cur = inner;
+        }
+        if (br == null) return body;
+        if (conds.items.len == 0) return body;
+
+        const and_expr = if (conds.items.len == 1) conds.items[0] else blk: {
+            const values = try a.dupe(*Expr, conds.items);
+            const expr = try a.create(Expr);
+            expr.* = .{ .bool_op = .{ .op = .and_, .values = values } };
+            break :blk expr;
+        };
+
+        const or_vals = try a.alloc(*Expr, 2);
+        or_vals[0] = a_if.condition;
+        or_vals[1] = and_expr;
+        const or_expr = try a.create(Expr);
+        or_expr.* = .{ .bool_op = .{ .op = .or_, .values = or_vals } };
+
+        const br_body = try a.alloc(*Stmt, 1);
+        br_body[0] = a_if.body[0];
+
+        const merged = try a.create(Stmt);
+        merged.* = .{ .if_stmt = .{
+            .condition = or_expr,
+            .body = br_body,
+            .else_body = &.{},
+        } };
+
+        const new_body = try a.alloc(*Stmt, body.len - 1);
+        std.mem.copyForwards(*Stmt, new_body[0 .. body.len - 2], body[0 .. body.len - 2]);
+        new_body[body.len - 2] = merged;
+        return new_body;
     }
 
     fn decompileLoopHeader(self: *Decompiler, header: u32) DecompileError!?PatternResult {
@@ -13648,36 +13887,57 @@ pub const Decompiler = struct {
             if (join_block.? == post_try_entry.?) {
                 var join_from_handlers: ?u32 = null;
                 var join_conflict = false;
-                for (handler_pop, 0..) |pop_opt, idx| {
+                const post_off = if (post_try_entry.? < self.cfg.blocks.len)
+                    self.cfg.blocks[post_try_entry.?].start_offset
+                else
+                    0;
+                for (handler_blocks.items, 0..) |hid, idx| {
                     if (handler_final.items[idx]) continue;
-                    if (!handler_pop_dom[idx]) {
+                    if (hid >= self.cfg.blocks.len) {
                         join_conflict = true;
                         break;
                     }
-                    const pb = pop_opt orelse {
-                        join_conflict = true;
-                        break;
-                    };
-                    if (pb >= self.cfg.blocks.len) continue;
-                    const pop_blk = &self.cfg.blocks[pb];
-                    var succ: ?u32 = null;
-                    var multi = false;
-                    for (pop_blk.successors) |edge| {
-                        if (edge.edge_type == .exception) continue;
-                        if (succ != null) {
-                            multi = true;
-                            break;
+                    const info = try self.extractHandlerHeader(hid);
+                    const handler_end = handler_scan_end[idx];
+                    var cand: ?u32 = null;
+                    var scan_block = info.body_block;
+                    while (scan_block < handler_end and scan_block < self.cfg.blocks.len) : (scan_block += 1) {
+                        const scan_blk = &self.cfg.blocks[scan_block];
+                        var has_pop_except = false;
+                        for (scan_blk.instructions) |inst| {
+                            if (inst.opcode == .POP_EXCEPT) {
+                                has_pop_except = true;
+                                break;
+                            }
                         }
-                        succ = edge.target;
+                        if (!has_pop_except) continue;
+
+                        var succ: ?u32 = null;
+                        var multi = false;
+                        for (scan_blk.successors) |edge| {
+                            if (edge.edge_type == .exception) continue;
+                            if (succ != null) {
+                                multi = true;
+                                break;
+                            }
+                            succ = edge.target;
+                        }
+                        if (multi or succ == null) continue;
+                        const resolved = self.resolveJumpOnlyBlock(succ.?);
+                        if (resolved >= self.cfg.blocks.len) continue;
+                        if (self.cfg.blocks[resolved].start_offset < post_off) continue;
+                        if (protected_set.isSet(resolved)) continue;
+
+                        // Prefer a later POP_EXCEPT that jumps out past the post-try entry.
+                        cand = resolved;
                     }
-                    if (multi or succ == null) {
+                    if (cand == null) {
                         join_conflict = true;
                         break;
                     }
-                    const resolved = self.resolveJumpOnlyBlock(succ.?);
                     if (join_from_handlers == null) {
-                        join_from_handlers = resolved;
-                    } else if (join_from_handlers.? != resolved) {
+                        join_from_handlers = cand;
+                    } else if (join_from_handlers.? != cand.?) {
                         join_conflict = true;
                         break;
                     }
@@ -13790,6 +14050,10 @@ pub const Decompiler = struct {
 
         var else_start: ?u32 = pattern.else_block orelse blk: {
             if (post_try_entry) |entry| {
+                // Only treat post_try_entry as an else clause when it is outside the protected
+                // try region. Otherwise it's just the next block in the try body.
+                if (entry < handler_start) break :blk null;
+                if (protected_set.isSet(entry)) break :blk null;
                 if (!handler_reach.isSet(entry)) {
                     if (join_block == null or entry != join_block.?) {
                         break :blk entry;
@@ -13804,9 +14068,16 @@ pub const Decompiler = struct {
         }
         var force_tail: ?u32 = null;
         if (else_start != null and loop_header != null) {
-            if (try self.analyzer.allHandlerBlocksTerminal(handler_blocks.items, loop_exit)) {
-                force_tail = else_start;
-                else_start = null;
+            const header_id = loop_header.?;
+            const join_in_loop = if (join_block) |join_id|
+                self.inLoopRelaxed(join_id, header_id, loop_exit)
+            else
+                false;
+            if (!join_in_loop) {
+                if (try self.analyzer.allHandlerBlocksTerminal(handler_blocks.items, loop_exit)) {
+                    force_tail = else_start;
+                    else_start = null;
+                }
             }
         }
         if (loop_header) |header_id| {
@@ -19187,6 +19458,33 @@ pub const Decompiler = struct {
                         }
                     }
                 }
+                if (loop_header) |header_id| {
+                    if (if_pat.else_block) |else_id| {
+                        // Some patterns resolve the else edge through cleanup-only blocks and
+                        // end up pointing outside the loop body. Prefer the raw conditional-false
+                        // successor when it stays inside the loop so loop-specific `break`/`continue`
+                        // reconstruction can run.
+                        if (!self.analyzer.inLoop(else_id, header_id) and if_pat.condition_block < self.cfg.blocks.len) {
+                            const cond_blk = &self.cfg.blocks[if_pat.condition_block];
+                            if (cond_blk.terminator()) |t| {
+                                if (ctrl.Analyzer.isCondJump(t.opcode)) {
+                                    var false_id: ?u32 = null;
+                                    for (cond_blk.successors) |edge| {
+                                        if (edge.edge_type == .conditional_false) {
+                                            false_id = edge.target;
+                                            break;
+                                        }
+                                    }
+                                    if (false_id != null and false_id.? != if_pat.then_block) {
+                                        if (false_id.? < self.cfg.blocks.len and self.analyzer.inLoop(false_id.?, header_id)) {
+                                            if_pat.else_block = false_id;
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
                 var merge_in_range: ?u32 = null;
                 if (if_pat.else_block) |else_id| {
                     var reach_then = try self.reachableInRange(if_pat.then_block, end, null);
@@ -19411,13 +19709,25 @@ pub const Decompiler = struct {
                                     stmt = if_stmt;
                                     guard_then = parts.else_body;
                                 } else {
-                                    const if_stmt = try a.create(Stmt);
-                                    if_stmt.* = .{ .if_stmt = .{
-                                        .condition = parts.condition,
-                                        .body = parts.then_body,
-                                        .else_body = parts.else_body,
-                                    } };
-                                    stmt = if_stmt;
+                                    if (self.bodyEndsLoopTerminal(parts.then_body) and parts.else_body.len > 0) {
+                                        const if_stmt = try a.create(Stmt);
+                                        if_stmt.* = .{ .if_stmt = .{
+                                            .condition = parts.condition,
+                                            .body = parts.then_body,
+                                            .else_body = &.{},
+                                        } };
+                                        if_stmt.if_stmt.no_merge = true;
+                                        stmt = if_stmt;
+                                        guard_then = parts.else_body;
+                                    } else {
+                                        const if_stmt = try a.create(Stmt);
+                                        if_stmt.* = .{ .if_stmt = .{
+                                            .condition = parts.condition,
+                                            .body = parts.then_body,
+                                            .else_body = parts.else_body,
+                                        } };
+                                        stmt = if_stmt;
+                                    }
                                 }
                                 if (!else_cont and use_else_cont) {
                                     if (parts.else_block) |else_id| {
@@ -20111,8 +20421,12 @@ pub const Decompiler = struct {
             const block = &self.cfg.blocks[node];
             for (block.successors) |edge| {
                 if (edge.edge_type == .exception) continue;
-                if (!allow_loop_back and edge.edge_type == .loop_back) continue;
                 if (edge.target >= self.cfg.blocks.len) continue;
+                if (!allow_loop_back) {
+                    if (edge.edge_type == .loop_back) continue;
+                    // Also treat any jump to an earlier bytecode offset as a loop-back edge.
+                    if (self.cfg.blocks[edge.target].start_offset < block.start_offset) continue;
+                }
                 if (handler_set.isSet(edge.target)) continue;
                 if (!visited.isSet(edge.target)) {
                     try visited.set(self.allocator, edge.target);
@@ -20146,8 +20460,11 @@ pub const Decompiler = struct {
             const block = &self.cfg.blocks[node];
             for (block.successors) |edge| {
                 if (edge.edge_type == .exception) continue;
-                if (!allow_loop_back and edge.edge_type == .loop_back) continue;
                 if (edge.target >= self.cfg.blocks.len) continue;
+                if (!allow_loop_back) {
+                    if (edge.edge_type == .loop_back) continue;
+                    if (self.cfg.blocks[edge.target].start_offset < block.start_offset) continue;
+                }
                 if (handler_set.isSet(edge.target)) continue;
                 if (!visited.isSet(edge.target)) {
                     try visited.set(self.allocator, edge.target);
@@ -20179,8 +20496,11 @@ pub const Decompiler = struct {
             const block = &self.cfg.blocks[node];
             for (block.successors) |edge| {
                 if (edge.edge_type == .exception) continue;
-                if (!allow_loop_back and edge.edge_type == .loop_back) continue;
                 if (edge.target >= self.cfg.blocks.len) continue;
+                if (!allow_loop_back) {
+                    if (edge.edge_type == .loop_back) continue;
+                    if (self.cfg.blocks[edge.target].start_offset < block.start_offset) continue;
+                }
                 if (!visited.isSet(edge.target)) {
                     try visited.set(self.allocator, edge.target);
                     try queue.append(self.allocator, edge.target);
@@ -21142,6 +21462,25 @@ pub const Decompiler = struct {
                         }
                         break;
                     }
+                    if (parts.then_body.len > 0 and parts.else_body.len > 0 and self.bodyEndsTerminal(parts.then_body)) {
+                        // Prefer guard-style `if cond: <terminal>; <else>` over `if/else` when
+                        // one branch cannot fall through. This avoids extra jump glue and matches
+                        // CPython's common `if not x: raise; ...` patterns.
+                        const if_stmt = try a.create(Stmt);
+                        if_stmt.* = .{ .if_stmt = .{
+                            .condition = parts.condition,
+                            .body = parts.then_body,
+                            .else_body = &.{},
+                        } };
+                        try stmts.append(a, if_stmt);
+                        try stmts.appendSlice(a, parts.else_body);
+                        if (try self.nextLoopBlockAfterIf(p, header_block_id, block_idx, null)) |next_id| {
+                            self.markVisitedRange(&visited, header_block_id, block.start_offset, self.cfg.blocks[next_id].start_offset);
+                            block_idx = next_id;
+                            continue;
+                        }
+                        break;
+                    }
                     var use_else_cont = parts.else_is_continuation;
                     if (use_else_cont and parts.else_body.len > 0) {
                         const only_cont = parts.else_body.len == 1 and parts.else_body[0].* == .continue_stmt;
@@ -21193,13 +21532,25 @@ pub const Decompiler = struct {
                             }
                         }
                     } else {
-                        const if_stmt = try a.create(Stmt);
-                        if_stmt.* = .{ .if_stmt = .{
-                            .condition = parts.condition,
-                            .body = parts.then_body,
-                            .else_body = parts.else_body,
-                        } };
-                        try stmts.append(a, if_stmt);
+                        if (self.bodyEndsLoopTerminal(parts.then_body) and parts.else_body.len > 0) {
+                            const if_stmt = try a.create(Stmt);
+                            if_stmt.* = .{ .if_stmt = .{
+                                .condition = parts.condition,
+                                .body = parts.then_body,
+                                .else_body = &.{},
+                            } };
+                            if_stmt.if_stmt.no_merge = true;
+                            try stmts.append(a, if_stmt);
+                            try stmts.appendSlice(a, parts.else_body);
+                        } else {
+                            const if_stmt = try a.create(Stmt);
+                            if_stmt.* = .{ .if_stmt = .{
+                                .condition = parts.condition,
+                                .body = parts.then_body,
+                                .else_body = parts.else_body,
+                            } };
+                            try stmts.append(a, if_stmt);
+                        }
                     }
                     if (try self.nextLoopBlockAfterIf(p, header_block_id, block_idx, null)) |next_id| {
                         self.markVisitedRange(&visited, header_block_id, block.start_offset, self.cfg.blocks[next_id].start_offset);
@@ -21538,13 +21889,27 @@ pub const Decompiler = struct {
 
     fn blockExitsLoop(self: *Decompiler, block_id: u32, loop_header: u32) bool {
         if (block_id >= self.cfg.blocks.len) return false;
+        const loop_exit = blk: {
+            if (loop_header >= self.cfg.blocks.len) break :blk null;
+            const header = &self.cfg.blocks[loop_header];
+            var exit_id: ?u32 = null;
+            for (header.successors) |edge| {
+                if (edge.edge_type == .exception) continue;
+                if (edge.target >= self.cfg.blocks.len) continue;
+                if (self.analyzer.inLoop(edge.target, loop_header)) continue;
+                if (exit_id != null) break :blk null; // multiple exits
+                exit_id = edge.target;
+            }
+            if (exit_id) |id| break :blk self.resolveJumpOnlyBlock(id);
+            break :blk null;
+        };
         const blk = &self.cfg.blocks[block_id];
         var saw_succ = false;
         for (blk.successors) |edge| {
             if (edge.edge_type == .exception) continue;
             if (edge.target >= self.cfg.blocks.len) continue;
             saw_succ = true;
-            if (self.analyzer.inLoop(edge.target, loop_header)) return false;
+            if (self.inLoopRelaxed(edge.target, loop_header, loop_exit)) return false;
         }
         return saw_succ;
     }
@@ -21595,7 +21960,6 @@ pub const Decompiler = struct {
         if (self.loopBreakTarget(block_id, loop_header) != null) return true;
         if (block_id >= self.cfg.blocks.len) return false;
         const blk = &self.cfg.blocks[block_id];
-        if (!self.blockIsCleanupOnly(blk)) return false;
         var succ: ?u32 = null;
         for (blk.successors) |edge| {
             if (edge.edge_type == .exception) continue;
@@ -21603,6 +21967,13 @@ pub const Decompiler = struct {
             succ = edge.target;
         }
         if (succ == null) return false;
+        // Break edges can be split across a non-cleanup block (e.g. POP_BLOCK) followed by a
+        // jump-only block that actually exits the loop.
+        if (switch (self.analyzer.detectLoopExit(succ.?, &[_]u32{loop_header})) {
+            .break_stmt => true,
+            else => false,
+        }) return true;
+        if (!self.blockIsCleanupOnly(blk)) return false;
         return switch (self.analyzer.detectLoopExit(succ.?, &[_]u32{loop_header})) {
             .break_stmt => true,
             else => false,
@@ -21709,6 +22080,9 @@ pub const Decompiler = struct {
 
     fn inLoopRelaxed(self: *Decompiler, block: u32, header: u32, loop_exit: ?u32) bool {
         if (self.analyzer.inLoop(block, header)) return true;
+        // Blocks that terminate control flow (raise/return) are part of the source-level loop
+        // but are not in the CFG back-edge cycle; treat them as outside for branch shaping.
+        if (block < self.cfg.blocks.len and self.isTerminalBlock(block)) return false;
         if (loop_exit) |exit_id| {
             if (block < self.cfg.blocks.len and header < self.cfg.blocks.len and exit_id < self.cfg.blocks.len) {
                 const off = self.cfg.blocks[block].start_offset;
@@ -23462,6 +23836,7 @@ pub const Decompiler = struct {
                 const else_res = self.resolveJumpOnlyBlock(else_id);
                 const then_res = self.resolveJumpOnlyBlock(then_block);
                 if (else_res != loop_header and then_res != loop_header and
+                    self.analyzer.inLoop(else_res, loop_header) and
                     !self.blockLeadsToHeader(then_block, loop_header) and
                     else_id > pattern.condition_block and
                     try self.reachesBlockNoBack(then_block, else_id, loop_header))
@@ -23497,6 +23872,12 @@ pub const Decompiler = struct {
         var cond_tree_applied = false;
         if (!is_elif) {
             if (else_block) |else_id| {
+                // Don't fold conditions through the current loop header. That produces
+                // source like `buf and <while_cond>` for a simple `if not buf: break`.
+                // For bytecode-exactness, keep loop-header re-checks implicit.
+                if (self.resolveJumpOnlyBlock(then_block) == loop_header) {
+                    // keep as-is
+                } else {
                 var seen = try std.DynamicBitSet.initEmpty(self.allocator, self.cfg.blocks.len);
                 defer seen.deinit();
                 const else_res = self.resolveJumpOnlyBlock(else_id);
@@ -23587,6 +23968,7 @@ pub const Decompiler = struct {
                             visited.set(bid);
                         }
                     }
+                }
                 }
             }
         }
@@ -23741,19 +24123,41 @@ pub const Decompiler = struct {
 
         if (then_to_header and else_block == null) return null;
 
-        const then_in_loop = self.analyzer.inLoop(then_block, loop_header);
+        const loop_exit = blk: {
+            if (loop_header >= self.cfg.blocks.len) break :blk null;
+            const header = &self.cfg.blocks[loop_header];
+            var exit_id: ?u32 = null;
+            for (header.successors) |edge| {
+                if (edge.edge_type == .exception) continue;
+                if (edge.target >= self.cfg.blocks.len) continue;
+                if (self.analyzer.inLoop(edge.target, loop_header)) continue;
+                if (exit_id != null) break :blk null; // multiple exits
+                exit_id = edge.target;
+            }
+            if (exit_id) |id| break :blk self.resolveJumpOnlyBlock(id);
+            break :blk null;
+        };
+
+        const then_in_loop = self.inLoopRelaxed(then_block, loop_header, loop_exit);
         const else_in_loop = if (else_block) |else_id|
-            self.analyzer.inLoop(else_id, loop_header)
+            self.inLoopRelaxed(else_id, loop_header, loop_exit)
         else
             false;
         const merge_in_loop = if (merge_block) |merge_id|
-            self.analyzer.inLoop(merge_id, loop_header)
+            self.inLoopRelaxed(merge_id, loop_header, loop_exit)
         else
             false;
         var else_is_continuation = else_to_header or (else_in_loop and !merge_in_loop and !then_in_loop);
         var else_is_fallthrough = false;
         if (stop_block) |stop_id| {
             if (else_block) |else_id| {
+                // When decompiling a bounded range (e.g. a try body inside a loop), the "else"
+                // edge may jump beyond the range. Treat that as a continuation only if it does
+                // not represent a loop-exit edge; otherwise we'd hoist a `break` out of the
+                // branch and change semantics.
+                if (loop_exit != null and self.resolveJumpOnlyBlock(else_id) == loop_exit.?) {
+                    // keep else as a real branch
+                } else
                 if (else_id == stop_id) {
                     else_is_continuation = true;
                     else_is_fallthrough = true;
@@ -23834,21 +24238,6 @@ pub const Decompiler = struct {
         if (else_is_fallthrough) {
             else_is_continuation = true;
         }
-
-        const loop_exit = blk: {
-            if (loop_header >= self.cfg.blocks.len) break :blk null;
-            const header = &self.cfg.blocks[loop_header];
-            var exit_id: ?u32 = null;
-            for (header.successors) |edge| {
-                if (edge.edge_type == .exception) continue;
-                if (edge.target >= self.cfg.blocks.len) continue;
-                if (self.analyzer.inLoop(edge.target, loop_header)) continue;
-                if (exit_id != null) break :blk null; // multiple exits
-                exit_id = edge.target;
-            }
-            if (exit_id) |id| break :blk self.resolveJumpOnlyBlock(id);
-            break :blk null;
-        };
         const then_is_loop_exit = loop_exit != null and self.resolveJumpOnlyBlock(then_block) == loop_exit.?;
         const else_is_loop_exit = loop_exit != null and else_block != null and self.resolveJumpOnlyBlock(else_block.?) == loop_exit.?;
         if (loop_exit != null) {
@@ -23859,7 +24248,9 @@ pub const Decompiler = struct {
                 if (edge.target >= self.cfg.blocks.len) continue;
                 const tgt = edge.target;
                 if (self.resolveJumpOnlyBlock(tgt) != loop_exit.?) continue;
-                if (self.jumpTargetIfJumpOnly(tgt, true) == null) continue;
+                // Accept POP_BLOCK/cleanup-prefixed jump-only blocks; otherwise they can later
+                // surface as stray unconditional `break` statements.
+                if (self.jumpTargetIfJumpOnlyInst(tgt, true) == null) continue;
                 if (self.cfg.blocks[tgt].predecessors.len == 1 and self.cfg.blocks[tgt].predecessors[0] == pattern.condition_block) {
                     try self.consumed.set(self.allocator, tgt);
                     visited.set(tgt);
@@ -24114,7 +24505,16 @@ pub const Decompiler = struct {
             self.if_next = merge_block;
         }
         if (self.trace_decisions and self.trace_file != null) {
-            try self.emitDecisionTrace(pattern.condition_block, "loop_if_parts", condition);
+            const t_term = self.bodyEndsTerminal(then_body);
+            const e_term = self.bodyEndsTerminal(else_body);
+            const note = try std.fmt.allocPrint(self.arena.allocator(), "loop_if_parts tlen={} elen={} tterm={} eterm={} econt={}", .{
+                then_body.len,
+                else_body.len,
+                t_term,
+                e_term,
+                else_is_continuation,
+            });
+            try self.emitDecisionTrace(pattern.condition_block, note, condition);
         }
 
         return .{
@@ -24758,13 +25158,26 @@ pub const Decompiler = struct {
                             consumed_else = true;
                         }
                     } else {
-                        const if_stmt = try a.create(Stmt);
-                        if_stmt.* = .{ .if_stmt = .{
-                            .condition = parts.condition,
-                            .body = parts.then_body,
-                            .else_body = parts.else_body,
-                        } };
-                        try stmts.append(a, if_stmt);
+                        if (self.bodyEndsLoopTerminal(parts.then_body) and parts.else_body.len > 0) {
+                            const if_stmt = try a.create(Stmt);
+                            if_stmt.* = .{ .if_stmt = .{
+                                .condition = parts.condition,
+                                .body = parts.then_body,
+                                .else_body = &.{},
+                            } };
+                            if_stmt.if_stmt.no_merge = true;
+                            try stmts.append(a, if_stmt);
+                            try stmts.appendSlice(a, parts.else_body);
+                            consumed_else = true;
+                        } else {
+                            const if_stmt = try a.create(Stmt);
+                            if_stmt.* = .{ .if_stmt = .{
+                                .condition = parts.condition,
+                                .body = parts.then_body,
+                                .else_body = parts.else_body,
+                            } };
+                            try stmts.append(a, if_stmt);
+                        }
                     }
 
                     if (parts.else_is_continuation and !consumed_else) {

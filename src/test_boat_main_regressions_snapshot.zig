@@ -1332,3 +1332,16 @@ test "snapshot loop break guard 3.9" {
         \\"
     );
 }
+
+test "snapshot or break guard 3.9" {
+    try runSnapshot(@src(), "test/corpus/or_break_guard.3.9.pyc",
+        \\[]u8
+        \\  "def or_break_guard(timeout, val, buf):
+        \\    i = 0
+        \\    while i < 1:
+        \\        i += 1
+        \\        if timeout.expired() or val is not None and val > 0 and not buf:
+        \\            break
+        \\"
+    );
+}
