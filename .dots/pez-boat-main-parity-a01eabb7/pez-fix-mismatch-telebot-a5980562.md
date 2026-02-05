@@ -1,9 +1,9 @@
 ---
 title: Fix mismatch telebot/types
-status: open
+status: active
 priority: 1
 issue-type: task
-created-at: "2026-02-05T20:10:56.696961+01:00"
+created-at: "\"2026-02-05T20:10:56.696961+01:00\""
 blocks:
   - pez-fix-mismatch-aioice-2d93d276
 ---

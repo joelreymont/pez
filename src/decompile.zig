@@ -2202,9 +2202,32 @@ pub const Decompiler = struct {
         if (stmt.* != .try_stmt) return;
         const cleanup = try self.collectFinalCleanupNames(stmt.try_stmt.finalbody);
         defer self.allocator.free(cleanup);
-        if (cleanup.len == 0) return;
-        stmt.try_stmt.body = try self.stripCleanupAssignDupesInBody(stmt.try_stmt.body, cleanup);
-        stmt.try_stmt.else_body = try self.stripCleanupAssignDupesInBody(stmt.try_stmt.else_body, cleanup);
+        if (cleanup.len > 0) {
+            stmt.try_stmt.body = try self.stripCleanupAssignDupesInBody(stmt.try_stmt.body, cleanup);
+            stmt.try_stmt.else_body = try self.stripCleanupAssignDupesInBody(stmt.try_stmt.else_body, cleanup);
+        }
+        self.flattenNestedTryHandlers(stmt);
+    }
+
+    fn flattenNestedTryHandlers(self: *Decompiler, stmt: *Stmt) void {
+        if (stmt.* != .try_stmt) return;
+        var ts = &stmt.try_stmt;
+        if (ts.handlers.len != 0 or ts.body.len != 1 or ts.else_body.len != 0) return;
+        const inner_stmt = ts.body[0];
+        if (inner_stmt.* != .try_stmt) return;
+        const inner = inner_stmt.try_stmt;
+        if (inner.handlers.len == 0 or inner.else_body.len != 0) return;
+        const inner_final_empty = inner.finalbody.len == 0 or (inner.finalbody.len == 1 and inner.finalbody[0].* == .pass);
+        if (!inner_final_empty) return;
+        if (ts.finalbody.len == 0) return;
+        if (inner.body.len <= ts.finalbody.len) return;
+        if (!self.bodyEndsTerminal(inner.body)) return;
+        if (!stmtSeqEqual(inner.body[0..ts.finalbody.len], ts.finalbody)) return;
+
+        const new_body = inner.body[ts.finalbody.len..];
+        if (new_body.len == 0) return;
+        ts.body = new_body;
+        ts.handlers = inner.handlers;
     }
 
     fn recoverTryRetExpr(self: *Decompiler, try_block: u32) DecompileError!?*Expr {
@@ -5282,6 +5305,45 @@ pub const Decompiler = struct {
         return seen;
     }
 
+    fn regionAlwaysTerm(
+        self: *Decompiler,
+        start: u32,
+        limit: u32,
+        handler_set: *const GenSet,
+    ) DecompileError!bool {
+        if (start >= limit or start >= self.cfg.blocks.len) return false;
+        var seen = try std.DynamicBitSet.initEmpty(self.allocator, self.cfg.blocks.len);
+        defer seen.deinit();
+        var stack: std.ArrayListUnmanaged(u32) = .{};
+        defer stack.deinit(self.allocator);
+        try stack.append(self.allocator, start);
+
+        while (stack.items.len > 0) {
+            const cur = stack.items[stack.items.len - 1];
+            stack.items.len -= 1;
+            if (cur >= self.cfg.blocks.len) return false;
+            if (cur >= limit) return false;
+            if (seen.isSet(cur)) continue;
+            seen.set(cur);
+            if (handler_set.isSet(cur)) return false;
+            if (self.isTerminalBlock(cur)) continue;
+            var has_succ = false;
+            const blk = &self.cfg.blocks[cur];
+            for (blk.successors) |edge| {
+                if (edge.edge_type == .exception) continue;
+                const next = edge.target;
+                if (next >= self.cfg.blocks.len) return false;
+                if (next >= limit) return false;
+                has_succ = true;
+                if (!seen.isSet(next)) {
+                    try stack.append(self.allocator, next);
+                }
+            }
+            if (!has_succ) return false;
+        }
+        return true;
+    }
+
     fn commonMerge(self: *Decompiler, then_block: u32, else_block: u32, start: u32) DecompileError!u32 {
         var limit: u32 = @intCast(self.cfg.blocks.len);
         if (self.br_limit) |lim| {
@@ -5541,6 +5603,14 @@ pub const Decompiler = struct {
                 if (ifs.body.len == 0 or ifs.else_body.len == 0) break :blk false;
                 break :blk self.bodyEndsTerminal(ifs.body) and self.bodyEndsTerminal(ifs.else_body);
             },
+            .try_stmt => |ts| blk: {
+                if (ts.finalbody.len > 0 and self.bodyEndsTerminal(ts.finalbody)) break :blk true;
+                if (!self.bodyEndsTerminal(ts.body)) break :blk false;
+                for (ts.handlers) |h| {
+                    if (!self.bodyEndsTerminal(h.body)) break :blk false;
+                }
+                break :blk true;
+            },
             else => false,
         };
     }
@@ -5572,14 +5642,31 @@ pub const Decompiler = struct {
                 },
                 else => false,
             },
+            .delete => |l| switch (right.*) {
+                .delete => |r| blk: {
+                    if (l.targets.len != r.targets.len) break :blk false;
+                    for (l.targets, 0..) |lt, idx| {
+                        if (!ast.exprEqual(lt, r.targets[idx])) break :blk false;
+                    }
+                    break :blk true;
+                },
+                else => false,
+            },
             .expr_stmt => |l| switch (right.*) {
                 .expr_stmt => |r| ast.exprEqual(l.value, r.value),
+                else => false,
+            },
+            .if_stmt => |l| switch (right.*) {
+                .if_stmt => |r| ast.exprEqual(l.condition, r.condition) and
+                    stmtSeqEqual(l.body, r.body) and
+                    stmtSeqEqual(l.else_body, r.else_body),
                 else => false,
             },
             .return_stmt => |l| switch (right.*) {
                 .return_stmt => |r| optExprEqual(l.value, r.value),
                 else => false,
             },
+            .pass => right.* == .pass,
             else => false,
         };
     }
@@ -10967,7 +11054,13 @@ pub const Decompiler = struct {
                                     if (edge.target == then_block) has_then = true;
                                     if (edge.target == cur_else) has_else = true;
                                 }
-                                if (has_then and has_else) continue;
+                                if (has_then and has_else) {
+                                    if (guard_or_else_applied) {
+                                        join_pred = true;
+                                        break;
+                                    }
+                                    continue;
+                                }
                             }
                         }
                         for (pred_blk.successors) |edge| {
@@ -13912,14 +14005,17 @@ pub const Decompiler = struct {
                     }
                 }
                 if (has_pop_block) {
-                    var has_exc_to_handler = false;
+                    var saw_norm = false;
+                    var all_term = true;
                     for (blk.successors) |edge| {
-                        if (edge.edge_type == .exception and handler_set.isSet(edge.target)) {
-                            has_exc_to_handler = true;
+                        if (edge.edge_type == .exception) continue;
+                        saw_norm = true;
+                        if (!try self.regionAlwaysTerm(edge.target, handler_start, handler_set)) {
+                            all_term = false;
                             break;
                         }
                     }
-                    if (has_exc_to_handler) continue;
+                    if (saw_norm and all_term) continue;
                 }
                 for (blk.successors) |edge| {
                     if (edge.edge_type == .exception) continue;
@@ -14358,6 +14454,11 @@ pub const Decompiler = struct {
         if (has_finally and except_count == 0) {
             else_start = null;
         }
+        if (else_start) |start| {
+            if (protected_set.isSet(start)) {
+                else_start = null;
+            }
+        }
         var force_tail: ?u32 = null;
         if (else_start != null and loop_header != null) {
             const header_id = loop_header.?;
@@ -14472,9 +14573,57 @@ pub const Decompiler = struct {
         if (finally_start) |start| {
             if (start < try_end) try_end = start;
         }
+        if (loop_header == null and except_count == 0 and pattern.try_block < try_end and pattern.try_block < self.cfg.blocks.len) {
+            var pop_limit: ?u32 = null;
+            for (protected_set.list.items) |bid| {
+                if (bid >= self.cfg.blocks.len) continue;
+                const blk = &self.cfg.blocks[bid];
+                var has_pop = false;
+                for (blk.instructions) |inst| {
+                    if (inst.opcode == .POP_BLOCK) {
+                        has_pop = true;
+                        break;
+                    }
+                }
+                if (!has_pop) continue;
+                for (blk.successors) |edge| {
+                    if (edge.edge_type != .normal) continue;
+                    const target = edge.target;
+                    if (target >= self.cfg.blocks.len) continue;
+                    if (protected_set.isSet(target)) continue;
+                    if (handler_set.isSet(target)) continue;
+                    if (target >= handler_start) continue;
+                    var limit = target;
+                    if (self.isTryReturnCleanupBlock(target)) {
+                        if (target + 1 <= handler_start) {
+                            limit = target + 1;
+                        }
+                    }
+                    if (pop_limit == null or limit < pop_limit.?) {
+                        pop_limit = limit;
+                    }
+                }
+            }
+            if (pop_limit) |u| {
+                if (u < try_end) try_end = u;
+            }
+        }
 
+        var body_ps: ?*const GenSet = protected_set;
+        var need_guard = false;
+        if (!has_finally and pattern.try_block < try_end) {
+            var bid = pattern.try_block;
+            while (bid < try_end and bid < self.cfg.blocks.len) : (bid += 1) {
+                if (protected_set.isSet(bid)) continue;
+                if (self.isTryReturnCleanupBlock(bid)) continue;
+                if (self.blockIsCleanupOnly(&self.cfg.blocks[bid])) continue;
+                need_guard = true;
+                break;
+            }
+            if (!need_guard) body_ps = null;
+        }
         var try_body = if (pattern.try_block < try_end)
-            try self.decompileTryBody(pattern.try_block, try_end, loop_header, if (loop_header != null) null else visited)
+            try self.decompileTryBody(pattern.try_block, try_end, loop_header, if (loop_header != null) null else visited, body_ps)
         else
             &[_]*Stmt{};
         if (loop_header) |header_id| {
@@ -14501,6 +14650,25 @@ pub const Decompiler = struct {
         }
 
         const a = self.arena.allocator();
+        if (!has_finally and need_guard and try_end > pattern.try_block and
+            pattern.try_block == 0 and post_try_entry == null and join_block == null)
+        {
+            var guard_start: ?u32 = null;
+            var bid = pattern.try_block;
+            while (bid < try_end and bid < self.cfg.blocks.len) : (bid += 1) {
+                if (protected_set.isSet(bid)) continue;
+                if (self.isTryReturnCleanupBlock(bid)) continue;
+                if (self.blockIsCleanupOnly(&self.cfg.blocks[bid])) continue;
+                guard_start = bid;
+                break;
+            }
+            if (guard_start) |start| {
+                const guard_tail = try self.decompileStructuredRangeNoTry(start, try_end);
+                if (guard_tail.len > 0) {
+                    try_body = try self.appendStmtSlice(a, try_body, guard_tail);
+                }
+            }
+        }
 
         var else_end: u32 = @as(u32, @intCast(self.cfg.blocks.len));
         if (exit_for_range) |exit| {
@@ -14728,34 +14896,25 @@ pub const Decompiler = struct {
             };
             try self.writeTrace(ev);
         }
+        final_body = self.trimAfterTerminal(final_body);
 
         if (final_body.len > 0 and final_body[final_body.len - 1].* == .return_stmt) {
             var try_term = false;
             if (try_body.len > 0) {
-                try_term = self.stmtIsTerminal(try_body[try_body.len - 1]);
+                try_term = self.stmtAlwaysTerminal(try_body[try_body.len - 1]);
             }
-            if (!try_term) {
-                var finally_has_return = false;
-                for (handler_blocks.items, 0..) |hid, idx| {
-                    if (!handler_final.items[idx]) continue;
-                    if (try self.finallyHandlerHasReturn(hid, handler_set, scratch)) {
-                        finally_has_return = true;
-                        break;
-                    }
+            var finally_has_return = false;
+            for (handler_blocks.items, 0..) |hid, idx| {
+                if (!handler_final.items[idx]) continue;
+                if (try self.finallyHandlerHasReturn(hid, handler_set, scratch)) {
+                    finally_has_return = true;
+                    break;
                 }
-                if (!finally_has_return) {
-                    const ret_stmt = final_body[final_body.len - 1];
-                    if (ret_stmt.return_stmt.value) |val| {
-                        if (self.isPlaceholderExpr(val)) {
-                            const expr = self.recoverTryRetExpr(pattern.try_block) catch |err| switch (err) {
-                                error.PatternNoMatch => null,
-                                else => return err,
-                            };
-                            if (expr) |e| {
-                                ret_stmt.return_stmt.value = e;
-                            }
-                        }
-                    } else {
+            }
+            if (!finally_has_return) {
+                const ret_stmt = final_body[final_body.len - 1];
+                if (ret_stmt.return_stmt.value) |val| {
+                    if (self.isPlaceholderExpr(val)) {
                         const expr = self.recoverTryRetExpr(pattern.try_block) catch |err| switch (err) {
                             error.PatternNoMatch => null,
                             else => return err,
@@ -14764,16 +14923,27 @@ pub const Decompiler = struct {
                             ret_stmt.return_stmt.value = e;
                         }
                     }
+                } else {
+                    const expr = self.recoverTryRetExpr(pattern.try_block) catch |err| switch (err) {
+                        error.PatternNoMatch => null,
+                        else => return err,
+                    };
+                    if (expr) |e| {
+                        ret_stmt.return_stmt.value = e;
+                    }
+                }
+                if (!try_term) {
                     const new_body = try a.alloc(*Stmt, try_body.len + 1);
                     if (try_body.len > 0) {
                         std.mem.copyForwards(*Stmt, new_body[0..try_body.len], try_body);
                     }
                     new_body[try_body.len] = ret_stmt;
                     try_body = new_body;
-                    final_body = final_body[0 .. final_body.len - 1];
                 }
+                final_body = final_body[0 .. final_body.len - 1];
             }
         }
+        try_body = try self.foldTryAwaitRet(try_body);
 
         var next_block: u32 = final_end;
         if (next_block < try_end) next_block = try_end;
@@ -14925,9 +15095,25 @@ pub const Decompiler = struct {
                             }
                         }
                     }
-                    if (jump_out or scan_blk.predecessors.len == 0 or scan_blk.is_exception_handler or pop_dom) {
+                    if (pb > info.body_block and (jump_out or scan_blk.predecessors.len == 0 or scan_blk.is_exception_handler or pop_dom)) {
                         body_end = pb + 1;
                     }
+                }
+            }
+            if (pop_block != null and pop_block.? == info.body_block and body_end == handler_end and handler_end > info.body_block + 1) {
+                // When POP_EXCEPT appears in the first body block, keep the whole
+                // handler subgraph, not just the header block.
+                var reach = try self.reachableNoLoopBack(info.body_block, handler_end, null);
+                defer reach.deinit();
+                var max_block: u32 = info.body_block;
+                var it = reach.iterator(.{});
+                while (it.next()) |bit| {
+                    const bid: u32 = @intCast(bit);
+                    if (bid > max_block) max_block = bid;
+                }
+                const reach_end = max_block + 1;
+                if (reach_end > info.body_block + 1 and reach_end < body_end) {
+                    body_end = reach_end;
                 }
             }
             if (join_block) |join| {
@@ -14977,9 +15163,14 @@ pub const Decompiler = struct {
             body = try self.trimExceptionCleanup(body, info.name);
             body = try self.stripDuplicateCleanupPairs(body);
             body = try self.rewriteAwaitReturn(body);
-            body = try self.rewriteHandlerReturnExpr(body, info.body_block, body_end);
+            if (pattern.finally_block == null) {
+                body = try self.rewriteHandlerReturnExpr(body, info.body_block, body_end);
+            }
             body = try self.stripNestedExceptionCleanup(body, info.name);
-            body = try self.moveReturnNoneIntoElse(body);
+            if (pattern.finally_block == null) {
+                body = try self.moveReturnNoneIntoElse(body);
+            }
+            body = try self.dropNoopIfBeforeTerminal(body);
             if (info.name) |handler_name| {
                 if (body.len > 0) {
                     const first = body[0];
@@ -15148,6 +15339,9 @@ pub const Decompiler = struct {
             if (try self.rewriteHandlerContinueTail(h.body)) |new_body| {
                 h.body = new_body;
             }
+        }
+        if (has_finally) {
+            try_body = self.trimAfterAlwaysTerminal(try_body);
         }
 
         for (handler_reach.list.items) |hid| {
@@ -19681,8 +19875,14 @@ pub const Decompiler = struct {
         end: u32,
         loop_header: ?u32,
         visited: ?*std.DynamicBitSet,
+        protected_set: ?*const GenSet,
     ) DecompileError![]const *Stmt {
         if (start >= end or start >= self.cfg.blocks.len) return &[_]*Stmt{};
+        if (protected_set) |ps| {
+            if (!ps.isSet(start) and !self.isTryReturnCleanupBlock(start)) {
+                return &[_]*Stmt{};
+            }
+        }
         const start_block = &self.cfg.blocks[start];
         const prev_limit = self.br_limit;
         self.br_limit = end;
@@ -19702,8 +19902,10 @@ pub const Decompiler = struct {
                 errdefer stmts.deinit(a);
                 if (try self.tryDecompileBoolOpInto(start, end, &stmts, a)) |next_block| {
                     if (next_block < end and next_block < self.cfg.blocks.len) {
-                        const rest = if (loop_header != null)
-                            try self.decompileTryBody(next_block, end, loop_header, visited)
+                        const rest = if (protected_set != null)
+                            try self.decompileTryBody(next_block, end, loop_header, visited, protected_set)
+                        else if (loop_header != null)
+                            try self.decompileTryBody(next_block, end, loop_header, visited, null)
                         else
                             try self.decompileStructuredRangeNoTry(next_block, end);
                         try stmts.appendSlice(a, rest);
@@ -19871,8 +20073,10 @@ pub const Decompiler = struct {
                         if (merge_id >= end or merge_id >= self.cfg.blocks.len) {
                             return &[_]*Stmt{};
                         }
-                        return if (loop_header != null)
-                            try self.decompileTryBody(merge_id, end, loop_header, visited)
+                        return if (protected_set != null)
+                            try self.decompileTryBody(merge_id, end, loop_header, visited, protected_set)
+                        else if (loop_header != null)
+                            try self.decompileTryBody(merge_id, end, loop_header, visited, null)
                         else
                             try self.decompileStructuredRangeNoTry(merge_id, end);
                     }
@@ -20124,6 +20328,10 @@ pub const Decompiler = struct {
                         // Scan for unconsumed blocks starting from after the if branches
                         var scan = @max(min_next, start + 1);
                         while (scan < end and scan < self.cfg.blocks.len) : (scan += 1) {
+                            if (protected_set == null) {
+                                next = scan;
+                                break;
+                            }
                             if (!self.consumed.isSet(scan)) {
                                 next = scan;
                                 break;
@@ -20138,8 +20346,10 @@ pub const Decompiler = struct {
                         while (next < end and next < self.cfg.blocks.len and v.isSet(next)) : (next += 1) {}
                     }
                     if (next < end and next < self.cfg.blocks.len) {
-                        const rest = if (loop_header != null)
-                            try self.decompileTryBody(next, end, loop_header, vis_ptr)
+                        const rest = if (protected_set != null)
+                            try self.decompileTryBody(next, end, loop_header, vis_ptr, protected_set)
+                        else if (loop_header != null)
+                            try self.decompileTryBody(next, end, loop_header, vis_ptr, null)
                         else
                             try self.decompileStructuredRange(next, end);
                         if (s.* == .if_stmt and rest.len > 0) {
@@ -20168,8 +20378,10 @@ pub const Decompiler = struct {
         if (try self.shouldDeferForPrelude(start, end)) {
             const next = start + 1;
             if (next < end and next < self.cfg.blocks.len) {
-                const rest = if (loop_header != null)
-                    try self.decompileTryBody(next, end, loop_header, visited)
+                const rest = if (protected_set != null)
+                    try self.decompileTryBody(next, end, loop_header, visited, protected_set)
+                else if (loop_header != null)
+                    try self.decompileTryBody(next, end, loop_header, visited, null)
                 else
                     try self.decompileStructuredRangeNoTry(next, end);
                 return rest;
@@ -20596,7 +20808,7 @@ pub const Decompiler = struct {
             }
         }
 
-        if (head_has_pop_except) {
+        if (head_has_pop_except and start + 1 >= end) {
             return stmts.toOwnedSlice(a);
         }
 
@@ -22148,6 +22360,14 @@ pub const Decompiler = struct {
     fn isTryReturnCleanupBlock(self: *Decompiler, block_id: u32) bool {
         if (block_id >= self.cfg.blocks.len) return false;
         const blk = &self.cfg.blocks[block_id];
+        if (blk.instructions.len == 1) {
+            const op = blk.instructions[0].opcode;
+            return op == .RETURN_VALUE or op == .RETURN_CONST;
+        }
+        if (blk.instructions.len == 2) {
+            return blk.instructions[0].opcode == .POP_TOP and
+                (blk.instructions[1].opcode == .RETURN_VALUE or blk.instructions[1].opcode == .RETURN_CONST);
+        }
         if (blk.instructions.len != 3) return false;
         return blk.instructions[0].opcode == .ROT_TWO and
             blk.instructions[1].opcode == .POP_TOP and
@@ -25867,6 +26087,56 @@ pub const Decompiler = struct {
         return items;
     }
 
+    fn trimAfterTerminal(self: *Decompiler, items: []const *Stmt) []const *Stmt {
+        if (items.len == 0) return items;
+        for (items, 0..) |stmt, idx| {
+            if (self.stmtIsTerminal(stmt)) {
+                return items[0 .. idx + 1];
+            }
+        }
+        return items;
+    }
+
+    fn foldTryAwaitRet(self: *Decompiler, body: []const *Stmt) DecompileError![]const *Stmt {
+        if (body.len < 2) return body;
+        const last = body[body.len - 1];
+        if (last.* != .return_stmt) return body;
+        const ret_val = last.return_stmt.value orelse return body;
+        if (ret_val.* != .await_expr) return body;
+        const prev = body[body.len - 2];
+        if (prev.* != .try_stmt) return body;
+        var t = &prev.try_stmt;
+        if (t.handlers.len == 0) return body;
+        if (t.finalbody.len != 0) return body;
+        if (t.else_body.len != 0) return body;
+        if (!(t.body.len == 0 or (t.body.len == 1 and t.body[0].* == .pass))) return body;
+
+        const a = self.arena.allocator();
+        const new_tbody = try a.alloc(*Stmt, t.body.len + 1);
+        if (t.body.len > 0) {
+            std.mem.copyForwards(*Stmt, new_tbody[0..t.body.len], t.body);
+        }
+        new_tbody[t.body.len] = last;
+        t.body = new_tbody;
+
+        const new_body = try a.alloc(*Stmt, body.len - 1);
+        if (body.len > 2) {
+            std.mem.copyForwards(*Stmt, new_body[0 .. body.len - 2], body[0 .. body.len - 2]);
+        }
+        new_body[body.len - 2] = prev;
+        return new_body;
+    }
+
+    fn trimAfterAlwaysTerminal(self: *Decompiler, items: []const *Stmt) []const *Stmt {
+        if (items.len == 0) return items;
+        for (items, 0..) |stmt, idx| {
+            if (self.stmtAlwaysTerminal(stmt)) {
+                return items[0 .. idx + 1];
+            }
+        }
+        return items;
+    }
+
     fn stripDuplicateCleanupPairs(self: *Decompiler, items: []const *Stmt) DecompileError![]const *Stmt {
         if (items.len < 4) return items;
         const a = self.arena.allocator();
@@ -26283,6 +26553,28 @@ pub const Decompiler = struct {
         const out = try a.alloc(*Stmt, 2);
         out[0] = if_stmt;
         out[1] = body[3];
+        return out;
+    }
+
+    fn dropNoopIfBeforeTerminal(
+        self: *Decompiler,
+        body: []const *Stmt,
+    ) DecompileError![]const *Stmt {
+        if (body.len < 2) return body;
+        var start: usize = 0;
+        while (start + 1 < body.len) {
+            const first = body[start];
+            if (first.* != .if_stmt) break;
+            const ifs = first.if_stmt;
+            const body_is_noop = ifs.body.len == 0 or (ifs.body.len == 1 and ifs.body[0].* == .pass);
+            if (!body_is_noop or ifs.else_body.len != 0) break;
+            if (!self.stmtAlwaysTerminal(body[start + 1])) break;
+            start += 1;
+        }
+        if (start == 0) return body;
+        const a = self.arena.allocator();
+        const out = try a.alloc(*Stmt, body.len - start);
+        std.mem.copyForwards(*Stmt, out, body[start..]);
         return out;
     }
 

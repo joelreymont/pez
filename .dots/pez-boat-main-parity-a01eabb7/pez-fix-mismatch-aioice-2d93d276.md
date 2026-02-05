@@ -1,9 +1,11 @@
 ---
 title: Fix mismatch aioice/mdns
-status: open
+status: closed
 priority: 1
 issue-type: task
-created-at: "2026-02-05T20:10:53.567003+01:00"
+created-at: "\"\\\"2026-02-05T20:10:53.567003+01:00\\\"\""
+closed-at: "2026-02-05T22:09:30.635247+01:00"
+close-reason: completed
 blocks:
   - pez-stabilize-decompyle3-compare-bd82d94b
 ---
