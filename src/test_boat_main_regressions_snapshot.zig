@@ -223,6 +223,18 @@ test "snapshot if term raise 3.9" {
     );
 }
 
+test "snapshot if raise else fallthrough 3.9" {
+    try runSnapshot(@src(), "test/corpus/if_raise_else_fallthrough.3.9.pyc",
+        \\[]u8
+        \\  "def f(match):
+        \\    if not match:
+        \\        raise ValueError('x')
+        \\    a = 1
+        \\    b = 2
+        \\"
+    );
+}
+
 test "snapshot optparse add_option 3.9" {
     try runSnapshot(@src(), "test/corpus/optparse_add_option.3.9.pyc",
         \\[]u8

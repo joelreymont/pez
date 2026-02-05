@@ -1,9 +1,9 @@
 ---
 title: Repro packaging specifiers
-status: open
+status: active
 priority: 2
 issue-type: task
-created-at: "2026-02-05T21:25:22.551177+01:00"
+created-at: "\"2026-02-05T21:25:22.551177+01:00\""
 blocks:
   - pez-validate-and-commit-03e5b51c
 ---

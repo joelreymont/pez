@@ -5948,6 +5948,28 @@ pub const Decompiler = struct {
             const cur = stmts[i];
             if (cur.* == .if_stmt) {
                 const ifs = &cur.if_stmt;
+                const else_tail_none = if (ifs.else_body.len > 0)
+                    Decompiler.isReturnNone(ifs.else_body[ifs.else_body.len - 1])
+                else
+                    false;
+                if (ifs.body.len > 0 and ifs.body[ifs.body.len - 1].* == .raise_stmt and
+                    ifs.else_body.len > 0 and (!self.bodyEndsTerminal(ifs.else_body) or else_tail_none))
+                {
+                    // Prefer guard-style `if ...: raise` over wrapping the fallthrough in `else`.
+                    // This preserves original jump layout in many parser-produced constructors.
+                    const guard_if = try allocator.create(Stmt);
+                    guard_if.* = .{ .if_stmt = .{
+                        .condition = ifs.condition,
+                        .body = ifs.body,
+                        .else_body = &.{},
+                    } };
+                    guard_if.if_stmt.no_merge = ifs.no_merge;
+                    try out.append(allocator, guard_if);
+                    try out.appendSlice(allocator, ifs.else_body);
+                    i += 1;
+                    changed = true;
+                    continue;
+                }
                 if (ifs.else_body.len == 0 and ifs.body.len > 0 and ifs.body[ifs.body.len - 1].* == .return_stmt and
                     i + 2 < stmts.len and stmts[i + 1].* == .if_stmt and stmts[i + 2].* == .raise_stmt)
                 {
