@@ -1,9 +1,11 @@
 ---
 title: Locate tarfile divergence
-status: open
+status: closed
 priority: 2
 issue-type: task
-created-at: "2026-02-05T21:25:22.520298+01:00"
+created-at: "\"\\\"2026-02-05T21:25:22.520298+01:00\\\"\""
+closed-at: "2026-02-05T22:30:18.007851+01:00"
+close-reason: first divergence at <module>.TarInfo._create_pax_generic_header with handler scope inflation
 blocks:
   - pez-repro-tarfile-a50c35fa
 ---

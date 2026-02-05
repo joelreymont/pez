@@ -1326,6 +1326,17 @@ test "snapshot guard or 3.9" {
     );
 }
 
+test "snapshot guard in return 3.9" {
+    try runSnapshot(@src(), "test/corpus/guard_in_return.3.9.pyc",
+        \\[]u8
+        \\  "def guard_in_return(item, seq):
+        \\    if item in seq:
+        \\        return item
+        \\    raise KeyError(item)
+        \\"
+    );
+}
+
 test "snapshot guard or return 3.9" {
     try runSnapshotAligned(@src(), "test/corpus/if_guard_or_return.3.9.pyc",
         \\[]u8

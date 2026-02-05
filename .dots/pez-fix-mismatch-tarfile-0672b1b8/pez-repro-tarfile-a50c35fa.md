@@ -1,9 +1,11 @@
 ---
 title: Repro tarfile
-status: open
+status: closed
 priority: 2
 issue-type: task
-created-at: "2026-02-05T21:25:22.516723+01:00"
+created-at: "\"\\\"2026-02-05T21:25:22.516723+01:00\\\"\""
+closed-at: "2026-02-05T22:28:38.668014+01:00"
+close-reason: reproduced with /tmp/pez-tarfile-driver-1.json
 blocks:
   - pez-validate-and-commit-384c0fa5
 ---

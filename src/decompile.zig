@@ -207,6 +207,7 @@ fn rewriteFunctionStmts(decompiler: *Decompiler, stmts: []const *Stmt) Decompile
     var out = stmts;
     out = try decompiler.rewriteRetRaiseDeep(a, out);
     out = try decompiler.rewriteLoopGuardElseDeep(a, out);
+    out = try decompiler.rewriteGuardRetDeep(a, out);
     out = try decompiler.trimTailElseRetNone(out);
     return trimTrailingReturnNone(out);
 }
@@ -219,6 +220,7 @@ fn rewriteModuleStmts(decompiler: *Decompiler, stmts: []const *Stmt) DecompileEr
     out = try decompiler.mergeImportFromGroupsDeep(a, out);
     out = try decompiler.rewriteRetRaiseDeep(a, out);
     out = try decompiler.rewriteLoopGuardElseDeep(a, out);
+    out = try decompiler.rewriteGuardRetDeep(a, out);
     // Control-flow rewrites can change bytecode parity.
     out = try decompiler.trimPostTerminalCleanupDeep(a, out);
     return out;
@@ -15134,7 +15136,20 @@ pub const Decompiler = struct {
                     }
                 }
             }
-            if (loop_header != null and body_end > info.body_block + 1) {
+            const effective_loop_header = loop_header orelse self.innermostLoopHeader(info.body_block);
+            if (effective_loop_header) |header_id| {
+                if (body_end > info.body_block + 1) {
+                    // Keep handler bodies inside the enclosing loop when loop context is inferred.
+                    var scan_in_loop = info.body_block + 1;
+                    while (scan_in_loop < body_end and scan_in_loop < self.cfg.blocks.len) : (scan_in_loop += 1) {
+                        if (!self.analyzer.inLoop(scan_in_loop, header_id)) {
+                            body_end = scan_in_loop;
+                            break;
+                        }
+                    }
+                }
+            }
+            if (effective_loop_header != null and body_end > info.body_block + 1) {
                 const limit = @min(body_end, @as(u32, @intCast(self.cfg.blocks.len)));
                 var reach = try self.reachableNoLoopBack(info.body_block, limit, null);
                 defer reach.deinit();
@@ -15207,7 +15222,7 @@ pub const Decompiler = struct {
                     }
                 }
             }
-            const header_id_opt = loop_header orelse self.innermostLoopHeader(info.body_block);
+            const header_id_opt = effective_loop_header;
             if (header_id_opt) |header_id| {
                 if (handler_name) |hn| {
                     if (self.handlerIsContinue(info.body_block, body_end, header_id)) {
