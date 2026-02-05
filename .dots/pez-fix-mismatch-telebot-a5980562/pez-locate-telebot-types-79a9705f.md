@@ -1,9 +1,11 @@
 ---
 title: Locate telebot types divergence
-status: open
+status: closed
 priority: 2
 issue-type: task
-created-at: "2026-02-05T21:25:22.502607+01:00"
+created-at: "\"2026-02-05T21:25:22.502607+01:00\""
+closed-at: "2026-02-05T22:27:33.511034+01:00"
+close-reason: completed
 blocks:
   - pez-repro-telebot-types-7a75ab24
 ---

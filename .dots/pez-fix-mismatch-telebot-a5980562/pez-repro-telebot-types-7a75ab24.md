@@ -1,9 +1,11 @@
 ---
 title: Repro telebot types
-status: open
+status: closed
 priority: 2
 issue-type: task
-created-at: "2026-02-05T21:25:22.498589+01:00"
+created-at: "\"\\\"2026-02-05T21:25:22.498589+01:00\\\"\""
+closed-at: "2026-02-05T22:27:33.506597+01:00"
+close-reason: completed
 blocks:
   - pez-validate-and-commit-b0e23089
 ---

@@ -30,6 +30,9 @@ pub const Writer = struct {
     /// When inside an f-string, this is the quote char used by the f-string.
     /// Strings inside expressions must use the opposite quote.
     fstring_quote: ?u8,
+    /// When enabled, string-valued annotations are emitted as annotation source
+    /// text instead of as quoted string literals.
+    future_annotations: bool,
 
     pub fn init(_: std.mem.Allocator) Writer {
         return .{
@@ -37,6 +40,7 @@ pub const Writer = struct {
             .indent_level = 0,
             .indent_str = "    ",
             .fstring_quote = null,
+            .future_annotations = false,
         };
     }
 
@@ -945,7 +949,7 @@ pub const Writer = struct {
             try self.write(allocator, arg.arg);
             if (arg.annotation) |ann| {
                 try self.write(allocator, ": ");
-                try self.writeExpr(allocator, ann);
+                try self.writeAnnotationExpr(allocator, ann);
             }
             if (n_defaults > 0 and pos_idx >= defaults_start) {
                 const default_idx = pos_idx - defaults_start;
@@ -966,7 +970,7 @@ pub const Writer = struct {
             try self.write(allocator, arg.arg);
             if (arg.annotation) |ann| {
                 try self.write(allocator, ": ");
-                try self.writeExpr(allocator, ann);
+                try self.writeAnnotationExpr(allocator, ann);
             }
             if (n_defaults > 0 and pos_idx >= defaults_start) {
                 const default_idx = pos_idx - defaults_start;
@@ -984,7 +988,7 @@ pub const Writer = struct {
             try self.write(allocator, va.arg);
             if (va.annotation) |ann| {
                 try self.write(allocator, ": ");
-                try self.writeExpr(allocator, ann);
+                try self.writeAnnotationExpr(allocator, ann);
             }
         }
 
@@ -1001,7 +1005,7 @@ pub const Writer = struct {
             try self.write(allocator, arg.arg);
             if (arg.annotation) |ann| {
                 try self.write(allocator, ": ");
-                try self.writeExpr(allocator, ann);
+                try self.writeAnnotationExpr(allocator, ann);
             }
             if (i < args.kw_defaults.len) {
                 if (args.kw_defaults[i]) |default| {
@@ -1018,9 +1022,17 @@ pub const Writer = struct {
             try self.write(allocator, kw.arg);
             if (kw.annotation) |ann| {
                 try self.write(allocator, ": ");
-                try self.writeExpr(allocator, ann);
+                try self.writeAnnotationExpr(allocator, ann);
             }
         }
+    }
+
+    fn writeAnnotationExpr(self: *Writer, allocator: std.mem.Allocator, expr: *const Expr) WriteError!void {
+        if (expr.* == .constant and expr.constant == .string) {
+            try self.write(allocator, expr.constant.string);
+            return;
+        }
+        try self.writeExpr(allocator, expr);
     }
 
     fn writeComprehensionClauses(self: *Writer, allocator: std.mem.Allocator, generators: []const ast.Comprehension) !void {
@@ -1111,7 +1123,7 @@ pub const Writer = struct {
             .ann_assign => |a| {
                 try self.writeExpr(allocator, a.target);
                 try self.write(allocator, ": ");
-                try self.writeExpr(allocator, a.annotation);
+                try self.writeAnnotationExpr(allocator, a.annotation);
                 if (a.value) |v| {
                     try self.write(allocator, " = ");
                     try self.writeExpr(allocator, v);
@@ -1244,7 +1256,7 @@ pub const Writer = struct {
                 try self.writeByte(allocator, ')');
                 if (f.returns) |r| {
                     try self.write(allocator, " -> ");
-                    try self.writeExpr(allocator, r);
+                    try self.writeAnnotationExpr(allocator, r);
                 }
                 try self.write(allocator, ":\n");
                 self.indent_level += 1;

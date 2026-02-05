@@ -6093,9 +6093,14 @@ pub const Decompiler = struct {
                             const prev_last = prev_if.body[prev_if.body.len - 1];
                             break :blk self.stmtIsTerminal(prev_last);
                         } else false;
-                        if (last_then.* == .return_stmt and !prev_guard_chain and
-                            !(ifs.condition.* == .bool_op and ifs.condition.bool_op.op == .and_))
-                        {
+                        const cond = ifs.condition;
+                        const can_inv = switch (cond.*) {
+                            .bool_op => cond.bool_op.op == .or_,
+                            .unary_op => cond.unary_op.op == .not_ and cond.unary_op.operand.* == .bool_op and
+                                cond.unary_op.operand.bool_op.op == .or_,
+                            else => false,
+                        };
+                        if (last_then.* == .return_stmt and can_inv and !prev_guard_chain) {
                             const inv = try self.invertConditionExpr(ifs.condition);
                             const body = try allocator.alloc(*Stmt, 1);
                             body[0] = next;
@@ -28097,6 +28102,7 @@ pub fn decompileToSourceWithOptions(
 
         var cg = codegen.Writer.init(a);
         defer cg.deinit(a);
+        cg.future_annotations = (target.flags & pyc.Code.CO_FUTURE_ANNOTATIONS) != 0;
 
         var seen_body = false;
         for (effective_stmts) |stmt| {
@@ -28147,6 +28153,7 @@ fn decompileFunctionToSource(
 
         var cg = codegen.Writer.init(allocator);
         defer cg.deinit(allocator);
+        cg.future_annotations = (code.flags & pyc.Code.CO_FUTURE_ANNOTATIONS) != 0;
         try cg.writeExpr(allocator, lambda_expr);
         const output = try cg.getOutput(allocator);
         defer allocator.free(output);
@@ -28241,6 +28248,7 @@ fn decompileFunctionToSource(
             var cg = codegen.Writer.init(allocator);
             defer cg.deinit(allocator);
             cg.indent_level = indent + 1;
+            cg.future_annotations = (code.flags & pyc.Code.CO_FUTURE_ANNOTATIONS) != 0;
 
             for (effective_stmts) |stmt| {
                 try cg.writeStmt(allocator, stmt);
