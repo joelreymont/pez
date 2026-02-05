@@ -56,7 +56,7 @@ External Cross-checks
 - Parity harness (`tools/parity/run.sh`) runs pez against pycdc, uncompyle6, and decompyle3.
 - decompyle3:
   - Clone: `jj git clone https://github.com/rocky/python-decompile3 refs/python-decompile3`
-  - Repo: `/Users/joel/Work/pez/refs/python-decompile3`
+  - Repo: `/Users/joel/Work/pez/refs/python-decompile3` (@ 936ea1f36610ab20411b59d6d71323f2033a6bc2)
   - Runtime setup:
     - `uv python install 3.9`
     - `uv python install 3.12`

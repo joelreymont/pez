@@ -11,11 +11,11 @@ python3 tools/compare/compare_suite.py \
   --py /Users/joel/Work/pez/.uv/py39/bin/python \
   --xdis-python /Users/joel/Work/pez/.uv/py39/bin/python \
   --decompyle3 /Users/joel/Work/pez/.uv/py39/bin/decompyle3 \
-  --out-root /tmp/pez-boatmain-suite18 \
-  --out /tmp/pez-boatmain-suite18.json
+  --out-root /tmp/pez-boatmain-suite19 \
+  --out /tmp/pez-boatmain-suite19.json
 ```
 
-## Summary (from /tmp/pez-boatmain-suite18.json)
+## Summary (from /tmp/pez-boatmain-suite19.json)
 - pez decompile: ok=329 error=0
 - pez compare: exact=173 close=54 mismatch=102 error=0 missing_src=0
 - decompyle3 decompile: ok=329 error=0
@@ -23,15 +23,15 @@ python3 tools/compare/compare_suite.py \
 
 ## Worst semantic mismatches (pez, min_semantic_score)
 - aioice/mdns.pyc (min=0.1965)
+- packaging/specifiers.pyc (min=0.2000)
+- telebot/types.pyc (min=0.2000)
+- typing.pyc (min=0.2000)
+- subprocess.pyc (min=0.2000)
 - code.pyc (min=0.2000)
 - ftplib.pyc (min=0.2000)
 - glob.pyc (min=0.2000)
-- packaging/specifiers.pyc (min=0.2000)
 - picamera2/controls.pyc (min=0.2000)
-- subprocess.pyc (min=0.2000)
 - tarfile.pyc (min=0.2000)
-- telebot/types.pyc (min=0.2000)
-- typing.pyc (min=0.2000)
 
 ## Drill-down (single file)
 ```bash
@@ -60,5 +60,5 @@ python3 tools/compare/locate_mismatch.py \
 ```
 
 ## Decompyle3 corpus (extra .pyc fixtures)
-- repo: /Users/joel/Work/pez/refs/python-decompile3
+- repo: /Users/joel/Work/pez/refs/python-decompile3 (@ 936ea1f36610ab20411b59d6d71323f2033a6bc2)
 - corpora: /Users/joel/Work/pez/refs/python-decompile3/test/bytecode_3.8, /Users/joel/Work/pez/refs/python-decompile3/test/bytecode_3.7, pypy bytecode under /Users/joel/Work/pez/refs/python-decompile3/test/bytecode_*pypy
