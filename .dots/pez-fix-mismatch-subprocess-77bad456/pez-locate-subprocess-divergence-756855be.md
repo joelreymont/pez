@@ -1,9 +1,9 @@
 ---
 title: Locate subprocess divergence
-status: open
+status: active
 priority: 2
 issue-type: task
-created-at: "2026-02-05T21:25:22.537464+01:00"
+created-at: "\"2026-02-05T21:25:22.537464+01:00\""
 blocks:
   - pez-repro-subprocess-ae569d1f
 ---

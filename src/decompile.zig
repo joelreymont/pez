@@ -6766,8 +6766,13 @@ pub const Decompiler = struct {
                 ast.exprEqual(body_val.?, last_val.?);
             if (!same) continue;
 
-            const cond = try self.invertConditionExpr(ifs.condition);
             const tail = stmts[idx + 1 .. stmts.len - 1];
+            // Keep explicit early-return guard shape when the in-between tail starts with
+            // another conditional; collapsing into `if not ...` often perturbs jump layout.
+            if (tail.len > 0 and tail[0].* == .if_stmt) {
+                continue;
+            }
+            const cond = try self.invertConditionExpr(ifs.condition);
             const new_body = if (tail.len == 0)
                 &[_]*Stmt{}
             else blk: {
@@ -11385,7 +11390,9 @@ pub const Decompiler = struct {
                         }
                         for (pred_blk.successors) |edge| {
                             if (edge.target != cur_else) continue;
-                            if (edge.edge_type == .exception) continue;
+                            // Back-edges into loop headers are not evidence that cur_else is
+                            // a post-if fallthrough block.
+                            if (edge.edge_type == .exception or edge.edge_type == .loop_back) continue;
                             join_pred = true;
                             break;
                         }
@@ -11706,17 +11713,24 @@ pub const Decompiler = struct {
         if (!else_body_moved and !is_elif and !in_elif_chain and else_block != null and else_body.len > 0 and
             self.bodyEndsTerminal(then_body) and !self.bodyEndsTerminal(else_body))
         {
-            if (self.if_next == null) {
-                if (else_start) |sid| {
-                    self.if_next = sid;
-                } else if (else_block) |eid| {
-                    self.if_next = eid;
+            const guard_next = if (else_start) |sid|
+                sid
+            else if (else_block) |eid|
+                eid
+            else
+                @as(u32, @intCast(self.cfg.blocks.len));
+            const limit = self.br_limit orelse @as(u32, @intCast(self.cfg.blocks.len));
+            // Guard-style `if ...: break/return` requires emitting the tail in-range.
+            // If tail starts at/after the active range limit, keep the explicit else body.
+            if (guard_next < limit) {
+                if (self.if_next == null) {
+                    self.if_next = guard_next;
                 }
+                else_body = &[_]*Stmt{};
+                no_merge = true;
+                else_block = null;
+                try self.emitDecisionTrace(pattern.condition_block, "if_guard_terminal_then", condition);
             }
-            else_body = &[_]*Stmt{};
-            no_merge = true;
-            else_block = null;
-            try self.emitDecisionTrace(pattern.condition_block, "if_guard_terminal_then", condition);
         }
 
         if (chained_cmp) {
@@ -15816,6 +15830,12 @@ pub const Decompiler = struct {
             const blk = &self.cfg.blocks[cur];
 
             if (cur != body_block and self.hasWithExitCleanup(blk)) {
+                // Only treat a cleanup-pattern block as the body cutoff when it is on
+                // every path out of the with body. Per-branch cleanup stubs (e.g. inside
+                // `if ...: break`) must stay inside the structured body range.
+                if (!(try self.postDominates(cur, body_block))) {
+                    // not a global cleanup cutoff
+                } else {
                 var has_exc_to_cleanup = false;
                 for (blk.successors) |edge| {
                     if (edge.edge_type == .exception and edge.target == cleanup_block) {
@@ -15828,6 +15848,7 @@ pub const Decompiler = struct {
                         best = cur;
                         best_off = blk.start_offset;
                     }
+                }
                 }
             }
 
