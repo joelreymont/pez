@@ -1,9 +1,11 @@
 ---
 title: Stabilize decompyle3 compare
-status: open
+status: closed
 priority: 1
 issue-type: task
-created-at: "2026-02-05T20:10:49.340228+01:00"
+created-at: "\"2026-02-05T20:10:49.340228+01:00\""
+closed-at: "2026-02-05T20:59:31.258054+01:00"
+close-reason: suite18 decompyle3 decompile error=0
 blocks:
   - pez-wire-uv-paths-d4ef838b
 ---

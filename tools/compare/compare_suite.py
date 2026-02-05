@@ -55,6 +55,7 @@ def resolve_decompyle3(arg: str) -> str:
         return env
     candidates = [
         str(ROOT / ".uv" / "py39" / "bin" / "decompyle3"),
+        str(ROOT / ".uv" / "py312" / "bin" / "decompyle3"),
         "/tmp/decompyle3-venv-312/bin/decompyle3",
         "/tmp/decompyle3-venv-311/bin/decompyle3",
         "decompyle3",
