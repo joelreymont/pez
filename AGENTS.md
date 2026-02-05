@@ -2,7 +2,7 @@
 
 ## Active Plan
 
-Decompiler parity spec: `~/.claude/plans/composed-wishing-diffie.md`
+Decompiler parity spec: `PLAN.md`
 
 ## Dot
 
