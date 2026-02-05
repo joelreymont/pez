@@ -2944,6 +2944,7 @@ pub const SimContext = struct {
             .NOT_TAKEN,
             .SETUP_LOOP,
             .SETUP_EXCEPT,
+            .SETUP_ANNOTATIONS,
             .POP_BLOCK,
             .SET_LINENO,
             .JUMP_BACKWARD,

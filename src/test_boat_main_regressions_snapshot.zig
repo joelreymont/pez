@@ -220,6 +220,18 @@ test "snapshot loop exit reaches header 3.9" {
     );
 }
 
+test "snapshot setup annotations prelude 3.9" {
+    try runSnapshot(@src(), "test/corpus/setup_annotations_prelude.3.9.pyc",
+        \\[]u8
+        \\  "x: int
+        \\import math
+        \\xs = [1, 2, 3]
+        \\for y in xs:
+        \\    x = y + math.ceil(0.2)
+        \\"
+    );
+}
+
 test "snapshot loop merge break 3.9" {
     try runSnapshot(@src(), "test/corpus/loop_merge_break.3.9.pyc",
         \\[]u8
