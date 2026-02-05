@@ -19296,6 +19296,10 @@ pub const Decompiler = struct {
                         self.if_next = null;
                         if_next = null;
                     }
+                    if (if_next != null and if_next.? >= limit) {
+                        self.if_next = null;
+                        if_next = null;
+                    }
                     if (if_next) |next| {
                         block_idx = next;
                         self.if_next = null;
