@@ -1,9 +1,11 @@
 ---
 title: Fix subprocess root cause
-status: open
+status: closed
 priority: 2
 issue-type: task
-created-at: "2026-02-05T21:25:22.540854+01:00"
+created-at: "\"2026-02-05T21:25:22.540854+01:00\""
+closed-at: "2026-02-06T00:39:05.082671+01:00"
+close-reason: Patched rewriteRetRaiseList to preserve early return when else exists
 blocks:
   - pez-locate-subprocess-divergence-756855be
 ---

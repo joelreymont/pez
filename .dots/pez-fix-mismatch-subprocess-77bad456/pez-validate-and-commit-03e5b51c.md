@@ -1,9 +1,11 @@
 ---
 title: Validate and commit subprocess
-status: open
+status: closed
 priority: 2
 issue-type: task
-created-at: "2026-02-05T21:25:22.547864+01:00"
+created-at: "\"2026-02-05T21:25:22.547864+01:00\""
+closed-at: "2026-02-06T00:39:05.089731+01:00"
+close-reason: Ran zig build test + compare_driver + compare_suite
 blocks:
   - pez-add-subprocess-regression-77903f31
 ---

@@ -6133,7 +6133,10 @@ pub const Decompiler = struct {
                             continue;
                         }
                     }
-                    if (next.* == .return_stmt and ifs.body.len > 0) {
+                    // Preserve explicit early-return shape when this `if` has an else arm.
+                    // Dropping the duplicate then-return there degrades bytecode parity
+                    // into `if cond: pass`/`elif ...` form.
+                    if (next.* == .return_stmt and ifs.body.len > 0 and ifs.else_body.len == 0) {
                         const last_then = ifs.body[ifs.body.len - 1];
                         if (last_then.* == .return_stmt and self.terminalStmtEqual(last_then, next)) {
                             ifs.body = ifs.body[0 .. ifs.body.len - 1];

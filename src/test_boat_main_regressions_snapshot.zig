@@ -1085,6 +1085,21 @@ test "snapshot if return fallthrough 3.9" {
     );
 }
 
+test "snapshot if return elif fallthrough 3.9" {
+    try runSnapshot(@src(), "test/corpus/if_return_elif_fallthrough.3.9.pyc",
+        \\[]u8
+        \\  "def f(returncode, timeout):
+        \\    if returncode is not None:
+        \\        return returncode
+        \\    elif timeout is not None:
+        \\        a = 1
+        \\    else:
+        \\        b = 2
+        \\    return returncode
+        \\"
+    );
+}
+
 test "snapshot if return else fallthrough 3.9" {
     try runSnapshot(@src(), "test/corpus/if_else_return_fallthrough.3.9.pyc",
         \\[]u8
