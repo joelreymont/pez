@@ -18,6 +18,7 @@ Thumbs.db
 
 # Temporary files
 /tmp/
+.uv/
 __pycache__/
 tools/parity/out/
 
