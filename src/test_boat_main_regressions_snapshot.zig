@@ -326,6 +326,17 @@ test "snapshot for else break 3.9" {
     );
 }
 
+test "snapshot for break cleanup 3.9" {
+    try runSnapshot(@src(), "test/corpus/for_break_cleanup.3.9.pyc",
+        \\[]u8
+        \\  "def f(parameters):
+        \\    for codec in parameters.codecs:
+        \\        if codec:
+        \\            break
+        \\"
+    );
+}
+
 test "snapshot for prelude 3.9" {
     try runSnapshot(@src(), "test/corpus/for_prelude.3.9.pyc",
         \\[]u8

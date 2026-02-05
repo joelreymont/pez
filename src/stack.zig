@@ -5039,6 +5039,11 @@ pub const SimContext = struct {
                 // FOR_ITER delta - get next value from iterator
                 // On exhaustion, jumps forward by delta
                 if (self.lenient) {
+                    // Even in lenient simulation we want iterator cleanup (`POP_TOP`) to be
+                    // discarded, not emitted as a stray expression statement.
+                    if (self.stack.items.items.len > 0 and self.stack.items.items[self.stack.items.items.len - 1] == .expr) {
+                        self.stack.items.items[self.stack.items.items.len - 1] = .unknown;
+                    }
                     try self.stack.push(.unknown);
                     return;
                 }
@@ -5062,6 +5067,14 @@ pub const SimContext = struct {
                             try self.addCompGenerator(builder, iter_expr);
                         },
                         else => return error.NotAnExpression,
+                    }
+                } else {
+                    // In a normal `for` loop the iterator value lives on the eval stack for the
+                    // duration of the loop and is popped implicitly by `POP_TOP` when the loop
+                    // exits (including `break`). Treat it as unknown so we don't emit a spurious
+                    // expression statement for iterator cleanup.
+                    if (self.stack.items.items.len > 0 and self.stack.items.items[self.stack.items.items.len - 1] == .expr) {
+                        self.stack.items.items[self.stack.items.items.len - 1] = .unknown;
                     }
                 }
 
