@@ -11749,6 +11749,27 @@ pub const Decompiler = struct {
             // Clear if_next since the following code is handled via if_tail
             self.if_next = null;
         }
+        if (!is_elif and self.if_tail == null and else_start != null and
+            else_body.len == 1 and else_body[0].* == .raise_stmt and then_body.len > 0)
+        {
+            const else_id = else_start.?;
+            if (else_id < self.cfg.blocks.len and then_block < self.cfg.blocks.len) {
+                const else_off = self.cfg.blocks[else_id].start_offset;
+                const then_off = self.cfg.blocks[then_block].start_offset;
+                if (else_off < then_off) {
+                    condition = try self.invertConditionExpr(condition);
+                    try self.emitDecisionTrace(pattern.condition_block, "if_guard_raise_tail", condition);
+                    const guard_body = else_body;
+                    else_body = &[_]*Stmt{};
+                    else_block = null;
+                    self.if_tail = then_body;
+                    then_body = guard_body;
+                    else_body_moved = true;
+                    // Tail is rendered via if_tail.
+                    self.if_next = null;
+                }
+            }
+        }
         if (else_block) |else_id| {
             if (self.if_tail == null and else_body.len > 0 and then_body.len == 1 and then_body[0].* == .raise_stmt) {
                 const resolved_then = self.resolveJumpOnlyBlock(then_block);
@@ -23199,6 +23220,42 @@ pub const Decompiler = struct {
                     };
                     if (inst.opcode == .STORE_DEREF and self.version.gte(3, 14) and std.mem.eql(u8, name, "__classdict__")) {
                         name = "__unknown__";
+                    }
+                    if (idx > 0 and instructions[idx - 1].opcode == .ROT_TWO and idx + 1 < instructions.len and
+                        !std.mem.eql(u8, name, "__classcell__"))
+                    {
+                        const next_inst = instructions[idx + 1];
+                        const next_name: ?[]const u8 = switch (next_inst.opcode) {
+                            .STORE_FAST => sim.getLocal(next_inst.arg),
+                            .STORE_NAME, .STORE_GLOBAL => sim.getName(next_inst.arg),
+                            .STORE_DEREF => sim.getDeref(next_inst.arg),
+                            else => null,
+                        };
+                        if (next_name) |nn| {
+                            if (!std.mem.eql(u8, nn, "__classcell__")) {
+                                const items = sim.stack.items.items;
+                                if (items.len >= 2 and
+                                    (items[items.len - 1] == .expr or items[items.len - 1] == .unknown) and
+                                    (items[items.len - 2] == .expr or items[items.len - 2] == .unknown))
+                                {
+                                    const target1 = try self.makeName(name, .store);
+                                    const target2 = try self.makeName(nn, .store);
+                                    const val1 = try sim.stack.popExpr();
+                                    const val2 = try sim.stack.popExpr();
+                                    const rhs_elts = try a.alloc(*Expr, 2);
+                                    rhs_elts[0] = val1;
+                                    rhs_elts[1] = val2;
+                                    const rhs_tuple = try ast.makeTuple(a, rhs_elts, .load);
+                                    const tgt_slice = try a.alloc(*Expr, 2);
+                                    tgt_slice[0] = target1;
+                                    tgt_slice[1] = target2;
+                                    const stmt = try self.makeUnpackAssignExprs(tgt_slice, rhs_tuple);
+                                    try stmts.append(a, stmt);
+                                    idx += 1;
+                                    continue;
+                                }
+                            }
+                        }
                     }
                     var chain_idx = idx;
                     if (try self.tryHandleChainAssignStore(&sim, instructions, &chain_idx, name, stmts, a)) {

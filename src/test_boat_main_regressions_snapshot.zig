@@ -1543,3 +1543,14 @@ test "snapshot if or else platform 3.9" {
         \\"
     );
 }
+
+test "snapshot rot2 pair 3.9" {
+    try runSnapshot(@src(), "test/corpus/rot2_pair.3.9.pyc",
+        \\[]u8
+        \\  "def rot2_pair(args):
+        \\    optstring, args = (args[0], args[1:])
+        \\    optarg, optstring = (optstring, '')
+        \\    return (optarg, optstring, args)
+        \\"
+    );
+}
