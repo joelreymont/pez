@@ -658,6 +658,14 @@ pub fn Methods(comptime Self: type, comptime Err: type) type {
             stmts: *std.ArrayListUnmanaged(*Stmt),
             stmts_allocator: Allocator,
         ) DecompileError!?u32 {
+            // Support chained guard conditions feeding an `x and y or z` tail:
+            //   if A: if B: return C or Z else: Z else: Z
+            // which corresponds to `A and B and C or Z` in bytecode (py3.9 commonly uses
+            // POP_JUMP_IF_FALSE for the bool operands, then JUMP_IF_TRUE_OR_POP for the value).
+            if (try tryDecompileAndOrChainInto(self, block_id, limit, stmts, stmts_allocator)) |next_block| {
+                return next_block;
+            }
+
             const pattern = self.analyzer.detectAndOr(block_id) orelse return null;
             if (pattern.true_block >= limit or pattern.false_block >= limit or pattern.merge_block > limit) {
                 return null;
@@ -712,6 +720,201 @@ pub fn Methods(comptime Self: type, comptime Err: type) type {
             // block *after* the range. Allow matching `x and y or z` when the merge block is
             // exactly `limit` by saving the folded expression for the merge block and letting
             // the outer decompiler handle the terminator (e.g. RETURN_VALUE) outside the range.
+            if (pattern.merge_block == limit) {
+                try self.setStackEntryWithExpr(pattern.merge_block, base_vals, or_expr, &base_owned);
+                return pattern.merge_block;
+            }
+
+            const merge_block = &self.cfg.blocks[pattern.merge_block];
+            if (merge_block.terminator()) |mt| {
+                if (ctrl.Analyzer.isCondJump(mt.opcode)) {
+                    try self.setStackEntryWithExpr(pattern.merge_block, base_vals, or_expr, &base_owned);
+                    return pattern.merge_block;
+                }
+            }
+
+            var merge_sim = self.initSim(self.arena.allocator(), self.arena.allocator(), self.code, self.version);
+            defer merge_sim.deinit();
+            if (base_vals.len > 0) {
+                for (base_vals) |val| {
+                    const cloned = try merge_sim.cloneStackValue(val);
+                    try merge_sim.stack.push(cloned);
+                }
+            }
+            try merge_sim.stack.push(.{ .expr = or_expr });
+            self.processBlockWithSim(merge_block, &merge_sim, stmts, stmts_allocator) catch |err| {
+                switch (err) {
+                    error.StackUnderflow, error.NotAnExpression, error.InvalidBlock => {
+                        stmts.items.len = stmts_len;
+                        return error.PatternNoMatch;
+                    },
+                    else => return err,
+                }
+            };
+
+            return pattern.merge_block + 1;
+        }
+
+        fn isPopJumpFalse(op: Opcode) bool {
+            return switch (op) {
+                .POP_JUMP_IF_FALSE, .POP_JUMP_FORWARD_IF_FALSE, .POP_JUMP_BACKWARD_IF_FALSE => true,
+                else => false,
+            };
+        }
+
+        fn condSuccs(block: *const BasicBlock) ?struct { t: u32, f: u32 } {
+            if (block.successors.len != 2) return null;
+            var t_id: ?u32 = null;
+            var f_id: ?u32 = null;
+            for (block.successors) |edge| {
+                if (edge.edge_type == .exception) continue;
+                if (edge.edge_type == .conditional_true or edge.edge_type == .normal) {
+                    t_id = edge.target;
+                } else if (edge.edge_type == .conditional_false) {
+                    f_id = edge.target;
+                }
+            }
+            if (t_id == null or f_id == null) return null;
+            return .{ .t = t_id.?, .f = f_id.? };
+        }
+
+        fn tryDecompileAndOrChainInto(
+            self: *Self,
+            block_id: u32,
+            limit: u32,
+            stmts: *std.ArrayListUnmanaged(*Stmt),
+            stmts_allocator: Allocator,
+        ) DecompileError!?u32 {
+            if (block_id >= self.cfg.blocks.len) return null;
+            if (self.analyzer.detectAndOr(block_id) != null) return null;
+
+            const start_blk = &self.cfg.blocks[block_id];
+            const start_term = start_blk.terminator() orelse return null;
+            if (!isPopJumpFalse(start_term.opcode)) return null;
+            const start_succ = condSuccs(start_blk) orelse return null;
+
+            const false_id = start_succ.f;
+            var cur = start_succ.t;
+
+            // Fixed cap avoids heap allocations in the hot structured-range loop.
+            var cond_ids: [16]u32 = undefined;
+            var cond_len: usize = 0;
+            cond_ids[cond_len] = block_id;
+            cond_len += 1;
+
+            var tail: ?ctrl.AndOrPattern = null;
+            while (cond_len < cond_ids.len) {
+                const p = self.analyzer.detectAndOr(cur) orelse {
+                    if (cur >= self.cfg.blocks.len) return null;
+                    const blk = &self.cfg.blocks[cur];
+                    const term = blk.terminator() orelse return null;
+                    if (!isPopJumpFalse(term.opcode)) return null;
+                    const succ = condSuccs(blk) orelse return null;
+                    if (succ.f != false_id) return null;
+                    cond_ids[cond_len] = cur;
+                    cond_len += 1;
+                    cur = succ.t;
+                    continue;
+                };
+                if (p.false_block != false_id) return null;
+                cond_ids[cond_len] = cur;
+                cond_len += 1;
+                tail = p;
+                break;
+            }
+
+            // Needs at least one guard condition in addition to the `x and y or z` condition.
+            if (cond_len < 2) return null;
+            const pattern = tail orelse return null;
+
+            if (pattern.true_block >= limit or pattern.false_block >= limit or pattern.merge_block > limit) {
+                return null;
+            }
+            if (pattern.merge_block <= block_id) return null;
+
+            const stmts_len = stmts.items.len;
+
+            var cond_exprs: [16]*Expr = undefined;
+            var nconds: usize = 0;
+
+            var base_vals: []StackValue = &.{};
+            var base_owned = false;
+            defer if (base_owned) Self.deinitStackValuesSlice(
+                self.clone_sim.allocator,
+                self.clone_sim.stack_alloc,
+                self.allocator,
+                base_vals,
+            );
+
+            // Emit preludes (e.g. normalization stores) and collect the boolean operands.
+            for (cond_ids[0..cond_len], 0..) |cid, idx| {
+                const cond_opt = try initCondSim(self, cid, stmts, stmts_allocator);
+                const cond_res = cond_opt orelse {
+                    stmts.items.len = stmts_len;
+                    return null;
+                };
+                if (nconds >= cond_exprs.len) {
+                    stmts.items.len = stmts_len;
+                    Self.deinitStackValuesSlice(self.clone_sim.allocator, self.clone_sim.stack_alloc, self.allocator, cond_res.base_vals);
+                    return null;
+                }
+                cond_exprs[nconds] = cond_res.expr;
+                nconds += 1;
+
+                if (idx == 0) {
+                    base_vals = cond_res.base_vals;
+                    base_owned = true;
+                } else {
+                    if (cond_res.base_vals.len != base_vals.len) {
+                        stmts.items.len = stmts_len;
+                        Self.deinitStackValuesSlice(self.clone_sim.allocator, self.clone_sim.stack_alloc, self.allocator, cond_res.base_vals);
+                        return null;
+                    }
+                    Self.deinitStackValuesSlice(self.clone_sim.allocator, self.clone_sim.stack_alloc, self.allocator, cond_res.base_vals);
+                }
+            }
+
+            const true_blk = &self.cfg.blocks[pattern.true_block];
+            const false_blk = &self.cfg.blocks[pattern.false_block];
+            const true_skip = boolOpBlockSkip(self, true_blk, .or_pop);
+            const false_skip = boolOpBlockSkip(self, false_blk, .or_pop);
+
+            const true_expr = (try simulateValueExprSkip(self, pattern.true_block, base_vals, true_skip)) orelse {
+                stmts.items.len = stmts_len;
+                return null;
+            };
+            var false_expr: *Expr = undefined;
+            if (self.analyzer.detectBoolOp(pattern.false_block)) |bool_pat| {
+                if (bool_pat.merge_block == pattern.merge_block) {
+                    const first = (try simulateBoolOpCondExpr(self, pattern.false_block, base_vals, false_skip, bool_pat.kind)) orelse {
+                        stmts.items.len = stmts_len;
+                        return null;
+                    };
+                    const bool_res = try buildBoolOpExpr(self, first, bool_pat, base_vals);
+                    false_expr = bool_res.expr;
+                } else {
+                    false_expr = (try simulateValueExprSkip(self, pattern.false_block, base_vals, false_skip)) orelse {
+                        stmts.items.len = stmts_len;
+                        return null;
+                    };
+                }
+            } else {
+                false_expr = (try simulateValueExprSkip(self, pattern.false_block, base_vals, false_skip)) orelse {
+                    stmts.items.len = stmts_len;
+                    return null;
+                };
+            }
+
+            // Build a flat `and` BoolOp so Python compiles it as a single short-circuit chain.
+            const a = self.arena.allocator();
+            const and_vals = try a.alloc(*Expr, nconds + 1);
+            @memcpy(and_vals[0..nconds], cond_exprs[0..nconds]);
+            and_vals[nconds] = true_expr;
+
+            const and_expr = try a.create(Expr);
+            and_expr.* = .{ .bool_op = .{ .op = .and_, .values = and_vals } };
+            const or_expr = try self.makeBoolPair(and_expr, false_expr, .or_);
+
             if (pattern.merge_block == limit) {
                 try self.setStackEntryWithExpr(pattern.merge_block, base_vals, or_expr, &base_owned);
                 return pattern.merge_block;

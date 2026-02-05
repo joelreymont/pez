@@ -191,6 +191,20 @@ test "snapshot if or not 3.9" {
     );
 }
 
+test "snapshot and chain or 3.9" {
+    try runSnapshot(@src(), "test/corpus/and_chain_or.3.9.pyc",
+        \\[]u8
+        \\  "class Breakpoint:
+        \\    bplist = {}
+        \\def canonic(x):
+        \\    return x
+        \\def and_chain_or(breaks, filename, lineno):
+        \\    filename = canonic(filename)
+        \\    return filename in breaks and lineno in breaks[filename] and Breakpoint.bplist[filename, lineno] or []
+        \\"
+    );
+}
+
 test "snapshot while not call 3.9" {
     try runSnapshot(@src(), "test/corpus/while_not_call.3.9.pyc",
         \\[]u8
