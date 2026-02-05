@@ -7,6 +7,7 @@ from pathlib import Path
 from typing import Optional, Tuple
 
 
+ROOT = Path(__file__).resolve().parents[2]
 _CODE_ADDR_RE = re.compile(r"0x[0-9a-fA-F]+")
 
 
@@ -40,12 +41,9 @@ def check_xdis(python: str, timeout: int) -> bool:
 def pick_xdis_python(arg: str, timeout: int) -> str:
     if arg:
         return arg
-    candidate = "/private/tmp/xdis-venv39/bin/python"
-    if Path(candidate).exists() and check_xdis(candidate, timeout):
-        return candidate
-    candidate = "/private/tmp/uncompyle6-venv312/bin/python"
-    if Path(candidate).exists() and check_xdis(candidate, timeout):
-        return candidate
+    uv_candidate = ROOT / ".uv" / "py39" / "bin" / "python"
+    if uv_candidate.exists() and check_xdis(str(uv_candidate), timeout):
+        return str(uv_candidate)
     for name in ("python3.9", "python3.10", "python3.11", "python3.12"):
         path = shutil.which(name)
         if path and check_xdis(path, timeout):

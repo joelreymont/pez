@@ -54,6 +54,7 @@ def resolve_decompyle3(arg: str) -> str:
     if env:
         return env
     candidates = [
+        str(ROOT / ".uv" / "py39" / "bin" / "decompyle3"),
         "/tmp/decompyle3-venv-312/bin/decompyle3",
         "/tmp/decompyle3-venv-311/bin/decompyle3",
         "decompyle3",
@@ -68,6 +69,13 @@ def resolve_decompyle3(arg: str) -> str:
             if path_which(c):
                 return c
     return "decompyle3"
+
+
+def resolve_python(arg: str) -> str:
+    uv_py = ROOT / ".uv" / "py39" / "bin" / "python"
+    if uv_py.exists() and (not arg or arg == "python3.9"):
+        return str(uv_py)
+    return arg
 
 
 def path_which(name: str) -> Optional[str]:
@@ -125,6 +133,7 @@ def main() -> None:
     decompyle3 = Path(resolve_decompyle3(args.decompyle3))
     if not decompyle3.exists() and str(decompyle3) != "decompyle3":
         die(f"missing: {decompyle3}")
+    py = resolve_python(args.py)
 
     pyc_total = sum(1 for _ in orig_root.rglob("*.pyc"))
     if pyc_total == 0:
@@ -190,7 +199,7 @@ def main() -> None:
                 "--src-dir",
                 str(pez_src),
                 "--py",
-                args.py,
+                py,
                 "--timeout",
                 str(args.timeout_compare),
                 "--limit",
@@ -237,7 +246,7 @@ def main() -> None:
                 "--src-dir",
                 str(decomp_src),
                 "--py",
-                args.py,
+                py,
                 "--timeout",
                 str(args.timeout_compare),
                 "--limit",
