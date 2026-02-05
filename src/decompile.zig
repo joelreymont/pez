@@ -10854,6 +10854,22 @@ pub const Decompiler = struct {
                     for (self.cfg.blocks[cur_else].predecessors) |pred_id| {
                         if (pred_id == pattern.condition_block or pred_id >= self.cfg.blocks.len) continue;
                         const pred_blk = &self.cfg.blocks[pred_id];
+                        // Boolean chains like `A or B` are compiled as multiple conditional blocks
+                        // feeding a shared then/else. The else block will have a predecessor from
+                        // the tail condition block; that's not evidence the else is a fallthrough
+                        // "next statement" block.
+                        if (pred_blk.terminator()) |pred_term| {
+                            if (ctrl.Analyzer.isCondJump(pred_term.opcode)) {
+                                var has_then = false;
+                                var has_else = false;
+                                for (pred_blk.successors) |edge| {
+                                    if (edge.edge_type == .exception) continue;
+                                    if (edge.target == then_block) has_then = true;
+                                    if (edge.target == cur_else) has_else = true;
+                                }
+                                if (has_then and has_else) continue;
+                            }
+                        }
                         for (pred_blk.successors) |edge| {
                             if (edge.target != cur_else) continue;
                             if (edge.edge_type == .exception) continue;

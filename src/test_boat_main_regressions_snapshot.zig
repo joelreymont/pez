@@ -1345,3 +1345,15 @@ test "snapshot or break guard 3.9" {
         \\"
     );
 }
+
+test "snapshot if or else platform 3.9" {
+    try runSnapshot(@src(), "test/corpus/if_or_else_platform.3.9.pyc",
+        \\[]u8
+        \\  "import platform
+        \\if platform.system() == 'Darwin' or 'BSD' in platform.system():
+        \\    x = 1
+        \\else:
+        \\    x = 2
+        \\"
+    );
+}
