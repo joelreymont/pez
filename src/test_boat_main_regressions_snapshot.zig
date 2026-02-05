@@ -276,6 +276,18 @@ test "snapshot elif and not 3.9" {
     );
 }
 
+test "snapshot if ret raise and 3.9" {
+    try runSnapshot(@src(), "test/corpus/if_ret_raise_and.3.9.pyc",
+        \\[]u8
+        \\  "def if_ret_raise_and(a, x):
+        \\    i = 0
+        \\    if i != len(a) and a[i] == x:
+        \\        return i
+        \\    raise ValueError
+        \\"
+    );
+}
+
 test "snapshot and chain or 3.9" {
     try runSnapshot(@src(), "test/corpus/and_chain_or.3.9.pyc",
         \\[]u8

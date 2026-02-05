@@ -5959,7 +5959,9 @@ pub const Decompiler = struct {
                             const prev_last = prev_if.body[prev_if.body.len - 1];
                             break :blk self.stmtIsTerminal(prev_last);
                         } else false;
-                        if (last_then.* == .return_stmt and !prev_guard_chain) {
+                        if (last_then.* == .return_stmt and !prev_guard_chain and
+                            !(ifs.condition.* == .bool_op and ifs.condition.bool_op.op == .and_))
+                        {
                             const inv = try self.invertConditionExpr(ifs.condition);
                             const body = try allocator.alloc(*Stmt, 1);
                             body[0] = next;
