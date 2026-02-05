@@ -19,14 +19,17 @@ def parse_args() -> argparse.Namespace:
 
 
 def run_pez(pez: Path, pyc: Path, timeout: int) -> tuple[int, str, str]:
-    proc = subprocess.run(
-        [str(pez), str(pyc)],
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        text=True,
-        timeout=timeout,
-    )
-    return proc.returncode, proc.stdout, proc.stderr
+    try:
+        proc = subprocess.run(
+            [str(pez), str(pyc)],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            timeout=timeout,
+        )
+        return proc.returncode, proc.stdout, proc.stderr
+    except subprocess.TimeoutExpired:
+        return 124, "", f"timeout after {timeout}s"
 
 
 def main() -> None:
