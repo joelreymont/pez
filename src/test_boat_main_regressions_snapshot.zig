@@ -519,6 +519,22 @@ test "snapshot for prelude 3.9" {
     );
 }
 
+test "snapshot for prelude nested 3.9" {
+    try runSnapshot(@src(), "test/corpus/for_prelude_nested.3.9.pyc",
+        \\[]u8
+        \\  "def f(rows):
+        \\    out = []
+        \\    for row in rows:
+        \\        cw = 10
+        \\        names = (cw + i for i in row)
+        \\        out.append(list(names))
+        \\        for j in range(3):
+        \\            out.append(cw + j)
+        \\    return out
+        \\"
+    );
+}
+
 test "snapshot try finally nested 3.9" {
     try runSnapshot(@src(), "test/corpus/try_finally_nested.3.9.pyc",
         \\[]u8

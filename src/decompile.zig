@@ -20962,9 +20962,10 @@ pub const Decompiler = struct {
                 }
             }
         }
+        const base_depth = sim.stack.len();
         for (setup.instructions[0..get_iter_idx.?], 0..) |inst, idx| {
             try sim.simulate(inst);
-            if (sim.stack.len() == 0) {
+            if (sim.stack.len() == base_depth) {
                 pre_end = idx + 1;
             }
         }
