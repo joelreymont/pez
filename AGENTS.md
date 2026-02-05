@@ -7,6 +7,15 @@ Decompiler parity spec: `~/.claude/plans/composed-wishing-diffie.md`
 ## Dot
 
 - Run dot without asking when task tracking helps.
+- Never `dot off` unless the work is implemented, tests are updated, and the change is committed.
+- After `dot off`, start a fresh change (`jj new`) before doing more work.
+
+## Version Control (jj)
+
+- Use `jj` for all VCS operations.
+- Commit after every significant fix/feature; one fix/feature per commit.
+- Use `jj describe -m "msg"` for commit messages; keep them short and imperative.
+- Keep `master` as the integration bookmark and push with `jj git push`.
 
 ## Tools
 
