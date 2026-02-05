@@ -1,9 +1,10 @@
 ---
 title: Validate and commit tarfile
-status: open
+status: closed
 priority: 2
 issue-type: task
-created-at: "2026-02-05T21:25:22.530194+01:00"
+created-at: "\"2026-02-05T21:25:22.530194+01:00\""
+closed-at: "2026-02-05T22:57:39.829250+01:00"
 blocks:
   - pez-add-tarfile-regression-4b4df55c
 ---

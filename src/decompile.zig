@@ -6372,6 +6372,128 @@ pub const Decompiler = struct {
         return try self.rewriteLoopGuardElseList(allocator, stmts);
     }
 
+    fn isConstTrueExpr(expr: *const Expr) bool {
+        return switch (expr.*) {
+            .constant => expr.constant == .true_ or (expr.constant == .int and expr.constant.int != 0),
+            .name => |n| std.mem.eql(u8, n.id, "True"),
+            else => false,
+        };
+    }
+
+    fn rewriteWhileHeadReturnList(
+        self: *Decompiler,
+        allocator: Allocator,
+        stmts: []const *Stmt,
+    ) DecompileError![]const *Stmt {
+        if (stmts.len == 0) return stmts;
+        var out: std.ArrayListUnmanaged(*Stmt) = .{};
+        errdefer out.deinit(allocator);
+        var changed = false;
+        var i: usize = 0;
+        while (i < stmts.len) : (i += 1) {
+            const stmt = stmts[i];
+            if (stmt.* != .while_stmt) {
+                try out.append(allocator, stmt);
+                continue;
+            }
+
+            const ws = stmt.while_stmt;
+            if (!isConstTrueExpr(ws.condition) or ws.else_body.len != 0 or ws.body.len < 2) {
+                try out.append(allocator, stmt);
+                continue;
+            }
+
+            const head = ws.body[0];
+            if (head.* != .if_stmt) {
+                try out.append(allocator, stmt);
+                continue;
+            }
+            const ifs = head.if_stmt;
+            if (ifs.else_body.len != 0 or ifs.body.len == 0 or !self.bodyEndsTerminal(ifs.body)) {
+                try out.append(allocator, stmt);
+                continue;
+            }
+
+            const loop_cond = try self.invertConditionExpr(ifs.condition);
+            const loop_body = try allocator.alloc(*Stmt, ws.body.len - 1);
+            std.mem.copyForwards(*Stmt, loop_body, ws.body[1..]);
+
+            const new_while = try allocator.create(Stmt);
+            new_while.* = .{ .while_stmt = .{
+                .condition = loop_cond,
+                .body = loop_body,
+                .else_body = &.{},
+            } };
+            try out.append(allocator, new_while);
+            try out.appendSlice(allocator, ifs.body);
+            changed = true;
+        }
+
+        if (!changed) {
+            out.deinit(allocator);
+            return stmts;
+        }
+        return out.toOwnedSlice(allocator);
+    }
+
+    fn rewriteWhileHeadReturnDeep(
+        self: *Decompiler,
+        allocator: Allocator,
+        stmts: []const *Stmt,
+    ) DecompileError![]const *Stmt {
+        for (stmts) |stmt| {
+            switch (stmt.*) {
+                .function_def => |*f| {
+                    f.body = try self.rewriteWhileHeadReturnDeep(allocator, f.body);
+                },
+                .class_def => |*c| {
+                    c.body = try self.rewriteWhileHeadReturnDeep(allocator, c.body);
+                },
+                .for_stmt => |*f| {
+                    f.body = try self.rewriteWhileHeadReturnDeep(allocator, f.body);
+                    f.else_body = try self.rewriteWhileHeadReturnDeep(allocator, f.else_body);
+                },
+                .while_stmt => |*w| {
+                    w.body = try self.rewriteWhileHeadReturnDeep(allocator, w.body);
+                    w.else_body = try self.rewriteWhileHeadReturnDeep(allocator, w.else_body);
+                },
+                .if_stmt => |*ifs| {
+                    ifs.body = try self.rewriteWhileHeadReturnDeep(allocator, ifs.body);
+                    ifs.else_body = try self.rewriteWhileHeadReturnDeep(allocator, ifs.else_body);
+                },
+                .with_stmt => |*w| {
+                    w.body = try self.rewriteWhileHeadReturnDeep(allocator, w.body);
+                },
+                .try_stmt => |*t| {
+                    t.body = try self.rewriteWhileHeadReturnDeep(allocator, t.body);
+                    t.else_body = try self.rewriteWhileHeadReturnDeep(allocator, t.else_body);
+                    t.finalbody = try self.rewriteWhileHeadReturnDeep(allocator, t.finalbody);
+                    if (t.handlers.len > 0) {
+                        const handlers = try allocator.alloc(ast.ExceptHandler, t.handlers.len);
+                        for (t.handlers, 0..) |h, idx| {
+                            handlers[idx] = h;
+                            handlers[idx].body = try self.rewriteWhileHeadReturnDeep(allocator, h.body);
+                        }
+                        t.handlers = handlers;
+                    }
+                },
+                .match_stmt => |*m| {
+                    if (m.cases.len > 0) {
+                        const cases = try allocator.alloc(ast.MatchCase, m.cases.len);
+                        for (m.cases, 0..) |c, idx| {
+                            cases[idx] = c;
+                            cases[idx].body = try self.rewriteWhileHeadReturnDeep(allocator, c.body);
+                        }
+                        m.cases = cases;
+                    }
+                },
+                else => {},
+            }
+        }
+
+        return try self.rewriteWhileHeadReturnList(allocator, stmts);
+    }
+
     fn stmtAlwaysLoopTerminal(self: *Decompiler, stmt: *const Stmt) bool {
         return switch (stmt.*) {
             .return_stmt, .raise_stmt, .break_stmt, .continue_stmt => true,
@@ -6678,14 +6800,9 @@ pub const Decompiler = struct {
                 .class_def => |*c| {
                     c.body = try self.rewriteGuardRetDeep(allocator, c.body);
                 },
-                .for_stmt => |*f| {
-                    f.body = try self.rewriteGuardRetDeep(allocator, f.body);
-                    f.else_body = try self.rewriteGuardRetDeep(allocator, f.else_body);
-                },
-                .while_stmt => |*w| {
-                    w.body = try self.rewriteGuardRetDeep(allocator, w.body);
-                    w.else_body = try self.rewriteGuardRetDeep(allocator, w.else_body);
-                },
+                // Loop bodies are left untouched: guard-return rewrites there can
+                // alter loop-shape snapshots and bytecode parity.
+                .for_stmt, .while_stmt => {},
                 .if_stmt => |*i| {
                     i.body = try self.rewriteGuardRetDeep(allocator, i.body);
                     i.else_body = try self.rewriteGuardRetDeep(allocator, i.else_body);
@@ -12734,7 +12851,9 @@ pub const Decompiler = struct {
         if (pattern.exit_block < self.cfg.blocks.len) {
             const exit_block = &self.cfg.blocks[pattern.exit_block];
             // Process exit block as guard if header has prelude OR exit block has content
-            const should_process = condBlockHasPrelude(header) or exitBlockHasContent(exit_block);
+            const exit_terminal = self.isTerminalBlock(pattern.exit_block);
+            const should_process = condBlockHasPrelude(header) or
+                (exitBlockHasContent(exit_block) and (!exit_terminal or !body_true));
             if (should_process and exit_block.predecessors.len == 1 and exit_block.predecessors[0] == pattern.header_block) {
                 var has_cond = false;
                 for (exit_block.instructions) |inst| {
@@ -14467,6 +14586,16 @@ pub const Decompiler = struct {
             }
         }
         var force_tail: ?u32 = null;
+        if (loop_header) |header_id| {
+            if (!try_break and else_start == null and post_try_entry != null and join_block != null and
+                post_try_entry.? == join_block.?)
+            {
+                const entry = self.resolveJumpOnlyBlock(post_try_entry.?);
+                if (entry != header_id and !self.inLoopRelaxed(entry, header_id, loop_exit)) {
+                    try_break = true;
+                }
+            }
+        }
         if (else_start != null and loop_header != null) {
             const header_id = loop_header.?;
             const join_in_loop = if (join_block) |join_id|
@@ -14489,6 +14618,10 @@ pub const Decompiler = struct {
                 if (!in_loop or resolved == header_id or
                     (leads_cont and !has_exit))
                 {
+                    // When try-success leaves the loop, model it as `break` in loop context.
+                    if (!in_loop and !leads_cont) {
+                        try_break = true;
+                    }
                     else_start = null;
                 }
             }

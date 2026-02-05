@@ -1,9 +1,10 @@
 ---
 title: Add tarfile regression
-status: open
+status: closed
 priority: 2
 issue-type: task
-created-at: "2026-02-05T21:25:22.526898+01:00"
+created-at: "\"2026-02-05T21:25:22.526898+01:00\""
+closed-at: "2026-02-05T22:57:39.825827+01:00"
 blocks:
   - pez-fix-tarfile-root-23ca6772
 ---

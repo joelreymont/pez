@@ -131,6 +131,25 @@ test "snapshot loop guard while 3.9" {
     );
 }
 
+test "snapshot try except loop scope 3.9" {
+    try runSnapshot(@src(), "test/corpus/try_except_loop_scope.3.9.pyc",
+        \\[]u8
+        \\  "def pax_generic(pax_headers, encoding):
+        \\    binary = False
+        \\    for keyword, value in pax_headers.items():
+        \\        try:
+        \\            value.encode('utf-8', 'strict')
+        \\        except UnicodeEncodeError:
+        \\            binary = True
+        \\    records = b''
+        \\    if binary:
+        \\        records += b"""21 hdrcharset=BINARY
+        \\"""
+        \\    return records
+        \\"
+    );
+}
+
 test "snapshot if merge nested 3.9" {
     try runSnapshot(@src(), "test/corpus/if_merge_nested.3.9.pyc",
         \\[]u8
@@ -1333,6 +1352,24 @@ test "snapshot guard in return 3.9" {
         \\    if item in seq:
         \\        return item
         \\    raise KeyError(item)
+        \\"
+    );
+}
+
+test "snapshot while head return 3.9" {
+    try runSnapshot(@src(), "test/corpus/while_head_return.3.9.pyc",
+        \\[]u8
+        \\  "def while_head_return(fields, sparse, buf, read, tell):
+        \\    while True:
+        \\        if len(sparse) >= fields * 2:
+        \\            pos = tell()
+        \\            return (pos, list(zip(sparse[::2], sparse[1::2])))
+        \\        if b"""
+        \\""" not in buf:
+        \\            buf += read()
+        \\        n, buf = buf.split(b"""
+        \\""", 1)
+        \\        sparse.append(int(n))
         \\"
     );
 }

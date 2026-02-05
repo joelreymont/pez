@@ -1,9 +1,10 @@
 ---
 title: Fix tarfile root cause
-status: active
+status: closed
 priority: 2
 issue-type: task
-created-at: "\"2026-02-05T21:25:22.523638+01:00\""
+created-at: "\"\\\"2026-02-05T21:25:22.523638+01:00\\\"\""
+closed-at: "2026-02-05T22:57:39.821776+01:00"
 blocks:
   - pez-locate-tarfile-divergence-240c457c
 ---
