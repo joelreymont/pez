@@ -220,6 +220,23 @@ test "snapshot loop exit reaches header 3.9" {
     );
 }
 
+test "snapshot loop merge break 3.9" {
+    try runSnapshot(@src(), "test/corpus/loop_merge_break.3.9.pyc",
+        \\[]u8
+        \\  "def loop_merge_break(xs):
+        \\    for x in xs:
+        \\        if x:
+        \\            y = 1
+        \\        else:
+        \\            y = 2
+        \\        break
+        \\    else:
+        \\        raise ValueError('empty')
+        \\    return y
+        \\"
+    );
+}
+
 test "snapshot while in for 3.9" {
     try runSnapshot(@src(), "test/corpus/loop_while_in_for.3.9.pyc",
         \\[]u8

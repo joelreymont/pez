@@ -24455,7 +24455,27 @@ pub const Decompiler = struct {
             }
             then_body = body;
         }
-        if (self.loopBlockLeadsToBreak(then_block, loop_header)) {
+        const merge_breaks = blk: {
+            if (!merge_in_loop) break :blk false;
+            const merge_id = merge_block orelse break :blk false;
+            if (merge_id == then_block) break :blk false;
+            if (else_block == null) break :blk false;
+            if (merge_id == else_block.?) break :blk false;
+            // Only suppress per-branch breaks when this is a real join point for both branches.
+            var has_then = false;
+            var has_else = false;
+            if (merge_id < self.cfg.blocks.len) {
+                for (self.cfg.blocks[merge_id].predecessors) |pred_id| {
+                    if (pred_id == then_block) has_then = true;
+                    if (pred_id == else_block.?) has_else = true;
+                }
+            }
+            if (!(has_then and has_else)) break :blk false;
+            // When both branches join at a merge block whose terminator exits the loop, the
+            // `break` belongs after the if/else, not duplicated into each branch.
+            break :blk self.loopBreakTarget(merge_id, loop_header) != null;
+        };
+        if (!merge_breaks and self.loopBlockLeadsToBreak(then_block, loop_header)) {
             if (then_body.len == 0 or !self.bodyEndsLoopTerminal(then_body)) {
                 const br = try self.makeBreak();
                 const body = try a.alloc(*Stmt, then_body.len + 1);
@@ -24466,7 +24486,7 @@ pub const Decompiler = struct {
                 then_body = body;
             }
         }
-        if (else_block != null and self.loopBlockLeadsToBreak(else_block.?, loop_header)) {
+        if (!merge_breaks and else_block != null and self.loopBlockLeadsToBreak(else_block.?, loop_header)) {
             if (else_body.len == 0 or !self.bodyEndsLoopTerminal(else_body)) {
                 const br = try self.makeBreak();
                 const body = try a.alloc(*Stmt, else_body.len + 1);
