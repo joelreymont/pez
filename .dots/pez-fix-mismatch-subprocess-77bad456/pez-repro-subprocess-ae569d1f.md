@@ -1,9 +1,11 @@
 ---
 title: Repro subprocess
-status: open
+status: closed
 priority: 2
 issue-type: task
-created-at: "2026-02-05T21:25:22.533788+01:00"
+created-at: "\"\\\"2026-02-05T21:25:22.533788+01:00\\\"\""
+closed-at: "2026-02-06T00:07:24.455399+01:00"
+close-reason: implemented+committed in 3e698c4c; subprocess setcomp exact
 blocks:
   - pez-validate-and-commit-ad7f1b7f
 ---

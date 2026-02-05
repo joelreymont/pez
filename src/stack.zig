@@ -573,6 +573,8 @@ pub const SimContext = struct {
     pending_kwnames: ?[]const []const u8 = null,
     /// Pending conditional expressions (linear simulation).
     pending_ifexp: std.ArrayListUnmanaged(PendingIfExp) = .{},
+    /// Pending OR left-side for comprehension filters (POP_JUMP_IF_TRUE ... POP_JUMP_IF_FALSE).
+    pending_comp_or: ?PendingCompOr = null,
     /// Enable conditional expression handling in linear simulation.
     enable_ifexp: bool = false,
     /// GET_AWAITABLE was seen, next YIELD_FROM should be await.
@@ -595,6 +597,7 @@ pub const SimContext = struct {
             .comp_builder = null,
             .comp_unpack = null,
             .pending_ifexp = .{},
+            .pending_comp_or = null,
             .enable_ifexp = false,
             .lenient = false,
             .flow_mode = false,
@@ -613,6 +616,11 @@ pub const SimContext = struct {
             pending.deinit(self.allocator, self.stack_alloc);
         }
         self.comp_unpack = null;
+        if (self.pending_comp_or) |item| {
+            item.left.deinit(self.allocator);
+            self.allocator.destroy(item.left);
+        }
+        self.pending_comp_or = null;
         self.pending_kwnames = null;
         if (self.pending_ifexp.items.len > 0) {
             for (self.pending_ifexp.items) |*item| {
@@ -657,6 +665,11 @@ pub const SimContext = struct {
         }
         if (self.comp_unpack) |*pending| {
             pending.deinit(self.allocator, self.stack_alloc);
+        }
+        if (self.pending_comp_or) |item| {
+            item.left.deinit(self.allocator);
+            self.allocator.destroy(item.left);
+            self.pending_comp_or = null;
         }
     }
 
@@ -2955,6 +2968,14 @@ pub const SimContext = struct {
     pub fn simulate(self: *SimContext, inst: Instruction) SimError!void {
         if (self.enable_ifexp) {
             _ = try resolveIfExps(self.allocator, &self.stack, &self.pending_ifexp, inst.offset);
+        }
+        if (self.pending_comp_or) |pending| {
+            if (inst.offset >= pending.include_target) {
+                if (self.findActiveCompBuilder()) |builder| {
+                    try self.addCompIf(builder, pending.left);
+                    self.pending_comp_or = null;
+                }
+            }
         }
         switch (inst.opcode) {
             .NOP,
@@ -6188,7 +6209,7 @@ pub const SimContext = struct {
             .POP_JUMP_BACKWARD_IF_NOT_NONE,
             => {
                 const cond = try self.stack.popExpr();
-                if (self.enable_ifexp) {
+                if (self.enable_ifexp and self.findActiveCompBuilder() == null) {
                     const target = inst.jumpTarget(self.version) orelse inst.arg;
                     if (target > inst.offset) {
                         var final_cond = switch (inst.opcode) {
@@ -6220,11 +6241,45 @@ pub const SimContext = struct {
                     }
                 }
                 if (self.findActiveCompBuilder()) |builder| {
+                    const jump_target = inst.jumpTarget(self.version) orelse inst.arg;
+                    if (inst.opcode == .POP_JUMP_IF_TRUE or
+                        inst.opcode == .POP_JUMP_FORWARD_IF_TRUE or
+                        inst.opcode == .POP_JUMP_BACKWARD_IF_TRUE)
+                    {
+                        if (jump_target > inst.offset) {
+                            if (self.pending_comp_or) |pending| {
+                                const merged = try makeBoolPair(self.allocator, pending.left, cond, .or_);
+                                self.pending_comp_or = .{
+                                    .include_target = @max(pending.include_target, jump_target),
+                                    .left = merged,
+                                };
+                            } else {
+                                self.pending_comp_or = .{
+                                    .include_target = jump_target,
+                                    .left = cond,
+                                };
+                            }
+                            return;
+                        }
+                    }
+                    if (inst.opcode == .POP_JUMP_IF_FALSE or
+                        inst.opcode == .POP_JUMP_FORWARD_IF_FALSE or
+                        inst.opcode == .POP_JUMP_BACKWARD_IF_FALSE)
+                    {
+                        if (self.pending_comp_or) |pending| {
+                            if (pending.include_target > inst.offset) {
+                                const merged = try makeBoolPair(self.allocator, pending.left, cond, .or_);
+                                self.pending_comp_or = null;
+                                try self.addCompIf(builder, merged);
+                                return;
+                            }
+                        }
+                    }
                     // For comprehension filters, both old and new patterns result in
                     // "include when condition is truthy":
                     // - Old: POP_JUMP_IF_FALSE to skip, fall through to include -> include on TRUE
                     // - 3.14: POP_JUMP_IF_TRUE to include -> include on TRUE
-                    // So we use the condition as-is for TRUE jumps and negate for FALSE jumps
+                    // So we use the condition as-is for TRUE/ FALSE jumps.
                     const final_cond = switch (inst.opcode) {
                         .POP_JUMP_IF_FALSE,
                         .POP_JUMP_FORWARD_IF_FALSE,
@@ -7060,6 +7115,11 @@ const PendingIfExp = struct {
             allocator.destroy(expr);
         }
     }
+};
+
+const PendingCompOr = struct {
+    include_target: u32,
+    left: *Expr,
 };
 
 fn makeBoolPair(allocator: Allocator, left: *Expr, right: *Expr, op: ast.BoolOp) !*Expr {
