@@ -247,6 +247,20 @@ test "snapshot try finally return 3.9" {
     );
 }
 
+test "snapshot try finally ret simple 3.9" {
+    try runSnapshot(@src(), "test/corpus/try_finally_ret_simple.3.9.pyc",
+        \\[]u8
+        \\  "def side_effect() -> None:
+        \\    pass
+        \\def try_finally_ret_simple(x):
+        \\    try:
+        \\        return x + 1
+        \\    finally:
+        \\        side_effect()
+        \\"
+    );
+}
+
 test "snapshot loop merge break 3.9" {
     try runSnapshot(@src(), "test/corpus/loop_merge_break.3.9.pyc",
         \\[]u8

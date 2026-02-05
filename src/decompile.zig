@@ -13722,6 +13722,7 @@ pub const Decompiler = struct {
         }
 
         var post_try_entry: ?u32 = null;
+        var post_term: ?u32 = null;
         for (protected_set.list.items) |bid| {
             const block = &self.cfg.blocks[bid];
             for (block.successors) |edge| {
@@ -13763,6 +13764,16 @@ pub const Decompiler = struct {
                         if (term.opcode == .RETURN_VALUE or term.opcode == .RETURN_CONST or
                             term.opcode == .RAISE_VARARGS or term.opcode == .RERAISE)
                         {
+                            // Prefer a non-terminal post-try entry when one exists (avoids picking
+                            // early-return inline-finally blocks). If the try/finally has no
+                            // fallthrough path (e.g. `try: return ... finally: ...`), fall back to
+                            // the earliest terminal candidate before the handler region.
+                            if (candidate < handler_start) {
+                                post_term = if (post_term) |prev|
+                                    @min(prev, candidate)
+                                else
+                                    candidate;
+                            }
                             continue;
                         }
                     }
@@ -13772,6 +13783,9 @@ pub const Decompiler = struct {
                 else
                     candidate;
             }
+        }
+        if (post_try_entry == null and post_term != null) {
+            post_try_entry = post_term;
         }
 
         var handler_reach = &scratch.handler_reach;
