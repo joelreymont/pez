@@ -99,10 +99,11 @@ def main() -> None:
     worst_semantic = []
 
     processed = 0
-    for pyc in orig_root.rglob("*.pyc"):
+    for pyc in sorted(orig_root.rglob("*.pyc")):
         rel = pyc.relative_to(orig_root)
         src = src_root / rel
         src = src.with_suffix(".py")
+        processed += 1
         if not src.exists():
             counts["missing_src"] += 1
             results.append(
@@ -112,6 +113,8 @@ def main() -> None:
                     "summary": {},
                 }
             )
+            if args.limit and processed >= args.limit:
+                break
             continue
 
         report = run_compare(script, pyc, src, args.py, args.xdis_python, args.timeout)
@@ -143,8 +146,6 @@ def main() -> None:
         if report_dir:
             out_path = report_dir / (str(rel).replace(os.sep, "__") + ".json")
             out_path.write_text(json.dumps(report, indent=2))
-
-        processed += 1
         if args.limit and processed >= args.limit:
             break
 

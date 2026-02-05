@@ -54,10 +54,10 @@ def resolve_decompyle3(arg: str) -> str:
     if env:
         return env
     candidates = [
-        "/tmp/decompyle3-local",
         "/tmp/decompyle3-venv-312/bin/decompyle3",
         "/tmp/decompyle3-venv-311/bin/decompyle3",
         "decompyle3",
+        "/tmp/decompyle3-local",
     ]
     for c in candidates:
         p = Path(c)
