@@ -1,9 +1,9 @@
 ---
 title: Boat_main parity
-status: open
+status: active
 priority: 1
 issue-type: task
-created-at: "\"2026-02-05T09:47:22.814382+01:00\""
+created-at: "\"\\\"2026-02-05T09:47:22.814382+01:00\\\"\""
 ---
 
 Full context: boat_main (py3.9) suite run: /tmp/pez-boatmain-suite16.json (artifacts: /tmp/pez-boatmain-suite16/). Pez: decompile ok=329 error=0; compare exact=174 close=54 mismatch=101 error=0 missing_src=0. Decompyle3: decompile ok=329 error=0; compare exact=8 close=0 mismatch=321 error=0 missing_src=0. Pez unit tests: PASS (`zig build test`). Previously-reported pycdc failures now PASS (`./zig-out/bin/pez` exit 0): test_listComprehensions.2.7.pyc (invalid-free), test_loops2.2.2.pyc (hang).

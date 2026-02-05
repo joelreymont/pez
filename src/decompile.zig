@@ -1405,14 +1405,18 @@ pub const Decompiler = struct {
                 if (inst.arg == 0) {
                     const a = self.arena.allocator();
                     const stmt = try a.create(Stmt);
-                    stmt.* = .{ .raise_stmt = .{ .exc = null, .cause = null } };
+                    stmt.* = .{ .raise_stmt = .{ .exc = null, .cause = null, .is_assert = false } };
                     return stmt;
                 } else if (inst.arg == 1) {
                     const val = sim.stack.pop() orelse return error.StackUnderflow;
                     if (val == .expr) {
                         const a = self.arena.allocator();
                         const stmt = try a.create(Stmt);
-                        stmt.* = .{ .raise_stmt = .{ .exc = val.expr, .cause = null } };
+                        stmt.* = .{ .raise_stmt = .{
+                            .exc = val.expr,
+                            .cause = null,
+                            .is_assert = sim.isAssertExpr(val.expr),
+                        } };
                         return stmt;
                     }
                     val.deinit(sim.allocator, sim.stack_alloc);
@@ -1423,7 +1427,11 @@ pub const Decompiler = struct {
                     if (exc_val == .expr and cause_val == .expr) {
                         const a = self.arena.allocator();
                         const stmt = try a.create(Stmt);
-                        stmt.* = .{ .raise_stmt = .{ .exc = exc_val.expr, .cause = cause_val.expr } };
+                        stmt.* = .{ .raise_stmt = .{
+                            .exc = exc_val.expr,
+                            .cause = cause_val.expr,
+                            .is_assert = sim.isAssertExpr(exc_val.expr),
+                        } };
                         return stmt;
                     }
                     exc_val.deinit(sim.allocator, sim.stack_alloc);
@@ -5889,6 +5897,41 @@ pub const Decompiler = struct {
                     ifs.else_body.len > 0 and self.bodyEndsTerminal(ifs.else_body) and
                     ifs.else_body[ifs.else_body.len - 1].* == .raise_stmt)
                 {
+                    const last_raise = ifs.else_body[ifs.else_body.len - 1].raise_stmt;
+                    if (last_raise.is_assert) {
+                        var msg: ?*Expr = null;
+                        var match = false;
+                        if (last_raise.exc) |exc| {
+                            switch (exc.*) {
+                                .name => |n| {
+                                    if (std.mem.eql(u8, n.id, "AssertionError")) {
+                                        match = true;
+                                    }
+                                },
+                                .call => |c| {
+                                    if (c.func.* == .name and std.mem.eql(u8, c.func.name.id, "AssertionError") and
+                                        c.args.len == 1 and c.keywords.len == 0)
+                                    {
+                                        msg = c.args[0];
+                                        match = true;
+                                    }
+                                },
+                                else => {},
+                            }
+                        }
+                        if (match) {
+                            const assert_stmt = try allocator.create(Stmt);
+                            assert_stmt.* = .{ .assert_stmt = .{
+                                .condition = ifs.condition,
+                                .msg = msg,
+                            } };
+                            try out.append(allocator, assert_stmt);
+                            try out.appendSlice(allocator, ifs.body);
+                            i += 1;
+                            changed = true;
+                            continue;
+                        }
+                    }
                     const inv = try self.invertConditionExpr(ifs.condition);
                     const new_if = try allocator.create(Stmt);
                     new_if.* = .{ .if_stmt = .{
@@ -11757,6 +11800,17 @@ pub const Decompiler = struct {
                 const else_off = self.cfg.blocks[else_id].start_offset;
                 const then_off = self.cfg.blocks[then_block].start_offset;
                 if (else_off < then_off) {
+                    if (self.isAssertRaiseBlock(else_id)) {
+                        if (try self.tryDecompileAssertBlock(condition, else_id, skip)) |assert_stmt| {
+                            self.if_tail = then_body;
+                            else_body = &[_]*Stmt{};
+                            else_block = null;
+                            else_body_moved = true;
+                            // Tail is rendered via if_tail.
+                            self.if_next = null;
+                            return assert_stmt;
+                        }
+                    }
                     condition = try self.invertConditionExpr(condition);
                     try self.emitDecisionTrace(pattern.condition_block, "if_guard_raise_tail", condition);
                     const guard_body = else_body;
@@ -11955,6 +12009,23 @@ pub const Decompiler = struct {
                             }
                         }
                     }
+                }
+            }
+        }
+
+        if (!is_elif and else_body.len == 0 and then_body.len == 1 and then_body[0].* == .raise_stmt) {
+            var assert_block: ?u32 = null;
+            if (self.isAssertRaiseBlock(then_block)) {
+                assert_block = then_block;
+            } else if (else_block) |else_id| {
+                if (self.isAssertRaiseBlock(else_id)) assert_block = else_id;
+            } else if (merge_block) |merge_id| {
+                if (self.isAssertRaiseBlock(merge_id)) assert_block = merge_id;
+            }
+            if (assert_block) |ab| {
+                const inv = try self.invertConditionExpr(condition);
+                if (try self.tryDecompileAssertBlock(inv, ab, skip)) |assert_stmt| {
+                    return assert_stmt;
                 }
             }
         }

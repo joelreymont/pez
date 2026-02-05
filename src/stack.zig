@@ -561,6 +561,8 @@ pub const SimContext = struct {
     inplace_exprs: std.AutoHashMapUnmanaged(*Expr, bool) = .{},
     /// Track empty tuples built by BUILD_TUPLE 0 (used by CALL_FUNCTION_EX).
     empty_tuple_builds: std.AutoHashMapUnmanaged(*Expr, bool) = .{},
+    /// Expressions originating from LOAD_ASSERTION_ERROR/COMMON_CONSTANT (AssertionError).
+    assert_exprs: std.AutoHashMapUnmanaged(*Expr, bool) = .{},
     /// Override for iterator locals (used for genexpr/listcomp code objects).
     iter_override: ?IterOverride = null,
     /// Optional comprehension builder not stored on the stack.
@@ -599,6 +601,7 @@ pub const SimContext = struct {
             .class_name = null,
             .inplace_exprs = .{},
             .empty_tuple_builds = .{},
+            .assert_exprs = .{},
         };
     }
 
@@ -624,17 +627,22 @@ pub const SimContext = struct {
         self.prev_opcode = null;
         self.inplace_exprs.clearRetainingCapacity();
         self.empty_tuple_builds.clearRetainingCapacity();
+        self.assert_exprs.clearRetainingCapacity();
     }
 
     pub fn deinit(self: *SimContext) void {
         if (self.flow_mode) {
             self.stack.deinitShallow();
             self.pending_ifexp.deinit(self.stack_alloc);
+            self.inplace_exprs.deinit(self.stack_alloc);
+            self.empty_tuple_builds.deinit(self.stack_alloc);
+            self.assert_exprs.deinit(self.stack_alloc);
             return;
         }
         self.stack.deinit();
         self.inplace_exprs.deinit(self.stack_alloc);
         self.empty_tuple_builds.deinit(self.stack_alloc);
+        self.assert_exprs.deinit(self.stack_alloc);
         if (self.pending_ifexp.items.len > 0) {
             for (self.pending_ifexp.items) |*item| {
                 item.deinit(self.allocator);
@@ -660,6 +668,14 @@ pub const SimContext = struct {
     fn makeAttribute(self: *SimContext, value: *Expr, attr: []const u8, ctx: ast.ExprContext) !*Expr {
         const unmangled = try name_mangle.unmangleClassName(self.allocator, self.class_name, attr);
         return ast.makeAttribute(self.allocator, value, unmangled, ctx);
+    }
+
+    fn markAssertExpr(self: *SimContext, expr: *Expr) !void {
+        try self.assert_exprs.put(self.stack_alloc, expr, true);
+    }
+
+    pub fn isAssertExpr(self: *const SimContext, expr: *const Expr) bool {
+        return self.assert_exprs.get(@constCast(expr)) != null;
     }
 
     fn markInplaceExpr(self: *SimContext, expr: *Expr) !void {
@@ -1372,6 +1388,7 @@ pub const SimContext = struct {
         args_vals: []StackValue,
         keywords: []ast.Keyword,
     ) SimError!void {
+        const is_assert_callee = self.isAssertExpr(callee_expr);
         var cleanup_callee = true;
         var cleanup_args = true;
         var cleanup_keywords = keywords.len > 0;
@@ -1426,6 +1443,9 @@ pub const SimContext = struct {
         errdefer {
             expr.deinit(self.allocator);
             self.allocator.destroy(expr);
+        }
+        if (is_assert_callee) {
+            try self.markAssertExpr(expr);
         }
         cleanup_callee = false;
         cleanup_keywords = false;
@@ -3004,12 +3024,14 @@ pub const SimContext = struct {
 
             .LOAD_ASSERTION_ERROR => {
                 const expr = try self.makeName("AssertionError", .load);
+                try self.markAssertExpr(expr);
                 try self.stack.push(.{ .expr = expr });
             },
 
             .LOAD_COMMON_CONSTANT => {
                 if (inst.arg == 0) {
                     const expr = try self.makeName("AssertionError", .load);
+                    try self.markAssertExpr(expr);
                     try self.stack.push(.{ .expr = expr });
                 } else {
                     try self.stack.push(.unknown);

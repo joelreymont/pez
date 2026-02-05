@@ -1527,6 +1527,7 @@ pub const Stmt = union(enum) {
     raise_stmt: struct {
         exc: ?*Expr,
         cause: ?*Expr,
+        is_assert: bool = false,
     },
 
     /// Try statement
