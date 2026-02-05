@@ -1081,6 +1081,9 @@ pub fn Methods(comptime Self: type, comptime Err: type) type {
             const merge_block = &self.cfg.blocks[final_merge];
             if (merge_block.terminator()) |mt| {
                 if (ctrl.Analyzer.isCondJump(mt.opcode)) {
+                    // Keep the merge block for outer structuring (e.g. STORE_FAST prelude, assert),
+                    // but consume only the short-circuit condition chain leading to it.
+                    self.unmarkConsumed(final_merge);
                     try self.setStackEntryWithExpr(final_merge, base_vals, bool_expr, &base_owned);
                     return final_merge;
                 }

@@ -2040,6 +2040,10 @@ pub const Decompiler = struct {
         try self.consumed.set(self.allocator, block_id);
     }
 
+    pub fn unmarkConsumed(self: *Decompiler, block_id: u32) void {
+        self.consumed.unset(block_id);
+    }
+
     pub fn markBoolOpChain(
         self: *Decompiler,
         start_block: u32,
