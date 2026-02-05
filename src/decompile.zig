@@ -21674,6 +21674,23 @@ pub const Decompiler = struct {
                 pre_end = idx + 1;
             }
         }
+        if (pre_end == null or pre_end.? == 0) {
+            // Some loop setup preludes consume carried stack values from a predecessor
+            // (e.g. BUILD_MAP + STORE_FAST before GET_ITER), so depth may never return
+            // to the entry depth. Keep setup stores in that case.
+            var last_store_end: ?usize = null;
+            for (setup.instructions[0..get_iter_idx.?], 0..) |inst, idx| {
+                switch (inst.opcode) {
+                    .STORE_FAST,
+                    .STORE_NAME,
+                    .STORE_GLOBAL,
+                    .STORE_DEREF,
+                    => last_store_end = idx + 1,
+                    else => {},
+                }
+            }
+            pre_end = last_store_end;
+        }
         if (pre_end == null or pre_end.? == 0) return;
         var prelude_block = setup.*;
         prelude_block.instructions = setup.instructions[0..pre_end.?];

@@ -550,6 +550,20 @@ test "snapshot for prelude 3.9" {
     );
 }
 
+test "snapshot for prelude kw map 3.9" {
+    try runSnapshot(@src(), "test/corpus/for_prelude_kw_map.3.9.pyc",
+        \\[]u8
+        \\  "def g(x, **kw):
+        \\    return True
+        \\def f(iterable, flag = None):
+        \\    kw = {'k': flag if flag is not None else True}
+        \\    for item in iterable:
+        \\        if g(*(item,), **kw):
+        \\            yield item
+        \\"
+    );
+}
+
 test "snapshot for prelude nested 3.9" {
     try runSnapshot(@src(), "test/corpus/for_prelude_nested.3.9.pyc",
         \\[]u8

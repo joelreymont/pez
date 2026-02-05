@@ -1,9 +1,11 @@
 ---
 title: Add packaging specifiers regression
-status: open
+status: closed
 priority: 2
 issue-type: task
-created-at: "2026-02-05T21:25:22.561516+01:00"
+created-at: "\"2026-02-05T21:25:22.561516+01:00\""
+closed-at: "2026-02-06T01:01:07.247902+01:00"
+close-reason: Added regression fixture test/corpus_src/for_prelude_kw_map.py, compiled pyc, and snapshot coverage in src/test_boat_main_regressions_snapshot.zig.
 blocks:
   - pez-fix-packaging-specifiers-d9824131
 ---

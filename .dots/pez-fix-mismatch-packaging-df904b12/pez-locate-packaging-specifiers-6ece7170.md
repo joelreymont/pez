@@ -1,9 +1,11 @@
 ---
 title: Locate packaging specifiers divergence
-status: open
+status: closed
 priority: 2
 issue-type: task
-created-at: "2026-02-05T21:25:22.554759+01:00"
+created-at: "\"2026-02-05T21:25:22.554759+01:00\""
+closed-at: "2026-02-06T01:01:01.822236+01:00"
+close-reason: Located first divergence in <module>.Specifier.filter and captured /tmp/packaging_specifiers_filter.locate23.json and /tmp/packaging_specifiers_filter.unit23.json.
 blocks:
   - pez-repro-packaging-specifiers-c33da8c6
 ---
