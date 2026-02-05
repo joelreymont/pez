@@ -204,6 +204,27 @@ test "snapshot if term raise 3.9" {
     );
 }
 
+test "snapshot optparse add_option 3.9" {
+    try runSnapshot(@src(), "test/corpus/optparse_add_option.3.9.pyc",
+        \\[]u8
+        \\  "class Option:
+        \\    pass
+        \\class Container:
+        \\    option_class = Option
+        \\    def add_option(self, *args, **kwargs):
+        \\        if isinstance(args[0], str):
+        \\            option = self.option_class(*args, **kwargs)
+        \\        elif len(args) == 1 and not kwargs:
+        \\            option = args[0]
+        \\            if not isinstance(option, Option):
+        \\                raise TypeError('%r' % option)
+        \\        else:
+        \\            raise TypeError('invalid arguments')
+        \\        return option
+        \\"
+    );
+}
+
 test "snapshot elif tail 3.9" {
     try runSnapshot(@src(), "test/corpus/elif_tail.3.9.pyc",
         \\[]u8
@@ -226,6 +247,31 @@ test "snapshot elif tail 3.9" {
         \\        if hasattr(obj._fileoutput, 'raw') and isinstance(obj._fileoutput.raw, socket.SocketIO):
         \\            if obj._fileoutput.raw._sock.type == socket.SocketKind.SOCK_DGRAM:
         \\                obj._split = True
+        \\"
+    );
+}
+
+test "snapshot elif and not 3.9" {
+    try runSnapshot(@src(), "test/corpus/elif_and_not.3.9.pyc",
+        \\[]u8
+        \\  "class Option:
+        \\    pass
+        \\def option_class(*args, **kwargs):
+        \\    _ = args
+        \\    _ = kwargs
+        \\    return Option()
+        \\class C:
+        \\    option_class = option_class
+        \\    def add(self, *args, **kwargs):
+        \\        if isinstance(args[0], str):
+        \\            option = self.option_class(*args, **kwargs)
+        \\        elif len(args) == 1 and not kwargs:
+        \\            option = args[0]
+        \\            if not isinstance(option, Option):
+        \\                raise TypeError('not an Option instance: %r' % option)
+        \\        else:
+        \\            raise TypeError('invalid arguments')
+        \\        return option
         \\"
     );
 }
@@ -494,10 +540,11 @@ test "snapshot try loop continue 3.9" {
         \\        return None
         \\    elif x == 2:
         \\        return None
-        \\    try:
-        \\        foo()
-        \\    except Exception as e:
-        \\        bar()
+        \\    else:
+        \\        try:
+        \\            foo()
+        \\        except Exception as e:
+        \\            bar()
         \\"
     );
 }

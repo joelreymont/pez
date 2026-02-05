@@ -8897,13 +8897,20 @@ pub const Decompiler = struct {
         }
         if (inner_else_opt == null) return null;
         const inner_else = self.resolveJumpOnlyBlock(inner_else_opt.?);
-        if (inner_else != outer_else) {
+        const inner_then_res = self.resolveJumpOnlyBlock(inner.then_block);
+        if (inner_else != outer_else and inner_then_res != outer_else) {
             if (try self.condChainFalseTarget(else_block.?, then_block)) |fb| {
                 outer_else = self.resolveJumpOnlyBlock(fb);
             }
         }
-        if (inner_else != outer_else) return null;
-        if (inner.then_block >= self.cfg.blocks.len or self.cfg.blocks[inner.then_block].is_loop_header) return null;
+        const swap_inner = if (inner_else == outer_else)
+            false
+        else if (inner_then_res == outer_else)
+            true
+        else
+            return null;
+        const cont_id: u32 = if (swap_inner) inner_else_opt.? else inner.then_block;
+        if (cont_id >= self.cfg.blocks.len or self.cfg.blocks[cont_id].is_loop_header) return null;
         // Allow merging even when inner then is terminal (guard-style AND chains).
 
         const then_blk = &self.cfg.blocks[then_block];
@@ -8912,6 +8919,12 @@ pub const Decompiler = struct {
         var inner_cond = cond2;
         var inner_then_id = inner.then_block;
         var inner_else_id = inner_else_opt.?;
+        if (swap_inner) {
+            inner_cond = try self.invertConditionExpr(inner_cond);
+            const tmp = inner_then_id;
+            inner_then_id = inner_else_id;
+            inner_else_id = tmp;
+        }
         if (cond2.* == .compare and cond2.compare.ops.len == 1 and cond2.compare.comparators.len == 1) {
             const mid = cond2.compare.comparators[0];
             const inner_then_pat = try self.analyzer.detectPatternNoTry(inner.then_block);
@@ -9867,7 +9880,7 @@ pub const Decompiler = struct {
             }
         }
 
-        if (!chained_cmp and !cond_chain_then and !is_elif) {
+        if (!chained_cmp and !cond_chain_then and !is_elif and !in_elif_chain) {
             if (else_block) |else_id| {
                 const else_res = self.resolveJumpOnlyBlock(else_id);
                 var guard_or_applied = false;
@@ -10019,17 +10032,32 @@ pub const Decompiler = struct {
                                             then_sim.lenient = true;
                                             then_sim.stack.allow_underflow = true;
                                             if (try self.condExprFromBlock(then_block, &then_sim, t_id.?, f_id.?, 0)) |cond2| {
-                                                // This CFG shape is `if (not a) or b:`:
-                                                // - outer false edge -> else_res
-                                                // - inner true edge  -> else_res
-                                                // - inner false edge -> false_res
-                                                // Preserve parity by reconstructing the original short-circuit OR.
-                                                const inv0 = try self.invertConditionExpr(condition);
-                                                condition = try self.makeBoolPair(inv0, cond2, .or_);
-                                                then_block = else_res;
-                                                else_block = false_res;
-                                                cond_chain_then = true;
-                                                try self.emitDecisionTrace(pattern.condition_block, "if_chain_or_not", condition);
+                                                // This CFG shape can be expressed either as:
+                                                // - `if (not a) or b:`  (then = else_res, else = false_res)
+                                                // - `if a and not b:`   (then = false_res, else = else_res)
+                                                //
+                                                // To preserve parity, prefer the source form that matches the bytecode
+                                                // layout: when the terminal block is laid out after the non-terminal
+                                                // block, keep the explicit success-path (`a and not b`).
+                                                const else_is_term = else_res < self.cfg.blocks.len and self.isTerminalBlock(else_res);
+                                                const false_is_term = false_res < self.cfg.blocks.len and self.isTerminalBlock(false_res);
+                                                const prefer_and_not = else_is_term and !false_is_term and
+                                                    self.cfg.blocks[else_res].start_offset > self.cfg.blocks[false_res].start_offset;
+                                                if (prefer_and_not) {
+                                                    const inv1 = try self.invertConditionExpr(cond2);
+                                                    condition = try self.makeBoolPair(condition, inv1, .and_);
+                                                    then_block = false_res;
+                                                    else_block = else_res;
+                                                    cond_chain_then = true;
+                                                    try self.emitDecisionTrace(pattern.condition_block, "if_chain_and_not", condition);
+                                                } else {
+                                                    const inv0 = try self.invertConditionExpr(condition);
+                                                    condition = try self.makeBoolPair(inv0, cond2, .or_);
+                                                    then_block = else_res;
+                                                    else_block = false_res;
+                                                    cond_chain_then = true;
+                                                    try self.emitDecisionTrace(pattern.condition_block, "if_chain_or_not", condition);
+                                                }
                                             }
                                         }
                                     }
@@ -10230,7 +10258,7 @@ pub const Decompiler = struct {
                 else => {},
             };
         }
-        if (!inverted) {
+        if (!inverted and !in_elif_chain) {
             if (else_block) |else_id| {
                 const else_res = self.resolveJumpOnlyBlock(else_id);
                 if (else_res < self.cfg.blocks.len and
@@ -11213,7 +11241,7 @@ pub const Decompiler = struct {
             }
         }
 
-        if (!else_body_moved and !is_elif and else_block != null and else_body.len > 0 and
+        if (!else_body_moved and !is_elif and !in_elif_chain and else_block != null and else_body.len > 0 and
             self.bodyEndsTerminal(then_body) and !self.bodyEndsTerminal(else_body))
         {
             if (self.if_next == null) {
