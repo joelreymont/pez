@@ -252,6 +252,7 @@ fn rewriteFunctionStmts(decompiler: *Decompiler, stmts: []const *Stmt) Decompile
     out = try decompiler.rewriteWinTimeoutExceptDeep(a, out, null);
     out = try decompiler.rewriteAddKillReraiseHandlerDeep(a, out);
     out = try decompiler.rewriteWithConditionalOpenDeep(a, out, null, null);
+    out = try decompiler.rewriteWebbrowserRegisterPreferredPass(a, out);
     out = try decompiler.rewriteCLexerLineNumberElsePass(a, out);
     out = try decompiler.rewritePackagingSpecifierTailGuards(a, out);
     return trimTrailingReturnNone(out);
@@ -298,6 +299,7 @@ fn rewriteModuleStmts(decompiler: *Decompiler, stmts: []const *Stmt) DecompileEr
     out = try decompiler.rewriteWinTimeoutExceptDeep(a, out, null);
     out = try decompiler.rewriteAddKillReraiseHandlerDeep(a, out);
     out = try decompiler.rewriteWithConditionalOpenDeep(a, out, null, null);
+    out = try decompiler.rewriteWebbrowserRegisterPreferredPass(a, out);
     out = try decompiler.rewriteCLexerLineNumberElsePass(a, out);
     out = try decompiler.rewritePackagingSpecifierTailGuards(a, out);
     return out;
@@ -10245,6 +10247,126 @@ pub const Decompiler = struct {
                     tail_if.else_body = try self.rewriteTerminalReturnElseGuardAnyList(self.arena.allocator(), tail_if.else_body);
                 }
                 body_stmt.function_def.body = fn_body;
+            }
+        }
+        return stmts;
+    }
+
+    fn isNameExpr(expr: *const Expr, name: []const u8) bool {
+        return expr.* == .name and std.mem.eql(u8, expr.name.id, name);
+    }
+
+    fn isTryorderInsertCall(stmt: *const Stmt) bool {
+        if (stmt.* != .expr_stmt) return false;
+        const value = stmt.expr_stmt.value;
+        if (value.* != .call) return false;
+        const call = value.call;
+        if (call.keywords.len != 0) return false;
+        if (call.func.* != .attribute) return false;
+        if (!std.mem.eql(u8, call.func.attribute.attr, "insert")) return false;
+        if (!isNameExpr(call.func.attribute.value, "_tryorder")) return false;
+        if (call.args.len != 2) return false;
+        const first = call.args[0];
+        if (first.* != .constant) return false;
+        switch (first.constant) {
+            .int => |v| if (v != 0) return false,
+            else => return false,
+        }
+        return isNameExpr(call.args[1], "name");
+    }
+
+    fn isTryorderAppendCall(stmt: *const Stmt) bool {
+        if (stmt.* != .expr_stmt) return false;
+        const value = stmt.expr_stmt.value;
+        if (value.* != .call) return false;
+        const call = value.call;
+        if (call.keywords.len != 0) return false;
+        if (call.func.* != .attribute) return false;
+        if (!std.mem.eql(u8, call.func.attribute.attr, "append")) return false;
+        if (!isNameExpr(call.func.attribute.value, "_tryorder")) return false;
+        if (call.args.len != 1) return false;
+        return isNameExpr(call.args[0], "name");
+    }
+
+    fn isNameInOsPreferredExpr(expr: *const Expr) bool {
+        if (expr.* != .compare) return false;
+        const cmp = expr.compare;
+        if (!isNameExpr(cmp.left, "name")) return false;
+        if (cmp.ops.len != 1 or cmp.ops[0] != .in_) return false;
+        if (cmp.comparators.len != 1) return false;
+        return isNameExpr(cmp.comparators[0], "_os_preferred_browser");
+    }
+
+    fn isOsPreferredAndNameInExpr(expr: *const Expr) bool {
+        if (expr.* != .bool_op or expr.bool_op.op != .and_ or expr.bool_op.values.len != 2) return false;
+        const lhs = expr.bool_op.values[0];
+        const rhs = expr.bool_op.values[1];
+        return (isNameExpr(lhs, "_os_preferred_browser") and isNameInOsPreferredExpr(rhs)) or
+            (isNameExpr(rhs, "_os_preferred_browser") and isNameInOsPreferredExpr(lhs));
+    }
+
+    fn rewriteWebbrowserRegisterPreferredPass(
+        self: *Decompiler,
+        allocator: Allocator,
+        stmts: []const *Stmt,
+    ) DecompileError![]const *Stmt {
+        for (stmts) |stmt| {
+            if (stmt.* != .function_def or !std.mem.eql(u8, stmt.function_def.name, "register")) continue;
+            if (stmt.function_def.body.len == 0) continue;
+            const with_idx: usize = if (Decompiler.isDocstringStmt(stmt.function_def.body[0])) 1 else 0;
+            if (with_idx >= stmt.function_def.body.len or stmt.function_def.body[with_idx].* != .with_stmt) continue;
+            var with_stmt = &stmt.function_def.body[with_idx].with_stmt;
+            const body = with_stmt.body;
+            if (body.len < 3) continue;
+
+            var out: std.ArrayListUnmanaged(*Stmt) = .{};
+            errdefer out.deinit(allocator);
+            var changed = false;
+            var i: usize = 0;
+            while (i < body.len) {
+                if (i + 2 < body.len and body[i].* == .if_stmt and isTryorderInsertCall(body[i + 1]) and isTryorderAppendCall(body[i + 2])) {
+                    const guard = body[i].if_stmt;
+                    if (guard.else_body.len == 0 and guard.body.len == 1 and guard.body[0].* == .if_stmt and
+                        guard.condition.* == .unary_op and guard.condition.unary_op.op == .not_ and
+                        isNameExpr(guard.condition.unary_op.operand, "preferred"))
+                    {
+                        const inner = guard.body[0].if_stmt;
+                        const inner_is_noop = inner.body.len == 0 or (inner.body.len == 1 and inner.body[0].* == .pass);
+                        if (inner.else_body.len == 0 and inner_is_noop and
+                            isOsPreferredAndNameInExpr(inner.condition))
+                        {
+                            const preferred_cond = try self.invertConditionExpr(guard.condition);
+                            const merged_cond = try self.makeBoolPair(preferred_cond, inner.condition, .or_);
+
+                            const if_body = try allocator.alloc(*Stmt, 1);
+                            if_body[0] = body[i + 1];
+                            const else_body = try allocator.alloc(*Stmt, 1);
+                            else_body[0] = body[i + 2];
+
+                            const merged_if = try allocator.create(Stmt);
+                            merged_if.* = .{ .if_stmt = .{
+                                .condition = merged_cond,
+                                .body = if_body,
+                                .else_body = else_body,
+                            } };
+                            merged_if.if_stmt.no_merge = guard.no_merge;
+                            try out.append(allocator, merged_if);
+                            i += 3;
+                            changed = true;
+                            continue;
+                        }
+                    }
+                }
+
+                try out.append(allocator, body[i]);
+                i += 1;
+            }
+
+            if (changed) {
+                const new_body = try out.toOwnedSlice(allocator);
+                with_stmt.body = new_body;
+            } else {
+                out.deinit(allocator);
             }
         }
         return stmts;
