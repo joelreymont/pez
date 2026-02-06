@@ -1,9 +1,11 @@
 ---
 title: Repro typing
-status: active
+status: closed
 priority: 2
 issue-type: task
-created-at: "\"2026-02-05T21:25:22.568248+01:00\""
+created-at: "\"\\\"2026-02-05T21:25:22.568248+01:00\\\"\""
+closed-at: "2026-02-06T02:41:50.281161+01:00"
+close-reason: reproduced and persisted reports in /tmp during typing fixes
 blocks:
   - pez-validate-and-commit-4561f563
 ---

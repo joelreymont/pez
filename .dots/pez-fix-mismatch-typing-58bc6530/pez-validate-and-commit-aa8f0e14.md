@@ -1,9 +1,11 @@
 ---
 title: Validate and commit typing
-status: open
+status: closed
 priority: 2
 issue-type: task
-created-at: "2026-02-05T21:25:22.581871+01:00"
+created-at: "\"2026-02-05T21:25:22.581871+01:00\""
+closed-at: "2026-02-06T02:41:50.292837+01:00"
+close-reason: validated via zig build test + suite25 and committed
 blocks:
   - pez-add-typing-regression-d4eacdf3
 ---

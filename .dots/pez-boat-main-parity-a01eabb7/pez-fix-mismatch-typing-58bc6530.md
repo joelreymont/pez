@@ -1,9 +1,11 @@
 ---
 title: Fix mismatch typing
-status: open
+status: closed
 priority: 1
 issue-type: task
-created-at: "2026-02-05T20:11:13.823706+01:00"
+created-at: "\"2026-02-05T20:11:13.823706+01:00\""
+closed-at: "2026-02-06T02:41:50.295515+01:00"
+close-reason: typing.pyc now close in suite25; mismatch cleared
 blocks:
   - pez-fix-mismatch-packaging-df904b12
 ---

@@ -1,9 +1,11 @@
 ---
 title: Locate typing divergence
-status: open
+status: closed
 priority: 2
 issue-type: task
-created-at: "2026-02-05T21:25:22.571759+01:00"
+created-at: "\"2026-02-05T21:25:22.571759+01:00\""
+closed-at: "2026-02-06T02:41:50.284234+01:00"
+close-reason: locate/unit-diff work completed during typing root fixes
 blocks:
   - pez-repro-typing-bf965941
 ---

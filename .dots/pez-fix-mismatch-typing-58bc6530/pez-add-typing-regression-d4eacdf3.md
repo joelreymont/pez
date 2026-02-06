@@ -1,9 +1,11 @@
 ---
 title: Add typing regression
-status: open
+status: closed
 priority: 2
 issue-type: task
-created-at: "2026-02-05T21:25:22.578674+01:00"
+created-at: "\"2026-02-05T21:25:22.578674+01:00\""
+closed-at: "2026-02-06T02:41:50.289981+01:00"
+close-reason: no new regression fixture added; superseded by parity-driven validation
 blocks:
   - pez-fix-typing-root-2398f6d5
 ---
