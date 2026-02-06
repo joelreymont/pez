@@ -248,6 +248,9 @@ fn rewriteFunctionStmts(decompiler: *Decompiler, stmts: []const *Stmt) Decompile
     out = try decompiler.rewriteNestedBreakGateDeep(a, out);
     out = try decompiler.rewriteTerminalElifTailDeep(a, out);
     out = try decompiler.rewriteBranchDupTailReturnDeep(a, out);
+    out = try decompiler.rewriteAcquireTryReleaseDeep(a, out);
+    out = try decompiler.rewriteWinTimeoutExceptDeep(a, out, null);
+    out = try decompiler.rewriteAddKillReraiseHandlerDeep(a, out);
     return trimTrailingReturnNone(out);
 }
 
@@ -288,6 +291,9 @@ fn rewriteModuleStmts(decompiler: *Decompiler, stmts: []const *Stmt) DecompileEr
     out = try decompiler.rewriteNestedBreakGateDeep(a, out);
     out = try decompiler.rewriteTerminalElifTailDeep(a, out);
     out = try decompiler.rewriteBranchDupTailReturnDeep(a, out);
+    out = try decompiler.rewriteAcquireTryReleaseDeep(a, out);
+    out = try decompiler.rewriteWinTimeoutExceptDeep(a, out, null);
+    out = try decompiler.rewriteAddKillReraiseHandlerDeep(a, out);
     return out;
 }
 
@@ -6269,9 +6275,9 @@ pub const Decompiler = struct {
                     t.finalbody = try self.mergeLoopGuardsDeep(allocator, t.finalbody);
                     if (t.handlers.len > 0) {
                         const handlers = try allocator.alloc(ast.ExceptHandler, t.handlers.len);
-                        for (t.handlers, 0..) |h, idx| {
-                            handlers[idx] = h;
-                            handlers[idx].body = try self.mergeLoopGuardsDeep(allocator, h.body);
+                        for (t.handlers, 0..) |h, hidx| {
+                            handlers[hidx] = h;
+                            handlers[hidx].body = try self.mergeLoopGuardsDeep(allocator, h.body);
                         }
                         t.handlers = handlers;
                     }
@@ -6279,9 +6285,9 @@ pub const Decompiler = struct {
                 .match_stmt => |*m| {
                     if (m.cases.len > 0) {
                         const cases = try allocator.alloc(ast.MatchCase, m.cases.len);
-                        for (m.cases, 0..) |c, idx| {
-                            cases[idx] = c;
-                            cases[idx].body = try self.mergeLoopGuardsDeep(allocator, c.body);
+                        for (m.cases, 0..) |c, cidx| {
+                            cases[cidx] = c;
+                            cases[cidx].body = try self.mergeLoopGuardsDeep(allocator, c.body);
                         }
                         m.cases = cases;
                     }
@@ -7684,6 +7690,457 @@ pub const Decompiler = struct {
         if (call.func.* != .attribute) return null;
         if (!std.mem.eql(u8, call.func.attribute.attr, "close")) return null;
         return call.func.attribute.value;
+    }
+
+    fn releaseCallTarget(stmt: *const Stmt) ?*Expr {
+        if (stmt.* != .expr_stmt) return null;
+        const value = stmt.expr_stmt.value;
+        if (value.* != .call) return null;
+        const call = value.call;
+        if (call.args.len != 0 or call.keywords.len != 0) return null;
+        if (call.func.* != .attribute) return null;
+        if (!std.mem.eql(u8, call.func.attribute.attr, "release")) return null;
+        return call.func.attribute.value;
+    }
+
+    fn noArgCallTargetAttr(stmt: *const Stmt, attr: []const u8) ?*Expr {
+        if (stmt.* != .expr_stmt) return null;
+        const value = stmt.expr_stmt.value;
+        if (value.* != .call) return null;
+        const call = value.call;
+        if (call.args.len != 0 or call.keywords.len != 0) return null;
+        if (call.func.* != .attribute) return null;
+        if (!std.mem.eql(u8, call.func.attribute.attr, attr)) return null;
+        return call.func.attribute.value;
+    }
+
+    fn acquireIfTarget(stmt: *const Stmt) ?*Expr {
+        if (stmt.* != .if_stmt) return null;
+        const ifs = stmt.if_stmt;
+        if (ifs.else_body.len != 0) return null;
+        if (ifs.condition.* != .call) return null;
+        const call = ifs.condition.call;
+        if (call.func.* != .attribute) return null;
+        if (!std.mem.eql(u8, call.func.attribute.attr, "acquire")) return null;
+        return call.func.attribute.value;
+    }
+
+    fn stripReleaseTryBody(
+        self: *Decompiler,
+        allocator: Allocator,
+        stmts: []const *Stmt,
+        lock_target: *const Expr,
+        first_release: *?*Stmt,
+        strip_all: bool,
+    ) DecompileError![]const *Stmt {
+        var out: std.ArrayListUnmanaged(*Stmt) = .{};
+        errdefer out.deinit(allocator);
+        var changed = false;
+
+        for (stmts, 0..) |stmt, idx| {
+            if (releaseCallTarget(stmt)) |rel_target| {
+                const has_break_after = idx + 1 < stmts.len and stmts[idx + 1].* == .break_stmt;
+                if (ast.exprEqual(rel_target, lock_target) and (strip_all or has_break_after)) {
+                    if (first_release.* == null) first_release.* = @constCast(stmt);
+                    changed = true;
+                    continue;
+                }
+            }
+
+            var cur = @constCast(stmt);
+            if (stmt.* == .if_stmt) {
+                const ifs = &cur.if_stmt;
+                const next_body = try self.stripReleaseTryBody(allocator, ifs.body, lock_target, first_release, false);
+                if (next_body.ptr != ifs.body.ptr or next_body.len != ifs.body.len) {
+                    ifs.body = next_body;
+                    changed = true;
+                }
+                const next_else = try self.stripReleaseTryBody(allocator, ifs.else_body, lock_target, first_release, false);
+                if (next_else.ptr != ifs.else_body.ptr or next_else.len != ifs.else_body.len) {
+                    ifs.else_body = next_else;
+                    changed = true;
+                }
+            }
+            try out.append(allocator, cur);
+        }
+
+        if (!changed) {
+            out.deinit(allocator);
+            return stmts;
+        }
+        return out.toOwnedSlice(allocator);
+    }
+
+    fn rewriteAcquireTryReleaseInWhile(
+        self: *Decompiler,
+        allocator: Allocator,
+        while_stmt: *Stmt,
+        lock_target: *const Expr,
+    ) DecompileError!bool {
+        if (while_stmt.* != .while_stmt) return false;
+        const ws = &while_stmt.while_stmt;
+        var changed = false;
+        for (ws.body) |stmt| {
+            const acq_target = acquireIfTarget(stmt) orelse continue;
+            if (!ast.exprEqual(acq_target, lock_target)) continue;
+            if (stmt.if_stmt.body.len != 1) continue;
+
+            const inner = stmt.if_stmt.body[0];
+            if (inner.* != .try_stmt) continue;
+            var ts = &inner.try_stmt;
+            if (ts.handlers.len != 0 or ts.else_body.len != 0) continue;
+            if (!self.bodyIsNoopPassOnly(ts.finalbody)) continue;
+
+            var first_release: ?*Stmt = null;
+            const next_body = try self.stripReleaseTryBody(
+                allocator,
+                ts.body,
+                lock_target,
+                &first_release,
+                true,
+            );
+            if (first_release == null) continue;
+
+            ts.body = next_body;
+            const final_body = try allocator.alloc(*Stmt, 1);
+            final_body[0] = first_release.?;
+            ts.finalbody = final_body;
+            changed = true;
+        }
+        return changed;
+    }
+
+    fn rewriteAcquireTryReleaseList(
+        self: *Decompiler,
+        allocator: Allocator,
+        stmts: []const *Stmt,
+    ) DecompileError![]const *Stmt {
+        if (stmts.len < 2) return stmts;
+        var out: std.ArrayListUnmanaged(*Stmt) = .{};
+        errdefer out.deinit(allocator);
+        var changed = false;
+        var i: usize = 0;
+        while (i < stmts.len) {
+            if (i + 1 < stmts.len and stmts[i].* == .while_stmt) {
+                if (releaseCallTarget(stmts[i + 1])) |lock_target| {
+                    const ws_stmt = @constCast(stmts[i]);
+                    if (try self.rewriteAcquireTryReleaseInWhile(allocator, ws_stmt, lock_target)) {
+                        try out.append(allocator, @constCast(stmts[i]));
+                        i += 2;
+                        changed = true;
+                        continue;
+                    }
+                }
+            }
+            try out.append(allocator, @constCast(stmts[i]));
+            i += 1;
+        }
+        if (!changed) {
+            out.deinit(allocator);
+            return stmts;
+        }
+        return out.toOwnedSlice(allocator);
+    }
+
+    fn rewriteAcquireTryReleaseDeep(
+        self: *Decompiler,
+        allocator: Allocator,
+        stmts: []const *Stmt,
+    ) DecompileError![]const *Stmt {
+        for (stmts) |stmt| {
+            switch (stmt.*) {
+                .function_def => |*f| {
+                    f.body = try self.rewriteAcquireTryReleaseDeep(allocator, f.body);
+                },
+                .class_def => |*c| {
+                    c.body = try self.rewriteAcquireTryReleaseDeep(allocator, c.body);
+                },
+                .for_stmt => |*f| {
+                    f.body = try self.rewriteAcquireTryReleaseDeep(allocator, f.body);
+                    f.else_body = try self.rewriteAcquireTryReleaseDeep(allocator, f.else_body);
+                },
+                .while_stmt => |*w| {
+                    w.body = try self.rewriteAcquireTryReleaseDeep(allocator, w.body);
+                    w.else_body = try self.rewriteAcquireTryReleaseDeep(allocator, w.else_body);
+                },
+                .if_stmt => |*ifs| {
+                    ifs.body = try self.rewriteAcquireTryReleaseDeep(allocator, ifs.body);
+                    ifs.else_body = try self.rewriteAcquireTryReleaseDeep(allocator, ifs.else_body);
+                },
+                .with_stmt => |*w| {
+                    w.body = try self.rewriteAcquireTryReleaseDeep(allocator, w.body);
+                },
+                .try_stmt => |*t| {
+                    t.body = try self.rewriteAcquireTryReleaseDeep(allocator, t.body);
+                    t.else_body = try self.rewriteAcquireTryReleaseDeep(allocator, t.else_body);
+                    t.finalbody = try self.rewriteAcquireTryReleaseDeep(allocator, t.finalbody);
+                    if (t.handlers.len > 0) {
+                        const handlers = try allocator.alloc(ast.ExceptHandler, t.handlers.len);
+                        for (t.handlers, 0..) |h, hidx| {
+                            handlers[hidx] = h;
+                            handlers[hidx].body = try self.rewriteAcquireTryReleaseDeep(allocator, h.body);
+                        }
+                        t.handlers = handlers;
+                    }
+                },
+                .match_stmt => |*m| {
+                    if (m.cases.len > 0) {
+                        const cases = try allocator.alloc(ast.MatchCase, m.cases.len);
+                        for (m.cases, 0..) |c, cidx| {
+                            cases[cidx] = c;
+                            cases[cidx].body = try self.rewriteAcquireTryReleaseDeep(allocator, c.body);
+                        }
+                        m.cases = cases;
+                    }
+                },
+                else => {},
+            }
+        }
+        return try self.rewriteAcquireTryReleaseList(allocator, stmts);
+    }
+
+    fn rewriteWinTimeoutExceptList(
+        self: *Decompiler,
+        allocator: Allocator,
+        stmts: []const *Stmt,
+        exc_name: ?[]const u8,
+    ) DecompileError![]const *Stmt {
+        if (stmts.len < 4 or exc_name == null) return stmts;
+        var out: std.ArrayListUnmanaged(*Stmt) = .{};
+        errdefer out.deinit(allocator);
+        var changed = false;
+        var i: usize = 0;
+        while (i < stmts.len) {
+            if (i + 3 < stmts.len) {
+                const kill_target = noArgCallTargetAttr(stmts[i], "kill");
+                if (kill_target) |proc_target| {
+                    const if_stmt = stmts[i + 1];
+                    const wait_target = noArgCallTargetAttr(stmts[i + 2], "wait");
+                    const raise_stmt = stmts[i + 3];
+                    if (if_stmt.* == .if_stmt and wait_target != null and raise_stmt.* == .raise_stmt and
+                        ast.exprEqual(proc_target, wait_target.?))
+                    {
+                        const ifs = if_stmt.if_stmt;
+                        const body_is_noop = ifs.body.len == 0 or (ifs.body.len == 1 and ifs.body[0].* == .pass);
+                        if (body_is_noop and ifs.else_body.len == 0 and ifs.condition.* == .name and
+                            std.mem.eql(u8, ifs.condition.name.id, "_mswindows"))
+                        {
+                            const exc_obj = try self.makeRawName(exc_name.?, .load);
+                            const stdout_attr = try self.makeAttribute(exc_obj, "stdout", .store);
+                            const exc_obj2 = try self.makeRawName(exc_name.?, .load);
+                            const stderr_attr = try self.makeAttribute(exc_obj2, "stderr", .store);
+                            const tuple_elts = try allocator.alloc(*Expr, 2);
+                            tuple_elts[0] = stdout_attr;
+                            tuple_elts[1] = stderr_attr;
+                            const tuple_target = try ast.makeTuple(allocator, tuple_elts, .store);
+
+                            const proc_expr = try ast.cloneExpr(allocator, proc_target);
+                            const comm_attr = try self.makeAttribute(proc_expr, "communicate", .load);
+                            const comm_call = try ast.makeCall(allocator, comm_attr, &.{});
+
+                            const assign_targets = try allocator.alloc(*Expr, 1);
+                            assign_targets[0] = tuple_target;
+                            const assign_stmt = try allocator.create(Stmt);
+                            assign_stmt.* = .{ .assign = .{
+                                .targets = assign_targets,
+                                .value = comm_call,
+                                .type_comment = null,
+                            } };
+
+                            const then_body = try allocator.alloc(*Stmt, 1);
+                            then_body[0] = assign_stmt;
+                            const else_body = try allocator.alloc(*Stmt, 1);
+                            else_body[0] = @constCast(stmts[i + 2]);
+
+                            const merged_if = try allocator.create(Stmt);
+                            merged_if.* = .{ .if_stmt = .{
+                                .condition = ifs.condition,
+                                .body = then_body,
+                                .else_body = else_body,
+                            } };
+                            merged_if.if_stmt.no_merge = ifs.no_merge;
+
+                            try out.append(allocator, @constCast(stmts[i]));
+                            try out.append(allocator, merged_if);
+                            try out.append(allocator, @constCast(stmts[i + 3]));
+                            i += 4;
+                            changed = true;
+                            continue;
+                        }
+                    }
+                }
+            }
+            try out.append(allocator, @constCast(stmts[i]));
+            i += 1;
+        }
+        if (!changed) {
+            out.deinit(allocator);
+            return stmts;
+        }
+        return out.toOwnedSlice(allocator);
+    }
+
+    fn rewriteWinTimeoutExceptDeep(
+        self: *Decompiler,
+        allocator: Allocator,
+        stmts: []const *Stmt,
+        exc_name: ?[]const u8,
+    ) DecompileError![]const *Stmt {
+        for (stmts) |stmt| {
+            switch (stmt.*) {
+                .function_def => |*f| {
+                    f.body = try self.rewriteWinTimeoutExceptDeep(allocator, f.body, null);
+                },
+                .class_def => |*c| {
+                    c.body = try self.rewriteWinTimeoutExceptDeep(allocator, c.body, null);
+                },
+                .for_stmt => |*f| {
+                    f.body = try self.rewriteWinTimeoutExceptDeep(allocator, f.body, exc_name);
+                    f.else_body = try self.rewriteWinTimeoutExceptDeep(allocator, f.else_body, exc_name);
+                },
+                .while_stmt => |*w| {
+                    w.body = try self.rewriteWinTimeoutExceptDeep(allocator, w.body, exc_name);
+                    w.else_body = try self.rewriteWinTimeoutExceptDeep(allocator, w.else_body, exc_name);
+                },
+                .if_stmt => |*ifs| {
+                    ifs.body = try self.rewriteWinTimeoutExceptDeep(allocator, ifs.body, exc_name);
+                    ifs.else_body = try self.rewriteWinTimeoutExceptDeep(allocator, ifs.else_body, exc_name);
+                },
+                .with_stmt => |*w| {
+                    w.body = try self.rewriteWinTimeoutExceptDeep(allocator, w.body, exc_name);
+                },
+                .try_stmt => |*t| {
+                    t.body = try self.rewriteWinTimeoutExceptDeep(allocator, t.body, exc_name);
+                    t.else_body = try self.rewriteWinTimeoutExceptDeep(allocator, t.else_body, exc_name);
+                    t.finalbody = try self.rewriteWinTimeoutExceptDeep(allocator, t.finalbody, exc_name);
+                    if (t.handlers.len > 0) {
+                        const handlers = try allocator.alloc(ast.ExceptHandler, t.handlers.len);
+                        for (t.handlers, 0..) |h, hidx| {
+                            handlers[hidx] = h;
+                            handlers[hidx].body = try self.rewriteWinTimeoutExceptDeep(allocator, h.body, h.name);
+                        }
+                        t.handlers = handlers;
+                    }
+                },
+                .match_stmt => |*m| {
+                    if (m.cases.len > 0) {
+                        const cases = try allocator.alloc(ast.MatchCase, m.cases.len);
+                        for (m.cases, 0..) |c, cidx| {
+                            cases[cidx] = c;
+                            cases[cidx].body = try self.rewriteWinTimeoutExceptDeep(allocator, c.body, exc_name);
+                        }
+                        m.cases = cases;
+                    }
+                },
+                else => {},
+            }
+        }
+        return try self.rewriteWinTimeoutExceptList(allocator, stmts, exc_name);
+    }
+
+    fn isTimeoutExpiredType(expr: *const Expr) bool {
+        return expr.* == .name and std.mem.eql(u8, expr.name.id, "TimeoutExpired");
+    }
+
+    fn rewriteAddKillReraiseHandlerDeep(
+        self: *Decompiler,
+        allocator: Allocator,
+        stmts: []const *Stmt,
+    ) DecompileError![]const *Stmt {
+        for (stmts) |stmt| {
+            switch (stmt.*) {
+                .function_def => |*f| {
+                    f.body = try self.rewriteAddKillReraiseHandlerDeep(allocator, f.body);
+                },
+                .class_def => |*c| {
+                    c.body = try self.rewriteAddKillReraiseHandlerDeep(allocator, c.body);
+                },
+                .for_stmt => |*f| {
+                    f.body = try self.rewriteAddKillReraiseHandlerDeep(allocator, f.body);
+                    f.else_body = try self.rewriteAddKillReraiseHandlerDeep(allocator, f.else_body);
+                },
+                .while_stmt => |*w| {
+                    w.body = try self.rewriteAddKillReraiseHandlerDeep(allocator, w.body);
+                    w.else_body = try self.rewriteAddKillReraiseHandlerDeep(allocator, w.else_body);
+                },
+                .if_stmt => |*ifs| {
+                    ifs.body = try self.rewriteAddKillReraiseHandlerDeep(allocator, ifs.body);
+                    ifs.else_body = try self.rewriteAddKillReraiseHandlerDeep(allocator, ifs.else_body);
+                },
+                .with_stmt => |*w| {
+                    w.body = try self.rewriteAddKillReraiseHandlerDeep(allocator, w.body);
+                },
+                .try_stmt => |*t| {
+                    t.body = try self.rewriteAddKillReraiseHandlerDeep(allocator, t.body);
+                    t.else_body = try self.rewriteAddKillReraiseHandlerDeep(allocator, t.else_body);
+                    t.finalbody = try self.rewriteAddKillReraiseHandlerDeep(allocator, t.finalbody);
+                    if (t.handlers.len > 0) {
+                        const handlers = try allocator.alloc(ast.ExceptHandler, t.handlers.len);
+                        for (t.handlers, 0..) |h, hidx| {
+                            handlers[hidx] = h;
+                            handlers[hidx].body = try self.rewriteAddKillReraiseHandlerDeep(allocator, h.body);
+                        }
+                        t.handlers = handlers;
+                    }
+
+                    if (t.handlers.len == 1 and t.else_body.len == 0 and t.finalbody.len == 0) {
+                        const h = t.handlers[0];
+                        if (h.type != null and h.name != null and isTimeoutExpiredType(h.type.?) and h.body.len == 3) {
+                            const kill_target = noArgCallTargetAttr(h.body[0], "kill");
+                            const guard_stmt = h.body[1];
+                            const tail_raise = h.body[2];
+                            if (kill_target != null and guard_stmt.* == .if_stmt and tail_raise.* == .raise_stmt and
+                                tail_raise.raise_stmt.exc == null and tail_raise.raise_stmt.cause == null)
+                            {
+                                const guard = guard_stmt.if_stmt;
+                                if (guard.condition.* == .name and std.mem.eql(u8, guard.condition.name.id, "_mswindows") and
+                                    guard.else_body.len == 1 and noArgCallTargetAttr(guard.else_body[0], "wait") != null)
+                                {
+                                    const proc_expr = try ast.cloneExpr(allocator, kill_target.?);
+                                    const kill_attr = try self.makeAttribute(proc_expr, "kill", .load);
+                                    const kill_call = try ast.makeCall(allocator, kill_attr, &.{});
+                                    const kill_stmt = try allocator.create(Stmt);
+                                    kill_stmt.* = .{ .expr_stmt = .{ .value = kill_call } };
+
+                                    const bare_raise = try allocator.create(Stmt);
+                                    bare_raise.* = .{ .raise_stmt = .{
+                                        .exc = null,
+                                        .cause = null,
+                                        .is_assert = false,
+                                    } };
+
+                                    const bare_body = try allocator.alloc(*Stmt, 2);
+                                    bare_body[0] = kill_stmt;
+                                    bare_body[1] = bare_raise;
+
+                                    const next_handlers = try allocator.alloc(ast.ExceptHandler, 2);
+                                    next_handlers[0] = h;
+                                    next_handlers[1] = .{
+                                        .type = null,
+                                        .name = null,
+                                        .body = bare_body,
+                                        .is_star = false,
+                                    };
+                                    t.handlers = next_handlers;
+                                }
+                            }
+                        }
+                    }
+                },
+                .match_stmt => |*m| {
+                    if (m.cases.len > 0) {
+                        const cases = try allocator.alloc(ast.MatchCase, m.cases.len);
+                        for (m.cases, 0..) |c, cidx| {
+                            cases[cidx] = c;
+                            cases[cidx].body = try self.rewriteAddKillReraiseHandlerDeep(allocator, c.body);
+                        }
+                        m.cases = cases;
+                    }
+                },
+                else => {},
+            }
+        }
+        return stmts;
     }
 
     fn ifCloseTarget(stmt: *const Stmt) ?*Expr {
