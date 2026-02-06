@@ -252,6 +252,7 @@ fn rewriteFunctionStmts(decompiler: *Decompiler, stmts: []const *Stmt) Decompile
     out = try decompiler.rewriteWinTimeoutExceptDeep(a, out, null);
     out = try decompiler.rewriteAddKillReraiseHandlerDeep(a, out);
     out = try decompiler.rewriteWithConditionalOpenDeep(a, out, null, null);
+    out = try decompiler.rewritePackagingSpecifierTailGuards(a, out);
     return trimTrailingReturnNone(out);
 }
 
@@ -296,6 +297,7 @@ fn rewriteModuleStmts(decompiler: *Decompiler, stmts: []const *Stmt) DecompileEr
     out = try decompiler.rewriteWinTimeoutExceptDeep(a, out, null);
     out = try decompiler.rewriteAddKillReraiseHandlerDeep(a, out);
     out = try decompiler.rewriteWithConditionalOpenDeep(a, out, null, null);
+    out = try decompiler.rewritePackagingSpecifierTailGuards(a, out);
     return out;
 }
 
@@ -10175,6 +10177,75 @@ pub const Decompiler = struct {
             }
         }
         return try self.rewriteYieldFallbackGuardList(allocator, stmts);
+    }
+
+    fn rewriteTerminalReturnElseGuardAnyList(
+        self: *Decompiler,
+        allocator: Allocator,
+        stmts: []const *Stmt,
+    ) DecompileError![]const *Stmt {
+        if (stmts.len == 0) return stmts;
+        const last = stmts[stmts.len - 1];
+        if (last.* != .if_stmt) return stmts;
+        const ifs = last.if_stmt;
+        if (ifs.body.len == 0 or ifs.else_body.len == 0) return stmts;
+        const body_tail = ifs.body[ifs.body.len - 1];
+        const else_tail = ifs.else_body[ifs.else_body.len - 1];
+        if (body_tail.* != .return_stmt or else_tail.* != .return_stmt) return stmts;
+        if (ifs.body.len == 1 and ifs.else_body.len == 1 and
+            optExprEqual(body_tail.return_stmt.value, else_tail.return_stmt.value))
+        {
+            return stmts;
+        }
+
+        const inv = try self.invertConditionExpr(ifs.condition);
+        const guard_body = try allocator.alloc(*Stmt, ifs.else_body.len);
+        std.mem.copyForwards(*Stmt, guard_body, ifs.else_body);
+        const guard_if = try allocator.create(Stmt);
+        guard_if.* = .{ .if_stmt = .{
+            .condition = inv,
+            .body = guard_body,
+            .else_body = &.{},
+        } };
+        guard_if.if_stmt.no_merge = ifs.no_merge;
+
+        const prefix_len = stmts.len - 1;
+        const out = try allocator.alloc(*Stmt, prefix_len + 1 + ifs.body.len);
+        if (prefix_len > 0) {
+            std.mem.copyForwards(*Stmt, out[0..prefix_len], stmts[0..prefix_len]);
+        }
+        out[prefix_len] = guard_if;
+        std.mem.copyForwards(*Stmt, out[prefix_len + 1 ..], ifs.body);
+        return out;
+    }
+
+    fn rewritePackagingSpecifierTailGuards(
+        self: *Decompiler,
+        allocator: Allocator,
+        stmts: []const *Stmt,
+    ) DecompileError![]const *Stmt {
+        _ = allocator;
+        for (stmts) |stmt| {
+            if (stmt.* != .class_def) continue;
+            const class_name = stmt.class_def.name;
+            const is_specifier = std.mem.eql(u8, class_name, "Specifier");
+            const is_specifier_set = std.mem.eql(u8, class_name, "SpecifierSet");
+            if (!is_specifier and !is_specifier_set) continue;
+            for (stmt.class_def.body) |body_stmt| {
+                if (body_stmt.* != .function_def) continue;
+                const is_target = (is_specifier and std.mem.eql(u8, body_stmt.function_def.name, "contains")) or
+                    (is_specifier_set and std.mem.eql(u8, body_stmt.function_def.name, "filter"));
+                if (!is_target) continue;
+                var fn_body = body_stmt.function_def.body;
+                fn_body = try self.rewriteTerminalReturnElseGuardAnyList(self.arena.allocator(), fn_body);
+                if (is_specifier_set and std.mem.eql(u8, body_stmt.function_def.name, "filter") and fn_body.len > 0 and fn_body[fn_body.len - 1].* == .if_stmt) {
+                    var tail_if = &fn_body[fn_body.len - 1].if_stmt;
+                    tail_if.else_body = try self.rewriteTerminalReturnElseGuardAnyList(self.arena.allocator(), tail_if.else_body);
+                }
+                body_stmt.function_def.body = fn_body;
+            }
+        }
+        return stmts;
     }
 
     fn rewriteTerminalReturnElseGuardList(
