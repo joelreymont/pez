@@ -1,9 +1,11 @@
 ---
 title: Validate and commit ftplib
-status: open
+status: closed
 priority: 2
 issue-type: task
-created-at: "2026-02-05T21:25:22.616354+01:00"
+created-at: "\"2026-02-05T21:25:22.616354+01:00\""
+closed-at: "2026-02-06T02:50:48.475500+01:00"
+close-reason: zig build test + suite26 run and committed
 blocks:
   - pez-add-ftplib-regression-ada1efc3
 ---

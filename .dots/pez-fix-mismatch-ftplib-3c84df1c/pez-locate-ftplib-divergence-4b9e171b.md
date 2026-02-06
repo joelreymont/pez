@@ -1,9 +1,11 @@
 ---
 title: Locate ftplib divergence
-status: open
+status: closed
 priority: 2
 issue-type: task
-created-at: "2026-02-05T21:25:22.605846+01:00"
+created-at: "\"2026-02-05T21:25:22.605846+01:00\""
+closed-at: "2026-02-06T02:50:48.467081+01:00"
+close-reason: locate/unit analysis completed; sentinel-loop root found
 blocks:
   - pez-repro-ftplib-3f292785
 ---

@@ -1,9 +1,11 @@
 ---
 title: Repro ftplib
-status: open
+status: closed
 priority: 2
 issue-type: task
-created-at: "2026-02-05T21:25:22.602381+01:00"
+created-at: "\"2026-02-05T21:25:22.602381+01:00\""
+closed-at: "2026-02-06T02:50:48.463546+01:00"
+close-reason: repro and reports completed in /tmp
 blocks:
   - pez-validate-and-commit-c24b51bf
 ---

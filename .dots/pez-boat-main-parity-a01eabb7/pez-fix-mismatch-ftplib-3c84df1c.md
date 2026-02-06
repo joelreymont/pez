@@ -1,9 +1,11 @@
 ---
 title: Fix mismatch ftplib
-status: open
+status: closed
 priority: 1
 issue-type: task
-created-at: "2026-02-05T20:11:21.628735+01:00"
+created-at: "\"2026-02-05T20:11:21.628735+01:00\""
+closed-at: "2026-02-06T02:50:48.478001+01:00"
+close-reason: ftplib.pyc now close in suite26; mismatch cleared
 blocks:
   - pez-fix-mismatch-picamera2-65da8c1d
 ---

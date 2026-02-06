@@ -1,9 +1,11 @@
 ---
 title: Fix ftplib root cause
-status: open
+status: closed
 priority: 2
 issue-type: task
-created-at: "2026-02-05T21:25:22.609397+01:00"
+created-at: "\"2026-02-05T21:25:22.609397+01:00\""
+closed-at: "2026-02-06T02:50:48.469999+01:00"
+close-reason: root fix committed in 2a6df5e0
 blocks:
   - pez-locate-ftplib-divergence-4b9e171b
 ---
