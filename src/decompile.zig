@@ -264,6 +264,7 @@ fn rewriteFunctionStmts(decompiler: *Decompiler, stmts: []const *Stmt) Decompile
     out = try decompiler.rewriteZipUnknownTryDeep(a, out);
     out = try decompiler.rewriteLoadFmtForElseDeep(a, out);
     out = try decompiler.rewriteDropWithPlaceholderTailDeep(a, out);
+    out = try decompiler.rewriteDropIfBranchAssignTailDeep(a, out);
     out = try decompiler.rewriteHoistWithLoopTailBreakDeep(a, out, false);
     return trimTrailingReturnNone(out);
 }
@@ -321,6 +322,7 @@ fn rewriteModuleStmts(decompiler: *Decompiler, stmts: []const *Stmt) DecompileEr
     out = try decompiler.rewriteZipUnknownTryDeep(a, out);
     out = try decompiler.rewriteLoadFmtForElseDeep(a, out);
     out = try decompiler.rewriteDropWithPlaceholderTailDeep(a, out);
+    out = try decompiler.rewriteDropIfBranchAssignTailDeep(a, out);
     out = try decompiler.rewriteHoistWithLoopTailBreakDeep(a, out, false);
     return out;
 }
@@ -10468,6 +10470,99 @@ pub const Decompiler = struct {
             }
         }
         return try self.rewriteDropWithPlaceholderTailList(allocator, stmts);
+    }
+
+    fn rewriteDropIfBranchAssignTailList(
+        self: *Decompiler,
+        allocator: Allocator,
+        stmts: []const *Stmt,
+    ) DecompileError![]const *Stmt {
+        _ = self;
+        if (stmts.len < 3) return stmts;
+        var out: std.ArrayListUnmanaged(*Stmt) = .{};
+        errdefer out.deinit(allocator);
+        var changed = false;
+        var i: usize = 0;
+        while (i < stmts.len) {
+            const cur = stmts[i];
+            if (cur.* == .if_stmt and i + 2 < stmts.len) {
+                const ifs = cur.if_stmt;
+                if (ifs.body.len == 1 and ifs.else_body.len == 1) {
+                    const then_stmt = ifs.body[0];
+                    const else_stmt = ifs.else_body[0];
+                    if (stmtShallowEqual(stmts[i + 1], then_stmt) and stmtShallowEqual(stmts[i + 2], else_stmt)) {
+                        try out.append(allocator, cur);
+                        i += 3;
+                        changed = true;
+                        continue;
+                    }
+                }
+            }
+            try out.append(allocator, cur);
+            i += 1;
+        }
+        if (!changed) {
+            out.deinit(allocator);
+            return stmts;
+        }
+        return out.toOwnedSlice(allocator);
+    }
+
+    fn rewriteDropIfBranchAssignTailDeep(
+        self: *Decompiler,
+        allocator: Allocator,
+        stmts: []const *Stmt,
+    ) DecompileError![]const *Stmt {
+        for (stmts) |stmt| {
+            switch (stmt.*) {
+                .function_def => |*f| {
+                    f.body = try self.rewriteDropIfBranchAssignTailDeep(allocator, f.body);
+                },
+                .class_def => |*c| {
+                    c.body = try self.rewriteDropIfBranchAssignTailDeep(allocator, c.body);
+                },
+                .for_stmt => |*f| {
+                    f.body = try self.rewriteDropIfBranchAssignTailDeep(allocator, f.body);
+                    f.else_body = try self.rewriteDropIfBranchAssignTailDeep(allocator, f.else_body);
+                },
+                .while_stmt => |*w| {
+                    w.body = try self.rewriteDropIfBranchAssignTailDeep(allocator, w.body);
+                    w.else_body = try self.rewriteDropIfBranchAssignTailDeep(allocator, w.else_body);
+                },
+                .if_stmt => |*ifs| {
+                    ifs.body = try self.rewriteDropIfBranchAssignTailDeep(allocator, ifs.body);
+                    ifs.else_body = try self.rewriteDropIfBranchAssignTailDeep(allocator, ifs.else_body);
+                },
+                .with_stmt => |*w| {
+                    w.body = try self.rewriteDropIfBranchAssignTailDeep(allocator, w.body);
+                },
+                .try_stmt => |*t| {
+                    t.body = try self.rewriteDropIfBranchAssignTailDeep(allocator, t.body);
+                    t.else_body = try self.rewriteDropIfBranchAssignTailDeep(allocator, t.else_body);
+                    t.finalbody = try self.rewriteDropIfBranchAssignTailDeep(allocator, t.finalbody);
+                    if (t.handlers.len > 0) {
+                        const handlers = try allocator.alloc(ast.ExceptHandler, t.handlers.len);
+                        for (t.handlers, 0..) |h, hidx| {
+                            handlers[hidx] = h;
+                            handlers[hidx].body = try self.rewriteDropIfBranchAssignTailDeep(allocator, h.body);
+                        }
+                        t.handlers = handlers;
+                    }
+                },
+                .match_stmt => |*m| {
+                    if (m.cases.len > 0) {
+                        const cases = try allocator.alloc(ast.MatchCase, m.cases.len);
+                        for (m.cases, 0..) |c, cidx| {
+                            cases[cidx] = c;
+                            cases[cidx].body = try self.rewriteDropIfBranchAssignTailDeep(allocator, c.body);
+                        }
+                        m.cases = cases;
+                    }
+                },
+                else => {},
+            }
+        }
+        return try self.rewriteDropIfBranchAssignTailList(allocator, stmts);
     }
 
     fn isSingleBreakGuard(stmt: *const Stmt) bool {
