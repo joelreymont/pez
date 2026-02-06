@@ -1300,6 +1300,24 @@ test "snapshot if return elif fallthrough 3.9" {
     );
 }
 
+test "snapshot if none pass chain 3.9" {
+    try runSnapshot(@src(), "test/corpus/if_none_pass_chain.3.9.pyc",
+        \\[]u8
+        \\  "def f(stdin):
+        \\    a = 0
+        \\    if stdin is None:
+        \\        pass
+        \\    elif stdin == 1:
+        \\        a = 1
+        \\    elif stdin == 2:
+        \\        a = 2
+        \\    else:
+        \\        a = 3
+        \\    return a
+        \\"
+    );
+}
+
 test "snapshot if return else fallthrough 3.9" {
     try runSnapshot(@src(), "test/corpus/if_else_return_fallthrough.3.9.pyc",
         \\[]u8

@@ -7906,6 +7906,10 @@ pub const Decompiler = struct {
                 try out.append(allocator, stmt);
                 continue;
             }
+            if (isIsNoneCompare(ifs.condition)) {
+                try out.append(allocator, stmt);
+                continue;
+            }
 
             const inv = try self.invertConditionExpr(ifs.condition);
             const next = try allocator.create(Stmt);
@@ -7924,6 +7928,18 @@ pub const Decompiler = struct {
             return stmts;
         }
         return out.toOwnedSlice(allocator);
+    }
+
+    fn isIsNoneCompare(expr: *const Expr) bool {
+        if (expr.* != .compare) return false;
+        const cmp = expr.compare;
+        if (cmp.ops.len != 1 or cmp.comparators.len != 1) return false;
+        if (cmp.ops[0] != .is and cmp.ops[0] != .is_not) return false;
+        if (cmp.comparators[0].* != .constant) return false;
+        return switch (cmp.comparators[0].constant) {
+            .none => true,
+            else => false,
+        };
     }
 
     fn rewritePassElifGuardDeep(
