@@ -16067,7 +16067,7 @@ pub const Decompiler = struct {
                 }
             }
             const allow_guard = !force_else or (then_is_raise and !has_norm);
-            if (allow_guard and !is_elif and then_is_raise and else_body.len > 0) {
+            if (allow_guard and !is_elif and !in_elif_chain and then_is_raise and else_body.len > 0) {
                 if (term) |t| {
                     if (self.elseIsJumpTarget(t.opcode)) {
                         else_body = &[_]*Stmt{};
