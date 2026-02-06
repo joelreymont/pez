@@ -264,6 +264,7 @@ fn rewriteFunctionStmts(decompiler: *Decompiler, stmts: []const *Stmt) Decompile
     out = try decompiler.rewriteZipUnknownTryDeep(a, out);
     out = try decompiler.rewriteLoadFmtForElseDeep(a, out);
     out = try decompiler.rewriteDropWithPlaceholderTailDeep(a, out);
+    out = try decompiler.rewriteHoistWithLoopTailBreakDeep(a, out, false);
     return trimTrailingReturnNone(out);
 }
 
@@ -320,6 +321,7 @@ fn rewriteModuleStmts(decompiler: *Decompiler, stmts: []const *Stmt) DecompileEr
     out = try decompiler.rewriteZipUnknownTryDeep(a, out);
     out = try decompiler.rewriteLoadFmtForElseDeep(a, out);
     out = try decompiler.rewriteDropWithPlaceholderTailDeep(a, out);
+    out = try decompiler.rewriteHoistWithLoopTailBreakDeep(a, out, false);
     return out;
 }
 
@@ -10466,6 +10468,163 @@ pub const Decompiler = struct {
             }
         }
         return try self.rewriteDropWithPlaceholderTailList(allocator, stmts);
+    }
+
+    fn isSingleBreakGuard(stmt: *const Stmt) bool {
+        if (stmt.* != .if_stmt) return false;
+        const ifs = stmt.if_stmt;
+        return ifs.else_body.len == 0 and ifs.body.len == 1 and ifs.body[0].* == .break_stmt;
+    }
+
+    fn stripEllipsisNoopTrySeq(
+        self: *Decompiler,
+        allocator: Allocator,
+        stmts: []const *Stmt,
+    ) DecompileError![]const *Stmt {
+        _ = self;
+        if (stmts.len < 2) return stmts;
+        var cur = stmts;
+        while (true) {
+            var out: std.ArrayListUnmanaged(*Stmt) = .{};
+            errdefer out.deinit(allocator);
+            var changed = false;
+            var i: usize = 0;
+            while (i < cur.len) {
+                if (i + 1 < cur.len and cur[i].* == .assign and isConstEllipsis(cur[i].assign.value) and assignTargetName(cur[i]) != null and cur[i + 1].* == .try_stmt) {
+                    const ts = cur[i + 1].try_stmt;
+                    if (ts.handlers.len == 0 and ts.else_body.len == 0 and (ts.body.len == 0 or (ts.body.len == 1 and ts.body[0].* == .pass))) {
+                        if (ts.finalbody.len > 0) {
+                            try out.appendSlice(allocator, ts.finalbody);
+                        }
+                        changed = true;
+                        i += 2;
+                        continue;
+                    }
+                }
+                try out.append(allocator, cur[i]);
+                i += 1;
+            }
+            if (!changed) {
+                out.deinit(allocator);
+                return cur;
+            }
+            cur = try out.toOwnedSlice(allocator);
+            if (cur.len < 2) return cur;
+        }
+    }
+
+    fn rewriteHoistWithLoopTailBreakList(
+        self: *Decompiler,
+        allocator: Allocator,
+        stmts: []const *Stmt,
+        in_with: bool,
+    ) DecompileError![]const *Stmt {
+        if (!in_with or stmts.len < 2) return stmts;
+        var i: usize = 0;
+        while (i < stmts.len) : (i += 1) {
+            const cur = stmts[i];
+            if (cur.* != .while_stmt) continue;
+            var w = &cur.while_stmt;
+            if (w.else_body.len != 0 or w.body.len == 0) continue;
+
+            var guard_idx: ?usize = null;
+            for (w.body, 0..) |s, idx| {
+                if (isSingleBreakGuard(s)) {
+                    guard_idx = idx;
+                    break;
+                }
+            }
+            if (guard_idx == null) continue;
+            const gidx = guard_idx.?;
+            if (gidx + 1 < w.body.len and self.bodyHasBreakInCurrentLoop(w.body[gidx + 1 ..])) continue;
+
+            const tail = stmts[i + 1 ..];
+            if (tail.len == 0) continue;
+            var has_ellipsis_scaffold = false;
+            if (tail.len >= 2) {
+                var t: usize = 0;
+                while (t + 1 < tail.len) : (t += 1) {
+                    if (tail[t].* == .assign and isConstEllipsis(tail[t].assign.value) and assignTargetName(tail[t]) != null and tail[t + 1].* == .try_stmt) {
+                        const ts = tail[t + 1].try_stmt;
+                        if (ts.handlers.len == 0 and ts.else_body.len == 0 and (ts.body.len == 0 or (ts.body.len == 1 and ts.body[0].* == .pass))) {
+                            has_ellipsis_scaffold = true;
+                            break;
+                        }
+                    }
+                }
+            }
+            if (!has_ellipsis_scaffold) continue;
+            const cleaned_tail = try self.stripEllipsisNoopTrySeq(allocator, tail);
+
+            const guard = &w.body[gidx].if_stmt;
+            const guard_body = try allocator.alloc(*Stmt, cleaned_tail.len + 1);
+            std.mem.copyForwards(*Stmt, guard_body[0..cleaned_tail.len], cleaned_tail);
+            guard_body[cleaned_tail.len] = guard.body[0];
+            guard.body = guard_body;
+
+            const out = try allocator.alloc(*Stmt, i + 1);
+            std.mem.copyForwards(*Stmt, out, stmts[0 .. i + 1]);
+            return out;
+        }
+        return stmts;
+    }
+
+    fn rewriteHoistWithLoopTailBreakDeep(
+        self: *Decompiler,
+        allocator: Allocator,
+        stmts: []const *Stmt,
+        in_with: bool,
+    ) DecompileError![]const *Stmt {
+        for (stmts) |stmt| {
+            switch (stmt.*) {
+                .function_def => |*f| {
+                    f.body = try self.rewriteHoistWithLoopTailBreakDeep(allocator, f.body, false);
+                },
+                .class_def => |*c| {
+                    c.body = try self.rewriteHoistWithLoopTailBreakDeep(allocator, c.body, false);
+                },
+                .for_stmt => |*f| {
+                    f.body = try self.rewriteHoistWithLoopTailBreakDeep(allocator, f.body, in_with);
+                    f.else_body = try self.rewriteHoistWithLoopTailBreakDeep(allocator, f.else_body, in_with);
+                },
+                .while_stmt => |*w| {
+                    w.body = try self.rewriteHoistWithLoopTailBreakDeep(allocator, w.body, in_with);
+                    w.else_body = try self.rewriteHoistWithLoopTailBreakDeep(allocator, w.else_body, in_with);
+                },
+                .if_stmt => |*ifs| {
+                    ifs.body = try self.rewriteHoistWithLoopTailBreakDeep(allocator, ifs.body, in_with);
+                    ifs.else_body = try self.rewriteHoistWithLoopTailBreakDeep(allocator, ifs.else_body, in_with);
+                },
+                .with_stmt => |*w| {
+                    w.body = try self.rewriteHoistWithLoopTailBreakDeep(allocator, w.body, true);
+                },
+                .try_stmt => |*t| {
+                    t.body = try self.rewriteHoistWithLoopTailBreakDeep(allocator, t.body, in_with);
+                    t.else_body = try self.rewriteHoistWithLoopTailBreakDeep(allocator, t.else_body, in_with);
+                    t.finalbody = try self.rewriteHoistWithLoopTailBreakDeep(allocator, t.finalbody, in_with);
+                    if (t.handlers.len > 0) {
+                        const handlers = try allocator.alloc(ast.ExceptHandler, t.handlers.len);
+                        for (t.handlers, 0..) |h, hidx| {
+                            handlers[hidx] = h;
+                            handlers[hidx].body = try self.rewriteHoistWithLoopTailBreakDeep(allocator, h.body, in_with);
+                        }
+                        t.handlers = handlers;
+                    }
+                },
+                .match_stmt => |*m| {
+                    if (m.cases.len > 0) {
+                        const cases = try allocator.alloc(ast.MatchCase, m.cases.len);
+                        for (m.cases, 0..) |c, cidx| {
+                            cases[cidx] = c;
+                            cases[cidx].body = try self.rewriteHoistWithLoopTailBreakDeep(allocator, c.body, in_with);
+                        }
+                        m.cases = cases;
+                    }
+                },
+                else => {},
+            }
+        }
+        return try self.rewriteHoistWithLoopTailBreakList(allocator, stmts, in_with);
     }
 
     fn exprIsName(expr: *const Expr, name: []const u8) bool {
