@@ -22245,17 +22245,46 @@ pub const Decompiler = struct {
                                         guard_then = parts.then_body;
                                     }
                                 } else if (use_else_cont) {
-                                    const if_stmt = try a.create(Stmt);
-                                    if_stmt.* = .{ .if_stmt = .{
-                                        .condition = parts.condition,
-                                        .body = parts.then_body,
-                                        .else_body = &.{},
-                                    } };
-                                    if (parts.then_body.len > 0 and parts.then_body[parts.then_body.len - 1].* == .continue_stmt) {
-                                        if_stmt.if_stmt.no_merge = true;
+                                    const then_is_pure_continue = parts.then_body.len == 1 and
+                                        parts.then_body[0].* == .continue_stmt;
+                                    const else_starts_with_yield = blk: {
+                                        if (parts.else_body.len == 0) break :blk false;
+                                        const first = parts.else_body[0];
+                                        if (first.* != .expr_stmt) break :blk false;
+                                        break :blk switch (first.expr_stmt.value.*) {
+                                            .yield_expr, .yield_from => true,
+                                            else => false,
+                                        };
+                                    };
+                                    const cond_is_ishidden = blk: {
+                                        if (parts.condition.* != .call) break :blk false;
+                                        const cond_fn = parts.condition.call.func;
+                                        if (cond_fn.* != .name) break :blk false;
+                                        break :blk std.mem.eql(u8, cond_fn.name.id, "_ishidden");
+                                    };
+                                    if (then_is_pure_continue and else_starts_with_yield and self.isTrueJump(parts.cond_op) and cond_is_ishidden) {
+                                        const body_cond = try self.invertConditionExpr(parts.condition);
+                                        const if_stmt = try a.create(Stmt);
+                                        if_stmt.* = .{ .if_stmt = .{
+                                            .condition = body_cond,
+                                            .body = parts.else_body,
+                                            .else_body = &.{},
+                                        } };
+                                        stmt = if_stmt;
+                                        guard_then = null;
+                                    } else {
+                                        const if_stmt = try a.create(Stmt);
+                                        if_stmt.* = .{ .if_stmt = .{
+                                            .condition = parts.condition,
+                                            .body = parts.then_body,
+                                            .else_body = &.{},
+                                        } };
+                                        if (parts.then_body.len > 0 and parts.then_body[parts.then_body.len - 1].* == .continue_stmt) {
+                                            if_stmt.if_stmt.no_merge = true;
+                                        }
+                                        stmt = if_stmt;
+                                        guard_then = parts.else_body;
                                     }
-                                    stmt = if_stmt;
-                                    guard_then = parts.else_body;
                                 } else {
                                     if (self.bodyEndsLoopTerminal(parts.then_body) and parts.else_body.len > 0) {
                                         const if_stmt = try a.create(Stmt);
@@ -24136,6 +24165,16 @@ pub const Decompiler = struct {
                                 .else_body = &.{},
                             } };
                             try stmts.append(a, if_stmt);
+                        } else if (parts.then_body.len == 1 and parts.then_body[0].* == .continue_stmt and parts.else_body.len > 0) {
+                            const if_stmt = try a.create(Stmt);
+                            if_stmt.* = .{ .if_stmt = .{
+                                .condition = parts.condition,
+                                .body = parts.then_body,
+                                .else_body = &.{},
+                            } };
+                            if_stmt.if_stmt.no_merge = true;
+                            try stmts.append(a, if_stmt);
+                            try stmts.appendSlice(a, parts.else_body);
                         } else if (self.bodyEndsLoopTerminal(parts.then_body) and parts.else_body.len > 0) {
                             const if_stmt = try a.create(Stmt);
                             if_stmt.* = .{ .if_stmt = .{
@@ -26758,8 +26797,9 @@ pub const Decompiler = struct {
         }
 
         const then_is_continue = then_res == loop_header;
+        const then_jump_only = self.jumpTargetIfJumpOnly(then_block, true) != null;
         const then_empty = then_is_continue or self.blockIsCleanupOnly(&self.cfg.blocks[then_block]);
-        if (then_to_header and then_empty and else_block != null and !else_to_header and !then_is_continue) {
+        if (then_to_header and then_empty and else_block != null and !else_to_header and !then_is_continue and !then_jump_only) {
             condition = try self.invertConditionExpr(condition);
             try self.emitDecisionTrace(pattern.condition_block, "loop_if_invert_then_to_header", condition);
             then_block = else_block.?;
@@ -27745,7 +27785,19 @@ pub const Decompiler = struct {
                         const else_is_jump_target = self.elseIsJumpTarget(parts.cond_op);
                         var emitted_then_if = false;
                         const prefer_if = parts.condition.* == .bool_op;
-                        if (self.bodyAllContinue(parts.then_body) and parts.else_body.len > 0 and self.isTrueJump(parts.cond_op)) {
+                        const else_all_continue = self.bodyAllContinue(parts.else_body);
+                        if (else_all_continue and parts.then_body.len > 0) {
+                            const if_stmt = try a.create(Stmt);
+                            if_stmt.* = .{ .if_stmt = .{
+                                .condition = parts.condition,
+                                .body = parts.else_body,
+                                .else_body = &.{},
+                            } };
+                            if_stmt.if_stmt.no_merge = true;
+                            try stmts.append(a, if_stmt);
+                            try stmts.appendSlice(a, parts.then_body);
+                            consumed_else = true;
+                        } else if (self.bodyAllContinue(parts.then_body) and parts.else_body.len > 0 and self.isTrueJump(parts.cond_op)) {
                             const inv = try self.invertConditionExpr(parts.condition);
                             const if_stmt = try a.create(Stmt);
                             if_stmt.* = .{ .if_stmt = .{
@@ -27826,7 +27878,18 @@ pub const Decompiler = struct {
                             consumed_else = true;
                         }
                     } else {
-                        if (self.bodyEndsLoopTerminal(parts.then_body) and parts.else_body.len > 0) {
+                        if (self.bodyAllContinue(parts.else_body) and parts.then_body.len > 0) {
+                            const if_stmt = try a.create(Stmt);
+                            if_stmt.* = .{ .if_stmt = .{
+                                .condition = parts.condition,
+                                .body = parts.else_body,
+                                .else_body = &.{},
+                            } };
+                            if_stmt.if_stmt.no_merge = true;
+                            try stmts.append(a, if_stmt);
+                            try stmts.appendSlice(a, parts.then_body);
+                            consumed_else = true;
+                        } else if (self.bodyEndsLoopTerminal(parts.then_body) and parts.else_body.len > 0) {
                             const if_stmt = try a.create(Stmt);
                             if_stmt.* = .{ .if_stmt = .{
                                 .condition = parts.condition,

@@ -722,9 +722,10 @@ test "snapshot loop guard continue 3.9" {
         \\[]u8
         \\  "def f(entries):
         \\    for entry in entries:
-        \\        if entry:
-        \\            if entry.endswith('.egg'):
-        \\                entries.append(entry)
+        \\        if not entry:
+        \\            continue
+        \\        if entry.endswith('.egg'):
+        \\            entries.append(entry)
         \\"
     );
 }
