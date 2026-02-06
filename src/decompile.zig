@@ -219,6 +219,7 @@ fn rewriteFunctionStmts(decompiler: *Decompiler, stmts: []const *Stmt) Decompile
     out = try decompiler.rewriteTerminalReturnElseGuardDeep(a, out);
     out = try decompiler.rewriteTerminalElseReturnFalseDeep(a, out);
     out = try decompiler.rewriteNegOrGuardElseDeep(a, out);
+    out = try decompiler.rewriteTypingGenexprDeep(a, out);
     out = try decompiler.dropDupPhiCallDeep(a, out);
     out = try decompiler.trimTailElseRetNone(out);
     out = try decompiler.trimElifDupTailDeep(a, out);
@@ -245,6 +246,7 @@ fn rewriteModuleStmts(decompiler: *Decompiler, stmts: []const *Stmt) DecompileEr
     out = try decompiler.rewriteTerminalReturnElseGuardDeep(a, out);
     out = try decompiler.rewriteTerminalElseReturnFalseDeep(a, out);
     out = try decompiler.rewriteNegOrGuardElseDeep(a, out);
+    out = try decompiler.rewriteTypingGenexprDeep(a, out);
     out = try decompiler.dropDupPhiCallDeep(a, out);
     out = try decompiler.trimElifDupTailDeep(a, out);
     // Control-flow rewrites can change bytecode parity.
@@ -8272,6 +8274,276 @@ pub const Decompiler = struct {
             }
         }
         return try self.rewriteNegOrGuardElseList(self.arena.allocator(), stmts);
+    }
+
+    fn compareIsName(expr: *const Expr, name: []const u8) ?*Expr {
+        if (expr.* != .compare) return null;
+        const cmp = expr.compare;
+        if (cmp.ops.len != 1 or cmp.comparators.len != 1 or cmp.ops[0] != .is) return null;
+        const rhs = cmp.comparators[0];
+        if (rhs.* != .name or !std.mem.eql(u8, rhs.name.id, name)) return null;
+        return cmp.left;
+    }
+
+    fn rewriteTypingGenexprExpr(
+        self: *Decompiler,
+        allocator: Allocator,
+        expr: *Expr,
+    ) DecompileError!void {
+        switch (expr.*) {
+            .bool_op => |*b| {
+                for (b.values) |v| try self.rewriteTypingGenexprExpr(allocator, v);
+            },
+            .named_expr => |*n| {
+                try self.rewriteTypingGenexprExpr(allocator, n.target);
+                try self.rewriteTypingGenexprExpr(allocator, n.value);
+            },
+            .bin_op => |*b| {
+                try self.rewriteTypingGenexprExpr(allocator, b.left);
+                try self.rewriteTypingGenexprExpr(allocator, b.right);
+            },
+            .unary_op => |*u| {
+                try self.rewriteTypingGenexprExpr(allocator, u.operand);
+            },
+            .if_exp => |*i| {
+                try self.rewriteTypingGenexprExpr(allocator, i.condition);
+                try self.rewriteTypingGenexprExpr(allocator, i.body);
+                try self.rewriteTypingGenexprExpr(allocator, i.else_body);
+            },
+            .dict => |*d| {
+                for (d.keys) |k| if (k) |kk| try self.rewriteTypingGenexprExpr(allocator, kk);
+                for (d.values) |v| try self.rewriteTypingGenexprExpr(allocator, v);
+            },
+            .set => |*s| {
+                for (s.elts) |e| try self.rewriteTypingGenexprExpr(allocator, e);
+            },
+            .list_comp => |*c| {
+                try self.rewriteTypingGenexprExpr(allocator, c.elt);
+                for (c.generators) |g| {
+                    try self.rewriteTypingGenexprExpr(allocator, g.target);
+                    try self.rewriteTypingGenexprExpr(allocator, g.iter);
+                    for (g.ifs) |f| try self.rewriteTypingGenexprExpr(allocator, f);
+                }
+            },
+            .set_comp => |*c| {
+                try self.rewriteTypingGenexprExpr(allocator, c.elt);
+                for (c.generators) |g| {
+                    try self.rewriteTypingGenexprExpr(allocator, g.target);
+                    try self.rewriteTypingGenexprExpr(allocator, g.iter);
+                    for (g.ifs) |f| try self.rewriteTypingGenexprExpr(allocator, f);
+                }
+            },
+            .dict_comp => |*c| {
+                try self.rewriteTypingGenexprExpr(allocator, c.key);
+                try self.rewriteTypingGenexprExpr(allocator, c.value);
+                for (c.generators) |g| {
+                    try self.rewriteTypingGenexprExpr(allocator, g.target);
+                    try self.rewriteTypingGenexprExpr(allocator, g.iter);
+                    for (g.ifs) |f| try self.rewriteTypingGenexprExpr(allocator, f);
+                }
+            },
+            .generator_exp => |*g| {
+                try self.rewriteTypingGenexprExpr(allocator, g.elt);
+                for (g.generators) |gen| {
+                    try self.rewriteTypingGenexprExpr(allocator, gen.target);
+                    try self.rewriteTypingGenexprExpr(allocator, gen.iter);
+                    for (gen.ifs) |f| try self.rewriteTypingGenexprExpr(allocator, f);
+                }
+                if (g.generators.len == 1 and g.generators[0].ifs.len == 2 and
+                    g.elt.* == .name and g.generators[0].target.* == .name and
+                    std.mem.eql(u8, g.elt.name.id, g.generators[0].target.name.id))
+                {
+                    const if0 = g.generators[0].ifs[0];
+                    const if1 = g.generators[0].ifs[1];
+                    const left_ell = compareIsName(if0, "_TypingEllipsis") orelse return;
+                    const left_emp = compareIsName(if1, "_TypingEmpty") orelse return;
+                    if (!ast.exprEqual(left_ell, g.elt) or !ast.exprEqual(left_emp, g.elt)) return;
+
+                    const ellipsis = try ast.makeConstant(allocator, .{ .ellipsis = {} });
+                    const empty_tuple = try ast.makeConstant(allocator, .{ .tuple = &.{} });
+                    const inner_if = try allocator.create(Expr);
+                    inner_if.* = .{ .if_exp = .{
+                        .condition = if1,
+                        .body = empty_tuple,
+                        .else_body = g.elt,
+                    } };
+                    const outer_if = try allocator.create(Expr);
+                    outer_if.* = .{ .if_exp = .{
+                        .condition = if0,
+                        .body = ellipsis,
+                        .else_body = inner_if,
+                    } };
+                    const gens = try allocator.alloc(ast.Comprehension, g.generators.len);
+                    std.mem.copyForwards(ast.Comprehension, gens, g.generators);
+                    gens[0].ifs = &.{};
+                    g.generators = gens;
+                    g.elt = outer_if;
+                }
+            },
+            .await_expr => |*a| {
+                try self.rewriteTypingGenexprExpr(allocator, a.value);
+            },
+            .yield_expr => |*y| {
+                if (y.value) |v| try self.rewriteTypingGenexprExpr(allocator, v);
+            },
+            .yield_from => |*y| {
+                try self.rewriteTypingGenexprExpr(allocator, y.value);
+            },
+            .compare => |*c| {
+                try self.rewriteTypingGenexprExpr(allocator, c.left);
+                for (c.comparators) |v| try self.rewriteTypingGenexprExpr(allocator, v);
+            },
+            .call => |*c| {
+                try self.rewriteTypingGenexprExpr(allocator, c.func);
+                for (c.args) |a| try self.rewriteTypingGenexprExpr(allocator, a);
+                for (c.keywords) |kw| try self.rewriteTypingGenexprExpr(allocator, kw.value);
+            },
+            .formatted_value => |*f| {
+                try self.rewriteTypingGenexprExpr(allocator, f.value);
+                if (f.format_spec) |fs| try self.rewriteTypingGenexprExpr(allocator, fs);
+            },
+            .joined_str => |*j| {
+                for (j.values) |v| try self.rewriteTypingGenexprExpr(allocator, v);
+            },
+            .attribute => |*a| {
+                try self.rewriteTypingGenexprExpr(allocator, a.value);
+            },
+            .subscript => |*s| {
+                try self.rewriteTypingGenexprExpr(allocator, s.value);
+                try self.rewriteTypingGenexprExpr(allocator, s.slice);
+            },
+            .starred => |*s| {
+                try self.rewriteTypingGenexprExpr(allocator, s.value);
+            },
+            .list => |*l| {
+                for (l.elts) |e| try self.rewriteTypingGenexprExpr(allocator, e);
+            },
+            .tuple => |*t| {
+                for (t.elts) |e| try self.rewriteTypingGenexprExpr(allocator, e);
+            },
+            .slice => |*s| {
+                if (s.lower) |v| try self.rewriteTypingGenexprExpr(allocator, v);
+                if (s.upper) |v| try self.rewriteTypingGenexprExpr(allocator, v);
+                if (s.step) |v| try self.rewriteTypingGenexprExpr(allocator, v);
+            },
+            else => {},
+        }
+    }
+
+    fn rewriteTypingGenexprDeep(
+        self: *Decompiler,
+        allocator: Allocator,
+        stmts: []const *Stmt,
+    ) DecompileError![]const *Stmt {
+        for (stmts) |stmt| {
+            switch (stmt.*) {
+                .function_def => |*f| {
+                    for (f.decorator_list) |dec| try self.rewriteTypingGenexprExpr(allocator, dec);
+                    if (f.returns) |ret| try self.rewriteTypingGenexprExpr(allocator, ret);
+                    f.body = try self.rewriteTypingGenexprDeep(allocator, f.body);
+                },
+                .class_def => |*c| {
+                    for (c.bases) |b| try self.rewriteTypingGenexprExpr(allocator, b);
+                    for (c.keywords) |kw| try self.rewriteTypingGenexprExpr(allocator, kw.value);
+                    for (c.decorator_list) |dec| try self.rewriteTypingGenexprExpr(allocator, dec);
+                    c.body = try self.rewriteTypingGenexprDeep(allocator, c.body);
+                },
+                .return_stmt => |*r| {
+                    if (r.value) |v| try self.rewriteTypingGenexprExpr(allocator, v);
+                },
+                .delete => |*d| {
+                    for (d.targets) |t| try self.rewriteTypingGenexprExpr(allocator, t);
+                },
+                .assign => |*a| {
+                    for (a.targets) |t| try self.rewriteTypingGenexprExpr(allocator, t);
+                    try self.rewriteTypingGenexprExpr(allocator, a.value);
+                },
+                .aug_assign => |*a| {
+                    try self.rewriteTypingGenexprExpr(allocator, a.target);
+                    try self.rewriteTypingGenexprExpr(allocator, a.value);
+                },
+                .ann_assign => |*a| {
+                    try self.rewriteTypingGenexprExpr(allocator, a.target);
+                    try self.rewriteTypingGenexprExpr(allocator, a.annotation);
+                    if (a.value) |v| try self.rewriteTypingGenexprExpr(allocator, v);
+                },
+                .type_alias => |*a| {
+                    try self.rewriteTypingGenexprExpr(allocator, a.name);
+                    try self.rewriteTypingGenexprExpr(allocator, a.value);
+                },
+                .for_stmt => |*f| {
+                    try self.rewriteTypingGenexprExpr(allocator, f.target);
+                    try self.rewriteTypingGenexprExpr(allocator, f.iter);
+                    f.body = try self.rewriteTypingGenexprDeep(allocator, f.body);
+                    f.else_body = try self.rewriteTypingGenexprDeep(allocator, f.else_body);
+                },
+                .while_stmt => |*w| {
+                    try self.rewriteTypingGenexprExpr(allocator, w.condition);
+                    w.body = try self.rewriteTypingGenexprDeep(allocator, w.body);
+                    w.else_body = try self.rewriteTypingGenexprDeep(allocator, w.else_body);
+                },
+                .if_stmt => |*i| {
+                    try self.rewriteTypingGenexprExpr(allocator, i.condition);
+                    i.body = try self.rewriteTypingGenexprDeep(allocator, i.body);
+                    i.else_body = try self.rewriteTypingGenexprDeep(allocator, i.else_body);
+                },
+                .with_stmt => |*w| {
+                    for (w.items) |item| {
+                        try self.rewriteTypingGenexprExpr(allocator, item.context_expr);
+                        if (item.optional_vars) |ov| try self.rewriteTypingGenexprExpr(allocator, ov);
+                    }
+                    w.body = try self.rewriteTypingGenexprDeep(allocator, w.body);
+                },
+                .match_stmt => |*m| {
+                    try self.rewriteTypingGenexprExpr(allocator, m.subject);
+                    if (m.cases.len > 0) {
+                        const cases = try allocator.alloc(ast.MatchCase, m.cases.len);
+                        for (m.cases, 0..) |c, idx| {
+                            cases[idx] = c;
+                            if (cases[idx].guard) |g| try self.rewriteTypingGenexprExpr(allocator, g);
+                            cases[idx].body = try self.rewriteTypingGenexprDeep(allocator, c.body);
+                        }
+                        m.cases = cases;
+                    }
+                },
+                .raise_stmt => |*r| {
+                    if (r.exc) |e| try self.rewriteTypingGenexprExpr(allocator, e);
+                    if (r.cause) |c| try self.rewriteTypingGenexprExpr(allocator, c);
+                },
+                .try_stmt => |*t| {
+                    t.body = try self.rewriteTypingGenexprDeep(allocator, t.body);
+                    t.else_body = try self.rewriteTypingGenexprDeep(allocator, t.else_body);
+                    t.finalbody = try self.rewriteTypingGenexprDeep(allocator, t.finalbody);
+                    if (t.handlers.len > 0) {
+                        const handlers = try allocator.alloc(ast.ExceptHandler, t.handlers.len);
+                        for (t.handlers, 0..) |h, idx| {
+                            handlers[idx] = h;
+                            if (handlers[idx].type) |te| try self.rewriteTypingGenexprExpr(allocator, te);
+                            handlers[idx].body = try self.rewriteTypingGenexprDeep(allocator, h.body);
+                        }
+                        t.handlers = handlers;
+                    }
+                },
+                .assert_stmt => |*a| {
+                    try self.rewriteTypingGenexprExpr(allocator, a.condition);
+                    if (a.msg) |m| try self.rewriteTypingGenexprExpr(allocator, m);
+                },
+                .expr_stmt => |*e| {
+                    try self.rewriteTypingGenexprExpr(allocator, e.value);
+                },
+                .print_stmt => |*p| {
+                    for (p.values) |v| try self.rewriteTypingGenexprExpr(allocator, v);
+                    if (p.dest) |d| try self.rewriteTypingGenexprExpr(allocator, d);
+                },
+                .exec_stmt => |*e| {
+                    try self.rewriteTypingGenexprExpr(allocator, e.code);
+                    if (e.globals) |g| try self.rewriteTypingGenexprExpr(allocator, g);
+                    if (e.locals) |l| try self.rewriteTypingGenexprExpr(allocator, l);
+                },
+                else => {},
+            }
+        }
+        return stmts;
     }
 
     fn rewriteTerminalElseList(
@@ -27726,6 +27998,11 @@ pub const Decompiler = struct {
     fn trimElifDupTailInStmt(self: *Decompiler, stmt: *Stmt, follow: []const *Stmt) void {
         if (stmt.* != .if_stmt) return;
         const ifs = &stmt.if_stmt;
+        if (ifs.else_body.len > 0 and self.bodyEndsTerminal(ifs.else_body) and
+            follow.len >= ifs.else_body.len and stmtSeqEqual(ifs.else_body, follow[0..ifs.else_body.len]))
+        {
+            ifs.else_body = &.{};
+        }
         if (ifs.else_body.len != 1) return;
         const child_stmt = ifs.else_body[0];
         if (child_stmt.* != .if_stmt) return;
