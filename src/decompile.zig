@@ -26169,25 +26169,6 @@ pub const Decompiler = struct {
         for (body.instructions, 0..) |inst, inst_idx| {
             switch (inst.opcode) {
                 .STORE_FAST => {
-                    // Check for pattern: STORE_FAST var, LOAD_FAST var, UNPACK_SEQUENCE
-                    // This is Python 3.9's way of doing nested tuple unpacking in for loops
-                    if (inst_idx + 2 < body.instructions.len) {
-                        const next = body.instructions[inst_idx + 1];
-                        const after = body.instructions[inst_idx + 2];
-                        if (next.opcode == .LOAD_FAST and next.arg == inst.arg and
-                            (after.opcode == .UNPACK_SEQUENCE or after.opcode == .UNPACK_EX))
-                        {
-                            // Use the UNPACK_SEQUENCE as the target
-                            const unpack = try self.collectUnpackTgts(&target_sim, body.instructions, inst_idx + 2, a);
-                            if (unpack != null and unpack.?.ok) {
-                                const tuple_expr = try a.create(Expr);
-                                tuple_expr.* = .{ .tuple = .{ .elts = unpack.?.tgts, .ctx = .store } };
-                                target = tuple_expr;
-                                found_target = true;
-                                break;
-                            }
-                        }
-                    }
                     const name = if (self.code.varnames.len > inst.arg)
                         self.code.varnames[inst.arg]
                     else
