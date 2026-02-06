@@ -243,6 +243,8 @@ fn rewriteFunctionStmts(decompiler: *Decompiler, stmts: []const *Stmt) Decompile
     out = try decompiler.rewriteTailTryFinallyDupReturnDeep(a, out);
     out = try decompiler.rewriteNoopFinallyCloseReturnDeep(a, out);
     out = try decompiler.rewriteIterModuleGuardsDeep(a, out, false);
+    out = try decompiler.rewritePassElifGuardDeep(a, out);
+    out = try decompiler.rewriteYieldPassGuardDeep(a, out);
     out = try decompiler.rewriteBranchDupTailReturnDeep(a, out);
     return trimTrailingReturnNone(out);
 }
@@ -279,6 +281,8 @@ fn rewriteModuleStmts(decompiler: *Decompiler, stmts: []const *Stmt) DecompileEr
     out = try decompiler.rewriteTailTryFinallyDupReturnDeep(a, out);
     out = try decompiler.rewriteNoopFinallyCloseReturnDeep(a, out);
     out = try decompiler.rewriteIterModuleGuardsDeep(a, out, false);
+    out = try decompiler.rewritePassElifGuardDeep(a, out);
+    out = try decompiler.rewriteYieldPassGuardDeep(a, out);
     out = try decompiler.rewriteBranchDupTailReturnDeep(a, out);
     return out;
 }
@@ -7873,6 +7877,214 @@ pub const Decompiler = struct {
             }
         }
         return self.rewriteBranchDupTailReturnList(stmts);
+    }
+
+    fn rewritePassElifGuardList(
+        self: *Decompiler,
+        allocator: Allocator,
+        stmts: []const *Stmt,
+    ) DecompileError![]const *Stmt {
+        if (stmts.len == 0) return stmts;
+        var out: std.ArrayListUnmanaged(*Stmt) = .{};
+        errdefer out.deinit(allocator);
+        var changed = false;
+
+        for (stmts) |stmt| {
+            if (stmt.* != .if_stmt) {
+                try out.append(allocator, stmt);
+                continue;
+            }
+
+            const ifs = stmt.if_stmt;
+            const body_is_noop = ifs.body.len == 0 or (ifs.body.len == 1 and ifs.body[0].* == .pass);
+            const else_is_elif = ifs.else_body.len == 1 and ifs.else_body[0].* == .if_stmt;
+            if (!body_is_noop or !else_is_elif) {
+                try out.append(allocator, stmt);
+                continue;
+            }
+
+            const inv = try self.invertConditionExpr(ifs.condition);
+            const next = try allocator.create(Stmt);
+            next.* = .{ .if_stmt = .{
+                .condition = inv,
+                .body = ifs.else_body,
+                .else_body = &.{},
+            } };
+            next.if_stmt.no_merge = ifs.no_merge;
+            try out.append(allocator, next);
+            changed = true;
+        }
+
+        if (!changed) {
+            out.deinit(allocator);
+            return stmts;
+        }
+        return out.toOwnedSlice(allocator);
+    }
+
+    fn rewritePassElifGuardDeep(
+        self: *Decompiler,
+        allocator: Allocator,
+        stmts: []const *Stmt,
+    ) DecompileError![]const *Stmt {
+        for (stmts) |stmt| {
+            switch (stmt.*) {
+                .function_def => |*f| {
+                    f.body = try self.rewritePassElifGuardDeep(allocator, f.body);
+                },
+                .class_def => |*c| {
+                    c.body = try self.rewritePassElifGuardDeep(allocator, c.body);
+                },
+                .for_stmt => |*f| {
+                    f.body = try self.rewritePassElifGuardDeep(allocator, f.body);
+                    f.else_body = try self.rewritePassElifGuardDeep(allocator, f.else_body);
+                },
+                .while_stmt => |*w| {
+                    w.body = try self.rewritePassElifGuardDeep(allocator, w.body);
+                    w.else_body = try self.rewritePassElifGuardDeep(allocator, w.else_body);
+                },
+                .if_stmt => |*ifs| {
+                    ifs.body = try self.rewritePassElifGuardDeep(allocator, ifs.body);
+                    ifs.else_body = try self.rewritePassElifGuardDeep(allocator, ifs.else_body);
+                },
+                .with_stmt => |*w| {
+                    w.body = try self.rewritePassElifGuardDeep(allocator, w.body);
+                },
+                .try_stmt => |*t| {
+                    t.body = try self.rewritePassElifGuardDeep(allocator, t.body);
+                    t.else_body = try self.rewritePassElifGuardDeep(allocator, t.else_body);
+                    t.finalbody = try self.rewritePassElifGuardDeep(allocator, t.finalbody);
+                    if (t.handlers.len > 0) {
+                        const handlers = try allocator.alloc(ast.ExceptHandler, t.handlers.len);
+                        for (t.handlers, 0..) |h, hidx| {
+                            handlers[hidx] = h;
+                            handlers[hidx].body = try self.rewritePassElifGuardDeep(allocator, h.body);
+                        }
+                        t.handlers = handlers;
+                    }
+                },
+                .match_stmt => |*m| {
+                    if (m.cases.len > 0) {
+                        const cases = try allocator.alloc(ast.MatchCase, m.cases.len);
+                        for (m.cases, 0..) |c, cidx| {
+                            cases[cidx] = c;
+                            cases[cidx].body = try self.rewritePassElifGuardDeep(allocator, c.body);
+                        }
+                        m.cases = cases;
+                    }
+                },
+                else => {},
+            }
+        }
+        return try self.rewritePassElifGuardList(allocator, stmts);
+    }
+
+    fn isYieldStmt(stmt: *const Stmt) bool {
+        if (stmt.* != .expr_stmt) return false;
+        const v = stmt.expr_stmt.value;
+        return v.* == .yield_expr or v.* == .yield_from;
+    }
+
+    fn rewriteYieldPassGuardList(
+        self: *Decompiler,
+        allocator: Allocator,
+        stmts: []const *Stmt,
+    ) DecompileError![]const *Stmt {
+        if (stmts.len < 2) return stmts;
+        var out: std.ArrayListUnmanaged(*Stmt) = .{};
+        errdefer out.deinit(allocator);
+        var changed = false;
+        var i: usize = 0;
+        while (i < stmts.len) {
+            if (i + 1 < stmts.len and stmts[i].* == .if_stmt and isYieldStmt(stmts[i + 1])) {
+                const outer = stmts[i].if_stmt;
+                if (outer.else_body.len == 0 and outer.body.len == 1 and outer.body[0].* == .if_stmt) {
+                    const inner = outer.body[0].if_stmt;
+                    const inner_noop = inner.body.len == 0 or (inner.body.len == 1 and inner.body[0].* == .pass);
+                    if (inner_noop and inner.else_body.len == 0) {
+                        const inv_outer = try self.invertConditionExpr(outer.condition);
+                        const cond = try self.makeBoolPair(inv_outer, inner.condition, .or_);
+                        const body = try allocator.alloc(*Stmt, 1);
+                        body[0] = stmts[i + 1];
+                        const next_if = try allocator.create(Stmt);
+                        next_if.* = .{ .if_stmt = .{
+                            .condition = cond,
+                            .body = body,
+                            .else_body = &.{},
+                        } };
+                        next_if.if_stmt.no_merge = outer.no_merge or inner.no_merge;
+                        try out.append(allocator, next_if);
+                        i += 2;
+                        changed = true;
+                        continue;
+                    }
+                }
+            }
+            try out.append(allocator, stmts[i]);
+            i += 1;
+        }
+        if (!changed) {
+            out.deinit(allocator);
+            return stmts;
+        }
+        return out.toOwnedSlice(allocator);
+    }
+
+    fn rewriteYieldPassGuardDeep(
+        self: *Decompiler,
+        allocator: Allocator,
+        stmts: []const *Stmt,
+    ) DecompileError![]const *Stmt {
+        for (stmts) |stmt| {
+            switch (stmt.*) {
+                .function_def => |*f| {
+                    f.body = try self.rewriteYieldPassGuardDeep(allocator, f.body);
+                },
+                .class_def => |*c| {
+                    c.body = try self.rewriteYieldPassGuardDeep(allocator, c.body);
+                },
+                .for_stmt => |*f| {
+                    f.body = try self.rewriteYieldPassGuardDeep(allocator, f.body);
+                    f.else_body = try self.rewriteYieldPassGuardDeep(allocator, f.else_body);
+                },
+                .while_stmt => |*w| {
+                    w.body = try self.rewriteYieldPassGuardDeep(allocator, w.body);
+                    w.else_body = try self.rewriteYieldPassGuardDeep(allocator, w.else_body);
+                },
+                .if_stmt => |*ifs| {
+                    ifs.body = try self.rewriteYieldPassGuardDeep(allocator, ifs.body);
+                    ifs.else_body = try self.rewriteYieldPassGuardDeep(allocator, ifs.else_body);
+                },
+                .with_stmt => |*w| {
+                    w.body = try self.rewriteYieldPassGuardDeep(allocator, w.body);
+                },
+                .try_stmt => |*t| {
+                    t.body = try self.rewriteYieldPassGuardDeep(allocator, t.body);
+                    t.else_body = try self.rewriteYieldPassGuardDeep(allocator, t.else_body);
+                    t.finalbody = try self.rewriteYieldPassGuardDeep(allocator, t.finalbody);
+                    if (t.handlers.len > 0) {
+                        const handlers = try allocator.alloc(ast.ExceptHandler, t.handlers.len);
+                        for (t.handlers, 0..) |h, hidx| {
+                            handlers[hidx] = h;
+                            handlers[hidx].body = try self.rewriteYieldPassGuardDeep(allocator, h.body);
+                        }
+                        t.handlers = handlers;
+                    }
+                },
+                .match_stmt => |*m| {
+                    if (m.cases.len > 0) {
+                        const cases = try allocator.alloc(ast.MatchCase, m.cases.len);
+                        for (m.cases, 0..) |c, cidx| {
+                            cases[cidx] = c;
+                            cases[cidx].body = try self.rewriteYieldPassGuardDeep(allocator, c.body);
+                        }
+                        m.cases = cases;
+                    }
+                },
+                else => {},
+            }
+        }
+        return try self.rewriteYieldPassGuardList(allocator, stmts);
     }
 
     fn isSimpleContinueGuard(stmt: *const Stmt) bool {

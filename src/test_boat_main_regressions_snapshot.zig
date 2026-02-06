@@ -482,6 +482,30 @@ test "snapshot branch dup tail return attr 3.9" {
     );
 }
 
+test "snapshot glob iterdir guard 3.9" {
+    try runSnapshot(@src(), "test/corpus/glob_iterdir.3.9.pyc",
+        \\[]u8
+        \\  "import os
+        \\def _iterdir(dirname, dironly):
+        \\    if not dirname:
+        \\        if isinstance(dirname, bytes):
+        \\            dirname = bytes(os.curdir, 'ASCII')
+        \\        else:
+        \\            dirname = os.curdir
+        \\    try:
+        \\        with os.scandir(dirname) as it:
+        \\            for entry in it:
+        \\                try:
+        \\                    if not dironly or entry.is_dir():
+        \\                        yield entry.name
+        \\                except OSError:
+        \\                    pass
+        \\    except OSError:
+        \\        return None
+        \\"
+    );
+}
+
 test "snapshot loop merge break 3.9" {
     try runSnapshot(@src(), "test/corpus/loop_merge_break.3.9.pyc",
         \\[]u8
