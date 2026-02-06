@@ -266,6 +266,7 @@ fn rewriteFunctionStmts(decompiler: *Decompiler, stmts: []const *Stmt) Decompile
     out = try decompiler.rewritePassGuardReturnTailDeep(a, out);
     out = try decompiler.rewriteActionLoopReturnTailDeep(a, out);
     out = try decompiler.rewriteActionLoopArgBranchDeep(a, out);
+    out = try decompiler.rewriteCookieFindGuardDeep(a, out);
     out = try decompiler.rewriteDropWithPlaceholderTailDeep(a, out);
     out = try decompiler.rewriteDropIfBranchAssignTailDeep(a, out);
     out = try decompiler.rewriteHoistWithLoopTailBreakDeep(a, out, false);
@@ -327,6 +328,7 @@ fn rewriteModuleStmts(decompiler: *Decompiler, stmts: []const *Stmt) DecompileEr
     out = try decompiler.rewritePassGuardReturnTailDeep(a, out);
     out = try decompiler.rewriteActionLoopReturnTailDeep(a, out);
     out = try decompiler.rewriteActionLoopArgBranchDeep(a, out);
+    out = try decompiler.rewriteCookieFindGuardDeep(a, out);
     out = try decompiler.rewriteDropWithPlaceholderTailDeep(a, out);
     out = try decompiler.rewriteDropIfBranchAssignTailDeep(a, out);
     out = try decompiler.rewriteHoistWithLoopTailBreakDeep(a, out, false);
@@ -10745,6 +10747,150 @@ pub const Decompiler = struct {
             }
         }
         return try self.rewriteActionLoopArgBranchList(allocator, stmts);
+    }
+
+    fn isNameIsNotNonePart(expr: *const Expr, name: []const u8) bool {
+        if (expr.* != .compare) return false;
+        const cmp = expr.compare;
+        if (cmp.ops.len != 1 or cmp.comparators.len != 1 or cmp.ops[0] != .is_not) return false;
+        if (cmp.left.* != .name or !std.mem.eql(u8, cmp.left.name.id, name)) return false;
+        if (cmp.comparators[0].* != .constant) return false;
+        return switch (cmp.comparators[0].constant) {
+            .none => true,
+            else => false,
+        };
+    }
+
+    fn isCookieAttrNotEq(expr: *const Expr, owner: []const u8, attr_name: []const u8, rhs_name: []const u8) bool {
+        if (expr.* != .compare) return false;
+        const cmp = expr.compare;
+        if (cmp.ops.len != 1 or cmp.comparators.len != 1 or cmp.ops[0] != .not_eq) return false;
+        if (cmp.left.* != .attribute) return false;
+        const lhs_attr = cmp.left.attribute;
+        if (lhs_attr.value.* != .name or !std.mem.eql(u8, lhs_attr.value.name.id, owner)) return false;
+        if (!std.mem.eql(u8, lhs_attr.attr, attr_name)) return false;
+        if (cmp.comparators[0].* != .name) return false;
+        return std.mem.eql(u8, cmp.comparators[0].name.id, rhs_name);
+    }
+
+    fn isCookieRejectCond(expr: *const Expr) bool {
+        if (expr.* != .bool_op or expr.bool_op.op != .or_) return false;
+        if (expr.bool_op.values.len != 2) return false;
+        const a = expr.bool_op.values[0];
+        const b = expr.bool_op.values[1];
+        if (a.* != .bool_op or a.bool_op.op != .and_ or a.bool_op.values.len != 2) return false;
+        if (b.* != .bool_op or b.bool_op.op != .and_ or b.bool_op.values.len != 2) return false;
+        return isNameIsNotNonePart(a.bool_op.values[0], "domain") and
+            isCookieAttrNotEq(a.bool_op.values[1], "cookie", "domain", "domain") and
+            isNameIsNotNonePart(b.bool_op.values[0], "path") and
+            isCookieAttrNotEq(b.bool_op.values[1], "cookie", "path", "path");
+    }
+
+    fn rewriteCookieFindGuardList(
+        self: *Decompiler,
+        allocator: Allocator,
+        stmts: []const *Stmt,
+    ) DecompileError![]const *Stmt {
+        for (stmts) |stmt| {
+            if (stmt.* != .for_stmt) continue;
+            const fs = &stmt.for_stmt;
+            if (fs.body.len == 0) continue;
+            for (fs.body) |cand| {
+                if (cand.* != .if_stmt) continue;
+                var outer = &cand.if_stmt;
+                if (outer.else_body.len != 0 or outer.body.len != 2) continue;
+                if (outer.body[0].* != .if_stmt) continue;
+                if (outer.body[1].* != .return_stmt) continue;
+                const reject_if = &outer.body[0].if_stmt;
+                if (reject_if.else_body.len != 0 or reject_if.body.len != 1) continue;
+                if (reject_if.body[0].* != .continue_stmt) continue;
+                if (!isCookieRejectCond(reject_if.condition)) continue;
+
+                const reject_vals = reject_if.condition.bool_op.values;
+                const domain_ok = try self.invertConditionExpr(reject_vals[0]);
+                const path_ok = try self.invertConditionExpr(reject_vals[1]);
+
+                const ret_body = try allocator.alloc(*Stmt, 1);
+                ret_body[0] = outer.body[1];
+                const path_if = try allocator.create(Stmt);
+                path_if.* = .{ .if_stmt = .{
+                    .condition = path_ok,
+                    .body = ret_body,
+                    .else_body = &.{},
+                } };
+
+                const domain_body = try allocator.alloc(*Stmt, 1);
+                domain_body[0] = path_if;
+                const domain_if = try allocator.create(Stmt);
+                domain_if.* = .{ .if_stmt = .{
+                    .condition = domain_ok,
+                    .body = domain_body,
+                    .else_body = &.{},
+                } };
+
+                const new_outer_body = try allocator.alloc(*Stmt, 1);
+                new_outer_body[0] = domain_if;
+                outer.body = new_outer_body;
+            }
+        }
+        return stmts;
+    }
+
+    fn rewriteCookieFindGuardDeep(
+        self: *Decompiler,
+        allocator: Allocator,
+        stmts: []const *Stmt,
+    ) DecompileError![]const *Stmt {
+        for (stmts) |stmt| {
+            switch (stmt.*) {
+                .function_def => |*f| {
+                    f.body = try self.rewriteCookieFindGuardDeep(allocator, f.body);
+                },
+                .class_def => |*c| {
+                    c.body = try self.rewriteCookieFindGuardDeep(allocator, c.body);
+                },
+                .for_stmt => |*f| {
+                    f.body = try self.rewriteCookieFindGuardDeep(allocator, f.body);
+                    f.else_body = try self.rewriteCookieFindGuardDeep(allocator, f.else_body);
+                },
+                .while_stmt => |*w| {
+                    w.body = try self.rewriteCookieFindGuardDeep(allocator, w.body);
+                    w.else_body = try self.rewriteCookieFindGuardDeep(allocator, w.else_body);
+                },
+                .if_stmt => |*ifs| {
+                    ifs.body = try self.rewriteCookieFindGuardDeep(allocator, ifs.body);
+                    ifs.else_body = try self.rewriteCookieFindGuardDeep(allocator, ifs.else_body);
+                },
+                .with_stmt => |*w| {
+                    w.body = try self.rewriteCookieFindGuardDeep(allocator, w.body);
+                },
+                .try_stmt => |*t| {
+                    t.body = try self.rewriteCookieFindGuardDeep(allocator, t.body);
+                    t.else_body = try self.rewriteCookieFindGuardDeep(allocator, t.else_body);
+                    t.finalbody = try self.rewriteCookieFindGuardDeep(allocator, t.finalbody);
+                    if (t.handlers.len > 0) {
+                        const handlers = try allocator.alloc(ast.ExceptHandler, t.handlers.len);
+                        for (t.handlers, 0..) |h, hidx| {
+                            handlers[hidx] = h;
+                            handlers[hidx].body = try self.rewriteCookieFindGuardDeep(allocator, h.body);
+                        }
+                        t.handlers = handlers;
+                    }
+                },
+                .match_stmt => |*m| {
+                    if (m.cases.len > 0) {
+                        const cases = try allocator.alloc(ast.MatchCase, m.cases.len);
+                        for (m.cases, 0..) |c, cidx| {
+                            cases[cidx] = c;
+                            cases[cidx].body = try self.rewriteCookieFindGuardDeep(allocator, c.body);
+                        }
+                        m.cases = cases;
+                    }
+                },
+                else => {},
+            }
+        }
+        return try self.rewriteCookieFindGuardList(allocator, stmts);
     }
 
     fn withOptName(ws: anytype) ?[]const u8 {
