@@ -7330,74 +7330,108 @@ pub const Decompiler = struct {
     ) DecompileError![]const *Stmt {
         if (stmts.len < 2) return stmts;
         const last = stmts[stmts.len - 1];
-        if (last.* != .return_stmt) return stmts;
-        const last_val = last.return_stmt.value;
-        var idx: usize = stmts.len - 1;
-        while (idx > 0) {
-            idx -= 1;
-            const stmt = stmts[idx];
-            if (stmt.* != .if_stmt) continue;
-            const ifs = stmt.if_stmt;
-            if (ifs.else_body.len != 0) continue;
-            if (ifs.body.len != 1) continue;
-            const body_stmt = ifs.body[0];
-            if (body_stmt.* != .return_stmt) continue;
-            const body_val = body_stmt.return_stmt.value;
-            const same = if (body_val == null or last_val == null)
-                body_val == last_val
-            else
-                ast.exprEqual(body_val.?, last_val.?);
-            if (!same) continue;
+        if (last.* == .return_stmt) {
+            const last_val = last.return_stmt.value;
+            var idx: usize = stmts.len - 1;
+            while (idx > 0) {
+                idx -= 1;
+                const stmt = stmts[idx];
+                if (stmt.* != .if_stmt) continue;
+                const ifs = stmt.if_stmt;
+                if (ifs.else_body.len != 0) continue;
+                if (ifs.body.len != 1) continue;
+                const body_stmt = ifs.body[0];
+                if (body_stmt.* != .return_stmt) continue;
+                const body_val = body_stmt.return_stmt.value;
+                const same = if (body_val == null or last_val == null)
+                    body_val == last_val
+                else
+                    ast.exprEqual(body_val.?, last_val.?);
+                if (!same) continue;
 
-            const tail = stmts[idx + 1 .. stmts.len - 1];
-            if (tail.len > 16) continue;
-            var has_complex_tail = false;
-            for (tail) |tail_stmt| {
-                switch (tail_stmt.*) {
-                    .if_stmt,
-                    .for_stmt,
-                    .while_stmt,
-                    .try_stmt,
-                    .with_stmt,
-                    .match_stmt,
-                    .function_def,
-                    .class_def,
-                    => {
-                        has_complex_tail = true;
-                    },
-                    else => {},
+                const tail = stmts[idx + 1 .. stmts.len - 1];
+                if (tail.len > 16) continue;
+                var has_complex_tail = false;
+                for (tail) |tail_stmt| {
+                    switch (tail_stmt.*) {
+                        .if_stmt,
+                        .for_stmt,
+                        .while_stmt,
+                        .try_stmt,
+                        .with_stmt,
+                        .match_stmt,
+                        .function_def,
+                        .class_def,
+                        => {
+                            has_complex_tail = true;
+                        },
+                        else => {},
+                    }
+                    if (has_complex_tail) break;
                 }
-                if (has_complex_tail) break;
+                if (has_complex_tail) continue;
+                // Keep explicit early-return guard shape when the in-between tail starts with
+                // another conditional; collapsing into `if not ...` often perturbs jump layout.
+                if (tail.len > 0 and tail[0].* == .if_stmt) {
+                    continue;
+                }
+                const cond = try self.invertConditionExpr(ifs.condition);
+                const new_body = if (tail.len == 0)
+                    &[_]*Stmt{}
+                else blk: {
+                    const body = try allocator.alloc(*Stmt, tail.len);
+                    std.mem.copyForwards(*Stmt, body, tail);
+                    break :blk body;
+                };
+                const new_if = try allocator.create(Stmt);
+                new_if.* = .{ .if_stmt = .{
+                    .condition = cond,
+                    .body = new_body,
+                    .else_body = &.{},
+                } };
+
+                const out_len = idx + 2;
+                const out = try allocator.alloc(*Stmt, out_len);
+                if (idx > 0) {
+                    std.mem.copyForwards(*Stmt, out[0..idx], stmts[0..idx]);
+                }
+                out[idx] = new_if;
+                out[idx + 1] = last;
+                return out;
             }
-            if (has_complex_tail) continue;
-            // Keep explicit early-return guard shape when the in-between tail starts with
-            // another conditional; collapsing into `if not ...` often perturbs jump layout.
-            if (tail.len > 0 and tail[0].* == .if_stmt) {
-                continue;
-            }
-            const cond = try self.invertConditionExpr(ifs.condition);
-            const new_body = if (tail.len == 0)
-                &[_]*Stmt{}
-            else blk: {
+        } else {
+            var idx: usize = stmts.len - 1;
+            while (idx > 0) {
+                idx -= 1;
+                const stmt = stmts[idx];
+                if (stmt.* != .if_stmt) continue;
+                const ifs = stmt.if_stmt;
+                if (ifs.else_body.len != 0) continue;
+                if (ifs.body.len != 1) continue;
+                if (!Decompiler.isReturnNone(ifs.body[0])) continue;
+
+                const tail = stmts[idx + 1 ..];
+                if (tail.len != 1) continue;
+                if (tail[0].* != .expr_stmt or tail[0].expr_stmt.value.* != .call) continue;
+
+                const cond = try self.invertConditionExpr(ifs.condition);
                 const body = try allocator.alloc(*Stmt, tail.len);
                 std.mem.copyForwards(*Stmt, body, tail);
-                break :blk body;
-            };
-            const new_if = try allocator.create(Stmt);
-            new_if.* = .{ .if_stmt = .{
-                .condition = cond,
-                .body = new_body,
-                .else_body = &.{},
-            } };
+                const new_if = try allocator.create(Stmt);
+                new_if.* = .{ .if_stmt = .{
+                    .condition = cond,
+                    .body = body,
+                    .else_body = &.{},
+                } };
 
-            const out_len = idx + 2;
-            const out = try allocator.alloc(*Stmt, out_len);
-            if (idx > 0) {
-                std.mem.copyForwards(*Stmt, out[0..idx], stmts[0..idx]);
+                const out_len = idx + 1;
+                const out = try allocator.alloc(*Stmt, out_len);
+                if (idx > 0) {
+                    std.mem.copyForwards(*Stmt, out[0..idx], stmts[0..idx]);
+                }
+                out[idx] = new_if;
+                return out;
             }
-            out[idx] = new_if;
-            out[idx + 1] = last;
-            return out;
         }
         return stmts;
     }
