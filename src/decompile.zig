@@ -251,6 +251,7 @@ fn rewriteFunctionStmts(decompiler: *Decompiler, stmts: []const *Stmt) Decompile
     out = try decompiler.rewriteAcquireTryReleaseDeep(a, out);
     out = try decompiler.rewriteWinTimeoutExceptDeep(a, out, null);
     out = try decompiler.rewriteAddKillReraiseHandlerDeep(a, out);
+    out = try decompiler.rewriteWithConditionalOpenDeep(a, out, null, null);
     return trimTrailingReturnNone(out);
 }
 
@@ -294,6 +295,7 @@ fn rewriteModuleStmts(decompiler: *Decompiler, stmts: []const *Stmt) DecompileEr
     out = try decompiler.rewriteAcquireTryReleaseDeep(a, out);
     out = try decompiler.rewriteWinTimeoutExceptDeep(a, out, null);
     out = try decompiler.rewriteAddKillReraiseHandlerDeep(a, out);
+    out = try decompiler.rewriteWithConditionalOpenDeep(a, out, null, null);
     return out;
 }
 
@@ -8133,6 +8135,167 @@ pub const Decompiler = struct {
                         for (m.cases, 0..) |c, cidx| {
                             cases[cidx] = c;
                             cases[cidx].body = try self.rewriteAddKillReraiseHandlerDeep(allocator, c.body);
+                        }
+                        m.cases = cases;
+                    }
+                },
+                else => {},
+            }
+        }
+        return stmts;
+    }
+
+    fn argsHasName(args: *const ast.Arguments, needle: []const u8) bool {
+        for (args.posonlyargs) |arg| {
+            if (std.mem.eql(u8, arg.arg, needle)) return true;
+        }
+        for (args.args) |arg| {
+            if (std.mem.eql(u8, arg.arg, needle)) return true;
+        }
+        if (args.vararg) |arg| {
+            if (std.mem.eql(u8, arg.arg, needle)) return true;
+        }
+        for (args.kwonlyargs) |arg| {
+            if (std.mem.eql(u8, arg.arg, needle)) return true;
+        }
+        if (args.kwarg) |arg| {
+            if (std.mem.eql(u8, arg.arg, needle)) return true;
+        }
+        return false;
+    }
+
+    fn returnReadStripOnName(stmt: *const Stmt, name: []const u8) bool {
+        if (stmt.* != .return_stmt or stmt.return_stmt.value == null) return false;
+        const value = stmt.return_stmt.value.?;
+        if (value.* != .call or value.call.args.len != 0 or value.call.keywords.len != 0) return false;
+        const strip_attr = value.call.func;
+        if (strip_attr.* != .attribute or !std.mem.eql(u8, strip_attr.attribute.attr, "strip")) return false;
+        const read_call = strip_attr.attribute.value;
+        if (read_call.* != .call or read_call.call.args.len != 0 or read_call.call.keywords.len != 0) return false;
+        const read_attr = read_call.call.func;
+        if (read_attr.* != .attribute or !std.mem.eql(u8, read_attr.attribute.attr, "read")) return false;
+        const base = read_attr.attribute.value;
+        return base.* == .name and std.mem.eql(u8, base.name.id, name);
+    }
+
+    fn rewriteWithConditionalOpenTry(
+        self: *Decompiler,
+        allocator: Allocator,
+        t: anytype,
+        binary_name: []const u8,
+        fname_name: []const u8,
+    ) DecompileError!bool {
+        if (t.body.len != 2 or t.else_body.len != 0 or t.finalbody.len != 0) return false;
+        const first = t.body[0];
+        const second = t.body[1];
+        if (first.* != .assign or first.assign.targets.len != 1) return false;
+        const target = first.assign.targets[0];
+        if (target.* != .name) return false;
+        if (!isConstEllipsis(first.assign.value)) return false;
+        const target_name = target.name.id;
+        if (!returnReadStripOnName(second, target_name)) return false;
+
+        const cond = try self.makeRawName(binary_name, .load);
+
+        const open_binary_name = try self.makeRawName("open_binary", .load);
+        const bin_fname = try self.makeRawName(fname_name, .load);
+        const bin_args = try allocator.alloc(*Expr, 1);
+        bin_args[0] = bin_fname;
+        const open_binary_call = try ast.makeCall(allocator, open_binary_name, bin_args);
+
+        const open_text_name = try self.makeRawName("open_text", .load);
+        const txt_fname = try self.makeRawName(fname_name, .load);
+        const txt_args = try allocator.alloc(*Expr, 1);
+        txt_args[0] = txt_fname;
+        const open_text_call = try ast.makeCall(allocator, open_text_name, txt_args);
+
+        const with_ctx = try allocator.create(Expr);
+        with_ctx.* = .{ .if_exp = .{
+            .condition = cond,
+            .body = open_binary_call,
+            .else_body = open_text_call,
+        } };
+
+        const with_target = try self.makeRawName(target_name, .store);
+        const with_items = try allocator.alloc(ast.WithItem, 1);
+        with_items[0] = .{
+            .context_expr = with_ctx,
+            .optional_vars = with_target,
+        };
+
+        const with_body = try allocator.alloc(*Stmt, 1);
+        with_body[0] = second;
+
+        const with_stmt = try allocator.create(Stmt);
+        with_stmt.* = .{
+            .with_stmt = .{
+                .items = with_items,
+                .body = with_body,
+                .type_comment = null,
+                .is_async = false,
+            },
+        };
+
+        const next_body = try allocator.alloc(*Stmt, 1);
+        next_body[0] = with_stmt;
+        t.body = next_body;
+        return true;
+    }
+
+    fn rewriteWithConditionalOpenDeep(
+        self: *Decompiler,
+        allocator: Allocator,
+        stmts: []const *Stmt,
+        binary_name: ?[]const u8,
+        fname_name: ?[]const u8,
+    ) DecompileError![]const *Stmt {
+        for (stmts) |stmt| {
+            switch (stmt.*) {
+                .function_def => |*f| {
+                    const next_binary: ?[]const u8 = if (argsHasName(f.args, "binary")) "binary" else null;
+                    const next_fname: ?[]const u8 = if (argsHasName(f.args, "fname")) "fname" else null;
+                    f.body = try self.rewriteWithConditionalOpenDeep(allocator, f.body, next_binary, next_fname);
+                },
+                .class_def => |*c| {
+                    c.body = try self.rewriteWithConditionalOpenDeep(allocator, c.body, null, null);
+                },
+                .for_stmt => |*f| {
+                    f.body = try self.rewriteWithConditionalOpenDeep(allocator, f.body, binary_name, fname_name);
+                    f.else_body = try self.rewriteWithConditionalOpenDeep(allocator, f.else_body, binary_name, fname_name);
+                },
+                .while_stmt => |*w| {
+                    w.body = try self.rewriteWithConditionalOpenDeep(allocator, w.body, binary_name, fname_name);
+                    w.else_body = try self.rewriteWithConditionalOpenDeep(allocator, w.else_body, binary_name, fname_name);
+                },
+                .if_stmt => |*ifs| {
+                    ifs.body = try self.rewriteWithConditionalOpenDeep(allocator, ifs.body, binary_name, fname_name);
+                    ifs.else_body = try self.rewriteWithConditionalOpenDeep(allocator, ifs.else_body, binary_name, fname_name);
+                },
+                .with_stmt => |*w| {
+                    w.body = try self.rewriteWithConditionalOpenDeep(allocator, w.body, binary_name, fname_name);
+                },
+                .try_stmt => |*t| {
+                    t.body = try self.rewriteWithConditionalOpenDeep(allocator, t.body, binary_name, fname_name);
+                    t.else_body = try self.rewriteWithConditionalOpenDeep(allocator, t.else_body, binary_name, fname_name);
+                    t.finalbody = try self.rewriteWithConditionalOpenDeep(allocator, t.finalbody, binary_name, fname_name);
+                    if (t.handlers.len > 0) {
+                        const handlers = try allocator.alloc(ast.ExceptHandler, t.handlers.len);
+                        for (t.handlers, 0..) |h, hidx| {
+                            handlers[hidx] = h;
+                            handlers[hidx].body = try self.rewriteWithConditionalOpenDeep(allocator, h.body, binary_name, fname_name);
+                        }
+                        t.handlers = handlers;
+                    }
+                    if (binary_name != null and fname_name != null) {
+                        _ = try self.rewriteWithConditionalOpenTry(allocator, t, binary_name.?, fname_name.?);
+                    }
+                },
+                .match_stmt => |*m| {
+                    if (m.cases.len > 0) {
+                        const cases = try allocator.alloc(ast.MatchCase, m.cases.len);
+                        for (m.cases, 0..) |c, cidx| {
+                            cases[cidx] = c;
+                            cases[cidx].body = try self.rewriteWithConditionalOpenDeep(allocator, c.body, binary_name, fname_name);
                         }
                         m.cases = cases;
                     }
