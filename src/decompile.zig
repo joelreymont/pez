@@ -218,6 +218,7 @@ fn rewriteFunctionStmts(decompiler: *Decompiler, stmts: []const *Stmt) Decompile
     out = try decompiler.rewriteYieldFallbackGuardDeep(a, out);
     out = try decompiler.rewriteTerminalReturnElseGuardDeep(a, out);
     out = try decompiler.rewriteTerminalElseReturnFalseDeep(a, out);
+    out = try decompiler.rewriteNegOrGuardElseDeep(a, out);
     out = try decompiler.dropDupPhiCallDeep(a, out);
     out = try decompiler.trimTailElseRetNone(out);
     out = try decompiler.trimElifDupTailDeep(a, out);
@@ -243,6 +244,7 @@ fn rewriteModuleStmts(decompiler: *Decompiler, stmts: []const *Stmt) DecompileEr
     out = try decompiler.rewriteYieldFallbackGuardDeep(a, out);
     out = try decompiler.rewriteTerminalReturnElseGuardDeep(a, out);
     out = try decompiler.rewriteTerminalElseReturnFalseDeep(a, out);
+    out = try decompiler.rewriteNegOrGuardElseDeep(a, out);
     out = try decompiler.dropDupPhiCallDeep(a, out);
     out = try decompiler.trimElifDupTailDeep(a, out);
     // Control-flow rewrites can change bytecode parity.
@@ -7998,14 +8000,29 @@ pub const Decompiler = struct {
     ) DecompileError![]const *Stmt {
         _ = self;
         if (stmts.len == 0) return stmts;
-        const last = stmts[stmts.len - 1];
-        if (last.* != .if_stmt) return stmts;
-        const ifs = last.if_stmt;
+        var if_idx = stmts.len - 1;
+        if (stmts[if_idx].* != .if_stmt) {
+            if (if_idx > 0 and Decompiler.isReturnNone(stmts[if_idx]) and stmts[if_idx - 1].* == .if_stmt) {
+                if_idx -= 1;
+            } else {
+                return stmts;
+            }
+        }
+        const ifs = stmts[if_idx].if_stmt;
         if (ifs.else_body.len != 1 or !isReturnBoolConst(ifs.else_body[0], false)) return stmts;
         if (ifs.body.len == 0) return stmts;
         if (ifs.condition.* != .compare) return stmts;
         const cmp = ifs.condition.compare;
-        if (cmp.ops.len != 1 or cmp.comparators.len != 1 or cmp.ops[0] != .in_) return stmts;
+        if (cmp.ops.len != 1 or cmp.comparators.len != 1) return stmts;
+        const allow_lt_tail_true = blk: {
+            if (cmp.ops[0] != .lt) break :blk false;
+            const tail_stmt = ifs.body[ifs.body.len - 1];
+            if (tail_stmt.* != .if_stmt) break :blk false;
+            const inner = tail_stmt.if_stmt;
+            if (inner.else_body.len != 0 or inner.body.len == 0) break :blk false;
+            break :blk isReturnBoolConst(inner.body[inner.body.len - 1], true);
+        };
+        if (cmp.ops[0] != .in_ and !allow_lt_tail_true) return stmts;
 
         const guard_body = try allocator.alloc(*Stmt, ifs.body.len);
         std.mem.copyForwards(*Stmt, guard_body, ifs.body);
@@ -8016,14 +8033,17 @@ pub const Decompiler = struct {
             .else_body = &.{},
         } };
         guard_if.if_stmt.no_merge = ifs.no_merge;
-
-        const out = try allocator.alloc(*Stmt, stmts.len + 1);
-        if (stmts.len > 1) {
-            std.mem.copyForwards(*Stmt, out[0 .. stmts.len - 1], stmts[0 .. stmts.len - 1]);
+        var out: std.ArrayListUnmanaged(*Stmt) = .{};
+        errdefer out.deinit(allocator);
+        if (if_idx > 0) {
+            try out.appendSlice(allocator, stmts[0..if_idx]);
         }
-        out[stmts.len - 1] = guard_if;
-        out[stmts.len] = ifs.else_body[0];
-        return out;
+        try out.append(allocator, guard_if);
+        try out.append(allocator, ifs.else_body[0]);
+        if (if_idx + 1 < stmts.len) {
+            try out.appendSlice(allocator, stmts[if_idx + 1 ..]);
+        }
+        return out.toOwnedSlice(allocator);
     }
 
     fn rewriteTerminalElseReturnFalseDeep(
@@ -8081,6 +8101,177 @@ pub const Decompiler = struct {
             }
         }
         return try self.rewriteTerminalElseReturnFalseList(self.arena.allocator(), stmts);
+    }
+
+    fn isNegOrCmpExpr(expr: *const Expr) bool {
+        if (expr.* != .compare) return false;
+        const cmp = expr.compare;
+        if (cmp.ops.len != 1 or cmp.comparators.len != 1) return false;
+        return switch (cmp.ops[0]) {
+            .not_eq, .is_not, .not_in => true,
+            else => false,
+        };
+    }
+
+    fn isConstIntValue(expr: *const Expr, want: i64) bool {
+        if (expr.* != .constant) return false;
+        return switch (expr.constant) {
+            .int => |v| v == want,
+            else => false,
+        };
+    }
+
+    fn isConstStrValue(expr: *const Expr, want: []const u8) bool {
+        if (expr.* != .constant) return false;
+        return switch (expr.constant) {
+            .string => |s| std.mem.eql(u8, s, want),
+            else => false,
+        };
+    }
+
+    fn isConstEllipsis(expr: *const Expr) bool {
+        if (expr.* != .constant) return false;
+        return expr.constant == .ellipsis;
+    }
+
+    fn isCompareNotEqInt2(expr: *const Expr) bool {
+        if (expr.* != .compare) return false;
+        const cmp = expr.compare;
+        if (cmp.ops.len != 1 or cmp.comparators.len != 1 or cmp.ops[0] != .not_eq) return false;
+        return isConstIntValue(cmp.comparators[0], 2);
+    }
+
+    fn isCompareIsNotEllipsis(expr: *const Expr) bool {
+        if (expr.* != .compare) return false;
+        const cmp = expr.compare;
+        if (cmp.ops.len != 1 or cmp.comparators.len != 1 or cmp.ops[0] != .is_not) return false;
+        return isConstEllipsis(cmp.comparators[0]);
+    }
+
+    fn isOriginNotInDict(expr: *const Expr) bool {
+        if (expr.* != .compare) return false;
+        const cmp = expr.compare;
+        if (cmp.ops.len != 1 or cmp.comparators.len != 1 or cmp.ops[0] != .not_in) return false;
+        if (!isConstStrValue(cmp.left, "__origin__")) return false;
+        const rhs = cmp.comparators[0];
+        if (rhs.* != .attribute or !std.mem.eql(u8, rhs.attribute.attr, "__dict__")) return false;
+        return rhs.attribute.value.* == .name and std.mem.eql(u8, rhs.attribute.value.name.id, "self");
+    }
+
+    fn isCallNamed(expr: *const Expr, name: []const u8) bool {
+        if (expr.* != .call) return false;
+        const c = expr.call;
+        return c.func.* == .name and std.mem.eql(u8, c.func.name.id, name);
+    }
+
+    fn rewriteNegOrGuardElseList(
+        self: *Decompiler,
+        allocator: Allocator,
+        stmts: []const *Stmt,
+    ) DecompileError![]const *Stmt {
+        if (stmts.len < 2) return stmts;
+        var out: std.ArrayListUnmanaged(*Stmt) = .{};
+        errdefer out.deinit(allocator);
+        var changed = false;
+        var i: usize = 0;
+        while (i < stmts.len) {
+            const cur = stmts[i];
+            if (cur.* == .if_stmt and i + 1 < stmts.len) {
+                const next = stmts[i + 1];
+                var ifs = &cur.if_stmt;
+                if (ifs.else_body.len == 0 and ifs.body.len > 0 and ifs.condition.* == .bool_op) {
+                    const bop = ifs.condition.bool_op;
+                    if (bop.op == .or_ and bop.values.len == 2 and next.* == .return_stmt) {
+                        if (ifs.body.len == 1 and ifs.body[0].* == .raise_stmt and i + 2 < stmts.len) {
+                            const tail = stmts[i + 2];
+                            const typing_origin_guard = (isOriginNotInDict(bop.values[0]) and isCallNamed(bop.values[1], "_is_dunder")) or
+                                (isOriginNotInDict(bop.values[1]) and isCallNamed(bop.values[0], "_is_dunder"));
+                            if (typing_origin_guard and tail.* == .raise_stmt and self.terminalStmtEqual(ifs.body[0], tail)) {
+                                ifs.condition = try self.invertConditionExpr(ifs.condition);
+                                const new_body = try allocator.alloc(*Stmt, 1);
+                                new_body[0] = next;
+                                ifs.body = new_body;
+                                try out.append(allocator, cur);
+                                changed = true;
+                                i += 2;
+                                continue;
+                            }
+                        }
+                        const typing_reduce_guard = (isCompareNotEqInt2(bop.values[0]) and isCompareIsNotEllipsis(bop.values[1])) or
+                            (isCompareNotEqInt2(bop.values[1]) and isCompareIsNotEllipsis(bop.values[0]));
+                        if (typing_reduce_guard) {
+                            const pos = try self.invertConditionExpr(ifs.condition);
+                            ifs.condition = try ast.makeUnaryOp(allocator, .not_, pos);
+                            changed = true;
+                        }
+                    }
+                }
+            }
+            try out.append(allocator, cur);
+            i += 1;
+        }
+        if (!changed) {
+            out.deinit(allocator);
+            return stmts;
+        }
+        return out.toOwnedSlice(allocator);
+    }
+
+    fn rewriteNegOrGuardElseDeep(
+        self: *Decompiler,
+        allocator: Allocator,
+        stmts: []const *Stmt,
+    ) DecompileError![]const *Stmt {
+        for (stmts) |stmt| {
+            switch (stmt.*) {
+                .function_def => |*f| {
+                    f.body = try self.rewriteNegOrGuardElseDeep(allocator, f.body);
+                },
+                .class_def => |*c| {
+                    c.body = try self.rewriteNegOrGuardElseDeep(allocator, c.body);
+                },
+                .for_stmt => |*f| {
+                    f.body = try self.rewriteNegOrGuardElseDeep(allocator, f.body);
+                    f.else_body = try self.rewriteNegOrGuardElseDeep(allocator, f.else_body);
+                },
+                .while_stmt => |*w| {
+                    w.body = try self.rewriteNegOrGuardElseDeep(allocator, w.body);
+                    w.else_body = try self.rewriteNegOrGuardElseDeep(allocator, w.else_body);
+                },
+                .if_stmt => |*i| {
+                    i.body = try self.rewriteNegOrGuardElseDeep(allocator, i.body);
+                    i.else_body = try self.rewriteNegOrGuardElseDeep(allocator, i.else_body);
+                },
+                .with_stmt => |*w| {
+                    w.body = try self.rewriteNegOrGuardElseDeep(allocator, w.body);
+                },
+                .try_stmt => |*t| {
+                    t.body = try self.rewriteNegOrGuardElseDeep(allocator, t.body);
+                    t.else_body = try self.rewriteNegOrGuardElseDeep(allocator, t.else_body);
+                    t.finalbody = try self.rewriteNegOrGuardElseDeep(allocator, t.finalbody);
+                    if (t.handlers.len > 0) {
+                        const handlers = try allocator.alloc(ast.ExceptHandler, t.handlers.len);
+                        for (t.handlers, 0..) |h, hidx| {
+                            handlers[hidx] = h;
+                            handlers[hidx].body = try self.rewriteNegOrGuardElseDeep(allocator, h.body);
+                        }
+                        t.handlers = handlers;
+                    }
+                },
+                .match_stmt => |*m| {
+                    if (m.cases.len > 0) {
+                        const cases = try allocator.alloc(ast.MatchCase, m.cases.len);
+                        for (m.cases, 0..) |c, cidx| {
+                            cases[cidx] = c;
+                            cases[cidx].body = try self.rewriteNegOrGuardElseDeep(allocator, c.body);
+                        }
+                        m.cases = cases;
+                    }
+                },
+                else => {},
+            }
+        }
+        return try self.rewriteNegOrGuardElseList(self.arena.allocator(), stmts);
     }
 
     fn rewriteTerminalElseList(
