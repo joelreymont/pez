@@ -782,6 +782,8 @@ test "snapshot if or chain 3.9" {
         \\  "def f(a, b, c):
         \\    if a == '' or b == '' or c == '':
         \\        raise Exception('x')
+        \\    else:
+        \\        return None
         \\"
     );
 }
@@ -1095,6 +1097,8 @@ test "snapshot with if else return 3.9" {
         \\    with _lock:
         \\        if x:
         \\            x = x + 1
+        \\        else:
+        \\            return None
         \\    return x
         \\"
     );
@@ -1615,6 +1619,7 @@ test "snapshot or break guard 3.9" {
         \\        i += 1
         \\        if timeout.expired() or val is not None and val > 0 and not buf:
         \\            break
+        \\        break
         \\"
     );
 }
@@ -1715,6 +1720,36 @@ test "snapshot dictcomp conditional value 3.9" {
         \\            continue
         \\        if new[key] != old[key]:
         \\            out[key] = [old[key], new[key]]
+        \\    return out
+        \\"
+    );
+}
+
+test "snapshot configparser inline prefix 3.9" {
+    try runSnapshot(@src(), "test/corpus/configparser_inline_prefix.3.9.pyc",
+        \\[]u8
+        \\  "import sys
+        \\def parse_lines(lines, inline_prefixes):
+        \\    out = []
+        \\    for line in lines:
+        \\        comment_start = sys.maxsize
+        \\        inline = {p: -1 for p in inline_prefixes}
+        \\        while comment_start == sys.maxsize and inline:
+        \\            nxt = {}
+        \\            for prefix, index in inline.items():
+        \\                index = line.find(prefix, index + 1)
+        \\                if index == -1:
+        \\                    continue
+        \\                nxt[prefix] = index
+        \\                if index == 0 or index > 0 and line[index - 1].isspace():
+        \\                    comment_start = min(comment_start, index)
+        \\            inline = nxt
+        \\        if comment_start == sys.maxsize:
+        \\            comment_start = None
+        \\        value = line[:comment_start].strip()
+        \\        if not value:
+        \\            continue
+        \\        out.append(value)
         \\    return out
         \\"
     );

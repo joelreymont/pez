@@ -11,27 +11,27 @@ python3 tools/compare/compare_suite.py \
   --py /Users/joel/Work/pez/.uv/py39/bin/python \
   --xdis-python /Users/joel/Work/pez/.uv/py39/bin/python \
   --decompyle3 /Users/joel/Work/pez/.uv/py39/bin/decompyle3 \
-  --out-root /tmp/pez-boatmain-suite19 \
-  --out /tmp/pez-boatmain-suite19.json
+  --out-root /tmp/pez-boatmain-suite-fix2 \
+  --out /tmp/pez-boatmain-suite-fix2.json
 ```
 
-## Summary (from /tmp/pez-boatmain-suite19.json)
+## Summary (from /tmp/pez-boatmain-suite-fix2.json)
 - pez decompile: ok=329 error=0
-- pez compare: exact=173 close=54 mismatch=102 error=0 missing_src=0
+- pez compare: exact=179 close=64 mismatch=86 error=0 missing_src=0
 - decompyle3 decompile: ok=329 error=0
 - decompyle3 compare: exact=8 close=0 mismatch=321 error=0 missing_src=0
 
 ## Worst semantic mismatches (pez, min_semantic_score)
-- aioice/mdns.pyc (min=0.1965)
-- packaging/specifiers.pyc (min=0.2000)
-- telebot/types.pyc (min=0.2000)
-- typing.pyc (min=0.2000)
-- subprocess.pyc (min=0.2000)
-- code.pyc (min=0.2000)
-- ftplib.pyc (min=0.2000)
-- glob.pyc (min=0.2000)
-- picamera2/controls.pyc (min=0.2000)
-- tarfile.pyc (min=0.2000)
+- pkgutil.pyc (min=0.0000)
+- psutil/_pslinux.pyc (min=0.0000)
+- plistlib.pyc (min=0.0093)
+- dis.pyc (min=0.0607)
+- inspect.pyc (min=0.0667)
+- packaging/metadata.pyc (min=0.0667)
+- pdb.pyc (min=0.0667)
+- pydoc.pyc (min=0.1023)
+- pathlib.pyc (min=0.1189)
+- tempfile.pyc (min=0.1350)
 
 ## Drill-down (single file)
 ```bash
