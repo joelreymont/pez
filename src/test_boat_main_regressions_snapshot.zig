@@ -422,6 +422,66 @@ test "snapshot pkgutil load module 3.9" {
     );
 }
 
+test "snapshot pkgutil iter modules 3.9" {
+    try runSnapshot(@src(), "test/corpus/pkgutil_iter_modules.3.9.pyc",
+        \\[]u8
+        \\  "import os
+        \\def f(importer, filenames, prefix = ''):
+        \\    yielded = {}
+        \\    import inspect
+        \\    for fn in filenames:
+        \\        modname = inspect.getmodulename(fn)
+        \\        if modname == '__init__' or modname in yielded:
+        \\            continue
+        \\        path = os.path.join(importer.path, fn)
+        \\        ispkg = False
+        \\        if not modname:
+        \\            if os.path.isdir(path):
+        \\                if '.' not in fn:
+        \\                    modname = fn
+        \\                    try:
+        \\                        dircontents = os.listdir(path)
+        \\                    except OSError:
+        \\                        dircontents = []
+        \\                    for fn in dircontents:
+        \\                        subname = inspect.getmodulename(fn)
+        \\                        if subname == '__init__':
+        \\                            ispkg = True
+        \\                            break
+        \\                    else:
+        \\                        continue
+        \\        if modname:
+        \\            if '.' not in modname:
+        \\                yielded[modname] = 1
+        \\                yield (prefix + modname, ispkg)
+        \\"
+    );
+}
+
+test "snapshot branch dup tail return attr 3.9" {
+    try runSnapshot(@src(), "test/corpus/branch_dup_tail_return_attr.3.9.pyc",
+        \\[]u8
+        \\  "def read_code(f):
+        \\    return f.read()
+        \\class Loader:
+        \\    code = None
+        \\    def __init__(self, file, kind):
+        \\        self.file = file
+        \\        self.kind = kind
+        \\    def _reopen(self):
+        \\        pass
+        \\    def get(self):
+        \\        if self.code is None and self.kind == 1:
+        \\            self._reopen()
+        \\            try:
+        \\                self.code = read_code(self.file)
+        \\            finally:
+        \\                self.file.close()
+        \\        return self.code
+        \\"
+    );
+}
+
 test "snapshot loop merge break 3.9" {
     try runSnapshot(@src(), "test/corpus/loop_merge_break.3.9.pyc",
         \\[]u8
