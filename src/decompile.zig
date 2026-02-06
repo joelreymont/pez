@@ -263,6 +263,7 @@ fn rewriteFunctionStmts(decompiler: *Decompiler, stmts: []const *Stmt) Decompile
     out = try decompiler.rewritePackagingSpecifierTailGuards(a, out);
     out = try decompiler.rewriteZipUnknownTryDeep(a, out);
     out = try decompiler.rewriteLoadFmtForElseDeep(a, out);
+    out = try decompiler.rewriteDropWithPlaceholderTailDeep(a, out);
     return trimTrailingReturnNone(out);
 }
 
@@ -318,6 +319,7 @@ fn rewriteModuleStmts(decompiler: *Decompiler, stmts: []const *Stmt) DecompileEr
     out = try decompiler.rewritePackagingSpecifierTailGuards(a, out);
     out = try decompiler.rewriteZipUnknownTryDeep(a, out);
     out = try decompiler.rewriteLoadFmtForElseDeep(a, out);
+    out = try decompiler.rewriteDropWithPlaceholderTailDeep(a, out);
     return out;
 }
 
@@ -10334,6 +10336,136 @@ pub const Decompiler = struct {
             }
         }
         return try self.rewriteLoadFmtForElseList(self.arena.allocator(), stmts);
+    }
+
+    fn withOptName(ws: anytype) ?[]const u8 {
+        if (ws.items.len != 1) return null;
+        const opt = ws.items[0].optional_vars orelse return null;
+        if (opt.* != .name) return null;
+        return opt.name.id;
+    }
+
+    fn rewriteDropWithPlaceholderTailList(
+        self: *Decompiler,
+        allocator: Allocator,
+        stmts: []const *Stmt,
+    ) DecompileError![]const *Stmt {
+        _ = self;
+        if (stmts.len < 3) return stmts;
+        var out: std.ArrayListUnmanaged(*Stmt) = .{};
+        errdefer out.deinit(allocator);
+        var changed = false;
+        var i: usize = 0;
+        while (i < stmts.len) {
+            const stmt = stmts[i];
+            try out.append(allocator, stmt);
+
+            if (stmt.* == .if_stmt) {
+                const ifs = stmt.if_stmt;
+                if (ifs.body.len > 0) {
+                    const tail = ifs.body[ifs.body.len - 1];
+                    if (tail.* == .with_stmt) {
+                        const ws = tail.with_stmt;
+                        if (withOptName(&ws)) |opt_name| {
+                            const ph_idx = i + 1;
+                            const dup_start = ph_idx + 1;
+                            const dup_end = dup_start + ws.body.len;
+                            if (ws.body.len > 0 and ph_idx < stmts.len and dup_end <= stmts.len and stmts[ph_idx].* == .assign and isConstEllipsis(stmts[ph_idx].assign.value)) {
+                                if (assignTargetName(stmts[ph_idx])) |ph_name| {
+                                    if (std.mem.eql(u8, ph_name, opt_name) and stmtSeqEqual(ws.body, stmts[dup_start..dup_end])) {
+                                        i = dup_end;
+                                        changed = true;
+                                        continue;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
+            if (stmt.* == .with_stmt) {
+                const ws = stmt.with_stmt;
+                if (withOptName(&ws)) |opt_name| {
+                    const ph_idx = i + 1;
+                    if (ph_idx < stmts.len and stmts[ph_idx].* == .assign and isConstEllipsis(stmts[ph_idx].assign.value)) {
+                        if (assignTargetName(stmts[ph_idx])) |ph_name| {
+                            const dup_start = ph_idx + 1;
+                            const dup_end = dup_start + ws.body.len;
+                            if (std.mem.eql(u8, ph_name, opt_name) and ws.body.len > 0 and dup_end <= stmts.len and stmtSeqEqual(ws.body, stmts[dup_start..dup_end])) {
+                                i = dup_end;
+                                changed = true;
+                                continue;
+                            }
+                        }
+                    }
+                }
+            }
+
+            i += 1;
+        }
+        if (!changed) {
+            out.deinit(allocator);
+            return stmts;
+        }
+        return out.toOwnedSlice(allocator);
+    }
+
+    fn rewriteDropWithPlaceholderTailDeep(
+        self: *Decompiler,
+        allocator: Allocator,
+        stmts: []const *Stmt,
+    ) DecompileError![]const *Stmt {
+        for (stmts) |stmt| {
+            switch (stmt.*) {
+                .function_def => |*f| {
+                    f.body = try self.rewriteDropWithPlaceholderTailDeep(allocator, f.body);
+                },
+                .class_def => |*c| {
+                    c.body = try self.rewriteDropWithPlaceholderTailDeep(allocator, c.body);
+                },
+                .for_stmt => |*f| {
+                    f.body = try self.rewriteDropWithPlaceholderTailDeep(allocator, f.body);
+                    f.else_body = try self.rewriteDropWithPlaceholderTailDeep(allocator, f.else_body);
+                },
+                .while_stmt => |*w| {
+                    w.body = try self.rewriteDropWithPlaceholderTailDeep(allocator, w.body);
+                    w.else_body = try self.rewriteDropWithPlaceholderTailDeep(allocator, w.else_body);
+                },
+                .if_stmt => |*ifs| {
+                    ifs.body = try self.rewriteDropWithPlaceholderTailDeep(allocator, ifs.body);
+                    ifs.else_body = try self.rewriteDropWithPlaceholderTailDeep(allocator, ifs.else_body);
+                },
+                .with_stmt => |*w| {
+                    w.body = try self.rewriteDropWithPlaceholderTailDeep(allocator, w.body);
+                },
+                .try_stmt => |*t| {
+                    t.body = try self.rewriteDropWithPlaceholderTailDeep(allocator, t.body);
+                    t.else_body = try self.rewriteDropWithPlaceholderTailDeep(allocator, t.else_body);
+                    t.finalbody = try self.rewriteDropWithPlaceholderTailDeep(allocator, t.finalbody);
+                    if (t.handlers.len > 0) {
+                        const handlers = try allocator.alloc(ast.ExceptHandler, t.handlers.len);
+                        for (t.handlers, 0..) |h, hidx| {
+                            handlers[hidx] = h;
+                            handlers[hidx].body = try self.rewriteDropWithPlaceholderTailDeep(allocator, h.body);
+                        }
+                        t.handlers = handlers;
+                    }
+                },
+                .match_stmt => |*m| {
+                    if (m.cases.len > 0) {
+                        const cases = try allocator.alloc(ast.MatchCase, m.cases.len);
+                        for (m.cases, 0..) |c, cidx| {
+                            cases[cidx] = c;
+                            cases[cidx].body = try self.rewriteDropWithPlaceholderTailDeep(allocator, c.body);
+                        }
+                        m.cases = cases;
+                    }
+                },
+                else => {},
+            }
+        }
+        return try self.rewriteDropWithPlaceholderTailList(allocator, stmts);
     }
 
     fn exprIsName(expr: *const Expr, name: []const u8) bool {
