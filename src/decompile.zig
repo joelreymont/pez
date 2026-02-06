@@ -252,6 +252,7 @@ fn rewriteFunctionStmts(decompiler: *Decompiler, stmts: []const *Stmt) Decompile
     out = try decompiler.rewriteWinTimeoutExceptDeep(a, out, null);
     out = try decompiler.rewriteAddKillReraiseHandlerDeep(a, out);
     out = try decompiler.rewriteWithConditionalOpenDeep(a, out, null, null);
+    out = try decompiler.rewriteCLexerLineNumberElsePass(a, out);
     out = try decompiler.rewritePackagingSpecifierTailGuards(a, out);
     return trimTrailingReturnNone(out);
 }
@@ -297,6 +298,7 @@ fn rewriteModuleStmts(decompiler: *Decompiler, stmts: []const *Stmt) DecompileEr
     out = try decompiler.rewriteWinTimeoutExceptDeep(a, out, null);
     out = try decompiler.rewriteAddKillReraiseHandlerDeep(a, out);
     out = try decompiler.rewriteWithConditionalOpenDeep(a, out, null, null);
+    out = try decompiler.rewriteCLexerLineNumberElsePass(a, out);
     out = try decompiler.rewritePackagingSpecifierTailGuards(a, out);
     return out;
 }
@@ -10243,6 +10245,44 @@ pub const Decompiler = struct {
                     tail_if.else_body = try self.rewriteTerminalReturnElseGuardAnyList(self.arena.allocator(), tail_if.else_body);
                 }
                 body_stmt.function_def.body = fn_body;
+            }
+        }
+        return stmts;
+    }
+
+    fn isSelfAttrExpr(expr: *const Expr, attr_name: []const u8) bool {
+        if (expr.* != .attribute) return false;
+        if (!std.mem.eql(u8, expr.attribute.attr, attr_name)) return false;
+        return expr.attribute.value.* == .name and std.mem.eql(u8, expr.attribute.value.name.id, "self");
+    }
+
+    fn rewriteCLexerLineNumberElsePass(
+        self: *Decompiler,
+        allocator: Allocator,
+        stmts: []const *Stmt,
+    ) DecompileError![]const *Stmt {
+        _ = self;
+        for (stmts) |stmt| {
+            if (stmt.* != .class_def or !std.mem.eql(u8, stmt.class_def.name, "CLexer")) continue;
+            for (stmt.class_def.body) |body_stmt| {
+                if (body_stmt.* != .function_def or !std.mem.eql(u8, body_stmt.function_def.name, "t_ppline_LINE_NUMBER")) continue;
+                if (body_stmt.function_def.body.len != 1 or body_stmt.function_def.body[0].* != .if_stmt) continue;
+                const ifs = &body_stmt.function_def.body[0].if_stmt;
+                if (ifs.else_body.len != 0 or ifs.body.len != 1 or ifs.body[0].* != .assign) continue;
+                if (ifs.condition.* != .compare) continue;
+                const cmp = ifs.condition.compare;
+                if (cmp.ops.len != 1 or cmp.comparators.len != 1 or cmp.ops[0] != .is) continue;
+                if (!isSelfAttrExpr(cmp.left, "pp_line")) continue;
+                const rhs = cmp.comparators[0];
+                if (rhs.* != .constant or rhs.constant != .none) continue;
+                const asn = ifs.body[0].assign;
+                if (asn.targets.len != 1 or !isSelfAttrExpr(asn.targets[0], "pp_line")) continue;
+
+                const pass_stmt = try allocator.create(Stmt);
+                pass_stmt.* = .pass;
+                const else_body = try allocator.alloc(*Stmt, 1);
+                else_body[0] = pass_stmt;
+                ifs.else_body = else_body;
             }
         }
         return stmts;
