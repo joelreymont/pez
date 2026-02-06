@@ -174,10 +174,11 @@ test "snapshot if guard prelude 3.9" {
         \\        if obj is None:
         \\            return None
         \\        return 0
-        \\    n = len(obj)
-        \\    if n <= 3:
-        \\        return n
-        \\    return n + 1
+        \\    else:
+        \\        n = len(obj)
+        \\        if n <= 3:
+        \\            return n
+        \\        return n + 1
         \\"
     );
 }
@@ -477,7 +478,9 @@ test "snapshot branch dup tail return attr 3.9" {
         \\                self.code = read_code(self.file)
         \\            finally:
         \\                self.file.close()
-        \\        return self.code
+        \\            return self.code
+        \\        else:
+        \\            return self.code
         \\"
     );
 }
@@ -2020,7 +2023,7 @@ test "snapshot subprocess run timeout handlers 3.9" {
         \\        except:
         \\            proc.kill()
         \\            raise
-        \\    retcode = proc.poll()
+        \\        retcode = proc.poll()
         \\    return (retcode, stdout, stderr)
         \\"
     );

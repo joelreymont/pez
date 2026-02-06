@@ -12415,6 +12415,10 @@ pub const Decompiler = struct {
                     if (stmt) |s| {
                         try self.statements.append(self.allocator, s);
                         try self.appendIfTail(&self.statements, self.allocator);
+                        if (s.* == .if_stmt and self.bodyEndsTerminal(s.if_stmt.body) and self.bodyEndsTerminal(s.if_stmt.else_body)) {
+                            self.if_next = null;
+                            self.chained_cmp_next_block = null;
+                        }
                     }
                     // Skip all processed blocks - use chained comparison override if set
                     const merge_tail: ?u32 = blk: {
@@ -16142,7 +16146,8 @@ pub const Decompiler = struct {
             const then_is_ret_none = then_body.len == 1 and Decompiler.isReturnNone(then_body[0]);
             const else_is_ret_none = else_body.len == 1 and Decompiler.isReturnNone(else_body[0]);
             const else_is_if = else_body.len == 1 and else_body[0].* == .if_stmt;
-            if (!then_is_ret_none and !else_is_ret_none and !else_is_if) {
+            const allow_ret_none_guard = else_is_ret_none and self.bodyEndsTerminal(then_body);
+            if (!then_is_ret_none and !else_is_if and (!else_is_ret_none or allow_ret_none_guard)) {
                 condition = try self.invertConditionExpr(condition);
                 try self.emitDecisionTrace(pattern.condition_block, "if_invert_terminal_then_merge", condition);
                 then_body = else_body;
@@ -16189,7 +16194,7 @@ pub const Decompiler = struct {
                 if (cfg_mod.jumpTargetIfJumpOnly(self.cfg, then_block, false) != null) break :blk true;
                 break :blk false;
             };
-            if (!else_is_if and !then_has_uncond_jump and self.bodyEndsTerminal(then_body)) {
+            if (!else_is_if and !then_has_uncond_jump and self.bodyEndsTerminal(then_body) and !self.bodyEndsTerminal(else_body)) {
                 try self.emitDecisionTrace(pattern.condition_block, "if_drop_else_terminal_then", condition);
                 const tail_next = else_block.?;
                 else_body = &[_]*Stmt{};
@@ -19788,16 +19793,27 @@ pub const Decompiler = struct {
                         }
                     }
                     if (next) |next_id| {
-                        if (next_id < self.cfg.blocks.len) {
-                            const next_blk = &self.cfg.blocks[next_id];
-                            for (next_blk.instructions) |inst| {
-                                if (inst.opcode == .RETURN_VALUE or inst.opcode == .RETURN_CONST) {
-                                    return null;
-                                }
+                        if (next_id >= self.cfg.blocks.len) return next;
+                        const next_blk = &self.cfg.blocks[next_id];
+                        for (next_blk.instructions) |inst| {
+                            if (inst.opcode == .RETURN_VALUE or inst.opcode == .RETURN_CONST) {
+                                return null;
                             }
                         }
+                        // Ignore POP_BLOCK sites from inner try/except inside with-bodies.
+                        // The with-exit cleanup follows immediately with WITH_EXCEPT_START
+                        // or the LOAD_CONST/DUP_TOP/DUP_TOP/CALL_FUNCTION sequence.
+                        if (next_id == cleanup_block or
+                            next_blk.is_exception_handler or
+                            self.hasWithExitCleanup(next_blk))
+                        {
+                            return next_id;
+                        }
+                        if (next_id != cleanup_block) {
+                            cur = next_id;
+                            continue;
+                        }
                     }
-                    return next;
                 }
             }
             var next_norm: ?u32 = null;
