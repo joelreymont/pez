@@ -246,6 +246,7 @@ fn rewriteFunctionStmts(decompiler: *Decompiler, stmts: []const *Stmt) Decompile
     out = try decompiler.rewritePassElifGuardDeep(a, out);
     out = try decompiler.rewriteYieldPassGuardDeep(a, out);
     out = try decompiler.rewriteNestedBreakGateDeep(a, out);
+    out = try decompiler.rewriteTerminalElifTailDeep(a, out);
     out = try decompiler.rewriteBranchDupTailReturnDeep(a, out);
     return trimTrailingReturnNone(out);
 }
@@ -285,6 +286,7 @@ fn rewriteModuleStmts(decompiler: *Decompiler, stmts: []const *Stmt) DecompileEr
     out = try decompiler.rewritePassElifGuardDeep(a, out);
     out = try decompiler.rewriteYieldPassGuardDeep(a, out);
     out = try decompiler.rewriteNestedBreakGateDeep(a, out);
+    out = try decompiler.rewriteTerminalElifTailDeep(a, out);
     out = try decompiler.rewriteBranchDupTailReturnDeep(a, out);
     return out;
 }
@@ -8217,6 +8219,170 @@ pub const Decompiler = struct {
             }
         }
         return try self.rewriteNestedBreakGateList(allocator, stmts);
+    }
+
+    fn matchNameIsNoneCmp(expr: *const Expr) ?[]const u8 {
+        if (expr.* != .compare) return null;
+        const cmp = expr.compare;
+        if (cmp.ops.len != 1 or cmp.comparators.len != 1) return null;
+        if (cmp.ops[0] != .is) return null;
+        if (cmp.left.* != .name) return null;
+        if (cmp.comparators[0].* != .constant) return null;
+        return switch (cmp.comparators[0].constant) {
+            .none => cmp.left.name.id,
+            else => null,
+        };
+    }
+
+    fn isAssignThenNoneGuardReturn(
+        self: *Decompiler,
+        body: []const *Stmt,
+        term: *const Stmt,
+    ) bool {
+        if (body.len != 2) return false;
+        if (body[0].* != .assign) return false;
+        const assign = body[0].assign;
+        if (assign.targets.len != 1 or assign.targets[0].* != .name) return false;
+        const target_name = assign.targets[0].name.id;
+        if (body[1].* != .if_stmt) return false;
+        const guard = body[1].if_stmt;
+        if (guard.else_body.len != 0 or guard.body.len == 0) return false;
+        const cond_name = matchNameIsNoneCmp(guard.condition) orelse return false;
+        if (!std.mem.eql(u8, cond_name, target_name)) return false;
+        const guard_term = guard.body[guard.body.len - 1];
+        if (!self.stmtIsTerminal(guard_term)) return false;
+        return self.terminalStmtEqual(guard_term, term);
+    }
+
+    fn rewriteTerminalElifTailList(
+        self: *Decompiler,
+        allocator: Allocator,
+        stmts: []const *Stmt,
+    ) DecompileError![]const *Stmt {
+        if (stmts.len < 2) return stmts;
+        var out: std.ArrayListUnmanaged(*Stmt) = .{};
+        errdefer out.deinit(allocator);
+        var changed = false;
+
+        for (stmts) |stmt| {
+            if (stmt.* != .if_stmt) {
+                try out.append(allocator, stmt);
+                continue;
+            }
+
+            const outer = stmt.if_stmt;
+            if (outer.else_body.len != 1 or outer.else_body[0].* != .if_stmt) {
+                try out.append(allocator, stmt);
+                continue;
+            }
+            const inner = outer.else_body[0].if_stmt;
+            if (!self.bodyEndsTerminal(outer.body)) {
+                try out.append(allocator, stmt);
+                continue;
+            }
+
+            const outer_term = outer.body[outer.body.len - 1];
+            if (!self.bodyEndsTerminal(inner.else_body)) {
+                try out.append(allocator, stmt);
+                continue;
+            }
+            const tail_term = inner.else_body[inner.else_body.len - 1];
+            if (!self.stmtIsTerminal(tail_term) or !self.terminalStmtEqual(outer_term, tail_term)) {
+                try out.append(allocator, stmt);
+                continue;
+            }
+
+            if (!isAssignThenNoneGuardReturn(self, inner.body, outer_term)) {
+                try out.append(allocator, stmt);
+                continue;
+            }
+
+            const first_if = try allocator.create(Stmt);
+            first_if.* = .{ .if_stmt = .{
+                .condition = outer.condition,
+                .body = outer.body,
+                .else_body = &.{},
+            } };
+            first_if.if_stmt.no_merge = outer.no_merge;
+            try out.append(allocator, first_if);
+
+            const second_if = try allocator.create(Stmt);
+            second_if.* = .{ .if_stmt = .{
+                .condition = inner.condition,
+                .body = inner.body,
+                .else_body = &.{},
+            } };
+            second_if.if_stmt.no_merge = inner.no_merge;
+            try out.append(allocator, second_if);
+
+            for (inner.else_body) |tail_stmt| {
+                try out.append(allocator, tail_stmt);
+            }
+            changed = true;
+        }
+
+        if (!changed) {
+            out.deinit(allocator);
+            return stmts;
+        }
+        return out.toOwnedSlice(allocator);
+    }
+
+    fn rewriteTerminalElifTailDeep(
+        self: *Decompiler,
+        allocator: Allocator,
+        stmts: []const *Stmt,
+    ) DecompileError![]const *Stmt {
+        for (stmts) |stmt| {
+            switch (stmt.*) {
+                .function_def => |*f| {
+                    f.body = try self.rewriteTerminalElifTailDeep(allocator, f.body);
+                },
+                .class_def => |*c| {
+                    c.body = try self.rewriteTerminalElifTailDeep(allocator, c.body);
+                },
+                .for_stmt => |*f| {
+                    f.body = try self.rewriteTerminalElifTailDeep(allocator, f.body);
+                    f.else_body = try self.rewriteTerminalElifTailDeep(allocator, f.else_body);
+                },
+                .while_stmt => |*w| {
+                    w.body = try self.rewriteTerminalElifTailDeep(allocator, w.body);
+                    w.else_body = try self.rewriteTerminalElifTailDeep(allocator, w.else_body);
+                },
+                .if_stmt => |*ifs| {
+                    ifs.body = try self.rewriteTerminalElifTailDeep(allocator, ifs.body);
+                    ifs.else_body = try self.rewriteTerminalElifTailDeep(allocator, ifs.else_body);
+                },
+                .with_stmt => |*w| {
+                    w.body = try self.rewriteTerminalElifTailDeep(allocator, w.body);
+                },
+                .try_stmt => |*t| {
+                    t.body = try self.rewriteTerminalElifTailDeep(allocator, t.body);
+                    t.else_body = try self.rewriteTerminalElifTailDeep(allocator, t.else_body);
+                    t.finalbody = try self.rewriteTerminalElifTailDeep(allocator, t.finalbody);
+                    if (t.handlers.len > 0) {
+                        const handlers = try allocator.alloc(ast.ExceptHandler, t.handlers.len);
+                        for (t.handlers, 0..) |h, hidx| {
+                            handlers[hidx] = h;
+                            handlers[hidx].body = try self.rewriteTerminalElifTailDeep(allocator, h.body);
+                        }
+                        t.handlers = handlers;
+                    }
+                },
+                .match_stmt => |*m| {
+                    if (m.cases.len > 0) {
+                        const cases = try allocator.alloc(ast.MatchCase, m.cases.len);
+                        for (m.cases, 0..) |c, cidx| {
+                            cases[cidx] = c;
+                            cases[cidx].body = try self.rewriteTerminalElifTailDeep(allocator, c.body);
+                        }
+                        m.cases = cases;
+                    }
+                },
+                else => {},
+            }
+        }
+        return try self.rewriteTerminalElifTailList(allocator, stmts);
     }
 
     fn isSimpleContinueGuard(stmt: *const Stmt) bool {
