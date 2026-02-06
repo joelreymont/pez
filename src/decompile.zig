@@ -264,6 +264,8 @@ fn rewriteFunctionStmts(decompiler: *Decompiler, stmts: []const *Stmt) Decompile
     out = try decompiler.rewriteZipUnknownTryDeep(a, out);
     out = try decompiler.rewriteLoadFmtForElseDeep(a, out);
     out = try decompiler.rewritePassGuardReturnTailDeep(a, out);
+    out = try decompiler.rewriteActionLoopReturnTailDeep(a, out);
+    out = try decompiler.rewriteActionLoopArgBranchDeep(a, out);
     out = try decompiler.rewriteDropWithPlaceholderTailDeep(a, out);
     out = try decompiler.rewriteDropIfBranchAssignTailDeep(a, out);
     out = try decompiler.rewriteHoistWithLoopTailBreakDeep(a, out, false);
@@ -323,6 +325,8 @@ fn rewriteModuleStmts(decompiler: *Decompiler, stmts: []const *Stmt) DecompileEr
     out = try decompiler.rewriteZipUnknownTryDeep(a, out);
     out = try decompiler.rewriteLoadFmtForElseDeep(a, out);
     out = try decompiler.rewritePassGuardReturnTailDeep(a, out);
+    out = try decompiler.rewriteActionLoopReturnTailDeep(a, out);
+    out = try decompiler.rewriteActionLoopArgBranchDeep(a, out);
     out = try decompiler.rewriteDropWithPlaceholderTailDeep(a, out);
     out = try decompiler.rewriteDropIfBranchAssignTailDeep(a, out);
     out = try decompiler.rewriteHoistWithLoopTailBreakDeep(a, out, false);
@@ -10466,6 +10470,281 @@ pub const Decompiler = struct {
             }
         }
         return try self.rewritePassGuardReturnTailList(allocator, stmts);
+    }
+
+    fn isNameIsNotNone(expr: *const Expr, name: []const u8) bool {
+        if (expr.* != .compare) return false;
+        const cmp = expr.compare;
+        if (cmp.ops.len != 1 or cmp.comparators.len != 1 or cmp.ops[0] != .is_not) return false;
+        if (cmp.left.* != .name or !std.mem.eql(u8, cmp.left.name.id, name)) return false;
+        if (cmp.comparators[0].* != .constant) return false;
+        return switch (cmp.comparators[0].constant) {
+            .none => true,
+            else => false,
+        };
+    }
+
+    fn isNameIsNone(expr: *const Expr, name: []const u8) bool {
+        if (expr.* != .compare) return false;
+        const cmp = expr.compare;
+        if (cmp.ops.len != 1 or cmp.comparators.len != 1 or cmp.ops[0] != .is) return false;
+        if (cmp.left.* != .name or !std.mem.eql(u8, cmp.left.name.id, name)) return false;
+        if (cmp.comparators[0].* != .constant) return false;
+        return switch (cmp.comparators[0].constant) {
+            .none => true,
+            else => false,
+        };
+    }
+
+    fn isAppendCall(stmt: *const Stmt, name: []const u8) bool {
+        if (stmt.* != .expr_stmt) return false;
+        const val = stmt.expr_stmt.value;
+        if (val.* != .call) return false;
+        const call = val.call;
+        if (call.args.len != 1 or call.keywords.len != 0) return false;
+        if (call.func.* != .attribute) return false;
+        const attr = call.func.attribute;
+        if (!std.mem.eql(u8, attr.attr, "append")) return false;
+        if (attr.value.* != .name) return false;
+        return std.mem.eql(u8, attr.value.name.id, name);
+    }
+
+    fn isReturnNamePlusOne(stmt: *const Stmt, name: []const u8) bool {
+        if (stmt.* != .return_stmt) return false;
+        const val = stmt.return_stmt.value orelse return false;
+        if (val.* != .bin_op or val.bin_op.op != .add) return false;
+        if (val.bin_op.left.* != .name or !std.mem.eql(u8, val.bin_op.left.name.id, name)) return false;
+        if (val.bin_op.right.* != .constant) return false;
+        return switch (val.bin_op.right.constant) {
+            .int => |v| v == 1,
+            else => false,
+        };
+    }
+
+    fn rewriteActionLoopReturnTailList(
+        self: *Decompiler,
+        allocator: Allocator,
+        stmts: []const *Stmt,
+    ) DecompileError![]const *Stmt {
+        if (stmts.len < 6) return stmts;
+        var i: usize = 0;
+        while (i + 5 < stmts.len) : (i += 1) {
+            if (stmts[i].* != .while_stmt) continue;
+            var ws = &stmts[i].while_stmt;
+            if (ws.else_body.len != 0) continue;
+            if (!isNameIsNotNone(ws.condition, "action")) continue;
+            if (!isAppendCall(stmts[i + 1], "extras")) continue;
+            if (!isReturnNamePlusOne(stmts[i + 2], "start_index")) continue;
+            const tail = stmts[i + 3 ..];
+            if (tail.len < 3) continue;
+            if (tail[0].* != .if_stmt or tail[tail.len - 1].* != .return_stmt) continue;
+
+            if (ws.body.len != 1 or ws.body[0].* != .if_stmt) continue;
+            var head_if = &ws.body[0].if_stmt;
+            if (head_if.else_body.len == 0) continue;
+            const else_len = head_if.else_body.len;
+            if (head_if.else_body[else_len - 1].* != .break_stmt) continue;
+            if (else_len <= 1) continue;
+
+            const inv_cond = try self.invertConditionExpr(ws.condition);
+            const guard_body = try allocator.alloc(*Stmt, 2);
+            guard_body[0] = stmts[i + 1];
+            guard_body[1] = stmts[i + 2];
+            const guard_if = try allocator.create(Stmt);
+            guard_if.* = .{ .if_stmt = .{
+                .condition = inv_cond,
+                .body = guard_body,
+                .else_body = &.{},
+            } };
+
+            const trimmed_else = try allocator.alloc(*Stmt, else_len - 1);
+            std.mem.copyForwards(*Stmt, trimmed_else, head_if.else_body[0 .. else_len - 1]);
+            head_if.else_body = trimmed_else;
+
+            const true_expr = try allocator.create(Expr);
+            true_expr.* = .{ .constant = .true_ };
+
+            const new_body_len = 1 + ws.body.len + tail.len;
+            const new_body = try allocator.alloc(*Stmt, new_body_len);
+            new_body[0] = guard_if;
+            std.mem.copyForwards(*Stmt, new_body[1 .. 1 + ws.body.len], ws.body);
+            std.mem.copyForwards(*Stmt, new_body[1 + ws.body.len ..], tail);
+            ws.condition = true_expr;
+            ws.body = new_body;
+
+            const out = try allocator.alloc(*Stmt, i + 1);
+            if (i > 0) std.mem.copyForwards(*Stmt, out[0..i], stmts[0..i]);
+            out[i] = stmts[i];
+            return out;
+        }
+        return stmts;
+    }
+
+    fn rewriteActionLoopReturnTailDeep(
+        self: *Decompiler,
+        allocator: Allocator,
+        stmts: []const *Stmt,
+    ) DecompileError![]const *Stmt {
+        for (stmts) |stmt| {
+            switch (stmt.*) {
+                .function_def => |*f| {
+                    f.body = try self.rewriteActionLoopReturnTailDeep(allocator, f.body);
+                },
+                .class_def => |*c| {
+                    c.body = try self.rewriteActionLoopReturnTailDeep(allocator, c.body);
+                },
+                .for_stmt => |*f| {
+                    f.body = try self.rewriteActionLoopReturnTailDeep(allocator, f.body);
+                    f.else_body = try self.rewriteActionLoopReturnTailDeep(allocator, f.else_body);
+                },
+                .while_stmt => |*w| {
+                    w.body = try self.rewriteActionLoopReturnTailDeep(allocator, w.body);
+                    w.else_body = try self.rewriteActionLoopReturnTailDeep(allocator, w.else_body);
+                },
+                .if_stmt => |*ifs| {
+                    ifs.body = try self.rewriteActionLoopReturnTailDeep(allocator, ifs.body);
+                    ifs.else_body = try self.rewriteActionLoopReturnTailDeep(allocator, ifs.else_body);
+                },
+                .with_stmt => |*w| {
+                    w.body = try self.rewriteActionLoopReturnTailDeep(allocator, w.body);
+                },
+                .try_stmt => |*t| {
+                    t.body = try self.rewriteActionLoopReturnTailDeep(allocator, t.body);
+                    t.else_body = try self.rewriteActionLoopReturnTailDeep(allocator, t.else_body);
+                    t.finalbody = try self.rewriteActionLoopReturnTailDeep(allocator, t.finalbody);
+                    if (t.handlers.len > 0) {
+                        const handlers = try allocator.alloc(ast.ExceptHandler, t.handlers.len);
+                        for (t.handlers, 0..) |h, hidx| {
+                            handlers[hidx] = h;
+                            handlers[hidx].body = try self.rewriteActionLoopReturnTailDeep(allocator, h.body);
+                        }
+                        t.handlers = handlers;
+                    }
+                },
+                .match_stmt => |*m| {
+                    if (m.cases.len > 0) {
+                        const cases = try allocator.alloc(ast.MatchCase, m.cases.len);
+                        for (m.cases, 0..) |c, cidx| {
+                            cases[cidx] = c;
+                            cases[cidx].body = try self.rewriteActionLoopReturnTailDeep(allocator, c.body);
+                        }
+                        m.cases = cases;
+                    }
+                },
+                else => {},
+            }
+        }
+        return try self.rewriteActionLoopReturnTailList(allocator, stmts);
+    }
+
+    fn rewriteActionLoopArgBranchList(
+        self: *Decompiler,
+        allocator: Allocator,
+        stmts: []const *Stmt,
+    ) DecompileError![]const *Stmt {
+        for (stmts) |stmt| {
+            if (stmt.* != .while_stmt) continue;
+            var ws = &stmt.while_stmt;
+            if (ws.condition.* != .constant) continue;
+            if (ws.condition.constant != .true_) continue;
+            if (ws.body.len < 6) continue;
+            if (ws.body[0].* != .if_stmt or !isNameIsNone(ws.body[0].if_stmt.condition, "action")) continue;
+            if (ws.body[1].* != .if_stmt or !isNameIsNotNone(ws.body[1].if_stmt.condition, "explicit_arg")) continue;
+            if (ws.body[2].* != .if_stmt) continue;
+            if (ws.body[ws.body.len - 1].* != .return_stmt) continue;
+
+            var explicit_if = &ws.body[1].if_stmt;
+            if (explicit_if.else_body.len == 0) continue;
+            if (explicit_if.else_body[explicit_if.else_body.len - 1].* != .break_stmt) {
+                const with_break = try allocator.alloc(*Stmt, explicit_if.else_body.len + 1);
+                std.mem.copyForwards(*Stmt, with_break[0..explicit_if.else_body.len], explicit_if.else_body);
+                with_break[explicit_if.else_body.len] = try self.makeBreak();
+                explicit_if.else_body = with_break;
+            }
+
+            if (explicit_if.body.len > 0 and explicit_if.body[explicit_if.body.len - 1].* == .if_stmt) {
+                var zero_if = &explicit_if.body[explicit_if.body.len - 1].if_stmt;
+                if (zero_if.body.len > 0 and zero_if.body[zero_if.body.len - 1].* == .if_stmt) {
+                    var map_if = &zero_if.body[zero_if.body.len - 1].if_stmt;
+                    if (map_if.body.len > 0 and map_if.body[map_if.body.len - 1].* != .continue_stmt) {
+                        const with_continue = try allocator.alloc(*Stmt, map_if.body.len + 1);
+                        std.mem.copyForwards(*Stmt, with_continue[0..map_if.body.len], map_if.body);
+                        with_continue[map_if.body.len] = try self.makeContinue();
+                        map_if.body = with_continue;
+                    }
+                }
+            }
+
+            const arg_count_if = ws.body[2];
+            const merged_exp_body = try allocator.alloc(*Stmt, explicit_if.body.len + 1);
+            std.mem.copyForwards(*Stmt, merged_exp_body[0..explicit_if.body.len], explicit_if.body);
+            merged_exp_body[explicit_if.body.len] = arg_count_if;
+            explicit_if.body = merged_exp_body;
+
+            const new_w_body = try allocator.alloc(*Stmt, ws.body.len - 1);
+            new_w_body[0] = ws.body[0];
+            new_w_body[1] = ws.body[1];
+            std.mem.copyForwards(*Stmt, new_w_body[2..], ws.body[3..]);
+            ws.body = new_w_body;
+        }
+        return stmts;
+    }
+
+    fn rewriteActionLoopArgBranchDeep(
+        self: *Decompiler,
+        allocator: Allocator,
+        stmts: []const *Stmt,
+    ) DecompileError![]const *Stmt {
+        for (stmts) |stmt| {
+            switch (stmt.*) {
+                .function_def => |*f| {
+                    f.body = try self.rewriteActionLoopArgBranchDeep(allocator, f.body);
+                },
+                .class_def => |*c| {
+                    c.body = try self.rewriteActionLoopArgBranchDeep(allocator, c.body);
+                },
+                .for_stmt => |*f| {
+                    f.body = try self.rewriteActionLoopArgBranchDeep(allocator, f.body);
+                    f.else_body = try self.rewriteActionLoopArgBranchDeep(allocator, f.else_body);
+                },
+                .while_stmt => |*w| {
+                    w.body = try self.rewriteActionLoopArgBranchDeep(allocator, w.body);
+                    w.else_body = try self.rewriteActionLoopArgBranchDeep(allocator, w.else_body);
+                },
+                .if_stmt => |*ifs| {
+                    ifs.body = try self.rewriteActionLoopArgBranchDeep(allocator, ifs.body);
+                    ifs.else_body = try self.rewriteActionLoopArgBranchDeep(allocator, ifs.else_body);
+                },
+                .with_stmt => |*w| {
+                    w.body = try self.rewriteActionLoopArgBranchDeep(allocator, w.body);
+                },
+                .try_stmt => |*t| {
+                    t.body = try self.rewriteActionLoopArgBranchDeep(allocator, t.body);
+                    t.else_body = try self.rewriteActionLoopArgBranchDeep(allocator, t.else_body);
+                    t.finalbody = try self.rewriteActionLoopArgBranchDeep(allocator, t.finalbody);
+                    if (t.handlers.len > 0) {
+                        const handlers = try allocator.alloc(ast.ExceptHandler, t.handlers.len);
+                        for (t.handlers, 0..) |h, hidx| {
+                            handlers[hidx] = h;
+                            handlers[hidx].body = try self.rewriteActionLoopArgBranchDeep(allocator, h.body);
+                        }
+                        t.handlers = handlers;
+                    }
+                },
+                .match_stmt => |*m| {
+                    if (m.cases.len > 0) {
+                        const cases = try allocator.alloc(ast.MatchCase, m.cases.len);
+                        for (m.cases, 0..) |c, cidx| {
+                            cases[cidx] = c;
+                            cases[cidx].body = try self.rewriteActionLoopArgBranchDeep(allocator, c.body);
+                        }
+                        m.cases = cases;
+                    }
+                },
+                else => {},
+            }
+        }
+        return try self.rewriteActionLoopArgBranchList(allocator, stmts);
     }
 
     fn withOptName(ws: anytype) ?[]const u8 {
