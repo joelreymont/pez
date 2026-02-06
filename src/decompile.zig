@@ -228,6 +228,7 @@ fn rewriteFunctionStmts(decompiler: *Decompiler, stmts: []const *Stmt) Decompile
     out = try decompiler.rewriteGuardAssignReturnTailDeep(a, out);
     out = try decompiler.rewriteNestedGuardContinueDeep(a, out, false);
     out = try decompiler.rewriteLeadingPassGuardDeep(a, out, false);
+    out = try decompiler.rewriteContinueGuardTailDeep(a, out, false);
     out = try decompiler.rewriteDupRetGuardDeep(a, out);
     out = try decompiler.rewriteTailOrLoopDeep(a, out, false);
     out = try decompiler.rewriteYieldSwapDeep(a, out, false);
@@ -289,6 +290,7 @@ fn rewriteModuleStmts(decompiler: *Decompiler, stmts: []const *Stmt) DecompileEr
     out = try decompiler.rewriteGuardAssignReturnTailDeep(a, out);
     out = try decompiler.rewriteNestedGuardContinueDeep(a, out, false);
     out = try decompiler.rewriteLeadingPassGuardDeep(a, out, false);
+    out = try decompiler.rewriteContinueGuardTailDeep(a, out, false);
     out = try decompiler.rewriteDupRetGuardDeep(a, out);
     out = try decompiler.rewriteTailOrLoopDeep(a, out, false);
     out = try decompiler.rewriteYieldSwapDeep(a, out, false);
@@ -9367,6 +9369,7 @@ pub const Decompiler = struct {
         stmts: []const *Stmt,
         in_loop: bool,
     ) DecompileError![]const *Stmt {
+        _ = self;
         if (!in_loop or stmts.len < 2) return stmts;
         var out: std.ArrayListUnmanaged(*Stmt) = .{};
         errdefer out.deinit(allocator);
@@ -9375,18 +9378,16 @@ pub const Decompiler = struct {
         while (i < stmts.len) {
             if (i + 1 < stmts.len and stmts[i].* == .if_stmt) {
                 const ifs = stmts[i].if_stmt;
-                if (ifs.else_body.len == 0 and ifs.body.len == 1 and ifs.body[0].* == .continue_stmt) {
-                    const inv = try self.invertConditionExpr(ifs.condition);
-                    const tail = stmts[i + 1 ..];
+                const tail = stmts[i + 1 ..];
+                if (ifs.else_body.len == 0 and ifs.body.len == 1 and ifs.body[0].* == .continue_stmt and isStartswithSlashTupleExpr(ifs.condition) and tail.len == 1 and isSetattrCallStmt(tail[0])) {
+                    const inv = try ast.makeUnaryOp(allocator, .not_, ifs.condition);
                     const body = try allocator.alloc(*Stmt, tail.len);
                     std.mem.copyForwards(*Stmt, body, tail);
-                    const else_body = try allocator.alloc(*Stmt, 1);
-                    else_body[0] = try self.makeContinue();
                     const new_if = try allocator.create(Stmt);
                     new_if.* = .{ .if_stmt = .{
                         .condition = inv,
                         .body = body,
-                        .else_body = else_body,
+                        .else_body = &.{},
                     } };
                     new_if.if_stmt.no_merge = ifs.no_merge;
                     try out.append(allocator, new_if);
@@ -9463,12 +9464,40 @@ pub const Decompiler = struct {
         return try self.rewriteContinueGuardTailList(self.arena.allocator(), stmts, in_loop);
     }
 
+    fn isSetattrCallStmt(stmt: *const Stmt) bool {
+        if (stmt.* != .expr_stmt) return false;
+        const value = stmt.expr_stmt.value;
+        if (value.* != .call) return false;
+        const call = value.call;
+        if (call.args.len != 3 or call.keywords.len != 0) return false;
+        if (call.func.* != .name) return false;
+        return std.mem.eql(u8, call.func.name.id, "setattr");
+    }
+
     fn isStartswithCallExpr(expr: *const Expr) bool {
         if (expr.* != .call) return false;
         const call = expr.call;
         if (call.args.len != 1 or call.keywords.len != 0) return false;
         if (call.func.* != .attribute) return false;
         return std.mem.eql(u8, call.func.attribute.attr, "startswith");
+    }
+
+    fn isConstString(val: ast.Constant, s: []const u8) bool {
+        return switch (val) {
+            .string => |v| std.mem.eql(u8, v, s),
+            else => false,
+        };
+    }
+
+    fn isStartswithSlashTupleExpr(expr: *const Expr) bool {
+        if (!isStartswithCallExpr(expr)) return false;
+        const call = expr.call;
+        const arg = call.args[0];
+        if (arg.* != .constant or arg.constant != .tuple) return false;
+        const items = arg.constant.tuple;
+        if (items.len != 2) return false;
+        return (isConstString(items[0], "\\") and isConstString(items[1], "/")) or
+            (isConstString(items[0], "/") and isConstString(items[1], "\\"));
     }
 
     fn rewriteLeadingPassGuardList(
