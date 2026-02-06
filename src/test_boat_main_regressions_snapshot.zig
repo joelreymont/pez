@@ -506,6 +506,32 @@ test "snapshot glob iterdir guard 3.9" {
     );
 }
 
+test "snapshot ftplib parse257 3.9" {
+    try runSnapshot(@src(), "test/corpus/ftplib_parse257.3.9.pyc",
+        \\[]u8
+        \\  "class error_reply(Exception):
+        \\    pass
+        \\def parse257(resp):
+        \\    if resp[:3] != '257':
+        \\        raise error_reply(resp)
+        \\    if resp[3:5] != ' "':
+        \\        return ''
+        \\    dirname = ''
+        \\    i = 5
+        \\    n = len(resp)
+        \\    while i < n:
+        \\        c = resp[i]
+        \\        i = i + 1
+        \\        if c == '"':
+        \\            if i >= n or resp[i] != '"':
+        \\                break
+        \\            i = i + 1
+        \\        dirname = dirname + c
+        \\    return dirname
+        \\"
+    );
+}
+
 test "snapshot loop merge break 3.9" {
     try runSnapshot(@src(), "test/corpus/loop_merge_break.3.9.pyc",
         \\[]u8

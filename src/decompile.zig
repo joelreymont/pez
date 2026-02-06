@@ -245,6 +245,7 @@ fn rewriteFunctionStmts(decompiler: *Decompiler, stmts: []const *Stmt) Decompile
     out = try decompiler.rewriteIterModuleGuardsDeep(a, out, false);
     out = try decompiler.rewritePassElifGuardDeep(a, out);
     out = try decompiler.rewriteYieldPassGuardDeep(a, out);
+    out = try decompiler.rewriteNestedBreakGateDeep(a, out);
     out = try decompiler.rewriteBranchDupTailReturnDeep(a, out);
     return trimTrailingReturnNone(out);
 }
@@ -283,6 +284,7 @@ fn rewriteModuleStmts(decompiler: *Decompiler, stmts: []const *Stmt) DecompileEr
     out = try decompiler.rewriteIterModuleGuardsDeep(a, out, false);
     out = try decompiler.rewritePassElifGuardDeep(a, out);
     out = try decompiler.rewriteYieldPassGuardDeep(a, out);
+    out = try decompiler.rewriteNestedBreakGateDeep(a, out);
     out = try decompiler.rewriteBranchDupTailReturnDeep(a, out);
     return out;
 }
@@ -8085,6 +8087,136 @@ pub const Decompiler = struct {
             }
         }
         return try self.rewriteYieldPassGuardList(allocator, stmts);
+    }
+
+    fn isSingleBreak(stmts: []const *Stmt) bool {
+        return stmts.len == 1 and stmts[0].* == .break_stmt;
+    }
+
+    fn rewriteNestedBreakGateList(
+        self: *Decompiler,
+        allocator: Allocator,
+        stmts: []const *Stmt,
+    ) DecompileError![]const *Stmt {
+        if (stmts.len == 0) return stmts;
+        var out: std.ArrayListUnmanaged(*Stmt) = .{};
+        errdefer out.deinit(allocator);
+        var changed = false;
+
+        for (stmts) |stmt| {
+            if (stmt.* != .if_stmt) {
+                try out.append(allocator, stmt);
+                continue;
+            }
+
+            const outer = stmt.if_stmt;
+            if (outer.else_body.len != 0 or outer.body.len != 1 or outer.body[0].* != .if_stmt) {
+                try out.append(allocator, stmt);
+                continue;
+            }
+
+            const mid = outer.body[0].if_stmt;
+            if (!isSingleBreak(mid.else_body) or mid.body.len != 2 or mid.body[0].* != .if_stmt) {
+                try out.append(allocator, stmt);
+                continue;
+            }
+
+            const gate = mid.body[0].if_stmt;
+            if (!isSingleBreak(gate.body) or gate.else_body.len != 0) {
+                try out.append(allocator, stmt);
+                continue;
+            }
+
+            const inv_mid = try self.invertConditionExpr(mid.condition);
+            const break_cond = try self.makeBoolPair(inv_mid, gate.condition, .or_);
+
+            const break_body = try allocator.alloc(*Stmt, 1);
+            break_body[0] = gate.body[0];
+            const break_if = try allocator.create(Stmt);
+            break_if.* = .{ .if_stmt = .{
+                .condition = break_cond,
+                .body = break_body,
+                .else_body = &.{},
+            } };
+            break_if.if_stmt.no_merge = mid.no_merge or gate.no_merge;
+
+            const new_body = try allocator.alloc(*Stmt, 2);
+            new_body[0] = break_if;
+            new_body[1] = mid.body[1];
+
+            const next_outer = try allocator.create(Stmt);
+            next_outer.* = .{ .if_stmt = .{
+                .condition = outer.condition,
+                .body = new_body,
+                .else_body = &.{},
+            } };
+            next_outer.if_stmt.no_merge = outer.no_merge or mid.no_merge or gate.no_merge;
+            try out.append(allocator, next_outer);
+            changed = true;
+        }
+
+        if (!changed) {
+            out.deinit(allocator);
+            return stmts;
+        }
+        return out.toOwnedSlice(allocator);
+    }
+
+    fn rewriteNestedBreakGateDeep(
+        self: *Decompiler,
+        allocator: Allocator,
+        stmts: []const *Stmt,
+    ) DecompileError![]const *Stmt {
+        for (stmts) |stmt| {
+            switch (stmt.*) {
+                .function_def => |*f| {
+                    f.body = try self.rewriteNestedBreakGateDeep(allocator, f.body);
+                },
+                .class_def => |*c| {
+                    c.body = try self.rewriteNestedBreakGateDeep(allocator, c.body);
+                },
+                .for_stmt => |*f| {
+                    f.body = try self.rewriteNestedBreakGateDeep(allocator, f.body);
+                    f.else_body = try self.rewriteNestedBreakGateDeep(allocator, f.else_body);
+                },
+                .while_stmt => |*w| {
+                    w.body = try self.rewriteNestedBreakGateDeep(allocator, w.body);
+                    w.else_body = try self.rewriteNestedBreakGateDeep(allocator, w.else_body);
+                },
+                .if_stmt => |*ifs| {
+                    ifs.body = try self.rewriteNestedBreakGateDeep(allocator, ifs.body);
+                    ifs.else_body = try self.rewriteNestedBreakGateDeep(allocator, ifs.else_body);
+                },
+                .with_stmt => |*w| {
+                    w.body = try self.rewriteNestedBreakGateDeep(allocator, w.body);
+                },
+                .try_stmt => |*t| {
+                    t.body = try self.rewriteNestedBreakGateDeep(allocator, t.body);
+                    t.else_body = try self.rewriteNestedBreakGateDeep(allocator, t.else_body);
+                    t.finalbody = try self.rewriteNestedBreakGateDeep(allocator, t.finalbody);
+                    if (t.handlers.len > 0) {
+                        const handlers = try allocator.alloc(ast.ExceptHandler, t.handlers.len);
+                        for (t.handlers, 0..) |h, hidx| {
+                            handlers[hidx] = h;
+                            handlers[hidx].body = try self.rewriteNestedBreakGateDeep(allocator, h.body);
+                        }
+                        t.handlers = handlers;
+                    }
+                },
+                .match_stmt => |*m| {
+                    if (m.cases.len > 0) {
+                        const cases = try allocator.alloc(ast.MatchCase, m.cases.len);
+                        for (m.cases, 0..) |c, cidx| {
+                            cases[cidx] = c;
+                            cases[cidx].body = try self.rewriteNestedBreakGateDeep(allocator, c.body);
+                        }
+                        m.cases = cases;
+                    }
+                },
+                else => {},
+            }
+        }
+        return try self.rewriteNestedBreakGateList(allocator, stmts);
     }
 
     fn isSimpleContinueGuard(stmt: *const Stmt) bool {
