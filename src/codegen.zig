@@ -1029,7 +1029,11 @@ pub const Writer = struct {
 
     fn writeAnnotationExpr(self: *Writer, allocator: std.mem.Allocator, expr: *const Expr) WriteError!void {
         if (expr.* == .constant and expr.constant == .string) {
-            try self.write(allocator, expr.constant.string);
+            if (self.future_annotations) {
+                try self.write(allocator, expr.constant.string);
+            } else {
+                try self.writeExpr(allocator, expr);
+            }
             return;
         }
         try self.writeExpr(allocator, expr);
