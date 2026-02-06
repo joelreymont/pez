@@ -263,6 +263,7 @@ fn rewriteFunctionStmts(decompiler: *Decompiler, stmts: []const *Stmt) Decompile
     out = try decompiler.rewritePackagingSpecifierTailGuards(a, out);
     out = try decompiler.rewriteZipUnknownTryDeep(a, out);
     out = try decompiler.rewriteLoadFmtForElseDeep(a, out);
+    out = try decompiler.rewritePassGuardReturnTailDeep(a, out);
     out = try decompiler.rewriteDropWithPlaceholderTailDeep(a, out);
     out = try decompiler.rewriteDropIfBranchAssignTailDeep(a, out);
     out = try decompiler.rewriteHoistWithLoopTailBreakDeep(a, out, false);
@@ -321,6 +322,7 @@ fn rewriteModuleStmts(decompiler: *Decompiler, stmts: []const *Stmt) DecompileEr
     out = try decompiler.rewritePackagingSpecifierTailGuards(a, out);
     out = try decompiler.rewriteZipUnknownTryDeep(a, out);
     out = try decompiler.rewriteLoadFmtForElseDeep(a, out);
+    out = try decompiler.rewritePassGuardReturnTailDeep(a, out);
     out = try decompiler.rewriteDropWithPlaceholderTailDeep(a, out);
     out = try decompiler.rewriteDropIfBranchAssignTailDeep(a, out);
     out = try decompiler.rewriteHoistWithLoopTailBreakDeep(a, out, false);
@@ -10340,6 +10342,130 @@ pub const Decompiler = struct {
             }
         }
         return try self.rewriteLoadFmtForElseList(self.arena.allocator(), stmts);
+    }
+
+    fn noopPassGuardCond(stmt: *const Stmt) ?*Expr {
+        if (stmt.* != .if_stmt) return null;
+        const ifs = stmt.if_stmt;
+        if (ifs.else_body.len != 0) return null;
+        if (ifs.body.len == 0) return ifs.condition;
+        if (ifs.body.len == 1 and ifs.body[0].* == .pass) return ifs.condition;
+        return null;
+    }
+
+    fn rewritePassGuardReturnTailList(
+        self: *Decompiler,
+        allocator: Allocator,
+        stmts: []const *Stmt,
+    ) DecompileError![]const *Stmt {
+        if (stmts.len < 3) return stmts;
+        var i: usize = 0;
+        while (i + 2 < stmts.len) : (i += 1) {
+            const lead = stmts[i];
+            if (lead.* != .if_stmt) continue;
+            const outer = lead.if_stmt;
+            if (outer.else_body.len != 0 or outer.body.len != 1) continue;
+            const inner_cond = noopPassGuardCond(outer.body[0]) orelse continue;
+            if (stmts[i + 1].* != .return_stmt) continue;
+            const tail = stmts[i + 2 ..];
+            if (tail.len == 0) continue;
+
+            var tail_has_return = false;
+            for (tail) |s| {
+                if (s.* == .return_stmt) {
+                    tail_has_return = true;
+                    break;
+                }
+            }
+            if (!tail_has_return) continue;
+
+            const inv_inner = try self.invertConditionExpr(inner_cond);
+            const and_vals = try allocator.alloc(*Expr, 2);
+            and_vals[0] = outer.condition;
+            and_vals[1] = inv_inner;
+            const and_expr = try allocator.create(Expr);
+            and_expr.* = .{ .bool_op = .{
+                .op = .and_,
+                .values = and_vals,
+            } };
+
+            const new_body = try allocator.alloc(*Stmt, tail.len);
+            std.mem.copyForwards(*Stmt, new_body, tail);
+
+            const else_body = try allocator.alloc(*Stmt, 1);
+            else_body[0] = stmts[i + 1];
+
+            const merged = try allocator.create(Stmt);
+            merged.* = .{ .if_stmt = .{
+                .condition = and_expr,
+                .body = new_body,
+                .else_body = else_body,
+            } };
+            merged.if_stmt.no_merge = outer.no_merge;
+
+            const out = try allocator.alloc(*Stmt, i + 1);
+            if (i > 0) std.mem.copyForwards(*Stmt, out[0..i], stmts[0..i]);
+            out[i] = merged;
+            return out;
+        }
+        return stmts;
+    }
+
+    fn rewritePassGuardReturnTailDeep(
+        self: *Decompiler,
+        allocator: Allocator,
+        stmts: []const *Stmt,
+    ) DecompileError![]const *Stmt {
+        for (stmts) |stmt| {
+            switch (stmt.*) {
+                .function_def => |*f| {
+                    f.body = try self.rewritePassGuardReturnTailDeep(allocator, f.body);
+                },
+                .class_def => |*c| {
+                    c.body = try self.rewritePassGuardReturnTailDeep(allocator, c.body);
+                },
+                .for_stmt => |*f| {
+                    f.body = try self.rewritePassGuardReturnTailDeep(allocator, f.body);
+                    f.else_body = try self.rewritePassGuardReturnTailDeep(allocator, f.else_body);
+                },
+                .while_stmt => |*w| {
+                    w.body = try self.rewritePassGuardReturnTailDeep(allocator, w.body);
+                    w.else_body = try self.rewritePassGuardReturnTailDeep(allocator, w.else_body);
+                },
+                .if_stmt => |*ifs| {
+                    ifs.body = try self.rewritePassGuardReturnTailDeep(allocator, ifs.body);
+                    ifs.else_body = try self.rewritePassGuardReturnTailDeep(allocator, ifs.else_body);
+                },
+                .with_stmt => |*w| {
+                    w.body = try self.rewritePassGuardReturnTailDeep(allocator, w.body);
+                },
+                .try_stmt => |*t| {
+                    t.body = try self.rewritePassGuardReturnTailDeep(allocator, t.body);
+                    t.else_body = try self.rewritePassGuardReturnTailDeep(allocator, t.else_body);
+                    t.finalbody = try self.rewritePassGuardReturnTailDeep(allocator, t.finalbody);
+                    if (t.handlers.len > 0) {
+                        const handlers = try allocator.alloc(ast.ExceptHandler, t.handlers.len);
+                        for (t.handlers, 0..) |h, hidx| {
+                            handlers[hidx] = h;
+                            handlers[hidx].body = try self.rewritePassGuardReturnTailDeep(allocator, h.body);
+                        }
+                        t.handlers = handlers;
+                    }
+                },
+                .match_stmt => |*m| {
+                    if (m.cases.len > 0) {
+                        const cases = try allocator.alloc(ast.MatchCase, m.cases.len);
+                        for (m.cases, 0..) |c, cidx| {
+                            cases[cidx] = c;
+                            cases[cidx].body = try self.rewritePassGuardReturnTailDeep(allocator, c.body);
+                        }
+                        m.cases = cases;
+                    }
+                },
+                else => {},
+            }
+        }
+        return try self.rewritePassGuardReturnTailList(allocator, stmts);
     }
 
     fn withOptName(ws: anytype) ?[]const u8 {
