@@ -1,9 +1,11 @@
 ---
 title: Fix mismatch subprocess
-status: open
+status: closed
 priority: 1
 issue-type: task
-created-at: "2026-02-05T20:11:04.703700+01:00"
+created-at: "\"2026-02-05T20:11:04.703700+01:00\""
+closed-at: "2026-02-06T02:40:41.388433+01:00"
+close-reason: no mismatch in suite25; now close
 blocks:
   - pez-fix-mismatch-tarfile-0672b1b8
 ---
