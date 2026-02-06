@@ -1,9 +1,11 @@
 ---
 title: Fix glob root cause
-status: open
+status: closed
 priority: 2
 issue-type: task
-created-at: "2026-02-05T21:25:22.627420+01:00"
+created-at: "\"2026-02-05T21:25:22.627420+01:00\""
+closed-at: "2026-02-06T09:32:11.421245+01:00"
+close-reason: fixed nested elif merge propagation and loop continue inversion parity
 blocks:
   - pez-locate-glob-divergence-b478bd9d
 ---

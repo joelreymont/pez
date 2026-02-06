@@ -722,10 +722,9 @@ test "snapshot loop guard continue 3.9" {
         \\[]u8
         \\  "def f(entries):
         \\    for entry in entries:
-        \\        if not entry:
-        \\            continue
-        \\        if entry.endswith('.egg'):
-        \\            entries.append(entry)
+        \\        if entry:
+        \\            if entry.endswith('.egg'):
+        \\                entries.append(entry)
         \\"
     );
 }
@@ -1677,6 +1676,28 @@ test "snapshot telebot annotations getattr 3.9" {
         \\        if item in ('message_thread_id', 'from_user', 'reply_to_message'):
         \\            return self.__universal_deprecation(item)
         \\        raise AttributeError(f'"{self.__class__.__name__}" object has no attribute "{item}"')
+        \\"
+    );
+}
+
+test "snapshot glob flow 3.9" {
+    try runSnapshot(@src(), "test/corpus/glob_flow.3.9.pyc",
+        \\[]u8
+        \\  "def iglob_like(pathname, recursive = False):
+        \\    it = iter((0,))
+        \\    if recursive and pathname:
+        \\        s = next(it)
+        \\        assert not s
+        \\    return it
+        \\def _ishidden(path):
+        \\    return path[0] == '.'
+        \\def rlistdir_like(names):
+        \\    for x in names:
+        \\        if not _ishidden(x):
+        \\            yield x
+        \\            path = x
+        \\            for y in rlistdir_like(path):
+        \\                yield y
         \\"
     );
 }

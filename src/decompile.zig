@@ -12052,7 +12052,10 @@ pub const Decompiler = struct {
                                     }
                                     if (t_id != null and f_id != null and self.resolveJumpOnlyBlock(t_id.?) == else_res) {
                                         const false_res = self.resolveJumpOnlyBlock(f_id.?);
-                                        if (else_res < self.cfg.blocks.len) {
+                                        const false_ok = false_res > pattern.condition_block and
+                                            false_res < self.cfg.blocks.len and
+                                            !self.cfg.blocks[false_res].is_loop_header;
+                                        if (false_ok and else_res < self.cfg.blocks.len) {
                                             const else_blk = &self.cfg.blocks[else_res];
                                             if (!condBlockHasPrelude(else_blk)) {
                                                 if (else_blk.terminator()) |else_term| {
@@ -12102,7 +12105,7 @@ pub const Decompiler = struct {
                                                 }
                                             }
                                         }
-                                        if (!cond_chain_then) {
+                                        if (false_ok and !cond_chain_then) {
                                             var then_sim = self.initSim(self.arena.allocator(), self.arena.allocator(), self.code, self.version);
                                             defer then_sim.deinit();
                                             then_sim.lenient = true;
@@ -13272,9 +13275,13 @@ pub const Decompiler = struct {
                 else_body_decompiled = true;
             }
             const result = try self.decompileBranchRangeTag(else_start_val, else_end_val, else_vals, skip, "if_else");
+            const nested_if_next = self.if_next;
             // Nested structured-range decompilation uses `self.if_next` for local control flow.
-            // It must not leak out of the branch; restore the outer value unconditionally.
+            // Keep an inner `if_next` only when it advances past this else range.
             self.if_next = saved_if_next;
+            if (saved_if_next == null and nested_if_next != null and nested_if_next.? >= else_end_val) {
+                self.if_next = nested_if_next;
+            }
             break :blk result;
         } else blk: {
             // No else block - clean up base_vals
@@ -13336,6 +13343,22 @@ pub const Decompiler = struct {
                     self.if_next = join_id;
                 }
                 try self.emitDecisionTrace(pattern.condition_block, "if_fallthrough_join", condition);
+            }
+        }
+
+        if (!else_body_moved and !is_elif and else_block != null and else_body.len == 1 and
+            self.stmtIsTerminal(else_body[0]) and !self.bodyEndsTerminal(then_body))
+        {
+            const else_id = else_block.?;
+            if (then_block < self.cfg.blocks.len and else_id < self.cfg.blocks.len and
+                try self.reachesBlockNoBack(then_block, else_id, pattern.condition_block))
+            {
+                else_body = &[_]*Stmt{};
+                else_block = null;
+                if (self.if_next == null) {
+                    self.if_next = else_id;
+                }
+                try self.emitDecisionTrace(pattern.condition_block, "if_terminal_else_join", condition);
             }
         }
 
@@ -13976,6 +13999,18 @@ pub const Decompiler = struct {
             else_body_moved = true;
             no_merge = true;
             self.if_next = null;
+        }
+
+        if (in_elif_chain and self.if_next == null and self.if_tail == null) {
+            if (merge_block) |merge_id| {
+                if (merge_id > pattern.condition_block and
+                    merge_id < self.cfg.blocks.len and
+                    merge_id != then_block and
+                    (else_block == null or merge_id != else_block.?))
+                {
+                    self.if_next = merge_id;
+                }
+            }
         }
 
         if (merge_block) |merge_id| {
@@ -21123,13 +21158,15 @@ pub const Decompiler = struct {
                         self.if_next = null;
                         if_next = null;
                     }
-                    if (if_next != null and if_next.? >= limit) {
-                        self.if_next = null;
-                        if_next = null;
-                    }
                     if (if_next) |next| {
-                        block_idx = next;
-                        self.if_next = null;
+                        if (next >= limit) {
+                            // Preserve forward continuation at/after range end for caller.
+                            block_idx = limit;
+                            self.if_next = next;
+                        } else {
+                            block_idx = next;
+                            self.if_next = null;
+                        }
                         self.chained_cmp_next_block = null;
                     } else if (self.chained_cmp_next_block) |chain_next| {
                         block_idx = chain_next;
@@ -22119,24 +22156,38 @@ pub const Decompiler = struct {
                                     const guard_taken = if (guard_is_then) !else_is_jump_target else else_is_jump_target;
                                     const guard_cond = try self.guardCondForBranch(parts.condition, parts.cond_op, guard_taken);
                                     var guard_body = if (guard_is_then) parts.then_body else parts.else_body;
-                                    if (!self.bodyEndsLoopTerminal(guard_body)) {
-                                        const cont = try self.makeContinue();
-                                        const next_body = try a.alloc(*Stmt, guard_body.len + 1);
-                                        std.mem.copyForwards(*Stmt, next_body[0..guard_body.len], guard_body);
-                                        next_body[guard_body.len] = cont;
-                                        guard_body = next_body;
+                                    const non_guard_body = if (guard_is_then) parts.else_body else parts.then_body;
+                                    const guard_is_pure_continue = guard_body.len == 1 and guard_body[0].* == .continue_stmt;
+                                    if (guard_is_pure_continue and non_guard_body.len > 0) {
+                                        const body_cond = try self.guardCondForBranch(parts.condition, parts.cond_op, !guard_taken);
+                                        const if_stmt = try a.create(Stmt);
+                                        if_stmt.* = .{ .if_stmt = .{
+                                            .condition = body_cond,
+                                            .body = non_guard_body,
+                                            .else_body = &.{},
+                                        } };
+                                        stmt = if_stmt;
+                                        guard_then = null;
+                                    } else {
+                                        if (!self.bodyEndsLoopTerminal(guard_body)) {
+                                            const cont = try self.makeContinue();
+                                            const next_body = try a.alloc(*Stmt, guard_body.len + 1);
+                                            std.mem.copyForwards(*Stmt, next_body[0..guard_body.len], guard_body);
+                                            next_body[guard_body.len] = cont;
+                                            guard_body = next_body;
+                                        }
+                                        const if_stmt = try a.create(Stmt);
+                                        if_stmt.* = .{ .if_stmt = .{
+                                            .condition = guard_cond,
+                                            .body = guard_body,
+                                            .else_body = &.{},
+                                        } };
+                                        if (guard_body.len > 0 and guard_body[guard_body.len - 1].* == .continue_stmt) {
+                                            if_stmt.if_stmt.no_merge = true;
+                                        }
+                                        stmt = if_stmt;
+                                        guard_then = non_guard_body;
                                     }
-                                    const if_stmt = try a.create(Stmt);
-                                    if_stmt.* = .{ .if_stmt = .{
-                                        .condition = guard_cond,
-                                        .body = guard_body,
-                                        .else_body = &.{},
-                                    } };
-                                    if (guard_body.len > 0 and guard_body[guard_body.len - 1].* == .continue_stmt) {
-                                        if_stmt.if_stmt.no_merge = true;
-                                    }
-                                    stmt = if_stmt;
-                                    guard_then = if (guard_is_then) parts.else_body else parts.then_body;
                                 } else {
                                 var use_else_cont = parts.else_is_continuation;
                                 if (use_else_cont and parts.else_body.len > 0) {
@@ -23933,23 +23984,35 @@ pub const Decompiler = struct {
                             const guard_taken = if (guard_then) !else_is_jump_target else else_is_jump_target;
                             const guard_cond = try self.guardCondForBranch(parts.condition, parts.cond_op, guard_taken);
                             var guard_body = if (guard_then) parts.then_body else parts.else_body;
-                            if (!self.bodyEndsLoopTerminal(guard_body)) {
-                                const cont = try self.makeContinue();
-                                const next_body = try a.alloc(*Stmt, guard_body.len + 1);
-                                std.mem.copyForwards(*Stmt, next_body[0..guard_body.len], guard_body);
-                                next_body[guard_body.len] = cont;
-                                guard_body = next_body;
-                            }
-                            const if_stmt = try a.create(Stmt);
-                            if_stmt.* = .{ .if_stmt = .{
-                                .condition = guard_cond,
-                                .body = guard_body,
-                                .else_body = &.{},
-                            } };
-                            try stmts.append(a, if_stmt);
                             const tail_body = if (guard_then) parts.else_body else parts.then_body;
-                            if (tail_body.len > 0) {
-                                try stmts.appendSlice(a, tail_body);
+                            const guard_is_pure_continue = guard_body.len == 1 and guard_body[0].* == .continue_stmt;
+                            if (guard_is_pure_continue and tail_body.len > 0) {
+                                const body_cond = try self.guardCondForBranch(parts.condition, parts.cond_op, !guard_taken);
+                                const if_stmt = try a.create(Stmt);
+                                if_stmt.* = .{ .if_stmt = .{
+                                    .condition = body_cond,
+                                    .body = tail_body,
+                                    .else_body = &.{},
+                                } };
+                                try stmts.append(a, if_stmt);
+                            } else {
+                                if (!self.bodyEndsLoopTerminal(guard_body)) {
+                                    const cont = try self.makeContinue();
+                                    const next_body = try a.alloc(*Stmt, guard_body.len + 1);
+                                    std.mem.copyForwards(*Stmt, next_body[0..guard_body.len], guard_body);
+                                    next_body[guard_body.len] = cont;
+                                    guard_body = next_body;
+                                }
+                                const if_stmt = try a.create(Stmt);
+                                if_stmt.* = .{ .if_stmt = .{
+                                    .condition = guard_cond,
+                                    .body = guard_body,
+                                    .else_body = &.{},
+                                } };
+                                try stmts.append(a, if_stmt);
+                                if (tail_body.len > 0) {
+                                    try stmts.appendSlice(a, tail_body);
+                                }
                             }
                             if (try self.nextLoopBlockAfterIf(p, header_block_id, block_idx, null)) |next_id| {
                                 self.markVisitedRange(&visited, header_block_id, block.start_offset, self.cfg.blocks[next_id].start_offset);
@@ -24055,7 +24118,25 @@ pub const Decompiler = struct {
                             }
                         }
                     } else {
-                        if (self.bodyEndsLoopTerminal(parts.then_body) and parts.else_body.len > 0) {
+                        const else_starts_with_yield = blk: {
+                            if (parts.else_body.len == 0) break :blk false;
+                            const first = parts.else_body[0];
+                            if (first.* != .expr_stmt) break :blk false;
+                            break :blk switch (first.expr_stmt.value.*) {
+                                .yield_expr, .yield_from => true,
+                                else => false,
+                            };
+                        };
+                        if (parts.then_body.len == 1 and parts.then_body[0].* == .continue_stmt and else_starts_with_yield) {
+                            const body_cond = try self.guardCondFromJump(parts.condition, parts.cond_op);
+                            const if_stmt = try a.create(Stmt);
+                            if_stmt.* = .{ .if_stmt = .{
+                                .condition = body_cond,
+                                .body = parts.else_body,
+                                .else_body = &.{},
+                            } };
+                            try stmts.append(a, if_stmt);
+                        } else if (self.bodyEndsLoopTerminal(parts.then_body) and parts.else_body.len > 0) {
                             const if_stmt = try a.create(Stmt);
                             if_stmt.* = .{ .if_stmt = .{
                                 .condition = parts.condition,

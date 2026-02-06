@@ -1,9 +1,11 @@
 ---
 title: Validate and commit glob
-status: open
+status: closed
 priority: 2
 issue-type: task
-created-at: "2026-02-05T21:25:22.634215+01:00"
+created-at: "\"2026-02-05T21:25:22.634215+01:00\""
+closed-at: "2026-02-06T09:32:11.428040+01:00"
+close-reason: zig build test plus glob compare exact on /tmp/glob_final_final.json
 blocks:
   - pez-add-glob-regression-ebb5e28f
 ---

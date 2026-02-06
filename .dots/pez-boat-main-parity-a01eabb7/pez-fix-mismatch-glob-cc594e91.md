@@ -1,9 +1,11 @@
 ---
 title: Fix mismatch glob
-status: open
+status: closed
 priority: 1
 issue-type: task
-created-at: "2026-02-05T20:11:24.816452+01:00"
+created-at: "\"\\\"2026-02-05T20:11:24.816452+01:00\\\"\""
+closed-at: "2026-02-06T09:32:11.431110+01:00"
+close-reason: glob mismatch closed in commit 3436ab5f
 blocks:
   - pez-fix-mismatch-ftplib-3c84df1c
 ---

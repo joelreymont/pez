@@ -1,9 +1,11 @@
 ---
 title: Repro glob
-status: open
+status: closed
 priority: 2
 issue-type: task
-created-at: "2026-02-05T21:25:22.620199+01:00"
+created-at: "\"\\\"2026-02-05T21:25:22.620199+01:00\\\"\""
+closed-at: "2026-02-06T09:32:11.413736+01:00"
+close-reason: reproduced with compare_driver and locate_mismatch
 blocks:
   - pez-validate-and-commit-60c79f18
 ---

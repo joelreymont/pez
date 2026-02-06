@@ -1,9 +1,11 @@
 ---
 title: Locate glob divergence
-status: open
+status: closed
 priority: 2
 issue-type: task
-created-at: "2026-02-05T21:25:22.623781+01:00"
+created-at: "\"2026-02-05T21:25:22.623781+01:00\""
+closed-at: "2026-02-06T09:32:11.417577+01:00"
+close-reason: first divergence traced to lost if_next at merge boundary
 blocks:
   - pez-repro-glob-a2ef77e1
 ---
