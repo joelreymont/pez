@@ -1,9 +1,11 @@
 ---
 title: Fix mismatch packaging/specifiers
-status: open
+status: closed
 priority: 1
 issue-type: task
-created-at: "2026-02-05T20:11:10.037938+01:00"
+created-at: "\"2026-02-05T20:11:10.037938+01:00\""
+closed-at: "2026-02-06T02:40:57.799692+01:00"
+close-reason: suite25 shows exact 59/59
 blocks:
   - pez-fix-mismatch-subprocess-77bad456
 ---
