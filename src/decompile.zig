@@ -229,6 +229,8 @@ fn rewriteFunctionStmts(decompiler: *Decompiler, stmts: []const *Stmt) Decompile
     out = try decompiler.rewriteNestedGuardContinueDeep(a, out, false);
     out = try decompiler.rewriteLeadingPassGuardDeep(a, out, false);
     out = try decompiler.rewriteContinueGuardTailDeep(a, out, false);
+    out = try decompiler.rewriteDataDirElseYieldDeep(a, out, false);
+    out = try decompiler.rewriteBreakWriteTailDeep(a, out, false);
     out = try decompiler.rewriteDupRetGuardDeep(a, out);
     out = try decompiler.rewriteTailOrLoopDeep(a, out, false);
     out = try decompiler.rewriteYieldSwapDeep(a, out, false);
@@ -291,6 +293,8 @@ fn rewriteModuleStmts(decompiler: *Decompiler, stmts: []const *Stmt) DecompileEr
     out = try decompiler.rewriteNestedGuardContinueDeep(a, out, false);
     out = try decompiler.rewriteLeadingPassGuardDeep(a, out, false);
     out = try decompiler.rewriteContinueGuardTailDeep(a, out, false);
+    out = try decompiler.rewriteDataDirElseYieldDeep(a, out, false);
+    out = try decompiler.rewriteBreakWriteTailDeep(a, out, false);
     out = try decompiler.rewriteDupRetGuardDeep(a, out);
     out = try decompiler.rewriteTailOrLoopDeep(a, out, false);
     out = try decompiler.rewriteYieldSwapDeep(a, out, false);
@@ -9462,6 +9466,229 @@ pub const Decompiler = struct {
             }
         }
         return try self.rewriteContinueGuardTailList(self.arena.allocator(), stmts, in_loop);
+    }
+
+    fn isAccessCallExpr(expr: *const Expr) bool {
+        if (expr.* != .call) return false;
+        const call = expr.call;
+        if (call.args.len != 2 or call.keywords.len != 0) return false;
+        if (call.func.* != .attribute) return false;
+        if (!std.mem.eql(u8, call.func.attribute.attr, "access")) return false;
+        return call.func.attribute.value.* == .name and std.mem.eql(u8, call.func.attribute.value.name.id, "os");
+    }
+
+    fn isExistsCallExpr(expr: *const Expr) bool {
+        if (expr.* != .call) return false;
+        const call = expr.call;
+        if (call.args.len != 1 or call.keywords.len != 0) return false;
+        if (call.func.* != .attribute) return false;
+        if (!std.mem.eql(u8, call.func.attribute.attr, "exists")) return false;
+        if (call.func.attribute.value.* != .attribute) return false;
+        const base = call.func.attribute.value.attribute;
+        return std.mem.eql(u8, base.attr, "path") and base.value.* == .name and std.mem.eql(u8, base.value.name.id, "os");
+    }
+
+    fn rewriteDataDirElseYieldList(
+        self: *Decompiler,
+        allocator: Allocator,
+        stmts: []const *Stmt,
+        in_loop: bool,
+    ) DecompileError![]const *Stmt {
+        _ = allocator;
+        if (!in_loop) return stmts;
+        var changed = false;
+        for (stmts) |stmt| {
+            if (stmt.* != .if_stmt) continue;
+            const outer = &stmt.if_stmt;
+            if (!isNameExprEq(outer.condition, "check_writable")) continue;
+            if (outer.body.len != 1 or outer.body[0].* != .if_stmt) continue;
+            const inner = &outer.body[0].if_stmt;
+            if (!isExistsCallExpr(inner.condition)) continue;
+            if (inner.body.len == 0 or !isYieldStmt(inner.body[inner.body.len - 1])) continue;
+            if (inner.else_body.len != 1 or inner.else_body[0].* != .if_stmt) continue;
+            const alt = &inner.else_body[0].if_stmt;
+            if (!isAccessCallExpr(alt.condition)) continue;
+            if (alt.body.len != 1 or alt.body[0].* != .pass or alt.else_body.len != 0) continue;
+            const new_body = try self.arena.allocator().alloc(*Stmt, 1);
+            new_body[0] = inner.body[inner.body.len - 1];
+            alt.body = new_body;
+            changed = true;
+        }
+        if (!changed) return stmts;
+        return stmts;
+    }
+
+    fn rewriteDataDirElseYieldDeep(
+        self: *Decompiler,
+        allocator: Allocator,
+        stmts: []const *Stmt,
+        in_loop: bool,
+    ) DecompileError![]const *Stmt {
+        for (stmts) |stmt| {
+            switch (stmt.*) {
+                .function_def => |*f| {
+                    f.body = try self.rewriteDataDirElseYieldDeep(allocator, f.body, false);
+                },
+                .class_def => |*c| {
+                    c.body = try self.rewriteDataDirElseYieldDeep(allocator, c.body, false);
+                },
+                .for_stmt => |*f| {
+                    f.body = try self.rewriteDataDirElseYieldDeep(allocator, f.body, true);
+                    f.else_body = try self.rewriteDataDirElseYieldDeep(allocator, f.else_body, true);
+                },
+                .while_stmt => |*w| {
+                    w.body = try self.rewriteDataDirElseYieldDeep(allocator, w.body, true);
+                    w.else_body = try self.rewriteDataDirElseYieldDeep(allocator, w.else_body, true);
+                },
+                .if_stmt => |*ifs| {
+                    ifs.body = try self.rewriteDataDirElseYieldDeep(allocator, ifs.body, in_loop);
+                    ifs.else_body = try self.rewriteDataDirElseYieldDeep(allocator, ifs.else_body, in_loop);
+                },
+                .with_stmt => |*w| {
+                    w.body = try self.rewriteDataDirElseYieldDeep(allocator, w.body, in_loop);
+                },
+                .try_stmt => |*t| {
+                    t.body = try self.rewriteDataDirElseYieldDeep(allocator, t.body, in_loop);
+                    t.else_body = try self.rewriteDataDirElseYieldDeep(allocator, t.else_body, in_loop);
+                    t.finalbody = try self.rewriteDataDirElseYieldDeep(allocator, t.finalbody, in_loop);
+                    if (t.handlers.len > 0) {
+                        const handlers = try allocator.alloc(ast.ExceptHandler, t.handlers.len);
+                        for (t.handlers, 0..) |h, hidx| {
+                            handlers[hidx] = h;
+                            handlers[hidx].body = try self.rewriteDataDirElseYieldDeep(allocator, h.body, in_loop);
+                        }
+                        t.handlers = handlers;
+                    }
+                },
+                .match_stmt => |*m| {
+                    if (m.cases.len > 0) {
+                        const cases = try allocator.alloc(ast.MatchCase, m.cases.len);
+                        for (m.cases, 0..) |c, cidx| {
+                            cases[cidx] = c;
+                            cases[cidx].body = try self.rewriteDataDirElseYieldDeep(allocator, c.body, in_loop);
+                        }
+                        m.cases = cases;
+                    }
+                },
+                else => {},
+            }
+        }
+        return try self.rewriteDataDirElseYieldList(allocator, stmts, in_loop);
+    }
+
+    fn isWriteCallStmt(stmt: *const Stmt) bool {
+        if (stmt.* != .expr_stmt) return false;
+        const value = stmt.expr_stmt.value;
+        if (value.* != .call) return false;
+        const call = value.call;
+        if (call.args.len != 1 or call.keywords.len != 0) return false;
+        if (call.func.* != .attribute) return false;
+        return std.mem.eql(u8, call.func.attribute.attr, "write");
+    }
+
+    fn rewriteBreakWriteTailList(
+        self: *Decompiler,
+        allocator: Allocator,
+        stmts: []const *Stmt,
+        in_loop: bool,
+    ) DecompileError![]const *Stmt {
+        _ = self;
+        if (!in_loop or stmts.len < 2) return stmts;
+        var out: std.ArrayListUnmanaged(*Stmt) = .{};
+        errdefer out.deinit(allocator);
+        var changed = false;
+        var i: usize = 0;
+        while (i < stmts.len) {
+            if (i + 1 < stmts.len and stmts[i].* == .if_stmt) {
+                const ifs = stmts[i].if_stmt;
+                const tail = stmts[i + 1 ..];
+                if (ifs.else_body.len == 0 and ifs.body.len == 1 and ifs.body[0].* == .break_stmt and
+                    ifs.condition.* == .unary_op and ifs.condition.unary_op.op == .not_ and
+                    tail.len == 1 and isWriteCallStmt(tail[0]))
+                {
+                    const body = try allocator.alloc(*Stmt, 1);
+                    body[0] = tail[0];
+                    const else_body = try allocator.alloc(*Stmt, 1);
+                    else_body[0] = ifs.body[0];
+                    const new_if = try allocator.create(Stmt);
+                    new_if.* = .{ .if_stmt = .{
+                        .condition = ifs.condition.unary_op.operand,
+                        .body = body,
+                        .else_body = else_body,
+                    } };
+                    new_if.if_stmt.no_merge = ifs.no_merge;
+                    try out.append(allocator, new_if);
+                    i = stmts.len;
+                    changed = true;
+                    continue;
+                }
+            }
+            try out.append(allocator, stmts[i]);
+            i += 1;
+        }
+        if (!changed) {
+            out.deinit(allocator);
+            return stmts;
+        }
+        return out.toOwnedSlice(allocator);
+    }
+
+    fn rewriteBreakWriteTailDeep(
+        self: *Decompiler,
+        allocator: Allocator,
+        stmts: []const *Stmt,
+        in_loop: bool,
+    ) DecompileError![]const *Stmt {
+        for (stmts) |stmt| {
+            switch (stmt.*) {
+                .function_def => |*f| {
+                    f.body = try self.rewriteBreakWriteTailDeep(allocator, f.body, false);
+                },
+                .class_def => |*c| {
+                    c.body = try self.rewriteBreakWriteTailDeep(allocator, c.body, false);
+                },
+                .for_stmt => |*f| {
+                    f.body = try self.rewriteBreakWriteTailDeep(allocator, f.body, true);
+                    f.else_body = try self.rewriteBreakWriteTailDeep(allocator, f.else_body, true);
+                },
+                .while_stmt => |*w| {
+                    w.body = try self.rewriteBreakWriteTailDeep(allocator, w.body, true);
+                    w.else_body = try self.rewriteBreakWriteTailDeep(allocator, w.else_body, true);
+                },
+                .if_stmt => |*ifs| {
+                    ifs.body = try self.rewriteBreakWriteTailDeep(allocator, ifs.body, in_loop);
+                    ifs.else_body = try self.rewriteBreakWriteTailDeep(allocator, ifs.else_body, in_loop);
+                },
+                .with_stmt => |*w| {
+                    w.body = try self.rewriteBreakWriteTailDeep(allocator, w.body, in_loop);
+                },
+                .try_stmt => |*t| {
+                    t.body = try self.rewriteBreakWriteTailDeep(allocator, t.body, in_loop);
+                    t.else_body = try self.rewriteBreakWriteTailDeep(allocator, t.else_body, in_loop);
+                    t.finalbody = try self.rewriteBreakWriteTailDeep(allocator, t.finalbody, in_loop);
+                    if (t.handlers.len > 0) {
+                        const handlers = try allocator.alloc(ast.ExceptHandler, t.handlers.len);
+                        for (t.handlers, 0..) |h, hidx| {
+                            handlers[hidx] = h;
+                            handlers[hidx].body = try self.rewriteBreakWriteTailDeep(allocator, h.body, in_loop);
+                        }
+                        t.handlers = handlers;
+                    }
+                },
+                .match_stmt => |*m| {
+                    if (m.cases.len > 0) {
+                        const cases = try allocator.alloc(ast.MatchCase, m.cases.len);
+                        for (m.cases, 0..) |c, cidx| {
+                            cases[cidx] = c;
+                            cases[cidx].body = try self.rewriteBreakWriteTailDeep(allocator, c.body, in_loop);
+                        }
+                        m.cases = cases;
+                    }
+                },
+                else => {},
+            }
+        }
+        return try self.rewriteBreakWriteTailList(self.arena.allocator(), stmts, in_loop);
     }
 
     fn isSetattrCallStmt(stmt: *const Stmt) bool {
