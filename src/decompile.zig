@@ -8360,7 +8360,6 @@ pub const Decompiler = struct {
         allocator: Allocator,
         stmts: []const *Stmt,
     ) DecompileError![]const *Stmt {
-        _ = self;
         if (stmts.len == 0) return stmts;
         var out: std.ArrayListUnmanaged(*Stmt) = .{};
         errdefer out.deinit(allocator);
@@ -8385,6 +8384,23 @@ pub const Decompiler = struct {
                                     continue;
                                 }
                             }
+                        }
+                    }
+                    if (Decompiler.isReturnNone(ret_stmt)) {
+                        if (cleanup_if.* == .if_stmt and cleanup_if.if_stmt.else_body.len == 0 and cleanup_if.if_stmt.body.len == 1 and
+                            cleanup_if.if_stmt.body[0].* == .expr_stmt and ts.finalbody[0].* == .expr_stmt and
+                            ast.exprEqual(cleanup_if.if_stmt.body[0].expr_stmt.value, ts.finalbody[0].expr_stmt.value))
+                        {
+                            ts.finalbody = ts.body[ts.body.len - 2 .. ts.body.len - 1];
+                            ts.body = ts.body[0 .. ts.body.len - 2];
+                            try out.append(allocator, stmt);
+                            const dup_next =
+                                i + 1 < stmts.len and self.terminalStmtEqual(ret_stmt, stmts[i + 1]);
+                            if (!dup_next) {
+                                try out.append(allocator, ret_stmt);
+                            }
+                            changed = true;
+                            continue;
                         }
                     }
                 }
