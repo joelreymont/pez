@@ -1,9 +1,11 @@
 ---
 title: Locate picamera2 controls divergence
-status: open
+status: closed
 priority: 2
 issue-type: task
-created-at: "2026-02-05T21:25:22.588980+01:00"
+created-at: "\"2026-02-05T21:25:22.588980+01:00\""
+closed-at: "2026-02-06T02:42:17.470665+01:00"
+close-reason: divergence analysis completed earlier
 blocks:
   - pez-repro-picamera2-controls-b9b7e2da
 ---

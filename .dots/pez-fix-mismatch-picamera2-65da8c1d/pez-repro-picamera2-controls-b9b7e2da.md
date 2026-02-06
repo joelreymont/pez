@@ -1,9 +1,11 @@
 ---
 title: Repro picamera2 controls
-status: open
+status: closed
 priority: 2
 issue-type: task
-created-at: "2026-02-05T21:25:22.585507+01:00"
+created-at: "\"2026-02-05T21:25:22.585507+01:00\""
+closed-at: "2026-02-06T02:42:17.467242+01:00"
+close-reason: repro/lower-level analysis previously completed
 blocks:
   - pez-validate-and-commit-aa8f0e14
 ---

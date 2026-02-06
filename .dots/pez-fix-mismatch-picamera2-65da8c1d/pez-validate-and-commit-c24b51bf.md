@@ -1,9 +1,11 @@
 ---
 title: Validate and commit picamera2 controls
-status: open
+status: closed
 priority: 2
 issue-type: task
-created-at: "2026-02-05T21:25:22.598993+01:00"
+created-at: "\"2026-02-05T21:25:22.598993+01:00\""
+closed-at: "2026-02-06T02:42:17.479300+01:00"
+close-reason: validated by suite25 and committed parity fixes
 blocks:
   - pez-add-picamera2-controls-b5778e26
 ---

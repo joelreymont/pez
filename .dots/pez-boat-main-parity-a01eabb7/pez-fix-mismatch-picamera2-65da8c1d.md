@@ -1,9 +1,11 @@
 ---
 title: Fix mismatch picamera2/controls
-status: open
+status: closed
 priority: 1
 issue-type: task
-created-at: "2026-02-05T20:11:17.120498+01:00"
+created-at: "\"2026-02-05T20:11:17.120498+01:00\""
+closed-at: "2026-02-06T02:42:17.482298+01:00"
+close-reason: picamera2/controls.pyc exact in suite25
 blocks:
   - pez-fix-mismatch-typing-58bc6530
 ---

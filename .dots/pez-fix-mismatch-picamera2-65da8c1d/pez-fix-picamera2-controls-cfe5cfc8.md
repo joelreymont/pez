@@ -1,9 +1,11 @@
 ---
 title: Fix picamera2 controls root cause
-status: open
+status: closed
 priority: 2
 issue-type: task
-created-at: "2026-02-05T21:25:22.592326+01:00"
+created-at: "\"2026-02-05T21:25:22.592326+01:00\""
+closed-at: "2026-02-06T02:42:17.473610+01:00"
+close-reason: root fixes merged in prior committed parity work
 blocks:
   - pez-locate-picamera2-controls-7b714507
 ---
