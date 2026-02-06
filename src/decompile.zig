@@ -268,6 +268,7 @@ fn rewriteFunctionStmts(decompiler: *Decompiler, stmts: []const *Stmt) Decompile
     out = try decompiler.rewriteActionLoopArgBranchDeep(a, out);
     out = try decompiler.rewriteCookieFindGuardDeep(a, out);
     out = try decompiler.rewriteDropWithPlaceholderTailDeep(a, out);
+    out = try decompiler.rewriteEllipsisAttrTempDeep(a, out);
     out = try decompiler.rewriteDropIfBranchAssignTailDeep(a, out);
     out = try decompiler.rewriteHoistWithLoopTailBreakDeep(a, out, false);
     return trimTrailingReturnNone(out);
@@ -330,6 +331,7 @@ fn rewriteModuleStmts(decompiler: *Decompiler, stmts: []const *Stmt) DecompileEr
     out = try decompiler.rewriteActionLoopArgBranchDeep(a, out);
     out = try decompiler.rewriteCookieFindGuardDeep(a, out);
     out = try decompiler.rewriteDropWithPlaceholderTailDeep(a, out);
+    out = try decompiler.rewriteEllipsisAttrTempDeep(a, out);
     out = try decompiler.rewriteDropIfBranchAssignTailDeep(a, out);
     out = try decompiler.rewriteHoistWithLoopTailBreakDeep(a, out, false);
     return out;
@@ -10891,6 +10893,99 @@ pub const Decompiler = struct {
             }
         }
         return try self.rewriteCookieFindGuardList(allocator, stmts);
+    }
+
+    fn rewriteEllipsisAttrTempList(
+        self: *Decompiler,
+        allocator: Allocator,
+        stmts: []const *Stmt,
+    ) DecompileError![]const *Stmt {
+        _ = self;
+        if (stmts.len < 2) return stmts;
+        for (0..stmts.len - 1) |i| {
+            const a = stmts[i];
+            const b = stmts[i + 1];
+            if (a.* != .assign or b.* != .assign) continue;
+            if (a.assign.targets.len != 1 or b.assign.targets.len != 1) continue;
+            if (a.assign.targets[0].* != .attribute or b.assign.targets[0].* != .name) continue;
+            const b_is_ellipsis = isConstEllipsis(b.assign.value);
+            const b_is_attr = ast.exprEqual(b.assign.value, a.assign.targets[0]);
+            if (!b_is_ellipsis and !b_is_attr) continue;
+
+            const targets = try allocator.alloc(*Expr, 2);
+            targets[0] = a.assign.targets[0];
+            targets[1] = b.assign.targets[0];
+            const merged = try allocator.create(Stmt);
+            merged.* = .{ .assign = .{
+                .targets = targets,
+                .value = a.assign.value,
+                .type_comment = a.assign.type_comment,
+            } };
+
+            const out = try allocator.alloc(*Stmt, stmts.len - 1);
+            if (i > 0) std.mem.copyForwards(*Stmt, out[0..i], stmts[0..i]);
+            out[i] = merged;
+            if (i + 2 < stmts.len) std.mem.copyForwards(*Stmt, out[i + 1 ..], stmts[i + 2 ..]);
+            return out;
+        }
+        return stmts;
+    }
+
+    fn rewriteEllipsisAttrTempDeep(
+        self: *Decompiler,
+        allocator: Allocator,
+        stmts: []const *Stmt,
+    ) DecompileError![]const *Stmt {
+        for (stmts) |stmt| {
+            switch (stmt.*) {
+                .function_def => |*f| {
+                    f.body = try self.rewriteEllipsisAttrTempDeep(allocator, f.body);
+                },
+                .class_def => |*c| {
+                    c.body = try self.rewriteEllipsisAttrTempDeep(allocator, c.body);
+                },
+                .for_stmt => |*f| {
+                    f.body = try self.rewriteEllipsisAttrTempDeep(allocator, f.body);
+                    f.else_body = try self.rewriteEllipsisAttrTempDeep(allocator, f.else_body);
+                },
+                .while_stmt => |*w| {
+                    w.body = try self.rewriteEllipsisAttrTempDeep(allocator, w.body);
+                    w.else_body = try self.rewriteEllipsisAttrTempDeep(allocator, w.else_body);
+                },
+                .if_stmt => |*ifs| {
+                    ifs.body = try self.rewriteEllipsisAttrTempDeep(allocator, ifs.body);
+                    ifs.else_body = try self.rewriteEllipsisAttrTempDeep(allocator, ifs.else_body);
+                },
+                .with_stmt => |*w| {
+                    w.body = try self.rewriteEllipsisAttrTempDeep(allocator, w.body);
+                },
+                .try_stmt => |*t| {
+                    t.body = try self.rewriteEllipsisAttrTempDeep(allocator, t.body);
+                    t.else_body = try self.rewriteEllipsisAttrTempDeep(allocator, t.else_body);
+                    t.finalbody = try self.rewriteEllipsisAttrTempDeep(allocator, t.finalbody);
+                    if (t.handlers.len > 0) {
+                        const handlers = try allocator.alloc(ast.ExceptHandler, t.handlers.len);
+                        for (t.handlers, 0..) |h, hidx| {
+                            handlers[hidx] = h;
+                            handlers[hidx].body = try self.rewriteEllipsisAttrTempDeep(allocator, h.body);
+                        }
+                        t.handlers = handlers;
+                    }
+                },
+                .match_stmt => |*m| {
+                    if (m.cases.len > 0) {
+                        const cases = try allocator.alloc(ast.MatchCase, m.cases.len);
+                        for (m.cases, 0..) |c, cidx| {
+                            cases[cidx] = c;
+                            cases[cidx].body = try self.rewriteEllipsisAttrTempDeep(allocator, c.body);
+                        }
+                        m.cases = cases;
+                    }
+                },
+                else => {},
+            }
+        }
+        return try self.rewriteEllipsisAttrTempList(allocator, stmts);
     }
 
     fn withOptName(ws: anytype) ?[]const u8 {
