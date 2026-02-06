@@ -1,9 +1,11 @@
 ---
 title: Validate and commit packaging specifiers
-status: open
+status: closed
 priority: 2
 issue-type: task
-created-at: "2026-02-05T21:25:22.564887+01:00"
+created-at: "\"2026-02-05T21:25:22.564887+01:00\""
+closed-at: "2026-02-06T01:53:54.218693+01:00"
+close-reason: Validated with zig build test, compare_driver exact on packaging/specifiers.pyc, and boat_main suite20 run; committed as 30b89306.
 blocks:
   - pez-add-packaging-specifiers-63f45d46
 ---
