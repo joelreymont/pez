@@ -2751,6 +2751,19 @@ pub const SimContext = struct {
         try builder.generators.items[idx].ifs.append(self.stack_alloc, cond);
     }
 
+    fn compJumpLooksLikeIfExp(self: *SimContext, from_off: u32, false_target: u32) bool {
+        if (false_target <= from_off) return false;
+        var iter = decoder.InstructionIterator.init(self.code.code, self.version);
+        while (iter.next()) |ins| {
+            if (ins.offset <= from_off) continue;
+            if (ins.offset >= false_target) break;
+            if (!ins.isUnconditionalJump()) continue;
+            const jump_tgt = ins.jumpTarget(self.version) orelse ins.arg;
+            if (jump_tgt > false_target) return true;
+        }
+        return false;
+    }
+
     fn addCompTargetName(self: *SimContext, name: []const u8) !void {
         const builder = self.findActiveCompBuilder() orelse return;
         if (builder.loop_stack.items.len == 0) return;
@@ -6209,9 +6222,23 @@ pub const SimContext = struct {
             .POP_JUMP_BACKWARD_IF_NOT_NONE,
             => {
                 const cond = try self.stack.popExpr();
-                if (self.enable_ifexp and self.findActiveCompBuilder() == null) {
-                    const target = inst.jumpTarget(self.version) orelse inst.arg;
-                    if (target > inst.offset) {
+                const jump_target = inst.jumpTarget(self.version) orelse inst.arg;
+                const active_comp_builder = self.findActiveCompBuilder();
+                const capture_comp_ifexp = blk: {
+                    if (active_comp_builder) |builder| {
+                        if (builder.kind != .dict) break :blk false;
+                        if (builder.key != null or builder.value != null) break :blk false;
+                        if (!self.compJumpLooksLikeIfExp(inst.offset, jump_target)) break :blk false;
+                        if (self.stack.items.items.len == 0) break :blk false;
+                        const top_idx = self.stack.items.items.len - 1;
+                        break :blk self.stack.items.items[top_idx] == .expr;
+                    }
+                    break :blk false;
+                };
+                const capture_ifexp = jump_target > inst.offset and
+                    ((self.enable_ifexp and active_comp_builder == null) or
+                    capture_comp_ifexp);
+                if (capture_ifexp) {
                         var final_cond = switch (inst.opcode) {
                             .POP_JUMP_IF_TRUE,
                             .POP_JUMP_FORWARD_IF_TRUE,
@@ -6232,16 +6259,14 @@ pub const SimContext = struct {
                             self.allocator.destroy(final_cond);
                         }
                         try self.pending_ifexp.append(self.stack_alloc, .{
-                            .false_target = target,
+                            .false_target = jump_target,
                             .merge_target = null,
                             .condition = final_cond,
                             .then_expr = null,
                         });
                         return;
-                    }
                 }
-                if (self.findActiveCompBuilder()) |builder| {
-                    const jump_target = inst.jumpTarget(self.version) orelse inst.arg;
+                if (active_comp_builder) |builder| {
                     if (inst.opcode == .POP_JUMP_IF_TRUE or
                         inst.opcode == .POP_JUMP_FORWARD_IF_TRUE or
                         inst.opcode == .POP_JUMP_BACKWARD_IF_TRUE)

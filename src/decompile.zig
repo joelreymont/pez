@@ -22158,7 +22158,16 @@ pub const Decompiler = struct {
                                     var guard_body = if (guard_is_then) parts.then_body else parts.else_body;
                                     const non_guard_body = if (guard_is_then) parts.else_body else parts.then_body;
                                     const guard_is_pure_continue = guard_body.len == 1 and guard_body[0].* == .continue_stmt;
-                                    if (guard_is_pure_continue and non_guard_body.len > 0) {
+                                    const tail_starts_with_yield = blk: {
+                                        if (non_guard_body.len == 0) break :blk false;
+                                        const first_tail = non_guard_body[0];
+                                        if (first_tail.* != .expr_stmt) break :blk false;
+                                        break :blk switch (first_tail.expr_stmt.value.*) {
+                                            .yield_expr, .yield_from => true,
+                                            else => false,
+                                        };
+                                    };
+                                    if (guard_is_pure_continue and non_guard_body.len > 0 and tail_starts_with_yield) {
                                         const body_cond = try self.guardCondForBranch(parts.condition, parts.cond_op, !guard_taken);
                                         const if_stmt = try a.create(Stmt);
                                         if_stmt.* = .{ .if_stmt = .{
@@ -24015,7 +24024,16 @@ pub const Decompiler = struct {
                             var guard_body = if (guard_then) parts.then_body else parts.else_body;
                             const tail_body = if (guard_then) parts.else_body else parts.then_body;
                             const guard_is_pure_continue = guard_body.len == 1 and guard_body[0].* == .continue_stmt;
-                            if (guard_is_pure_continue and tail_body.len > 0) {
+                            const tail_starts_with_yield = blk: {
+                                if (tail_body.len == 0) break :blk false;
+                                const first_tail = tail_body[0];
+                                if (first_tail.* != .expr_stmt) break :blk false;
+                                break :blk switch (first_tail.expr_stmt.value.*) {
+                                    .yield_expr, .yield_from => true,
+                                    else => false,
+                                };
+                            };
+                            if (guard_is_pure_continue and tail_body.len > 0 and tail_starts_with_yield) {
                                 const body_cond = try self.guardCondForBranch(parts.condition, parts.cond_op, !guard_taken);
                                 const if_stmt = try a.create(Stmt);
                                 if_stmt.* = .{ .if_stmt = .{
@@ -27798,15 +27816,16 @@ pub const Decompiler = struct {
                             try stmts.appendSlice(a, parts.then_body);
                             consumed_else = true;
                         } else if (self.bodyAllContinue(parts.then_body) and parts.else_body.len > 0 and self.isTrueJump(parts.cond_op)) {
-                            const inv = try self.invertConditionExpr(parts.condition);
+                            // Keep explicit continue guards to preserve loop CFG parity.
                             const if_stmt = try a.create(Stmt);
                             if_stmt.* = .{ .if_stmt = .{
-                                .condition = inv,
-                                .body = parts.else_body,
+                                .condition = parts.condition,
+                                .body = parts.then_body,
                                 .else_body = &.{},
                             } };
                             if_stmt.if_stmt.no_merge = true;
                             try stmts.append(a, if_stmt);
+                            try stmts.appendSlice(a, parts.else_body);
                             consumed_else = true;
                         } else if (self.bodyEndsTerminal(parts.then_body) and parts.else_body.len > 0) {
                             const if_stmt = try a.create(Stmt);
