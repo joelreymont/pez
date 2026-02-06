@@ -220,6 +220,7 @@ fn rewriteFunctionStmts(decompiler: *Decompiler, stmts: []const *Stmt) Decompile
     out = try decompiler.rewriteTerminalElseReturnFalseDeep(a, out);
     out = try decompiler.rewriteNegOrGuardElseDeep(a, out);
     out = try decompiler.rewriteTypingGenexprDeep(a, out);
+    out = try decompiler.rewriteSentinelPassBreakDeep(a, out);
     out = try decompiler.dropDupPhiCallDeep(a, out);
     out = try decompiler.trimTailElseRetNone(out);
     out = try decompiler.trimElifDupTailDeep(a, out);
@@ -247,6 +248,7 @@ fn rewriteModuleStmts(decompiler: *Decompiler, stmts: []const *Stmt) DecompileEr
     out = try decompiler.rewriteTerminalElseReturnFalseDeep(a, out);
     out = try decompiler.rewriteNegOrGuardElseDeep(a, out);
     out = try decompiler.rewriteTypingGenexprDeep(a, out);
+    out = try decompiler.rewriteSentinelPassBreakDeep(a, out);
     out = try decompiler.dropDupPhiCallDeep(a, out);
     out = try decompiler.trimElifDupTailDeep(a, out);
     // Control-flow rewrites can change bytecode parity.
@@ -8544,6 +8546,114 @@ pub const Decompiler = struct {
             }
         }
         return stmts;
+    }
+
+    fn unaryNotName(expr: *const Expr) ?[]const u8 {
+        if (expr.* != .unary_op) return null;
+        const op = expr.unary_op;
+        if (op.op != .not_) return null;
+        if (op.operand.* != .name) return null;
+        return op.operand.name.id;
+    }
+
+    fn assignCallName(stmt: *const Stmt) ?[]const u8 {
+        if (stmt.* != .assign) return null;
+        const asg = stmt.assign;
+        if (asg.targets.len != 1 or asg.targets[0].* != .name) return null;
+        if (asg.value.* != .call) return null;
+        return asg.targets[0].name.id;
+    }
+
+    fn rewriteSentinelPassBreakList(
+        self: *Decompiler,
+        allocator: Allocator,
+        stmts: []const *Stmt,
+    ) DecompileError![]const *Stmt {
+        _ = allocator;
+        for (stmts) |stmt| {
+            if (stmt.* != .while_stmt) continue;
+            const ws = &stmt.while_stmt;
+            if (ws.body.len < 2) continue;
+            const tail = ws.body[ws.body.len - 1];
+            if (tail.* != .if_stmt) continue;
+            var ifs = &tail.if_stmt;
+            const body_is_noop = ifs.body.len == 0 or (ifs.body.len == 1 and ifs.body[0].* == .pass);
+            if (!body_is_noop or ifs.else_body.len == 0) continue;
+            const guard_name = unaryNotName(ifs.condition) orelse continue;
+            var found_assign = false;
+            var j: usize = ws.body.len - 1;
+            while (j > 0) : (j -= 1) {
+                const prev = ws.body[j - 1];
+                const prev_name = assignCallName(prev) orelse continue;
+                if (std.mem.eql(u8, guard_name, prev_name)) {
+                    found_assign = true;
+                    break;
+                }
+            }
+            if (!found_assign) continue;
+            const brk = try self.makeBreak();
+            const break_body = try self.arena.allocator().alloc(*Stmt, 1);
+            break_body[0] = brk;
+            ifs.body = break_body;
+        }
+        return stmts;
+    }
+
+    fn rewriteSentinelPassBreakDeep(
+        self: *Decompiler,
+        allocator: Allocator,
+        stmts: []const *Stmt,
+    ) DecompileError![]const *Stmt {
+        for (stmts) |stmt| {
+            switch (stmt.*) {
+                .function_def => |*f| {
+                    f.body = try self.rewriteSentinelPassBreakDeep(allocator, f.body);
+                },
+                .class_def => |*c| {
+                    c.body = try self.rewriteSentinelPassBreakDeep(allocator, c.body);
+                },
+                .for_stmt => |*f| {
+                    f.body = try self.rewriteSentinelPassBreakDeep(allocator, f.body);
+                    f.else_body = try self.rewriteSentinelPassBreakDeep(allocator, f.else_body);
+                },
+                .while_stmt => |*w| {
+                    w.body = try self.rewriteSentinelPassBreakDeep(allocator, w.body);
+                    w.else_body = try self.rewriteSentinelPassBreakDeep(allocator, w.else_body);
+                },
+                .if_stmt => |*i| {
+                    i.body = try self.rewriteSentinelPassBreakDeep(allocator, i.body);
+                    i.else_body = try self.rewriteSentinelPassBreakDeep(allocator, i.else_body);
+                },
+                .with_stmt => |*w| {
+                    w.body = try self.rewriteSentinelPassBreakDeep(allocator, w.body);
+                },
+                .try_stmt => |*t| {
+                    t.body = try self.rewriteSentinelPassBreakDeep(allocator, t.body);
+                    t.else_body = try self.rewriteSentinelPassBreakDeep(allocator, t.else_body);
+                    t.finalbody = try self.rewriteSentinelPassBreakDeep(allocator, t.finalbody);
+                    if (t.handlers.len > 0) {
+                        const handlers = try allocator.alloc(ast.ExceptHandler, t.handlers.len);
+                        for (t.handlers, 0..) |h, hidx| {
+                            handlers[hidx] = h;
+                            handlers[hidx].body = try self.rewriteSentinelPassBreakDeep(allocator, h.body);
+                        }
+                        t.handlers = handlers;
+                    }
+                },
+                .match_stmt => |*m| {
+                    if (m.cases.len > 0) {
+                        const cases = try allocator.alloc(ast.MatchCase, m.cases.len);
+                        for (m.cases, 0..) |c, cidx| {
+                            cases[cidx] = c;
+                            cases[cidx].body = try self.rewriteSentinelPassBreakDeep(allocator, c.body);
+                        }
+                        m.cases = cases;
+                    }
+                },
+                else => {},
+            }
+        }
+        return try self.rewriteSentinelPassBreakList(allocator, stmts);
     }
 
     fn rewriteTerminalElseList(
