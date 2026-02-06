@@ -403,6 +403,25 @@ test "snapshot try finally ret simple 3.9" {
     );
 }
 
+test "snapshot pkgutil load module 3.9" {
+    try runSnapshot(@src(), "test/corpus/pkgutil_load_module.3.9.pyc",
+        \\[]u8
+        \\  "import imp
+        \\class Loader:
+        \\    def _reopen(self):
+        \\        pass
+        \\    def load_module(self, fullname):
+        \\        self._reopen()
+        \\        try:
+        \\            mod = imp.load_module(fullname, self.file, self.filename, self.etc)
+        \\        finally:
+        \\            if self.file:
+        \\                self.file.close()
+        \\        return mod
+        \\"
+    );
+}
+
 test "snapshot loop merge break 3.9" {
     try runSnapshot(@src(), "test/corpus/loop_merge_break.3.9.pyc",
         \\[]u8

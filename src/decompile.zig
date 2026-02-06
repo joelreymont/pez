@@ -210,6 +210,7 @@ fn rewriteFunctionStmts(decompiler: *Decompiler, stmts: []const *Stmt) Decompile
     out = try decompiler.rewriteWhileHeadReturnDeep(a, out);
     out = try decompiler.rewriteGuardRetDeep(a, out);
     out = try decompiler.rewriteTryCleanupPairDeep(a, out);
+    out = try decompiler.rewriteTryFinallyCloseReturnDeep(a, out);
     out = try decompiler.rewriteNestedGuardContinueDeep(a, out, false);
     out = try decompiler.rewriteNotCompareFalseGuardDeep(a, out);
     out = try decompiler.rewriteDupTailBoolGuardDeep(a, out);
@@ -226,6 +227,7 @@ fn rewriteFunctionStmts(decompiler: *Decompiler, stmts: []const *Stmt) Decompile
     out = try decompiler.trimTailElseRetNone(out);
     out = try decompiler.trimElifDupTailDeep(a, out);
     out = try decompiler.rewriteTailTryFinallyDupReturnDeep(a, out);
+    out = try decompiler.rewriteNoopFinallyCloseReturnDeep(a, out);
     return trimTrailingReturnNone(out);
 }
 
@@ -240,6 +242,7 @@ fn rewriteModuleStmts(decompiler: *Decompiler, stmts: []const *Stmt) DecompileEr
     out = try decompiler.rewriteWhileHeadReturnDeep(a, out);
     out = try decompiler.rewriteGuardRetDeep(a, out);
     out = try decompiler.rewriteTryCleanupPairDeep(a, out);
+    out = try decompiler.rewriteTryFinallyCloseReturnDeep(a, out);
     out = try decompiler.rewriteNestedGuardContinueDeep(a, out, false);
     out = try decompiler.rewriteNotCompareFalseGuardDeep(a, out);
     out = try decompiler.rewriteDupTailBoolGuardDeep(a, out);
@@ -258,6 +261,7 @@ fn rewriteModuleStmts(decompiler: *Decompiler, stmts: []const *Stmt) DecompileEr
     // Control-flow rewrites can change bytecode parity.
     out = try decompiler.trimPostTerminalCleanupDeep(a, out);
     out = try decompiler.rewriteTailTryFinallyDupReturnDeep(a, out);
+    out = try decompiler.rewriteNoopFinallyCloseReturnDeep(a, out);
     return out;
 }
 
@@ -2416,6 +2420,132 @@ pub const Decompiler = struct {
         if (!stmtSeqEqual(ts.body[start .. ts.body.len - 1], ts.finalbody)) return stmts;
         ts.body = ts.body[0..start];
         return stmts;
+    }
+
+    fn bodyIsNoopPassOnly(self: *Decompiler, body: []const *Stmt) bool {
+        if (body.len == 0) return true;
+        for (body) |stmt| {
+            switch (stmt.*) {
+                .pass => {},
+                .if_stmt => |ifs| {
+                    if (!self.bodyIsNoopPassOnly(ifs.body)) return false;
+                    if (!self.bodyIsNoopPassOnly(ifs.else_body)) return false;
+                },
+                else => return false,
+            }
+        }
+        return true;
+    }
+
+    fn stmtIsCloseCall(stmt: *const Stmt) bool {
+        if (stmt.* != .expr_stmt) return false;
+        const value = stmt.expr_stmt.value;
+        if (value.* != .call) return false;
+        const call = value.call;
+        if (call.args.len != 0 or call.keywords.len != 0) return false;
+        if (call.func.* != .attribute) return false;
+        return std.mem.eql(u8, call.func.attribute.attr, "close");
+    }
+
+    fn rewriteNoopFinallyCloseReturnList(
+        self: *Decompiler,
+        allocator: Allocator,
+        stmts: []const *Stmt,
+    ) DecompileError![]const *Stmt {
+        if (stmts.len == 0) return stmts;
+        var out: std.ArrayListUnmanaged(*Stmt) = .{};
+        errdefer out.deinit(allocator);
+        var changed = false;
+        var i: usize = 0;
+        while (i < stmts.len) : (i += 1) {
+            const stmt = stmts[i];
+            if (stmt.* == .try_stmt) {
+                var ts = &stmt.try_stmt;
+                if (ts.handlers.len == 0 and ts.else_body.len == 0 and
+                    self.bodyIsNoopPassOnly(ts.finalbody) and ts.body.len >= 2)
+                {
+                    const close_stmt = ts.body[ts.body.len - 2];
+                    const ret_stmt = ts.body[ts.body.len - 1];
+                    if (stmtIsCloseCall(close_stmt) and ret_stmt.* == .return_stmt) {
+                        ts.body = ts.body[0 .. ts.body.len - 2];
+                        const final_body = try self.arena.allocator().alloc(*Stmt, 1);
+                        final_body[0] = close_stmt;
+                        ts.finalbody = final_body;
+                        try out.append(allocator, stmt);
+                        const dup_next =
+                            i + 1 < stmts.len and self.terminalStmtEqual(ret_stmt, stmts[i + 1]);
+                        if (!dup_next) {
+                            try out.append(allocator, ret_stmt);
+                        }
+                        changed = true;
+                        continue;
+                    }
+                }
+            }
+            try out.append(allocator, stmt);
+        }
+        if (!changed) {
+            out.deinit(allocator);
+            return stmts;
+        }
+        return out.toOwnedSlice(allocator);
+    }
+
+    fn rewriteNoopFinallyCloseReturnDeep(
+        self: *Decompiler,
+        allocator: Allocator,
+        stmts: []const *Stmt,
+    ) DecompileError![]const *Stmt {
+        for (stmts) |stmt| {
+            switch (stmt.*) {
+                .function_def => |*f| {
+                    f.body = try self.rewriteNoopFinallyCloseReturnDeep(allocator, f.body);
+                },
+                .class_def => |*c| {
+                    c.body = try self.rewriteNoopFinallyCloseReturnDeep(allocator, c.body);
+                },
+                .for_stmt => |*f| {
+                    f.body = try self.rewriteNoopFinallyCloseReturnDeep(allocator, f.body);
+                    f.else_body = try self.rewriteNoopFinallyCloseReturnDeep(allocator, f.else_body);
+                },
+                .while_stmt => |*w| {
+                    w.body = try self.rewriteNoopFinallyCloseReturnDeep(allocator, w.body);
+                    w.else_body = try self.rewriteNoopFinallyCloseReturnDeep(allocator, w.else_body);
+                },
+                .if_stmt => |*ifs| {
+                    ifs.body = try self.rewriteNoopFinallyCloseReturnDeep(allocator, ifs.body);
+                    ifs.else_body = try self.rewriteNoopFinallyCloseReturnDeep(allocator, ifs.else_body);
+                },
+                .with_stmt => |*w| {
+                    w.body = try self.rewriteNoopFinallyCloseReturnDeep(allocator, w.body);
+                },
+                .try_stmt => |*t| {
+                    t.body = try self.rewriteNoopFinallyCloseReturnDeep(allocator, t.body);
+                    t.else_body = try self.rewriteNoopFinallyCloseReturnDeep(allocator, t.else_body);
+                    t.finalbody = try self.rewriteNoopFinallyCloseReturnDeep(allocator, t.finalbody);
+                    if (t.handlers.len > 0) {
+                        const handlers = try allocator.alloc(ast.ExceptHandler, t.handlers.len);
+                        for (t.handlers, 0..) |h, idx| {
+                            handlers[idx] = h;
+                            handlers[idx].body = try self.rewriteNoopFinallyCloseReturnDeep(allocator, h.body);
+                        }
+                        t.handlers = handlers;
+                    }
+                },
+                .match_stmt => |*m| {
+                    if (m.cases.len > 0) {
+                        const cases = try allocator.alloc(ast.MatchCase, m.cases.len);
+                        for (m.cases, 0..) |c, idx| {
+                            cases[idx] = c;
+                            cases[idx].body = try self.rewriteNoopFinallyCloseReturnDeep(allocator, c.body);
+                        }
+                        m.cases = cases;
+                    }
+                },
+                else => {},
+            }
+        }
+        return try self.rewriteNoopFinallyCloseReturnList(allocator, stmts);
     }
 
     fn flattenNestedTryHandlers(self: *Decompiler, stmt: *Stmt) void {
@@ -7517,6 +7647,126 @@ pub const Decompiler = struct {
             }
         }
         return try self.rewriteTryCleanupPairList(allocator, stmts);
+    }
+
+    fn closeCallTarget(stmt: *const Stmt) ?*Expr {
+        if (stmt.* != .expr_stmt) return null;
+        const value = stmt.expr_stmt.value;
+        if (value.* != .call) return null;
+        const call = value.call;
+        if (call.args.len != 0 or call.keywords.len != 0) return null;
+        if (call.func.* != .attribute) return null;
+        if (!std.mem.eql(u8, call.func.attribute.attr, "close")) return null;
+        return call.func.attribute.value;
+    }
+
+    fn ifCloseTarget(stmt: *const Stmt) ?*Expr {
+        if (stmt.* != .if_stmt) return null;
+        const ifs = stmt.if_stmt;
+        if (ifs.else_body.len != 0 or ifs.body.len != 1) return null;
+        const target = closeCallTarget(ifs.body[0]) orelse return null;
+        if (!ast.exprEqual(ifs.condition, target)) return null;
+        return target;
+    }
+
+    fn rewriteTryFinallyCloseReturnList(
+        self: *Decompiler,
+        allocator: Allocator,
+        stmts: []const *Stmt,
+    ) DecompileError![]const *Stmt {
+        _ = self;
+        if (stmts.len == 0) return stmts;
+        var out: std.ArrayListUnmanaged(*Stmt) = .{};
+        errdefer out.deinit(allocator);
+        var changed = false;
+        var i: usize = 0;
+        while (i < stmts.len) : (i += 1) {
+            const stmt = stmts[i];
+            if (stmt.* == .try_stmt) {
+                var ts = &stmt.try_stmt;
+                if (ts.handlers.len == 0 and ts.else_body.len == 0 and ts.body.len >= 3 and ts.finalbody.len == 1) {
+                    const ret_stmt = ts.body[ts.body.len - 1];
+                    const cleanup_if = ts.body[ts.body.len - 2];
+                    if (ret_stmt.* == .return_stmt and ret_stmt.return_stmt.value != null and ret_stmt.return_stmt.value.?.* == .name) {
+                        if (ifCloseTarget(cleanup_if)) |cleanup_target| {
+                            if (closeCallTarget(ts.finalbody[0])) |final_target| {
+                                if (ast.exprEqual(cleanup_target, final_target)) {
+                                    ts.finalbody = ts.body[ts.body.len - 2 .. ts.body.len - 1];
+                                    ts.body = ts.body[0 .. ts.body.len - 2];
+                                    try out.append(allocator, stmt);
+                                    try out.append(allocator, ret_stmt);
+                                    changed = true;
+                                    continue;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            try out.append(allocator, stmt);
+        }
+        if (!changed) {
+            out.deinit(allocator);
+            return stmts;
+        }
+        return out.toOwnedSlice(allocator);
+    }
+
+    fn rewriteTryFinallyCloseReturnDeep(
+        self: *Decompiler,
+        allocator: Allocator,
+        stmts: []const *Stmt,
+    ) DecompileError![]const *Stmt {
+        for (stmts) |stmt| {
+            switch (stmt.*) {
+                .function_def => |*f| {
+                    f.body = try self.rewriteTryFinallyCloseReturnDeep(allocator, f.body);
+                },
+                .class_def => |*c| {
+                    c.body = try self.rewriteTryFinallyCloseReturnDeep(allocator, c.body);
+                },
+                .for_stmt => |*f| {
+                    f.body = try self.rewriteTryFinallyCloseReturnDeep(allocator, f.body);
+                    f.else_body = try self.rewriteTryFinallyCloseReturnDeep(allocator, f.else_body);
+                },
+                .while_stmt => |*w| {
+                    w.body = try self.rewriteTryFinallyCloseReturnDeep(allocator, w.body);
+                    w.else_body = try self.rewriteTryFinallyCloseReturnDeep(allocator, w.else_body);
+                },
+                .if_stmt => |*ifs| {
+                    ifs.body = try self.rewriteTryFinallyCloseReturnDeep(allocator, ifs.body);
+                    ifs.else_body = try self.rewriteTryFinallyCloseReturnDeep(allocator, ifs.else_body);
+                },
+                .with_stmt => |*w| {
+                    w.body = try self.rewriteTryFinallyCloseReturnDeep(allocator, w.body);
+                },
+                .try_stmt => |*t| {
+                    t.body = try self.rewriteTryFinallyCloseReturnDeep(allocator, t.body);
+                    t.else_body = try self.rewriteTryFinallyCloseReturnDeep(allocator, t.else_body);
+                    t.finalbody = try self.rewriteTryFinallyCloseReturnDeep(allocator, t.finalbody);
+                    if (t.handlers.len > 0) {
+                        const handlers = try allocator.alloc(ast.ExceptHandler, t.handlers.len);
+                        for (t.handlers, 0..) |h, hidx| {
+                            handlers[hidx] = h;
+                            handlers[hidx].body = try self.rewriteTryFinallyCloseReturnDeep(allocator, h.body);
+                        }
+                        t.handlers = handlers;
+                    }
+                },
+                .match_stmt => |*m| {
+                    if (m.cases.len > 0) {
+                        const cases = try allocator.alloc(ast.MatchCase, m.cases.len);
+                        for (m.cases, 0..) |c, cidx| {
+                            cases[cidx] = c;
+                            cases[cidx].body = try self.rewriteTryFinallyCloseReturnDeep(allocator, c.body);
+                        }
+                        m.cases = cases;
+                    }
+                },
+                else => {},
+            }
+        }
+        return try self.rewriteTryFinallyCloseReturnList(allocator, stmts);
     }
 
     fn isSimpleContinueGuard(stmt: *const Stmt) bool {
@@ -29008,6 +29258,18 @@ pub const Decompiler = struct {
     fn trimElifDupTailInStmt(self: *Decompiler, stmt: *Stmt, follow: []const *Stmt) void {
         if (stmt.* != .if_stmt) return;
         const ifs = &stmt.if_stmt;
+        if (follow.len > 0 and follow[0].* == .return_stmt) {
+            if (ifs.body.len > 1 and ifs.body[ifs.body.len - 1].* == .return_stmt and
+                self.terminalStmtEqual(ifs.body[ifs.body.len - 1], follow[0]))
+            {
+                ifs.body = ifs.body[0 .. ifs.body.len - 1];
+            }
+            if (ifs.else_body.len > 1 and ifs.else_body[ifs.else_body.len - 1].* == .return_stmt and
+                self.terminalStmtEqual(ifs.else_body[ifs.else_body.len - 1], follow[0]))
+            {
+                ifs.else_body = ifs.else_body[0 .. ifs.else_body.len - 1];
+            }
+        }
         if (ifs.else_body.len > 0 and self.bodyEndsTerminal(ifs.else_body) and
             follow.len >= ifs.else_body.len and stmtSeqEqual(ifs.else_body, follow[0..ifs.else_body.len]))
         {
