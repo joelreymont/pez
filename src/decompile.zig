@@ -294,10 +294,12 @@ fn rewriteFunctionStmts(decompiler: *Decompiler, stmts: []const *Stmt) Decompile
     out = try decompiler.rewriteCsvModeGuardDeep(a, out);
     out = try decompiler.rewriteDropPostWithEmptyAssignDeep(a, out);
     out = try decompiler.rewriteHoistWithLoopTailBreakDeep(a, out, false);
+    out = try decompiler.rewriteNestedSearchLoopBreakDeep(a, out, false);
     out = try decompiler.rewriteTryElseBreakDeep(a, out, false);
     out = try decompiler.rewriteDropDeadTailBreakDeep(a, out, false);
     out = try decompiler.rewriteTryCleanupPairDeep(a, out);
     out = try decompiler.rewriteThreadWorkerGuardsDeep(a, out);
+    out = try decompiler.rewriteInvertRaiseTailDeep(a, out);
     for (out) |stmt| {
         if (stmt.* != .function_def) continue;
         if (std.mem.indexOf(u8, stmt.function_def.name, "find_common_codecs") == null) continue;
@@ -389,10 +391,12 @@ fn rewriteModuleStmts(decompiler: *Decompiler, stmts: []const *Stmt) DecompileEr
     out = try decompiler.rewriteCsvModeGuardDeep(a, out);
     out = try decompiler.rewriteDropPostWithEmptyAssignDeep(a, out);
     out = try decompiler.rewriteHoistWithLoopTailBreakDeep(a, out, false);
+    out = try decompiler.rewriteNestedSearchLoopBreakDeep(a, out, false);
     out = try decompiler.rewriteTryElseBreakDeep(a, out, false);
     out = try decompiler.rewriteDropDeadTailBreakDeep(a, out, false);
     out = try decompiler.rewriteTryCleanupPairDeep(a, out);
     out = try decompiler.rewriteThreadWorkerGuardsDeep(a, out);
+    out = try decompiler.rewriteInvertRaiseTailDeep(a, out);
     for (out) |stmt| {
         if (stmt.* != .function_def) continue;
         if (std.mem.indexOf(u8, stmt.function_def.name, "find_common_codecs") == null) continue;
@@ -10591,6 +10595,246 @@ pub const Decompiler = struct {
             }
         }
         return try self.rewriteDropDeadTailBreakList(allocator, stmts, in_loop);
+    }
+
+    fn rewriteNestedSearchLoopBreakList(
+        self: *Decompiler,
+        allocator: Allocator,
+        stmts: []const *Stmt,
+        in_loop: bool,
+    ) DecompileError![]const *Stmt {
+        _ = in_loop;
+        if (stmts.len < 2) return stmts;
+
+        var out: std.ArrayListUnmanaged(*Stmt) = .{};
+        errdefer out.deinit(allocator);
+
+        var changed = false;
+        var i: usize = 0;
+        while (i < stmts.len) {
+            const stmt = stmts[i];
+            if (stmt.* != .for_stmt) {
+                try out.append(allocator, stmt);
+                i += 1;
+                continue;
+            }
+
+            var outer = &stmt.for_stmt;
+            if (outer.body.len == 0) {
+                try out.append(allocator, stmt);
+                i += 1;
+                continue;
+            }
+
+            const tail = outer.body[outer.body.len - 1];
+            if (tail.* != .for_stmt) {
+                try out.append(allocator, stmt);
+                i += 1;
+                continue;
+            }
+
+            var inner = &tail.for_stmt;
+            if (inner.else_body.len != 0 or !self.bodyHasBreakInCurrentLoop(inner.body)) {
+                try out.append(allocator, stmt);
+                i += 1;
+                continue;
+            }
+
+            const has_raise_after = i + 1 < stmts.len and stmts[i + 1].* == .raise_stmt;
+            if (outer.else_body.len == 0 and !has_raise_after) {
+                try out.append(allocator, stmt);
+                i += 1;
+                continue;
+            }
+
+            var moved_raise = false;
+            if (outer.else_body.len == 0 and has_raise_after) {
+                const new_else = try allocator.alloc(*Stmt, 1);
+                new_else[0] = stmts[i + 1];
+                outer.else_body = new_else;
+                moved_raise = true;
+            }
+
+            const cont_stmt = try self.makeContinue();
+            const inner_else = try allocator.alloc(*Stmt, 1);
+            inner_else[0] = cont_stmt;
+            inner.else_body = inner_else;
+
+            const outer_break = try self.makeBreak();
+            const new_outer_body = try allocator.alloc(*Stmt, outer.body.len + 1);
+            std.mem.copyForwards(*Stmt, new_outer_body[0..outer.body.len], outer.body);
+            new_outer_body[outer.body.len] = outer_break;
+            outer.body = new_outer_body;
+
+            try out.append(allocator, stmt);
+            changed = true;
+            i += if (moved_raise) 2 else 1;
+        }
+
+        if (!changed) {
+            out.deinit(allocator);
+            return stmts;
+        }
+        return out.toOwnedSlice(allocator);
+    }
+
+    fn rewriteNestedSearchLoopBreakDeep(
+        self: *Decompiler,
+        allocator: Allocator,
+        stmts: []const *Stmt,
+        in_loop: bool,
+    ) DecompileError![]const *Stmt {
+        for (stmts) |stmt| {
+            switch (stmt.*) {
+                .function_def => |*f| {
+                    f.body = try self.rewriteNestedSearchLoopBreakDeep(allocator, f.body, false);
+                },
+                .class_def => |*c| {
+                    c.body = try self.rewriteNestedSearchLoopBreakDeep(allocator, c.body, false);
+                },
+                .for_stmt => |*f| {
+                    f.body = try self.rewriteNestedSearchLoopBreakDeep(allocator, f.body, true);
+                    f.else_body = try self.rewriteNestedSearchLoopBreakDeep(allocator, f.else_body, true);
+                },
+                .while_stmt => |*w| {
+                    w.body = try self.rewriteNestedSearchLoopBreakDeep(allocator, w.body, true);
+                    w.else_body = try self.rewriteNestedSearchLoopBreakDeep(allocator, w.else_body, true);
+                },
+                .if_stmt => |*ifs| {
+                    ifs.body = try self.rewriteNestedSearchLoopBreakDeep(allocator, ifs.body, in_loop);
+                    ifs.else_body = try self.rewriteNestedSearchLoopBreakDeep(allocator, ifs.else_body, in_loop);
+                },
+                .with_stmt => |*w| {
+                    w.body = try self.rewriteNestedSearchLoopBreakDeep(allocator, w.body, in_loop);
+                },
+                .try_stmt => |*t| {
+                    t.body = try self.rewriteNestedSearchLoopBreakDeep(allocator, t.body, in_loop);
+                    t.else_body = try self.rewriteNestedSearchLoopBreakDeep(allocator, t.else_body, in_loop);
+                    t.finalbody = try self.rewriteNestedSearchLoopBreakDeep(allocator, t.finalbody, in_loop);
+                    if (t.handlers.len > 0) {
+                        const handlers = try allocator.alloc(ast.ExceptHandler, t.handlers.len);
+                        for (t.handlers, 0..) |h, hidx| {
+                            handlers[hidx] = h;
+                            handlers[hidx].body = try self.rewriteNestedSearchLoopBreakDeep(allocator, h.body, in_loop);
+                        }
+                        t.handlers = handlers;
+                    }
+                },
+                .match_stmt => |*m| {
+                    if (m.cases.len > 0) {
+                        const cases = try allocator.alloc(ast.MatchCase, m.cases.len);
+                        for (m.cases, 0..) |c, cidx| {
+                            cases[cidx] = c;
+                            cases[cidx].body = try self.rewriteNestedSearchLoopBreakDeep(allocator, c.body, in_loop);
+                        }
+                        m.cases = cases;
+                    }
+                },
+                else => {},
+            }
+        }
+        return try self.rewriteNestedSearchLoopBreakList(allocator, stmts, in_loop);
+    }
+
+    fn rewriteInvertRaiseTailList(
+        self: *Decompiler,
+        allocator: Allocator,
+        stmts: []const *Stmt,
+    ) DecompileError![]const *Stmt {
+        if (stmts.len < 2) return stmts;
+        var out: std.ArrayListUnmanaged(*Stmt) = .{};
+        errdefer out.deinit(allocator);
+
+        var changed = false;
+        var i: usize = 0;
+        while (i < stmts.len) {
+            if (i + 1 < stmts.len and stmts[i].* == .if_stmt and stmts[i + 1].* == .return_stmt) {
+                const ifs = &stmts[i].if_stmt;
+                if (ifs.else_body.len == 0 and ifs.body.len > 1 and self.bodyEndsTerminal(ifs.body) and ifs.body[ifs.body.len - 1].* == .raise_stmt) {
+                    const inv_cond = try self.invertConditionExpr(ifs.condition);
+                    const new_if_body = try allocator.alloc(*Stmt, 1);
+                    new_if_body[0] = stmts[i + 1];
+                    const new_if = try allocator.create(Stmt);
+                    new_if.* = .{ .if_stmt = .{
+                        .condition = inv_cond,
+                        .body = new_if_body,
+                        .else_body = &.{},
+                        .no_merge = ifs.no_merge,
+                    } };
+
+                    try out.append(allocator, new_if);
+                    try out.appendSlice(allocator, ifs.body);
+                    changed = true;
+                    i += 2;
+                    continue;
+                }
+            }
+            try out.append(allocator, stmts[i]);
+            i += 1;
+        }
+
+        if (!changed) {
+            out.deinit(allocator);
+            return stmts;
+        }
+        return out.toOwnedSlice(allocator);
+    }
+
+    fn rewriteInvertRaiseTailDeep(
+        self: *Decompiler,
+        allocator: Allocator,
+        stmts: []const *Stmt,
+    ) DecompileError![]const *Stmt {
+        for (stmts) |stmt| {
+            switch (stmt.*) {
+                .function_def => |*f| {
+                    f.body = try self.rewriteInvertRaiseTailDeep(allocator, f.body);
+                },
+                .class_def => |*c| {
+                    c.body = try self.rewriteInvertRaiseTailDeep(allocator, c.body);
+                },
+                .for_stmt => |*f| {
+                    f.body = try self.rewriteInvertRaiseTailDeep(allocator, f.body);
+                    f.else_body = try self.rewriteInvertRaiseTailDeep(allocator, f.else_body);
+                },
+                .while_stmt => |*w| {
+                    w.body = try self.rewriteInvertRaiseTailDeep(allocator, w.body);
+                    w.else_body = try self.rewriteInvertRaiseTailDeep(allocator, w.else_body);
+                },
+                .if_stmt => |*ifs| {
+                    ifs.body = try self.rewriteInvertRaiseTailDeep(allocator, ifs.body);
+                    ifs.else_body = try self.rewriteInvertRaiseTailDeep(allocator, ifs.else_body);
+                },
+                .with_stmt => |*w| {
+                    w.body = try self.rewriteInvertRaiseTailDeep(allocator, w.body);
+                },
+                .try_stmt => |*t| {
+                    t.body = try self.rewriteInvertRaiseTailDeep(allocator, t.body);
+                    t.else_body = try self.rewriteInvertRaiseTailDeep(allocator, t.else_body);
+                    t.finalbody = try self.rewriteInvertRaiseTailDeep(allocator, t.finalbody);
+                    if (t.handlers.len > 0) {
+                        const handlers = try allocator.alloc(ast.ExceptHandler, t.handlers.len);
+                        for (t.handlers, 0..) |h, hidx| {
+                            handlers[hidx] = h;
+                            handlers[hidx].body = try self.rewriteInvertRaiseTailDeep(allocator, h.body);
+                        }
+                        t.handlers = handlers;
+                    }
+                },
+                .match_stmt => |*m| {
+                    if (m.cases.len > 0) {
+                        const cases = try allocator.alloc(ast.MatchCase, m.cases.len);
+                        for (m.cases, 0..) |c, cidx| {
+                            cases[cidx] = c;
+                            cases[cidx].body = try self.rewriteInvertRaiseTailDeep(allocator, c.body);
+                        }
+                        m.cases = cases;
+                    }
+                },
+                else => {},
+            }
+        }
+        return try self.rewriteInvertRaiseTailList(allocator, stmts);
     }
 
     fn isSetattrCallStmt(stmt: *const Stmt) bool {

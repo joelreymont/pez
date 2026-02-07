@@ -2090,6 +2090,25 @@ test "snapshot loop try dead break 3.9" {
     );
 }
 
+test "snapshot nested search loop break 3.9" {
+    try runSnapshot(@src(), "test/corpus/nested_search_loop_break.3.9.pyc",
+        \\[]u8
+        \\  "def nested_search(path):
+        \\    for entry in path:
+        \\        for suffix, mode in (('.py', 'r'), ('.pyc', 'rb')):
+        \\            file_path = entry + suffix
+        \\            if file_path.endswith('.pyc'):
+        \\                break
+        \\        else:
+        \\            continue
+        \\        break
+        \\    else:
+        \\        raise RuntimeError('not found')
+        \\    return (file_path, suffix, mode)
+        \\"
+    );
+}
+
 test "snapshot webbrowser register preferred 3.9" {
     try runSnapshot(@src(), "test/corpus/webbrowser_register_preferred.3.9.pyc",
         \\[]u8
