@@ -36,6 +36,18 @@ pub fn build(b: *std.Build) void {
     const run_step = b.step("run", "Run pez decompiler");
     run_step.dependOn(&run_cmd.step);
 
+    const matrix_cmd = b.addSystemCommand(&.{ "bash", "test_matrix.sh" });
+    matrix_cmd.setCwd(b.path("."));
+    matrix_cmd.step.dependOn(b.getInstallStep());
+    const matrix_step = b.step("matrix", "Run cross-version Python matrix checks");
+    matrix_step.dependOn(&matrix_cmd.step);
+
+    const parity_cmd = b.addSystemCommand(&.{ "bash", "tools/parity/run.sh" });
+    parity_cmd.setCwd(b.path("."));
+    parity_cmd.step.dependOn(b.getInstallStep());
+    const parity_step = b.step("parity", "Run external parity harness");
+    parity_step.dependOn(&parity_cmd.step);
+
     // Tests
     const unit_test_filters = if (test_filter) |filter| &.{filter} else &.{};
 

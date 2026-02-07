@@ -9859,7 +9859,10 @@ pub const Decompiler = struct {
                 continue;
             }
 
-            if (!isAssignThenNoneGuardReturn(self, inner.body, outer_term)) {
+            const inner_direct_terminal = inner.body.len == 1 and
+                self.stmtIsTerminal(inner.body[0]) and
+                self.terminalStmtEqual(inner.body[0], outer_term);
+            if (!inner_direct_terminal and !isAssignThenNoneGuardReturn(self, inner.body, outer_term)) {
                 try out.append(allocator, stmt);
                 continue;
             }

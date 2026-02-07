@@ -6,8 +6,13 @@ OUT_DIR="$ROOT_DIR/tools/parity/out"
 mkdir -p "$OUT_DIR"
 
 : "${PARITY_CORPUS_DIRS:=$ROOT_DIR/refs/pycdc/tests/compiled:$ROOT_DIR/test/corpus}"
+: "${PARITY_RUN_MATRIX:=1}"
 
 zig build
+
+if [[ "$PARITY_RUN_MATRIX" == "1" ]]; then
+  bash "$ROOT_DIR/test_matrix.sh"
+fi
 
 ensure_uv_py312() {
   local venv="$ROOT_DIR/.uv/py312"
