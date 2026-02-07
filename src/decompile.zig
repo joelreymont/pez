@@ -31279,10 +31279,12 @@ pub const Decompiler = struct {
                         self.if_next = null;
                         if_next = null;
                     }
+                    var used_if_next_override = false;
                     if (if_next) |override| {
                         next = override;
                         self.if_next = null;
                         self.chained_cmp_next_block = null;
+                        used_if_next_override = true;
                     } else if (self.chained_cmp_next_block) |chain_next| {
                         if (chain_next >= end) {
                             self.chained_cmp_next_block = null;
@@ -31308,7 +31310,7 @@ pub const Decompiler = struct {
                         min_next = @max(min_next, @min(else_end, end));
                     }
                     if (loop_header) |header| {
-                        if (emitted_else and next < min_next) {
+                        if (emitted_else and next < min_next and !used_if_next_override) {
                             if (min_next > 0) {
                                 const tail = min_next - 1;
                                 if (self.resolveJumpOnlyBlock(tail) == header) {
@@ -31329,7 +31331,7 @@ pub const Decompiler = struct {
                         };
                         try self.writeTrace(ev);
                     }
-                    if (next >= end or next >= self.cfg.blocks.len or (emitted_else and next < min_next)) {
+                    if (next >= end or next >= self.cfg.blocks.len or (emitted_else and next < min_next and !used_if_next_override)) {
                         // Scan for unconsumed blocks starting from after the if branches
                         var scan = @max(min_next, start + 1);
                         while (scan < end and scan < self.cfg.blocks.len) : (scan += 1) {
@@ -31342,7 +31344,7 @@ pub const Decompiler = struct {
                                 break;
                             }
                         }
-                        if (next < min_next and emitted_else) {
+                        if (next < min_next and emitted_else and !used_if_next_override) {
                             next = min_next;
                         }
                     }
