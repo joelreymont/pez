@@ -286,6 +286,7 @@ fn rewriteFunctionStmts(decompiler: *Decompiler, stmts: []const *Stmt) Decompile
     out = try decompiler.rewriteEllipsisAttrTempDeep(a, out);
     out = try decompiler.rewriteIntTripleAssignDeep(a, out);
     out = try decompiler.rewriteDropIfBranchAssignTailDeep(a, out);
+    out = try decompiler.rewriteDropPostWithEmptyAssignDeep(a, out);
     out = try decompiler.rewriteHoistWithLoopTailBreakDeep(a, out, false);
     return trimTrailingReturnNone(out);
 }
@@ -365,6 +366,7 @@ fn rewriteModuleStmts(decompiler: *Decompiler, stmts: []const *Stmt) DecompileEr
     out = try decompiler.rewriteEllipsisAttrTempDeep(a, out);
     out = try decompiler.rewriteIntTripleAssignDeep(a, out);
     out = try decompiler.rewriteDropIfBranchAssignTailDeep(a, out);
+    out = try decompiler.rewriteDropPostWithEmptyAssignDeep(a, out);
     out = try decompiler.rewriteHoistWithLoopTailBreakDeep(a, out, false);
     return out;
 }
@@ -12358,6 +12360,113 @@ pub const Decompiler = struct {
             }
         }
         return try self.rewriteDropIfBranchAssignTailList(allocator, stmts);
+    }
+
+    fn isConstEmptyBytes(expr: *const Expr) bool {
+        if (expr.* != .constant) return false;
+        return switch (expr.constant) {
+            .bytes => |b| b.len == 0,
+            else => false,
+        };
+    }
+
+    fn rewriteDropPostWithEmptyAssignList(
+        self: *Decompiler,
+        allocator: Allocator,
+        stmts: []const *Stmt,
+    ) DecompileError![]const *Stmt {
+        _ = self;
+        if (stmts.len < 2) return stmts;
+
+        var out: std.ArrayListUnmanaged(*Stmt) = .{};
+        errdefer out.deinit(allocator);
+        var changed = false;
+        var i: usize = 0;
+        while (i < stmts.len) {
+            if (i > 0 and stmts[i].* == .assign and isConstEmptyBytes(stmts[i].assign.value) and stmts[i - 1].* == .with_stmt) {
+                const name = assignTargetName(stmts[i]) orelse {
+                    try out.append(allocator, stmts[i]);
+                    i += 1;
+                    continue;
+                };
+                const ws = stmts[i - 1].with_stmt;
+                if (ws.body.len > 0) {
+                    const last = ws.body[ws.body.len - 1];
+                    if (assignTargetName(last)) |last_name| {
+                        if (std.mem.eql(u8, name, last_name)) {
+                            changed = true;
+                            i += 1;
+                            continue;
+                        }
+                    }
+                }
+            }
+            try out.append(allocator, stmts[i]);
+            i += 1;
+        }
+
+        if (!changed) {
+            out.deinit(allocator);
+            return stmts;
+        }
+        return out.toOwnedSlice(allocator);
+    }
+
+    fn rewriteDropPostWithEmptyAssignDeep(
+        self: *Decompiler,
+        allocator: Allocator,
+        stmts: []const *Stmt,
+    ) DecompileError![]const *Stmt {
+        for (stmts) |stmt| {
+            switch (stmt.*) {
+                .function_def => |*f| {
+                    f.body = try self.rewriteDropPostWithEmptyAssignDeep(allocator, f.body);
+                },
+                .class_def => |*c| {
+                    c.body = try self.rewriteDropPostWithEmptyAssignDeep(allocator, c.body);
+                },
+                .for_stmt => |*f| {
+                    f.body = try self.rewriteDropPostWithEmptyAssignDeep(allocator, f.body);
+                    f.else_body = try self.rewriteDropPostWithEmptyAssignDeep(allocator, f.else_body);
+                },
+                .while_stmt => |*w| {
+                    w.body = try self.rewriteDropPostWithEmptyAssignDeep(allocator, w.body);
+                    w.else_body = try self.rewriteDropPostWithEmptyAssignDeep(allocator, w.else_body);
+                },
+                .if_stmt => |*ifs| {
+                    ifs.body = try self.rewriteDropPostWithEmptyAssignDeep(allocator, ifs.body);
+                    ifs.else_body = try self.rewriteDropPostWithEmptyAssignDeep(allocator, ifs.else_body);
+                },
+                .with_stmt => |*w| {
+                    w.body = try self.rewriteDropPostWithEmptyAssignDeep(allocator, w.body);
+                },
+                .try_stmt => |*t| {
+                    t.body = try self.rewriteDropPostWithEmptyAssignDeep(allocator, t.body);
+                    t.else_body = try self.rewriteDropPostWithEmptyAssignDeep(allocator, t.else_body);
+                    t.finalbody = try self.rewriteDropPostWithEmptyAssignDeep(allocator, t.finalbody);
+                    if (t.handlers.len > 0) {
+                        const handlers = try allocator.alloc(ast.ExceptHandler, t.handlers.len);
+                        for (t.handlers, 0..) |h, hidx| {
+                            handlers[hidx] = h;
+                            handlers[hidx].body = try self.rewriteDropPostWithEmptyAssignDeep(allocator, h.body);
+                        }
+                        t.handlers = handlers;
+                    }
+                },
+                .match_stmt => |*m| {
+                    if (m.cases.len > 0) {
+                        const cases = try allocator.alloc(ast.MatchCase, m.cases.len);
+                        for (m.cases, 0..) |c, cidx| {
+                            cases[cidx] = c;
+                            cases[cidx].body = try self.rewriteDropPostWithEmptyAssignDeep(allocator, c.body);
+                        }
+                        m.cases = cases;
+                    }
+                },
+                else => {},
+            }
+        }
+        return try self.rewriteDropPostWithEmptyAssignList(allocator, stmts);
     }
 
     fn isSingleBreakGuard(stmt: *const Stmt) bool {
