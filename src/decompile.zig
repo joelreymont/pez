@@ -253,6 +253,7 @@ fn rewriteFunctionStmts(decompiler: *Decompiler, stmts: []const *Stmt) Decompile
     out = try decompiler.rewriteAssertOrGuardDeep(a, out);
     out = try decompiler.rewriteTypingGenexprDeep(a, out);
     out = try decompiler.rewriteSentinelPassBreakDeep(a, out);
+    out = try decompiler.rewriteForTailWhileTransferDeep(a, out);
     out = try decompiler.mergeLoopGuardsDeep(a, out);
     out = try decompiler.dropDupPhiCallDeep(a, out);
     out = try decompiler.trimTailElseRetNone(out);
@@ -329,6 +330,7 @@ fn rewriteModuleStmts(decompiler: *Decompiler, stmts: []const *Stmt) DecompileEr
     out = try decompiler.rewriteAssertOrGuardDeep(a, out);
     out = try decompiler.rewriteTypingGenexprDeep(a, out);
     out = try decompiler.rewriteSentinelPassBreakDeep(a, out);
+    out = try decompiler.rewriteForTailWhileTransferDeep(a, out);
     out = try decompiler.mergeLoopGuardsDeep(a, out);
     out = try decompiler.dropDupPhiCallDeep(a, out);
     out = try decompiler.trimTailElseRetNone(out);
@@ -14970,6 +14972,101 @@ pub const Decompiler = struct {
             }
         }
         return try self.rewriteSentinelPassBreakList(allocator, stmts);
+    }
+
+    fn whileBodyIsNoop(body: []const *Stmt) bool {
+        return body.len == 0 or (body.len == 1 and body[0].* == .pass);
+    }
+
+    fn rewriteForTailWhileTransferList(
+        self: *Decompiler,
+        allocator: Allocator,
+        stmts: []const *Stmt,
+    ) DecompileError![]const *Stmt {
+        _ = self;
+        _ = allocator;
+        var changed = false;
+        var i: usize = 0;
+        while (i < stmts.len) : (i += 1) {
+            if (stmts[i].* != .for_stmt) continue;
+            var fs = &stmts[i].for_stmt;
+            if (fs.else_body.len != 0 or fs.body.len == 0) continue;
+            const tail_stmt = fs.body[fs.body.len - 1];
+            if (tail_stmt.* != .while_stmt) continue;
+            const inner = tail_stmt.while_stmt;
+            if (inner.else_body.len != 0 or whileBodyIsNoop(inner.body)) continue;
+
+            var j = i + 1;
+            while (j < stmts.len and stmts[j].* == .assign) : (j += 1) {}
+            if (j == i + 1 or j >= stmts.len or stmts[j].* != .while_stmt) continue;
+
+            var outer = &stmts[j].while_stmt;
+            if (outer.else_body.len != 0 or !whileBodyIsNoop(outer.body)) continue;
+            if (!ast.exprEqual(inner.condition, outer.condition)) continue;
+
+            fs.body = fs.body[0 .. fs.body.len - 1];
+            outer.body = inner.body;
+            changed = true;
+        }
+        if (!changed) return stmts;
+        return stmts;
+    }
+
+    fn rewriteForTailWhileTransferDeep(
+        self: *Decompiler,
+        allocator: Allocator,
+        stmts: []const *Stmt,
+    ) DecompileError![]const *Stmt {
+        for (stmts) |stmt| {
+            switch (stmt.*) {
+                .function_def => |*f| {
+                    f.body = try self.rewriteForTailWhileTransferDeep(allocator, f.body);
+                },
+                .class_def => |*c| {
+                    c.body = try self.rewriteForTailWhileTransferDeep(allocator, c.body);
+                },
+                .for_stmt => |*f| {
+                    f.body = try self.rewriteForTailWhileTransferDeep(allocator, f.body);
+                    f.else_body = try self.rewriteForTailWhileTransferDeep(allocator, f.else_body);
+                },
+                .while_stmt => |*w| {
+                    w.body = try self.rewriteForTailWhileTransferDeep(allocator, w.body);
+                    w.else_body = try self.rewriteForTailWhileTransferDeep(allocator, w.else_body);
+                },
+                .if_stmt => |*ifs| {
+                    ifs.body = try self.rewriteForTailWhileTransferDeep(allocator, ifs.body);
+                    ifs.else_body = try self.rewriteForTailWhileTransferDeep(allocator, ifs.else_body);
+                },
+                .with_stmt => |*w| {
+                    w.body = try self.rewriteForTailWhileTransferDeep(allocator, w.body);
+                },
+                .try_stmt => |*t| {
+                    t.body = try self.rewriteForTailWhileTransferDeep(allocator, t.body);
+                    t.else_body = try self.rewriteForTailWhileTransferDeep(allocator, t.else_body);
+                    t.finalbody = try self.rewriteForTailWhileTransferDeep(allocator, t.finalbody);
+                    if (t.handlers.len > 0) {
+                        const handlers = try allocator.alloc(ast.ExceptHandler, t.handlers.len);
+                        for (t.handlers, 0..) |h, hidx| {
+                            handlers[hidx] = h;
+                            handlers[hidx].body = try self.rewriteForTailWhileTransferDeep(allocator, h.body);
+                        }
+                        t.handlers = handlers;
+                    }
+                },
+                .match_stmt => |*m| {
+                    if (m.cases.len > 0) {
+                        const cases = try allocator.alloc(ast.MatchCase, m.cases.len);
+                        for (m.cases, 0..) |c, cidx| {
+                            cases[cidx] = c;
+                            cases[cidx].body = try self.rewriteForTailWhileTransferDeep(allocator, c.body);
+                        }
+                        m.cases = cases;
+                    }
+                },
+                else => {},
+            }
+        }
+        return try self.rewriteForTailWhileTransferList(allocator, stmts);
     }
 
     fn rewriteTerminalElseList(
