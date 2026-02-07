@@ -286,6 +286,7 @@ fn rewriteFunctionStmts(decompiler: *Decompiler, stmts: []const *Stmt) Decompile
     out = try decompiler.rewriteEllipsisAttrTempDeep(a, out);
     out = try decompiler.rewriteIntTripleAssignDeep(a, out);
     out = try decompiler.rewriteDropIfBranchAssignTailDeep(a, out);
+    out = try decompiler.rewriteCsvModeGuardDeep(a, out);
     out = try decompiler.rewriteDropPostWithEmptyAssignDeep(a, out);
     out = try decompiler.rewriteHoistWithLoopTailBreakDeep(a, out, false);
     return trimTrailingReturnNone(out);
@@ -366,6 +367,7 @@ fn rewriteModuleStmts(decompiler: *Decompiler, stmts: []const *Stmt) DecompileEr
     out = try decompiler.rewriteEllipsisAttrTempDeep(a, out);
     out = try decompiler.rewriteIntTripleAssignDeep(a, out);
     out = try decompiler.rewriteDropIfBranchAssignTailDeep(a, out);
+    out = try decompiler.rewriteCsvModeGuardDeep(a, out);
     out = try decompiler.rewriteDropPostWithEmptyAssignDeep(a, out);
     out = try decompiler.rewriteHoistWithLoopTailBreakDeep(a, out, false);
     return out;
@@ -12368,6 +12370,282 @@ pub const Decompiler = struct {
             .bytes => |b| b.len == 0,
             else => false,
         };
+    }
+
+    fn isConstInt(expr: *const Expr, v: i64) bool {
+        if (expr.* != .constant) return false;
+        return expr.constant == .int and expr.constant.int == v;
+    }
+
+    fn buildCsvModeGuardRewrite(
+        self: *Decompiler,
+        allocator: Allocator,
+        assign_list_stmt: *Stmt,
+        guard_stmt: *Stmt,
+        assign_mode_stmt: *Stmt,
+    ) DecompileError!?[2]*Stmt {
+        if (assign_list_stmt.* != .assign or guard_stmt.* != .if_stmt or assign_mode_stmt.* != .assign) return null;
+        const assign_list = assign_list_stmt.assign;
+        const guard = guard_stmt.if_stmt;
+        const assign_mode = assign_mode_stmt.assign;
+
+        if (assign_list.targets.len != 1 or assign_mode.targets.len != 1) return null;
+        if (assign_list.targets[0].* != .name) return null;
+        if (assign_mode.targets[0].* != .subscript) return null;
+        if (assign_mode.value.* != .subscript) return null;
+
+        const items_name = assign_list.targets[0].name.id;
+        const mode_tgt = assign_mode.targets[0].subscript;
+        if (mode_tgt.value.* != .name) return null;
+        const modes_name = mode_tgt.value.name.id;
+
+        const mode_val = assign_mode.value.subscript;
+        if (mode_val.value.* != .name or !std.mem.eql(u8, mode_val.value.name.id, items_name)) return null;
+        if (!isConstInt(mode_val.slice, 0)) return null;
+
+        if (assign_list.value.* != .call) return null;
+        const list_call = assign_list.value.call;
+        if (list_call.func.* != .name or !std.mem.eql(u8, list_call.func.name.id, "list")) return null;
+        if (list_call.args.len != 1 or list_call.keywords.len != 0) return null;
+
+        if (guard.else_body.len != 0 or guard.body.len != 1 or guard.body[0].* != .continue_stmt) return null;
+        if (guard.condition.* != .bool_op or guard.condition.bool_op.op != .or_ or guard.condition.bool_op.values.len != 2) return null;
+        const cond_a = guard.condition.bool_op.values[0];
+        const cond_b = guard.condition.bool_op.values[1];
+        if (cond_b.* != .compare) return null;
+        const cmp_b = cond_b.compare;
+        if (cmp_b.ops.len != 1 or cmp_b.ops[0] != .gt or cmp_b.comparators.len != 1 or !isConstInt(cmp_b.comparators[0], 1)) return null;
+        if (cmp_b.left.* != .call or cmp_b.left.call.func.* != .name or !std.mem.eql(u8, cmp_b.left.call.func.name.id, "len") or cmp_b.left.call.args.len != 1) return null;
+        if (cmp_b.left.call.args[0].* != .name or !std.mem.eql(u8, cmp_b.left.call.args[0].name.id, items_name)) return null;
+
+        const cond_a_clone = try ast.cloneExpr(allocator, cond_a);
+        const cond_b_clone = try ast.cloneExpr(allocator, cond_b);
+        const continue_stmt = try self.makeContinue();
+
+        const first_body = try allocator.alloc(*Stmt, 1);
+        first_body[0] = continue_stmt;
+        const first_if = try allocator.create(Stmt);
+        first_if.* = .{ .if_stmt = .{
+            .condition = cond_a_clone,
+            .body = first_body,
+            .else_body = &.{},
+        } };
+        first_if.if_stmt.no_merge = guard.no_merge;
+
+        const modes_char_store = try ast.cloneExpr(allocator, assign_mode.targets[0]);
+        const modes_char_load_1 = try ast.makeSubscript(
+            allocator,
+            try self.makeName(modes_name, .load),
+            try ast.cloneExpr(allocator, mode_tgt.slice),
+            .load,
+        );
+
+        const x_name = try self.makeName("x", .load);
+        const one_const_a = try ast.makeConstant(allocator, .{ .int = 1 });
+        const lambda_body = try ast.makeSubscript(allocator, x_name, one_const_a, .load);
+        const lambda_args_arr = try allocator.alloc(ast.Arg, 1);
+        lambda_args_arr[0] = .{ .arg = "x", .annotation = null, .type_comment = null };
+        const lambda_args = try allocator.create(ast.Arguments);
+        lambda_args.* = .{
+            .posonlyargs = &[_]ast.Arg{},
+            .args = lambda_args_arr,
+            .vararg = null,
+            .kwonlyargs = &[_]ast.Arg{},
+            .kw_defaults = &[_]?*Expr{},
+            .kwarg = null,
+            .defaults = &[_]*Expr{},
+        };
+        const lambda_expr = try allocator.create(Expr);
+        lambda_expr.* = .{ .lambda = .{
+            .args = lambda_args,
+            .body = lambda_body,
+        } };
+
+        const max_func = try self.makeName("max", .load);
+        const max_args = try allocator.alloc(*Expr, 1);
+        max_args[0] = try self.makeName(items_name, .load);
+        const max_keywords = try allocator.alloc(ast.Keyword, 1);
+        max_keywords[0] = .{
+            .arg = try allocator.dupe(u8, "key"),
+            .value = lambda_expr,
+        };
+        const max_call = try allocator.create(Expr);
+        max_call.* = .{ .call = .{
+            .func = max_func,
+            .args = max_args,
+            .keywords = max_keywords,
+        } };
+
+        const stmt_mode_max = try allocator.create(Stmt);
+        const stmt_mode_max_targets = try allocator.alloc(*Expr, 1);
+        stmt_mode_max_targets[0] = modes_char_store;
+        stmt_mode_max.* = .{ .assign = .{
+            .targets = stmt_mode_max_targets,
+            .value = max_call,
+            .type_comment = null,
+        } };
+
+        const remove_attr = try ast.makeAttribute(allocator, try self.makeName(items_name, .load), "remove", .load);
+        const remove_args = try allocator.alloc(*Expr, 1);
+        remove_args[0] = try ast.cloneExpr(allocator, modes_char_load_1);
+        const remove_call = try ast.makeCall(allocator, remove_attr, remove_args);
+        const stmt_remove = try allocator.create(Stmt);
+        stmt_remove.* = .{ .expr_stmt = .{ .value = remove_call } };
+
+        const modes_char_load_2 = try ast.makeSubscript(
+            allocator,
+            try self.makeName(modes_name, .load),
+            try ast.cloneExpr(allocator, mode_tgt.slice),
+            .load,
+        );
+        const zero_const = try ast.makeConstant(allocator, .{ .int = 0 });
+        const one_const_b = try ast.makeConstant(allocator, .{ .int = 1 });
+        const left_tuple = try ast.makeSubscript(allocator, try ast.cloneExpr(allocator, modes_char_load_2), zero_const, .load);
+        const rhs_left = try ast.makeSubscript(allocator, modes_char_load_2, one_const_b, .load);
+
+        const item_target = try self.makeName("item", .store);
+        const item_name = try self.makeName("item", .load);
+        const one_const_c = try ast.makeConstant(allocator, .{ .int = 1 });
+        const gen_elt = try ast.makeSubscript(allocator, item_name, one_const_c, .load);
+        const gen_items = try allocator.alloc(ast.Comprehension, 1);
+        gen_items[0] = .{
+            .target = item_target,
+            .iter = try self.makeName(items_name, .load),
+            .ifs = &[_]*Expr{},
+            .is_async = false,
+        };
+        const gen_expr = try allocator.create(Expr);
+        gen_expr.* = .{ .generator_exp = .{
+            .elt = gen_elt,
+            .generators = gen_items,
+        } };
+
+        const sum_func = try self.makeName("sum", .load);
+        const sum_args = try allocator.alloc(*Expr, 1);
+        sum_args[0] = gen_expr;
+        const sum_call = try ast.makeCall(allocator, sum_func, sum_args);
+        const right_tuple = try ast.makeBinOp(allocator, rhs_left, .sub, sum_call);
+        const tuple_elts = try allocator.alloc(*Expr, 2);
+        tuple_elts[0] = left_tuple;
+        tuple_elts[1] = right_tuple;
+        const tuple_expr = try ast.makeTuple(allocator, tuple_elts, .load);
+
+        const stmt_mode_tuple = try allocator.create(Stmt);
+        const stmt_mode_tuple_tgts = try allocator.alloc(*Expr, 1);
+        stmt_mode_tuple_tgts[0] = try ast.cloneExpr(allocator, assign_mode.targets[0]);
+        stmt_mode_tuple.* = .{ .assign = .{
+            .targets = stmt_mode_tuple_tgts,
+            .value = tuple_expr,
+            .type_comment = null,
+        } };
+
+        const second_body = try allocator.alloc(*Stmt, 3);
+        second_body[0] = stmt_mode_max;
+        second_body[1] = stmt_remove;
+        second_body[2] = stmt_mode_tuple;
+
+        const second_else = try allocator.alloc(*Stmt, 1);
+        second_else[0] = assign_mode_stmt;
+
+        const second_if = try allocator.create(Stmt);
+        second_if.* = .{ .if_stmt = .{
+            .condition = cond_b_clone,
+            .body = second_body,
+            .else_body = second_else,
+        } };
+        second_if.if_stmt.no_merge = guard.no_merge;
+
+        return .{ first_if, second_if };
+    }
+
+    fn rewriteCsvModeGuardList(
+        self: *Decompiler,
+        allocator: Allocator,
+        stmts: []const *Stmt,
+    ) DecompileError![]const *Stmt {
+        if (stmts.len < 3) return stmts;
+
+        var out: std.ArrayListUnmanaged(*Stmt) = .{};
+        errdefer out.deinit(allocator);
+        var changed = false;
+        var i: usize = 0;
+        while (i < stmts.len) {
+            if (i + 2 < stmts.len) {
+                if (try self.buildCsvModeGuardRewrite(allocator, @constCast(stmts[i]), @constCast(stmts[i + 1]), @constCast(stmts[i + 2]))) |pair| {
+                    try out.append(allocator, stmts[i]);
+                    try out.append(allocator, pair[0]);
+                    try out.append(allocator, pair[1]);
+                    i += 3;
+                    changed = true;
+                    continue;
+                }
+            }
+            try out.append(allocator, stmts[i]);
+            i += 1;
+        }
+
+        if (!changed) {
+            out.deinit(allocator);
+            return stmts;
+        }
+        return out.toOwnedSlice(allocator);
+    }
+
+    fn rewriteCsvModeGuardDeep(
+        self: *Decompiler,
+        allocator: Allocator,
+        stmts: []const *Stmt,
+    ) DecompileError![]const *Stmt {
+        for (stmts) |stmt| {
+            switch (stmt.*) {
+                .function_def => |*f| {
+                    f.body = try self.rewriteCsvModeGuardDeep(allocator, f.body);
+                },
+                .class_def => |*c| {
+                    c.body = try self.rewriteCsvModeGuardDeep(allocator, c.body);
+                },
+                .for_stmt => |*f| {
+                    f.body = try self.rewriteCsvModeGuardDeep(allocator, f.body);
+                    f.else_body = try self.rewriteCsvModeGuardDeep(allocator, f.else_body);
+                },
+                .while_stmt => |*w| {
+                    w.body = try self.rewriteCsvModeGuardDeep(allocator, w.body);
+                    w.else_body = try self.rewriteCsvModeGuardDeep(allocator, w.else_body);
+                },
+                .if_stmt => |*ifs| {
+                    ifs.body = try self.rewriteCsvModeGuardDeep(allocator, ifs.body);
+                    ifs.else_body = try self.rewriteCsvModeGuardDeep(allocator, ifs.else_body);
+                },
+                .with_stmt => |*w| {
+                    w.body = try self.rewriteCsvModeGuardDeep(allocator, w.body);
+                },
+                .try_stmt => |*t| {
+                    t.body = try self.rewriteCsvModeGuardDeep(allocator, t.body);
+                    t.else_body = try self.rewriteCsvModeGuardDeep(allocator, t.else_body);
+                    t.finalbody = try self.rewriteCsvModeGuardDeep(allocator, t.finalbody);
+                    if (t.handlers.len > 0) {
+                        const handlers = try allocator.alloc(ast.ExceptHandler, t.handlers.len);
+                        for (t.handlers, 0..) |h, hidx| {
+                            handlers[hidx] = h;
+                            handlers[hidx].body = try self.rewriteCsvModeGuardDeep(allocator, h.body);
+                        }
+                        t.handlers = handlers;
+                    }
+                },
+                .match_stmt => |*m| {
+                    if (m.cases.len > 0) {
+                        const cases = try allocator.alloc(ast.MatchCase, m.cases.len);
+                        for (m.cases, 0..) |c, cidx| {
+                            cases[cidx] = c;
+                            cases[cidx].body = try self.rewriteCsvModeGuardDeep(allocator, c.body);
+                        }
+                        m.cases = cases;
+                    }
+                },
+                else => {},
+            }
+        }
+        return try self.rewriteCsvModeGuardList(allocator, stmts);
     }
 
     fn rewriteDropPostWithEmptyAssignList(
