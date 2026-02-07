@@ -1,170 +1,106 @@
-# Pez Plan: Boat_main Parity + UV Runtime Unification
+# PLAN
 
 ## Scope
 
-- Make boat_main decompilation and round-trip parity the active delivery target.
-- Use uv-managed runtimes only for decompiler comparison and parity tooling.
-- Drain all currently open boat_main mismatch dots to completion.
-- Keep prior parity architecture work (postdom/pattern contract/pipeline) as follow-on phases after boat_main mismatch zeroing.
+- Make boat_main decompilation + round-trip parity the immediate delivery target.
+- Keep all plan execution trackable via dot IDs and checkbox status.
+- Use uv-managed runtimes only for compare/parity workflows.
+- Fold prior `docs/testing-plan.md` content into this file as the only active plan.
 
-## Current Baseline
+## Current Baseline (2026-02-07)
 
 - Dataset: `/Users/joel/Work/Shakhed/boat_main_extracted_3.9/PYZ-00.pyz_extracted`
-- Latest suite baseline:
-  - pez decompile: `ok=329`, `error=0`
-  - pez compare: `exact=173`, `close=54`, `mismatch=102`
-  - decompyle3 decompile: `ok=329`, `error=0`
-- Known historical regressions to keep green:
-  - `test_listComprehensions.2.7.pyc` (invalid free)
-  - `test_loops2.2.2.pyc` (hang)
-- Open execution dots:
-  - `Fix mismatch aioice/mdns`
-  - `Fix mismatch telebot/types`
-  - `Fix mismatch tarfile`
-  - `Fix mismatch subprocess`
-  - `Fix mismatch packaging/specifiers`
-  - `Fix mismatch typing`
-  - `Fix mismatch picamera2/controls`
-  - `Fix mismatch ftplib`
-  - `Fix mismatch glob`
+- Latest suite artifact: `/tmp/pez-boatmain-suite-20260207.json`
+- pez decompile: `ok=329`, `error=0`
+- pez compare: `exact=206`, `close=75`, `mismatch=48`, `error=0`
+- decompyle3 decompile: `ok=329`, `error=0`
+- decompyle3 compare: `exact=8`, `close=0`, `mismatch=321`, `error=0`
 
-## Runtime Standardization (UV Only)
+## Plan-Tracking Setup
 
-### Environments
+- [ ] Merge testing plan into PLAN [dot:pez-merge-testing-plan-dc61ae79]
+- [ ] Add PLAN checklist with dot IDs [dot:pez-add-plan-checklist-7554f7e3]
+- [ ] Sync dot tree to checklist [dot:pez-sync-dot-tree-b96bfee9]
+- [ ] Rebaseline boat_main metrics in PLAN [dot:pez-rebaseline-boat-main-4fc4b54c]
+- [ ] Create detailed mismatch implementation dots [dot:pez-create-detailed-mismatch-84522086]
 
-- Python 3.9 runtime for compare/decompile loops:
-  - `.uv/py39`
-- Python 3.12 runtime for parity harnesses:
-  - `.uv/py312`
+## Runtime / Tooling Standardization (uv-only)
 
-### Installation Contract
+- [x] Provision uv venvs [dot:pez-add-uv-venv-48730f83]
+- [x] Clone decompyle3 refs [dot:pez-clone-decompyle3-refs-d4d268cf]
+- [x] Prefer `.uv/py39` in compare tools [dot:pez-wire-uv-paths-d4ef838b]
+- [x] Prefer `.uv/py312` in parity harness [dot:pez-wire-uv-paths-7201a0db]
 
-- `uv python install 3.9`
-- `uv python install 3.12`
-- `uv venv -p 3.9 /Users/joel/Work/pez/.uv/py39`
-- `uv venv -p 3.12 /Users/joel/Work/pez/.uv/py312`
-- `uv pip install -p /Users/joel/Work/pez/.uv/py39 -e /Users/joel/Work/pez/refs/python-decompile3`
-- `uv pip install -p /Users/joel/Work/pez/.uv/py39 xdis==6.1.7 spark-parser click configobj`
-- `uv pip install -p /Users/joel/Work/pez/.uv/py312 uncompyle6 decompyle3 xdis`
+## Boat_main Parity Execution
 
-### Tooling Defaults
+- [ ] Record current boat_main baseline [dot:pez-record-curr-boat-ccb838bb]
+- [ ] Drain remaining boat_main mismatches [dot:pez-drain-remaining-boat-615a5db9]
 
-- `tools/compare/compare_suite.py` must prefer:
-  - `.uv/py39/bin/decompyle3`
-  - `.uv/py39/bin/python`
-- `tools/compare/lib.py` xdis interpreter detection must prefer:
-  - `.uv/py39/bin/python`
-- `tools/parity/run.sh` must use:
-  - `.uv/py312` runtime
-- Keep env override support (`PEZ_DECOMPYLE3`, interpreter flags) for explicit operator control.
+### Active mismatch subtree (small-dot implementation)
 
-## Boat_main Delivery Plan
+- [ ] Repro pycparser lex mismatch [dot:pez-repro-pycparser-lex-3890f864]
+- [ ] Locate lex first divergence [dot:pez-locate-lex-first-ffcd9e45]
+- [ ] Patch lex divergence root cause [dot:pez-patch-lex-divergence-64271ce3]
+- [ ] Add lex regression fixture+snapshot [dot:pez-add-lex-regression-af236d63]
+- [ ] Validate lex fix and update suite [dot:pez-validate-lex-fix-5db7d8d9]
 
-## Phase 0: Preflight and Tracking
+### Historical fixes already shipped
 
-- Confirm repo state with `jj status`.
-- Keep one ready mismatch dot at a time.
-- Use compare suite output root progression (`suite18`, `suite19`, `suite20`, ...).
-- Record every run summary in docs after meaningful movement.
+- [x] Aioice mismatch fix [dot:pez-fix-mismatch-aioice-2d93d276]
+- [x] Telebot mismatch fix [dot:pez-fix-mismatch-telebot-a5980562]
+- [x] Tarfile mismatch fix [dot:pez-fix-mismatch-tarfile-0672b1b8]
+- [x] Glob mismatch fix [dot:pez-fix-mismatch-glob-cc594e91]
+- [x] Subprocess mismatch fix [dot:pez-fix-subprocess-parity-39c6f674]
+- [x] Bootsubprocess mismatch fix [dot:pez-fix-mismatch-bootsubprocess-435a9715]
 
-## Phase 1: Aioice Root-Cause Fix
+## Regression Hardening
 
-- Target unit: `<module>.MDnsProtocol.resolve`.
-- Required method:
-  - reproduce via `tools/compare/compare_driver.py`
-  - localize with `tools/compare/locate_mismatch.py`
-  - inspect unit signatures via `tools/compare/unit_trace.py`
-- Fix style:
-  - root-cause control-flow/body-range handling only
-  - no cleanup suppression hacks or fallback masking
-- Validation:
-  - `compare_driver` exact on `aioice/mdns.pyc`
+- [ ] Recheck listComprehensions crash regression [dot:pez-recheck-listcomprehensions-eb9cf738]
+- [ ] Recheck loops2 hang regression [dot:pez-recheck-loops2-hang-76a44e45]
+
+## Test Hardening (merged from docs/testing-plan.md)
+
+- [ ] Expand snapshot coverage matrix [dot:pez-expand-snapshot-coverage-c98b2e59]
+- [ ] Expand property invariants [dot:pez-expand-prop-invariants-d1dac452]
+- [ ] Wire version-matrix parity runs [dot:pez-wire-ver-matrix-5a7c1df8]
+
+### Snapshot coverage targets
+
+- [ ] Functions: decorators/defaults/kwdefaults/annotations/closures [dot:pez-expand-snapshot-coverage-c98b2e59]
+- [ ] Classes: build-class/metaclass paths [dot:pez-expand-snapshot-coverage-c98b2e59]
+- [ ] Control-flow: if/loop/try/with/match variants [dot:pez-expand-snapshot-coverage-c98b2e59]
+- [ ] Expressions: ternary/comprehensions/chained-compare/f-string [dot:pez-expand-snapshot-coverage-c98b2e59]
+- [ ] Version-specific opcode delta snapshots [dot:pez-expand-snapshot-coverage-c98b2e59]
+
+### Property invariant targets
+
+- [ ] Decoder invariants in `src/property_tests.zig` [dot:pez-expand-prop-invariants-d1dac452]
+- [ ] Opcode-table invariants in `src/property_tests.zig` [dot:pez-expand-prop-invariants-d1dac452]
+- [ ] CFG invariants in `src/property_tests.zig` [dot:pez-expand-prop-invariants-d1dac452]
+- [ ] Stack simulation invariants in `src/property_tests.zig` [dot:pez-expand-prop-invariants-d1dac452]
+- [ ] Decompiler invariants in `src/property_tests.zig` [dot:pez-expand-prop-invariants-d1dac452]
+- [ ] Marshal invariants in `src/property_tests.zig` [dot:pez-expand-prop-invariants-d1dac452]
+
+## Final Gate
+
+- [ ] Run final parity gate [dot:pez-run-final-parity-590494c5]
   - `zig build test`
-  - `compare_suite` mismatch count decreases
-
-## Phase 2: Ordered Mismatch Drain
-
-- Apply the same loop for each open dot, in this order:
-  1. `aioice/mdns`
-  2. `telebot/types`
-  3. `tarfile`
-  4. `subprocess`
-  5. `packaging/specifiers`
-  6. `typing`
-  7. `picamera2/controls`
-  8. `ftplib`
-  9. `glob`
-- For each target:
-  - add or update minimal fixture in `test/corpus_src/`
-  - ensure compiled corpus fixture exists under `test/corpus/`
-  - add regression test/snapshot
-  - run `zig build test`
-  - rerun targeted `compare_driver`
-  - rerun global `compare_suite`
-  - commit one fix per change (`jj describe -m "..."`, then `jj new`)
-
-## Phase 3: Regression Hardening
-
-- Re-run targeted historical crash/hang checks:
-  - `test_listComprehensions.2.7.pyc`
-  - `test_loops2.2.2.pyc`
-- Add dedicated regressions if any instability appears.
-- Ensure no silent error handling in changed code paths.
-
-## Phase 4: Final Parity Gate
-
-- Required final commands:
-  - `zig build test`
-  - `python3 tools/compare/compare_suite.py ...` (boat_main, uv paths)
+  - `python3 tools/compare/compare_suite.py --orig-dir /Users/joel/Work/Shakhed/boat_main_extracted_3.9/PYZ-00.pyz_extracted --py /Users/joel/Work/pez/.uv/py39/bin/python --xdis-python /Users/joel/Work/pez/.uv/py39/bin/python --decompyle3 /Users/joel/Work/pez/.uv/py39/bin/decompyle3 --out-root /tmp/pez-boatmain-suiteXX --out /tmp/pez-boatmain-suiteXX.json`
   - `bash tools/parity/run.sh`
 - Ship criterion:
   - boat_main `mismatch=0`
   - decompyle3 compare run stable with `decompile error=0`
 
-## Follow-on Architecture Plan (Post Boat_main)
+## Post-Parity Architecture
 
-- Re-activate parity architecture backlog from prior plan:
-  - postdominator-based merge and structure selection
+- [ ] Execute post-parity architecture backlog [dot:pez-exec-post-parity-a272c4af]
+  - postdominator-driven merge/regioning
   - single authoritative control-flow pattern contract
   - expression/stack graph caching
-  - explicit staged pipeline (region, expression, statement, canonicalize, emit)
-- Continue to gate by parity corpus and round-trip structural scores.
+  - staged pipeline (region -> expression -> statement -> canonicalize -> emit)
 
-## Operational Rules
+## Operating Rules
 
-- Dot lifecycle:
-  - do not close a dot until implementation + tests + commit are done
-  - after `dot off`, start a fresh change (`jj new`) before next work unit
-- Commit policy:
-  - one fix/feature per commit
-  - no unrelated batching
-- Deletion policy:
-  - use `trash` for cleanup/removals
-
-## Verification Commands
-
-```bash
-zig build test
-
-python3 tools/compare/compare_driver.py \
-  --orig /Users/joel/Work/Shakhed/boat_main_extracted_3.9/PYZ-00.pyz_extracted/aioice/mdns.pyc \
-  --pez zig-out/bin/pez \
-  --py /Users/joel/Work/pez/.uv/py39/bin/python \
-  --xdis-python /Users/joel/Work/pez/.uv/py39/bin/python
-
-python3 tools/compare/compare_suite.py \
-  --orig-dir /Users/joel/Work/Shakhed/boat_main_extracted_3.9/PYZ-00.pyz_extracted \
-  --py /Users/joel/Work/pez/.uv/py39/bin/python \
-  --xdis-python /Users/joel/Work/pez/.uv/py39/bin/python \
-  --decompyle3 /Users/joel/Work/pez/.uv/py39/bin/decompyle3 \
-  --out-root /tmp/pez-boatmain-suiteXX \
-  --out /tmp/pez-boatmain-suiteXX.json
-
-bash tools/parity/run.sh
-```
-
-## Assumptions
-
-- Boat_main on Python 3.9 is the primary parity corpus for immediate delivery.
-- uv runtimes under `.uv/` are the only supported local compare/parity environments.
-- `refs/python-decompile3` remains the pinned decompyle3 source of truth.
+- One fix per commit (`jj describe -m "..."`), then `jj new`.
+- Never close a dot before implementation + tests + commit.
+- Use `dot` as execution source; keep PLAN checkboxes synchronized to dot status.
