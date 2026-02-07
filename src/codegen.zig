@@ -377,18 +377,42 @@ pub const Writer = struct {
                 try self.writeByte(allocator, '}');
             },
             .dict => |d| {
-                try self.writeByte(allocator, '{');
-                for (d.keys, d.values, 0..) |k, v, i| {
-                    if (i > 0) try self.write(allocator, ", ");
-                    if (k) |key| {
-                        try self.writeExpr(allocator, key);
-                        try self.write(allocator, ": ");
-                    } else {
-                        try self.write(allocator, "**");
+                var comp_values: usize = 0;
+                for (d.values) |v| {
+                    switch (v.*) {
+                        .list_comp, .set_comp, .dict_comp, .generator_exp => comp_values += 1,
+                        else => {},
                     }
-                    try self.writeExpr(allocator, v);
                 }
-                try self.writeByte(allocator, '}');
+                const multiline = d.values.len > 1 and comp_values >= 2;
+
+                if (!multiline) {
+                    try self.writeByte(allocator, '{');
+                    for (d.keys, d.values, 0..) |k, v, i| {
+                        if (i > 0) try self.write(allocator, ", ");
+                        if (k) |key| {
+                            try self.writeExpr(allocator, key);
+                            try self.write(allocator, ": ");
+                        } else {
+                            try self.write(allocator, "**");
+                        }
+                        try self.writeExpr(allocator, v);
+                    }
+                    try self.writeByte(allocator, '}');
+                } else {
+                    try self.write(allocator, "{\n");
+                    for (d.keys, d.values, 0..) |k, v, i| {
+                        if (k) |key| {
+                            try self.writeExpr(allocator, key);
+                            try self.write(allocator, ": ");
+                        } else {
+                            try self.write(allocator, "**");
+                        }
+                        try self.writeExpr(allocator, v);
+                        if (i + 1 < d.values.len) try self.write(allocator, ",\n");
+                    }
+                    try self.write(allocator, "\n}");
+                }
             },
             .list_comp => |c| {
                 try self.writeByte(allocator, '[');
