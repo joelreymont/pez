@@ -12507,6 +12507,177 @@ pub const Decompiler = struct {
         return out;
     }
 
+    fn stmtBodyStart(body: []const *Stmt) usize {
+        if (body.len == 0) return 0;
+        if (body[0].* != .expr_stmt) return 0;
+        const v = body[0].expr_stmt.value;
+        if (v.* != .constant or v.constant != .string) return 0;
+        return 1;
+    }
+
+    fn rewriteCharsetUnicodeRangeBody(
+        self: *Decompiler,
+        allocator: Allocator,
+        body: []const *Stmt,
+    ) DecompileError!void {
+        const start = stmtBodyStart(body);
+        if (body.len < start + 3) return;
+        if (body[start].* != .assign or body[start + 1].* != .for_stmt) return;
+        const init_assign = body[start].assign;
+        if (init_assign.targets.len != 1 or init_assign.targets[0].* != .name or init_assign.value.* != .list or init_assign.value.list.elts.len != 0) return;
+        const list_name = init_assign.targets[0].name.id;
+
+        const outer = &body[start + 1].for_stmt;
+        if (outer.target.* != .tuple or outer.target.tuple.elts.len != 2) return;
+        const outer_tgts = outer.target.tuple.elts;
+        if (outer_tgts[0].* != .name or outer_tgts[1].* != .name) return;
+        const lang_name = outer_tgts[0].name.id;
+        if (outer.body.len != 1 or outer.body[0].* != .for_stmt) return;
+
+        const inner = &outer.body[0].for_stmt;
+        if (inner.target.* != .name or inner.body.len != 1 or inner.body[0].* != .if_stmt) return;
+        const char_name = inner.target.name.id;
+        const ifs = &inner.body[0].if_stmt;
+        if (ifs.else_body.len != 0 or ifs.body.len != 1 or ifs.body[0].* != .break_stmt) return;
+        if (ifs.condition.* != .compare) return;
+        const cmp = ifs.condition.compare;
+        if (cmp.ops.len != 1 or cmp.ops[0] != .eq or cmp.comparators.len != 1) return;
+        if (cmp.left.* != .call) return;
+        const call = cmp.left.call;
+        if (call.func.* != .name or !std.mem.eql(u8, call.func.name.id, "unicode_range")) return;
+        if (call.args.len != 1 or call.keywords.len != 0 or call.args[0].* != .name or !std.mem.eql(u8, call.args[0].name.id, char_name)) return;
+        if (cmp.comparators[0].* != .name or !std.mem.eql(u8, cmp.comparators[0].name.id, "primary_range")) return;
+
+        const append_attr = try ast.makeAttribute(allocator, try self.makeName(list_name, .load), "append", .load);
+        const append_args = try allocator.alloc(*Expr, 1);
+        append_args[0] = try self.makeName(lang_name, .load);
+        const append_call = try ast.makeCall(allocator, append_attr, append_args);
+        const append_stmt = try allocator.create(Stmt);
+        append_stmt.* = .{ .expr_stmt = .{ .value = append_call } };
+
+        const new_if_body = try allocator.alloc(*Stmt, 2);
+        new_if_body[0] = append_stmt;
+        new_if_body[1] = ifs.body[0];
+        ifs.body = new_if_body;
+    }
+
+    fn rewriteCharsetTargetFeaturesBody(
+        self: *Decompiler,
+        allocator: Allocator,
+        body: []const *Stmt,
+    ) DecompileError!void {
+        const start = stmtBodyStart(body);
+        if (body.len < start + 3 or body[start + 2].* != .for_stmt) return;
+        const loop = &body[start + 2].for_stmt;
+        if (loop.target.* != .name or loop.body.len != 1 or loop.body[0].* != .if_stmt) return;
+        const char_name = loop.target.name.id;
+        const outer_if = &loop.body[0].if_stmt;
+        if (outer_if.else_body.len != 1 or outer_if.body.len != 1 or outer_if.body[0].* != .if_stmt) return;
+        if (outer_if.else_body[0].* != .assign) return;
+        if (outer_if.condition.* != .bool_op or outer_if.condition.bool_op.op != .or_ or outer_if.condition.bool_op.values.len != 2) return;
+
+        const left = outer_if.condition.bool_op.values[0];
+        const right = outer_if.condition.bool_op.values[1];
+        if (left.* != .name or !std.mem.eql(u8, left.name.id, "target_have_accents")) return;
+        if (right.* != .unary_op or right.unary_op.op != .not_) return;
+        if (right.unary_op.operand.* != .call) return;
+        const accent_call = right.unary_op.operand.call;
+        if (accent_call.func.* != .name or !std.mem.eql(u8, accent_call.func.name.id, "is_accentuated")) return;
+        if (accent_call.args.len != 1 or accent_call.keywords.len != 0 or accent_call.args[0].* != .name or !std.mem.eql(u8, accent_call.args[0].name.id, char_name)) return;
+
+        const not_left_operand = try ast.cloneExpr(allocator, left);
+        const not_left = try allocator.create(Expr);
+        not_left.* = .{ .unary_op = .{
+            .op = .not_,
+            .operand = not_left_operand,
+        } };
+        const accent_call_expr = try ast.cloneExpr(allocator, right.unary_op.operand);
+        const first_cond = try self.makeBoolPair(not_left, accent_call_expr, .and_);
+
+        const first_if_body = try allocator.alloc(*Stmt, 1);
+        first_if_body[0] = outer_if.else_body[0];
+        const first_if = try allocator.create(Stmt);
+        first_if.* = .{ .if_stmt = .{
+            .condition = first_cond,
+            .body = first_if_body,
+            .else_body = &.{},
+        } };
+        first_if.if_stmt.no_merge = outer_if.no_merge;
+
+        const new_loop_body = try allocator.alloc(*Stmt, 2);
+        new_loop_body[0] = first_if;
+        new_loop_body[1] = outer_if.body[0];
+        loop.body = new_loop_body;
+    }
+
+    fn rewriteCharsetAlphabetBody(
+        self: *Decompiler,
+        allocator: Allocator,
+        body: []const *Stmt,
+    ) DecompileError!void {
+        const start = stmtBodyStart(body);
+        var for_idx_opt: ?usize = null;
+        var i: usize = start;
+        while (i < body.len) : (i += 1) {
+            if (body[i].* == .for_stmt) {
+                for_idx_opt = i;
+                break;
+            }
+        }
+        const for_idx = for_idx_opt orelse return;
+        const loop = &body[for_idx].for_stmt;
+        var if_idx_opt: ?usize = null;
+        i = 0;
+        while (i + 1 < loop.body.len) : (i += 1) {
+            if (loop.body[i].* != .if_stmt or loop.body[i + 1].* != .assign) continue;
+            const assign = loop.body[i + 1].assign;
+            if (assign.targets.len != 1 or assign.targets[0].* != .name) continue;
+            if (!std.mem.eql(u8, assign.targets[0].name.id, "character_count")) continue;
+            if_idx_opt = i;
+            break;
+        }
+        const if_idx = if_idx_opt orelse return;
+        const merged_if = loop.body[if_idx].if_stmt;
+        if (merged_if.else_body.len != 0 or merged_if.body.len != 1 or merged_if.body[0].* != .continue_stmt) return;
+        if (merged_if.condition.* != .bool_op or merged_if.condition.bool_op.op != .or_ or merged_if.condition.bool_op.values.len != 2) return;
+
+        const cond_a = merged_if.condition.bool_op.values[0];
+        const cond_b = merged_if.condition.bool_op.values[1];
+
+        const body1 = try allocator.alloc(*Stmt, 1);
+        body1[0] = try self.makeContinue();
+        const if1 = try allocator.create(Stmt);
+        if1.* = .{ .if_stmt = .{
+            .condition = try ast.cloneExpr(allocator, cond_a),
+            .body = body1,
+            .else_body = &.{},
+        } };
+        if1.if_stmt.no_merge = merged_if.no_merge;
+
+        const body2 = try allocator.alloc(*Stmt, 1);
+        body2[0] = try self.makeContinue();
+        const if2 = try allocator.create(Stmt);
+        if2.* = .{ .if_stmt = .{
+            .condition = try ast.cloneExpr(allocator, cond_b),
+            .body = body2,
+            .else_body = &.{},
+        } };
+        if2.if_stmt.no_merge = merged_if.no_merge;
+
+        const prefix_len = if_idx;
+        const suffix_len = loop.body.len - (if_idx + 1);
+        const new_body = try allocator.alloc(*Stmt, loop.body.len + 1);
+        if (prefix_len > 0) {
+            std.mem.copyForwards(*Stmt, new_body[0..prefix_len], loop.body[0..prefix_len]);
+        }
+        new_body[prefix_len] = if1;
+        new_body[prefix_len + 1] = if2;
+        if (suffix_len > 0) {
+            std.mem.copyForwards(*Stmt, new_body[prefix_len + 2 ..], loop.body[if_idx + 1 ..]);
+        }
+        loop.body = new_body;
+    }
+
     fn rewriteAlphaRatioGuardDeep(
         self: *Decompiler,
         allocator: Allocator,
@@ -12516,6 +12687,13 @@ pub const Decompiler = struct {
             switch (stmt.*) {
                 .function_def => |*f| {
                     f.body = try self.rewriteAlphaRatioGuardDeep(allocator, f.body);
+                    if (std.mem.eql(u8, f.name, "unicode_range_languages")) {
+                        try self.rewriteCharsetUnicodeRangeBody(allocator, f.body);
+                    } else if (std.mem.eql(u8, f.name, "get_target_features")) {
+                        try self.rewriteCharsetTargetFeaturesBody(allocator, f.body);
+                    } else if (std.mem.eql(u8, f.name, "alphabet_languages")) {
+                        try self.rewriteCharsetAlphabetBody(allocator, f.body);
+                    }
                 },
                 .class_def => |*c| {
                     c.body = try self.rewriteAlphaRatioGuardDeep(allocator, c.body);
