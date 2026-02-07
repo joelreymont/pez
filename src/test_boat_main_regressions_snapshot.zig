@@ -2049,6 +2049,17 @@ test "snapshot with conditional open as 3.9" {
     );
 }
 
+test "snapshot with tail return 3.9" {
+    try runSnapshot(@src(), "test/corpus/with_tail_return.3.9.pyc",
+        \\[]u8
+        \\  "def with_tail_return(winreg):
+        \\    cvkey = 'SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion'
+        \\    with winreg.OpenKeyEx(winreg.HKEY_LOCAL_MACHINE, cvkey) as key:
+        \\        return winreg.QueryValueEx(key, 'EditionId')[0]
+        \\"
+    );
+}
+
 test "snapshot webbrowser register preferred 3.9" {
     try runSnapshot(@src(), "test/corpus/webbrowser_register_preferred.3.9.pyc",
         \\[]u8

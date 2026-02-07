@@ -286,6 +286,7 @@ fn rewriteFunctionStmts(decompiler: *Decompiler, stmts: []const *Stmt) Decompile
     out = try decompiler.rewriteShiftGuardLoopDeep(a, out);
     out = try decompiler.rewriteCookieFindGuardDeep(a, out);
     out = try decompiler.rewriteDropWithPlaceholderTailDeep(a, out);
+    out = try decompiler.rewriteWithTailReturnDeep(a, out);
     out = try decompiler.rewriteEllipsisAttrTempDeep(a, out);
     out = try decompiler.rewriteIntTripleAssignDeep(a, out);
     out = try decompiler.rewriteDropIfBranchAssignTailDeep(a, out);
@@ -378,6 +379,7 @@ fn rewriteModuleStmts(decompiler: *Decompiler, stmts: []const *Stmt) DecompileEr
     out = try decompiler.rewriteShiftGuardLoopDeep(a, out);
     out = try decompiler.rewriteCookieFindGuardDeep(a, out);
     out = try decompiler.rewriteDropWithPlaceholderTailDeep(a, out);
+    out = try decompiler.rewriteWithTailReturnDeep(a, out);
     out = try decompiler.rewriteEllipsisAttrTempDeep(a, out);
     out = try decompiler.rewriteIntTripleAssignDeep(a, out);
     out = try decompiler.rewriteDropIfBranchAssignTailDeep(a, out);
@@ -14535,6 +14537,229 @@ pub const Decompiler = struct {
             }
         }
         return try self.rewriteDropPostWithEmptyAssignList(allocator, stmts);
+    }
+
+    fn exprHasName(expr: *const Expr, want: []const u8) bool {
+        return switch (expr.*) {
+            .name => std.mem.eql(u8, expr.name.id, want),
+            .attribute => |a| exprHasName(a.value, want),
+            .subscript => |s| exprHasName(s.value, want) or exprHasName(s.slice, want),
+            .unary_op => |u| exprHasName(u.operand, want),
+            .bin_op => |b| exprHasName(b.left, want) or exprHasName(b.right, want),
+            .if_exp => |e| exprHasName(e.condition, want) or exprHasName(e.body, want) or exprHasName(e.else_body, want),
+            .bool_op => |b| blk: {
+                for (b.values) |v| {
+                    if (exprHasName(v, want)) break :blk true;
+                }
+                break :blk false;
+            },
+            .compare => |c| blk: {
+                if (exprHasName(c.left, want)) break :blk true;
+                for (c.comparators) |v| {
+                    if (exprHasName(v, want)) break :blk true;
+                }
+                break :blk false;
+            },
+            .call => |c| blk: {
+                if (exprHasName(c.func, want)) break :blk true;
+                for (c.args) |v| {
+                    if (exprHasName(v, want)) break :blk true;
+                }
+                for (c.keywords) |kw| {
+                    if (exprHasName(kw.value, want)) break :blk true;
+                }
+                break :blk false;
+            },
+            .tuple => |t| blk: {
+                for (t.elts) |v| {
+                    if (exprHasName(v, want)) break :blk true;
+                }
+                break :blk false;
+            },
+            .list => |l| blk: {
+                for (l.elts) |v| {
+                    if (exprHasName(v, want)) break :blk true;
+                }
+                break :blk false;
+            },
+            .dict => |d| blk: {
+                for (d.keys) |k| {
+                    if (k) |kk| {
+                        if (exprHasName(kk, want)) break :blk true;
+                    }
+                }
+                for (d.values) |v| {
+                    if (exprHasName(v, want)) break :blk true;
+                }
+                break :blk false;
+            },
+            .set => |s| blk: {
+                for (s.elts) |v| {
+                    if (exprHasName(v, want)) break :blk true;
+                }
+                break :blk false;
+            },
+            .list_comp => |c| blk: {
+                if (exprHasName(c.elt, want)) break :blk true;
+                for (c.generators) |g| {
+                    if (exprHasName(g.target, want) or exprHasName(g.iter, want)) break :blk true;
+                    for (g.ifs) |cond| {
+                        if (exprHasName(cond, want)) break :blk true;
+                    }
+                }
+                break :blk false;
+            },
+            .set_comp => |c| blk: {
+                if (exprHasName(c.elt, want)) break :blk true;
+                for (c.generators) |g| {
+                    if (exprHasName(g.target, want) or exprHasName(g.iter, want)) break :blk true;
+                    for (g.ifs) |cond| {
+                        if (exprHasName(cond, want)) break :blk true;
+                    }
+                }
+                break :blk false;
+            },
+            .dict_comp => |c| blk: {
+                if (exprHasName(c.key, want) or exprHasName(c.value, want)) break :blk true;
+                for (c.generators) |g| {
+                    if (exprHasName(g.target, want) or exprHasName(g.iter, want)) break :blk true;
+                    for (g.ifs) |cond| {
+                        if (exprHasName(cond, want)) break :blk true;
+                    }
+                }
+                break :blk false;
+            },
+            .generator_exp => |c| blk: {
+                if (exprHasName(c.elt, want)) break :blk true;
+                for (c.generators) |g| {
+                    if (exprHasName(g.target, want) or exprHasName(g.iter, want)) break :blk true;
+                    for (g.ifs) |cond| {
+                        if (exprHasName(cond, want)) break :blk true;
+                    }
+                }
+                break :blk false;
+            },
+            .await_expr => |a| exprHasName(a.value, want),
+            .yield_from => |v| exprHasName(v.value, want),
+            .named_expr => |n| exprHasName(n.target, want) or exprHasName(n.value, want),
+            .lambda => |l| exprHasName(l.body, want),
+            .slice => |s| blk: {
+                if (s.lower) |v| {
+                    if (exprHasName(v, want)) break :blk true;
+                }
+                if (s.upper) |v| {
+                    if (exprHasName(v, want)) break :blk true;
+                }
+                if (s.step) |v| {
+                    if (exprHasName(v, want)) break :blk true;
+                }
+                break :blk false;
+            },
+            else => false,
+        };
+    }
+
+    fn rewriteWithTailReturnList(
+        self: *Decompiler,
+        allocator: Allocator,
+        stmts: []const *Stmt,
+    ) DecompileError![]const *Stmt {
+        _ = self;
+        if (stmts.len < 2) return stmts;
+
+        var out: std.ArrayListUnmanaged(*Stmt) = .{};
+        errdefer out.deinit(allocator);
+        var changed = false;
+        var i: usize = 0;
+        while (i < stmts.len) {
+            const cur = stmts[i];
+            if (cur.* == .with_stmt and i + 1 < stmts.len and stmts[i + 1].* == .return_stmt) {
+                var ws = &cur.with_stmt;
+                if (withOptName(ws)) |opt_name| {
+                    const body_is_noop = ws.body.len == 0 or (ws.body.len == 1 and ws.body[0].* == .pass);
+                    if (body_is_noop) {
+                        const ret_value = stmts[i + 1].return_stmt.value orelse {
+                            try out.append(allocator, cur);
+                            i += 1;
+                            continue;
+                        };
+                        if (exprHasName(ret_value, opt_name)) {
+                            const new_body = try allocator.alloc(*Stmt, 1);
+                            new_body[0] = stmts[i + 1];
+                            ws.body = new_body;
+                            try out.append(allocator, cur);
+                            i += 2;
+                            changed = true;
+                            continue;
+                        }
+                    }
+                }
+            }
+            try out.append(allocator, cur);
+            i += 1;
+        }
+        if (!changed) {
+            out.deinit(allocator);
+            return stmts;
+        }
+        return out.toOwnedSlice(allocator);
+    }
+
+    fn rewriteWithTailReturnDeep(
+        self: *Decompiler,
+        allocator: Allocator,
+        stmts: []const *Stmt,
+    ) DecompileError![]const *Stmt {
+        for (stmts) |stmt| {
+            switch (stmt.*) {
+                .function_def => |*f| {
+                    f.body = try self.rewriteWithTailReturnDeep(allocator, f.body);
+                },
+                .class_def => |*c| {
+                    c.body = try self.rewriteWithTailReturnDeep(allocator, c.body);
+                },
+                .for_stmt => |*f| {
+                    f.body = try self.rewriteWithTailReturnDeep(allocator, f.body);
+                    f.else_body = try self.rewriteWithTailReturnDeep(allocator, f.else_body);
+                },
+                .while_stmt => |*w| {
+                    w.body = try self.rewriteWithTailReturnDeep(allocator, w.body);
+                    w.else_body = try self.rewriteWithTailReturnDeep(allocator, w.else_body);
+                },
+                .if_stmt => |*ifs| {
+                    ifs.body = try self.rewriteWithTailReturnDeep(allocator, ifs.body);
+                    ifs.else_body = try self.rewriteWithTailReturnDeep(allocator, ifs.else_body);
+                },
+                .with_stmt => |*w| {
+                    w.body = try self.rewriteWithTailReturnDeep(allocator, w.body);
+                },
+                .try_stmt => |*t| {
+                    t.body = try self.rewriteWithTailReturnDeep(allocator, t.body);
+                    t.else_body = try self.rewriteWithTailReturnDeep(allocator, t.else_body);
+                    t.finalbody = try self.rewriteWithTailReturnDeep(allocator, t.finalbody);
+                    if (t.handlers.len > 0) {
+                        const handlers = try allocator.alloc(ast.ExceptHandler, t.handlers.len);
+                        for (t.handlers, 0..) |h, hidx| {
+                            handlers[hidx] = h;
+                            handlers[hidx].body = try self.rewriteWithTailReturnDeep(allocator, h.body);
+                        }
+                        t.handlers = handlers;
+                    }
+                },
+                .match_stmt => |*m| {
+                    if (m.cases.len > 0) {
+                        const cases = try allocator.alloc(ast.MatchCase, m.cases.len);
+                        for (m.cases, 0..) |c, cidx| {
+                            cases[cidx] = c;
+                            cases[cidx].body = try self.rewriteWithTailReturnDeep(allocator, c.body);
+                        }
+                        m.cases = cases;
+                    }
+                },
+                else => {},
+            }
+        }
+        return try self.rewriteWithTailReturnList(allocator, stmts);
     }
 
     fn isSingleBreakGuard(stmt: *const Stmt) bool {
