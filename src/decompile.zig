@@ -290,6 +290,7 @@ fn rewriteFunctionStmts(decompiler: *Decompiler, stmts: []const *Stmt) Decompile
     out = try decompiler.rewriteCsvModeGuardDeep(a, out);
     out = try decompiler.rewriteDropPostWithEmptyAssignDeep(a, out);
     out = try decompiler.rewriteHoistWithLoopTailBreakDeep(a, out, false);
+    out = try decompiler.rewriteTryCleanupPairDeep(a, out);
     for (out) |stmt| {
         if (stmt.* != .function_def) continue;
         if (std.mem.indexOf(u8, stmt.function_def.name, "find_common_codecs") == null) continue;
@@ -377,6 +378,7 @@ fn rewriteModuleStmts(decompiler: *Decompiler, stmts: []const *Stmt) DecompileEr
     out = try decompiler.rewriteCsvModeGuardDeep(a, out);
     out = try decompiler.rewriteDropPostWithEmptyAssignDeep(a, out);
     out = try decompiler.rewriteHoistWithLoopTailBreakDeep(a, out, false);
+    out = try decompiler.rewriteTryCleanupPairDeep(a, out);
     for (out) |stmt| {
         if (stmt.* != .function_def) continue;
         if (std.mem.indexOf(u8, stmt.function_def.name, "find_common_codecs") == null) continue;
@@ -6605,6 +6607,25 @@ pub const Decompiler = struct {
                     changed = true;
                     continue;
                 }
+                if (ifs.else_body.len == 0 and ifs.body.len == 1 and ifs.body[0].* == .if_stmt and i + 2 < stmts.len and stmts[i + 1].* == .raise_stmt) {
+                    const inner = ifs.body[0].if_stmt;
+                    if (inner.else_body.len == 0 and inner.body.len > 0 and !self.bodyEndsTerminal(inner.body)) {
+                        const cond = try self.makeBoolPair(ifs.condition, inner.condition, .and_);
+                        const else_body = try allocator.alloc(*Stmt, 1);
+                        else_body[0] = stmts[i + 1];
+                        const new_if = try allocator.create(Stmt);
+                        new_if.* = .{ .if_stmt = .{
+                            .condition = cond,
+                            .body = inner.body,
+                            .else_body = else_body,
+                        } };
+                        new_if.if_stmt.no_merge = ifs.no_merge or inner.no_merge;
+                        try out.append(allocator, new_if);
+                        i += 2;
+                        changed = true;
+                        continue;
+                    }
+                }
                 if (ifs.else_body.len == 0 and ifs.body.len > 0 and ifs.body[ifs.body.len - 1].* == .return_stmt and
                     i + 2 < stmts.len and stmts[i + 1].* == .if_stmt and stmts[i + 2].* == .raise_stmt)
                 {
@@ -6796,6 +6817,30 @@ pub const Decompiler = struct {
                     if (next.* == .return_stmt and ifs.body.len > 0 and ifs.else_body.len == 0) {
                         const last_then = ifs.body[ifs.body.len - 1];
                         if (last_then.* == .return_stmt and self.terminalStmtEqual(last_then, next)) {
+                            if (i + 2 < stmts.len) {
+                                var k = i + 2;
+                                var has_real_tail = false;
+                                while (k < stmts.len) {
+                                    if (Decompiler.isReturnNone(stmts[k])) {
+                                        k += 1;
+                                        continue;
+                                    }
+                                    if (k + 1 < stmts.len and self.cleanupPairName(stmts[k .. k + 2]) != null) {
+                                        k += 2;
+                                        continue;
+                                    }
+                                    has_real_tail = true;
+                                    break;
+                                }
+                                if (has_real_tail) {
+                                    // `if cond: return X; return X; <real code>` should keep the guarded
+                                    // return and drop the duplicated middle return.
+                                    try out.append(allocator, cur);
+                                    i += 2;
+                                    changed = true;
+                                    continue;
+                                }
+                            }
                             ifs.body = ifs.body[0 .. ifs.body.len - 1];
                             changed = true;
                         }
@@ -7780,6 +7825,14 @@ pub const Decompiler = struct {
         var changed = false;
         var i: usize = 0;
         while (i < stmts.len) {
+            if (i + 2 < stmts.len and stmts[i + 1].* == .assign and stmts[i + 2].* == .try_stmt) {
+                if (self.matchExcCleanupScaffold(stmts[i], stmts[i + 1], stmts[i + 2])) {
+                    try out.append(allocator, stmts[i]);
+                    i += 3;
+                    changed = true;
+                    continue;
+                }
+            }
             if (i + 2 < stmts.len) {
                 if (self.cleanupPairName(stmts[i + 1 .. i + 3])) |cleanup_name| {
                     if (self.stmtBindsExceptName(stmts[i], cleanup_name)) {
@@ -7806,6 +7859,92 @@ pub const Decompiler = struct {
             return stmts;
         }
         return out.toOwnedSlice(allocator);
+    }
+
+    fn isPhAssignName(self: *Decompiler, stmt: *const Stmt, name: []const u8) bool {
+        const tgt = assignTargetName(stmt) orelse return false;
+        if (!std.mem.eql(u8, tgt, name)) return false;
+        return isConstEllipsis(stmt.assign.value) or self.isPlaceholderExpr(stmt.assign.value);
+    }
+
+    fn isCleanupSeqName(
+        self: *Decompiler,
+        seq: []const *Stmt,
+        name: []const u8,
+        dup_head: ?*const Stmt,
+        require_cleanup: bool,
+    ) bool {
+        var i: usize = 0;
+        var saw_cleanup = false;
+        if (dup_head) |dup_stmt| {
+            if (seq.len > 0 and stmtShallowEqual(seq[0], dup_stmt)) {
+                i = 1;
+            }
+        }
+
+        while (i < seq.len) {
+            if (self.isPhAssignName(seq[i], name)) {
+                i += 1;
+                continue;
+            }
+            if (i + 1 < seq.len) {
+                if (self.cleanupPairName(seq[i .. i + 2])) |cleanup_name| {
+                    if (std.mem.eql(u8, cleanup_name, name)) {
+                        i += 2;
+                        saw_cleanup = true;
+                        continue;
+                    }
+                }
+            }
+            return false;
+        }
+        return !require_cleanup or saw_cleanup;
+    }
+
+    fn handlerTailByName(try_stmt: *const Stmt, name: []const u8) ?*const Stmt {
+        if (try_stmt.* != .try_stmt) return null;
+        for (try_stmt.try_stmt.handlers) |h| {
+            const hn = h.name orelse continue;
+            if (!std.mem.eql(u8, hn, name)) continue;
+            if (h.body.len == 0) return null;
+            return h.body[h.body.len - 1];
+        }
+        return null;
+    }
+
+    fn handlerTailFromPrev(self: *Decompiler, prev_stmt: *const Stmt, name: []const u8) ?*const Stmt {
+        switch (prev_stmt.*) {
+            .try_stmt => return handlerTailByName(prev_stmt, name),
+            .if_stmt => |ifs| {
+                if (ifs.else_body.len != 0 or ifs.body.len == 0) return null;
+                return self.handlerTailFromPrev(ifs.body[ifs.body.len - 1], name);
+            },
+            else => return null,
+        }
+    }
+
+    fn matchExcCleanupScaffold(
+        self: *Decompiler,
+        prev_stmt: *const Stmt,
+        assign_stmt: *const Stmt,
+        cleanup_try_stmt: *const Stmt,
+    ) bool {
+        const name = assignTargetName(assign_stmt) orelse return false;
+        if (!self.isPhAssignName(assign_stmt, name)) return false;
+        const cleanup_try = cleanup_try_stmt.try_stmt;
+        if (cleanup_try.handlers.len != 0 or cleanup_try.else_body.len != 0) return false;
+        if (!self.isCleanupSeqName(cleanup_try.finalbody, name, null, true)) return false;
+
+        if (self.isCleanupSeqName(cleanup_try.body, name, null, false)) return true;
+        if (cleanup_try.body.len > 0 and cleanup_try.body[0].* == .expr_stmt and
+            self.isCleanupSeqName(cleanup_try.body[1..], name, null, true))
+        {
+            return true;
+        }
+        if (self.handlerTailFromPrev(prev_stmt, name)) |dup_stmt| {
+            if (self.isCleanupSeqName(cleanup_try.body, name, dup_stmt, false)) return true;
+        }
+        return false;
     }
 
     fn stmtBindsExceptName(self: *Decompiler, stmt: *const Stmt, name: []const u8) bool {
@@ -8903,6 +9042,93 @@ pub const Decompiler = struct {
             }
         }
         return self.rewriteBranchDupTailReturnList(stmts);
+    }
+
+    fn rewriteIfTryDupTailList(
+        self: *Decompiler,
+        allocator: Allocator,
+        stmts: []const *Stmt,
+    ) DecompileError![]const *Stmt {
+        if (stmts.len < 2) return stmts;
+        var out: std.ArrayListUnmanaged(*Stmt) = .{};
+        errdefer out.deinit(allocator);
+        var changed = false;
+        var i: usize = 0;
+        while (i < stmts.len) {
+            if (i + 1 < stmts.len and stmts[i].* == .if_stmt) {
+                const ifs = stmts[i].if_stmt;
+                if (ifs.else_body.len == 0 and ifs.body.len == 1 and ifs.body[0].* == .try_stmt) {
+                    const ts = ifs.body[0].try_stmt;
+                    if (ts.else_body.len == 0 and ts.finalbody.len == 0 and ts.body.len > 0 and self.stmtIsTerminal(ts.body[ts.body.len - 1])) {
+                        if (i + 1 + ts.body.len <= stmts.len and stmtSeqEqual(stmts[i + 1 .. i + 1 + ts.body.len], ts.body)) {
+                            try out.append(allocator, stmts[i]);
+                            i += 1 + ts.body.len;
+                            changed = true;
+                            continue;
+                        }
+                    }
+                }
+            }
+            try out.append(allocator, stmts[i]);
+            i += 1;
+        }
+        if (!changed) {
+            out.deinit(allocator);
+            return stmts;
+        }
+        return out.toOwnedSlice(allocator);
+    }
+
+    fn rewriteIfTryDupTailDeep(
+        self: *Decompiler,
+        allocator: Allocator,
+        stmts: []const *Stmt,
+    ) DecompileError![]const *Stmt {
+        for (stmts) |stmt| {
+            switch (stmt.*) {
+                .function_def, .class_def => {},
+                .for_stmt => |*f| {
+                    f.body = try self.rewriteIfTryDupTailDeep(allocator, f.body);
+                    f.else_body = try self.rewriteIfTryDupTailDeep(allocator, f.else_body);
+                },
+                .while_stmt => |*w| {
+                    w.body = try self.rewriteIfTryDupTailDeep(allocator, w.body);
+                    w.else_body = try self.rewriteIfTryDupTailDeep(allocator, w.else_body);
+                },
+                .if_stmt => |*ifs| {
+                    ifs.body = try self.rewriteIfTryDupTailDeep(allocator, ifs.body);
+                    ifs.else_body = try self.rewriteIfTryDupTailDeep(allocator, ifs.else_body);
+                },
+                .with_stmt => |*w| {
+                    w.body = try self.rewriteIfTryDupTailDeep(allocator, w.body);
+                },
+                .try_stmt => |*t| {
+                    t.body = try self.rewriteIfTryDupTailDeep(allocator, t.body);
+                    t.else_body = try self.rewriteIfTryDupTailDeep(allocator, t.else_body);
+                    t.finalbody = try self.rewriteIfTryDupTailDeep(allocator, t.finalbody);
+                    if (t.handlers.len > 0) {
+                        const handlers = try allocator.alloc(ast.ExceptHandler, t.handlers.len);
+                        for (t.handlers, 0..) |h, hidx| {
+                            handlers[hidx] = h;
+                            handlers[hidx].body = try self.rewriteIfTryDupTailDeep(allocator, h.body);
+                        }
+                        t.handlers = handlers;
+                    }
+                },
+                .match_stmt => |*m| {
+                    if (m.cases.len > 0) {
+                        const cases = try allocator.alloc(ast.MatchCase, m.cases.len);
+                        for (m.cases, 0..) |c, cidx| {
+                            cases[cidx] = c;
+                            cases[cidx].body = try self.rewriteIfTryDupTailDeep(allocator, c.body);
+                        }
+                        m.cases = cases;
+                    }
+                },
+                else => {},
+            }
+        }
+        return try self.rewriteIfTryDupTailList(allocator, stmts);
     }
 
     fn rewritePassElifGuardList(
@@ -16155,6 +16381,100 @@ pub const Decompiler = struct {
         }
         const trimmed = try self.trimTailElseRetNone(stmts);
         return try self.trimPostTerminalCleanupList(allocator, trimmed);
+    }
+
+    fn trimTerminalEllipsisTryTailList(
+        self: *Decompiler,
+        allocator: Allocator,
+        stmts: []const *Stmt,
+    ) DecompileError![]const *Stmt {
+        if (stmts.len < 3) return stmts;
+        var i: usize = 0;
+        while (i + 2 < stmts.len) : (i += 1) {
+            if (!self.stmtIsTerminal(stmts[i])) continue;
+            var j = i + 1;
+            var saw_ellipsis_try = false;
+            while (j < stmts.len) {
+                if (j + 1 < stmts.len and stmts[j].* == .assign and assignTargetName(stmts[j]) != null and
+                    (isConstEllipsis(stmts[j].assign.value) or self.isPlaceholderExpr(stmts[j].assign.value)) and
+                    stmts[j + 1].* == .try_stmt)
+                {
+                    const ts = stmts[j + 1].try_stmt;
+                    if (ts.handlers.len == 0 and ts.else_body.len == 0) {
+                        saw_ellipsis_try = true;
+                        j += 2;
+                        continue;
+                    }
+                }
+                if (!saw_ellipsis_try) break;
+                if (Decompiler.isReturnNone(stmts[j])) {
+                    j += 1;
+                    continue;
+                }
+                if (j + 1 < stmts.len and self.cleanupPairName(stmts[j .. j + 2]) != null) {
+                    j += 2;
+                    continue;
+                }
+                break;
+            }
+            if (!saw_ellipsis_try or j != stmts.len) continue;
+            const out = try allocator.alloc(*Stmt, i + 1);
+            std.mem.copyForwards(*Stmt, out, stmts[0 .. i + 1]);
+            return out;
+        }
+        return stmts;
+    }
+
+    fn trimTerminalEllipsisTryTailDeep(
+        self: *Decompiler,
+        allocator: Allocator,
+        stmts: []const *Stmt,
+    ) DecompileError![]const *Stmt {
+        for (stmts) |stmt| {
+            switch (stmt.*) {
+                .function_def, .class_def => {},
+                .for_stmt => |*f| {
+                    f.body = try self.trimTerminalEllipsisTryTailDeep(allocator, f.body);
+                    f.else_body = try self.trimTerminalEllipsisTryTailDeep(allocator, f.else_body);
+                },
+                .while_stmt => |*w| {
+                    w.body = try self.trimTerminalEllipsisTryTailDeep(allocator, w.body);
+                    w.else_body = try self.trimTerminalEllipsisTryTailDeep(allocator, w.else_body);
+                },
+                .if_stmt => |*i| {
+                    i.body = try self.trimTerminalEllipsisTryTailDeep(allocator, i.body);
+                    i.else_body = try self.trimTerminalEllipsisTryTailDeep(allocator, i.else_body);
+                },
+                .with_stmt => |*w| {
+                    w.body = try self.trimTerminalEllipsisTryTailDeep(allocator, w.body);
+                },
+                .try_stmt => |*t| {
+                    t.body = try self.trimTerminalEllipsisTryTailDeep(allocator, t.body);
+                    t.else_body = try self.trimTerminalEllipsisTryTailDeep(allocator, t.else_body);
+                    t.finalbody = try self.trimTerminalEllipsisTryTailDeep(allocator, t.finalbody);
+                    if (t.handlers.len > 0) {
+                        const handlers = try allocator.alloc(ast.ExceptHandler, t.handlers.len);
+                        for (t.handlers, 0..) |h, hidx| {
+                            handlers[hidx] = h;
+                            handlers[hidx].body = try self.trimTerminalEllipsisTryTailDeep(allocator, h.body);
+                        }
+                        t.handlers = handlers;
+                    }
+                },
+                .match_stmt => |*m| {
+                    if (m.cases.len > 0) {
+                        const cases = try allocator.alloc(ast.MatchCase, m.cases.len);
+                        for (m.cases, 0..) |c, cidx| {
+                            cases[cidx] = c;
+                            cases[cidx].body = try self.trimTerminalEllipsisTryTailDeep(allocator, c.body);
+                        }
+                        m.cases = cases;
+                    }
+                },
+                else => {},
+            }
+        }
+        return try self.trimTerminalEllipsisTryTailList(allocator, stmts);
     }
 
     fn reachesBlock(
@@ -36644,6 +36964,9 @@ pub const Decompiler = struct {
         const a = self.arena.allocator();
 
         var body = try self.decompileNestedBody(func.code);
+        body = try self.rewriteIfTryDupTailDeep(a, body);
+        body = try self.trimTerminalEllipsisTryTailDeep(a, body);
+        body = try self.rewriteTryCleanupPairDeep(a, body);
         body = try self.trimTrailingReturnNone(body);
 
         // Generate global/nonlocal declarations
