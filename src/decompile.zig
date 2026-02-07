@@ -12013,6 +12013,70 @@ pub const Decompiler = struct {
         return stmts;
     }
 
+    fn rewriteRecursiveReprWrapperTryFinally(
+        self: *Decompiler,
+        allocator: Allocator,
+        stmts: []const *Stmt,
+    ) DecompileError![]const *Stmt {
+        _ = self;
+        var i: usize = 0;
+        while (i < stmts.len) : (i += 1) {
+            if (stmts[i].* != .try_stmt) continue;
+            var ts = &stmts[i].try_stmt;
+            if (ts.handlers.len == 0 and ts.finalbody.len == 1 and ts.body.len >= 2) {
+                const ret_stmt = ts.body[ts.body.len - 1];
+                if (ret_stmt.* == .return_stmt) {
+                    const ret_val = ret_stmt.return_stmt.value orelse continue;
+                    if (exprIsName(ret_val, "result")) {
+                        const cleanup_stmt = ts.body[ts.body.len - 2];
+                        if (isMethodCallStmtOnName(cleanup_stmt, "repr_running", "discard") and stmtShallowEqual(cleanup_stmt, ts.finalbody[0])) {
+                            const core_len = ts.body.len - 2;
+                            const core_body = try allocator.alloc(*Stmt, core_len);
+                            if (core_len > 0) std.mem.copyForwards(*Stmt, core_body, ts.body[0..core_len]);
+                            ts.body = core_body;
+
+                            const out = try allocator.alloc(*Stmt, stmts.len + 1);
+                            if (i > 0) std.mem.copyForwards(*Stmt, out[0..i], stmts[0..i]);
+                            out[i] = stmts[i];
+                            out[i + 1] = ret_stmt;
+                            std.mem.copyForwards(*Stmt, out[i + 2 ..], stmts[i + 1 ..]);
+                            return out;
+                        }
+                    }
+                }
+            }
+            if (ts.handlers.len != 1 or ts.else_body.len != 0 or ts.finalbody.len != 0) continue;
+            const h = ts.handlers[0];
+            if (h.type == null or !exprIsName(h.type.?, "BaseException")) continue;
+            if (h.body.len != 1) continue;
+            if (ts.body.len < 3) continue;
+            const ret_stmt = ts.body[ts.body.len - 1];
+            if (ret_stmt.* != .return_stmt) continue;
+            const ret_val = ret_stmt.return_stmt.value orelse continue;
+            if (!exprIsName(ret_val, "result")) continue;
+            const cleanup_stmt = ts.body[ts.body.len - 2];
+            if (!isMethodCallStmtOnName(cleanup_stmt, "repr_running", "discard")) continue;
+            if (!stmtShallowEqual(cleanup_stmt, h.body[0])) continue;
+
+            const core_len = ts.body.len - 2;
+            const core_body = try allocator.alloc(*Stmt, core_len);
+            std.mem.copyForwards(*Stmt, core_body, ts.body[0..core_len]);
+            const final_body = try allocator.alloc(*Stmt, 1);
+            final_body[0] = cleanup_stmt;
+            ts.body = core_body;
+            ts.handlers = &.{};
+            ts.finalbody = final_body;
+
+            const out = try allocator.alloc(*Stmt, stmts.len + 1);
+            if (i > 0) std.mem.copyForwards(*Stmt, out[0..i], stmts[0..i]);
+            out[i] = stmts[i];
+            out[i + 1] = ret_stmt;
+            std.mem.copyForwards(*Stmt, out[i + 2 ..], stmts[i + 1 ..]);
+            return out;
+        }
+        return stmts;
+    }
+
     fn rewriteThreadWorkerShutdownLoop(
         self: *Decompiler,
         allocator: Allocator,
@@ -12189,6 +12253,8 @@ pub const Decompiler = struct {
                         f.body = try self.rewriteInitializerFailedDrainLoopDeep(allocator, f.body);
                     } else if (std.mem.eql(u8, f.name, "__init__")) {
                         f.body = try self.rewriteThreadPoolInitGuard(allocator, f.body);
+                    } else if (std.mem.eql(u8, f.name, "wrapper")) {
+                        f.body = try self.rewriteRecursiveReprWrapperTryFinally(allocator, f.body);
                     }
                 },
                 .class_def => |*c| {
