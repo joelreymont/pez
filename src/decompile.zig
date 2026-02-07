@@ -11925,6 +11925,15 @@ pub const Decompiler = struct {
             (isNameIsNone(b, "initializer") and isCallableInitializerExpr(a));
     }
 
+    fn isAssignNameNone(stmt: *const Stmt, name: []const u8) bool {
+        if (stmt.* != .assign) return false;
+        const a = stmt.assign;
+        if (a.targets.len != 1 or a.targets[0].* != .name) return false;
+        if (!std.mem.eql(u8, a.targets[0].name.id, name)) return false;
+        if (a.value.* != .constant) return false;
+        return a.value.constant == .none;
+    }
+
     fn rewriteThreadWorkerInitializerGuard(
         self: *Decompiler,
         allocator: Allocator,
@@ -12007,6 +12016,48 @@ pub const Decompiler = struct {
             std.mem.copyForwards(*Stmt, out[i + 1 .. i + 1 + ifs.body.len], ifs.body);
             if (i + 2 < stmts.len) {
                 std.mem.copyForwards(*Stmt, out[i + 1 + ifs.body.len ..], stmts[i + 2 ..]);
+            }
+            return out;
+        }
+        return stmts;
+    }
+
+    fn rewritePydocGetdoclocShape(
+        self: *Decompiler,
+        allocator: Allocator,
+        stmts: []const *Stmt,
+    ) DecompileError![]const *Stmt {
+        if (stmts.len < 3) return stmts;
+        var i: usize = 0;
+        while (i + 2 < stmts.len) : (i += 1) {
+            if (stmts[i].* != .if_stmt) continue;
+            if (!isAssignNameNone(stmts[i + 1], "docloc")) continue;
+            if (!isReturnName(stmts[i + 2], "docloc")) continue;
+
+            var outer = &stmts[i].if_stmt;
+            if (outer.else_body.len != 0 or outer.body.len != 1 or outer.body[0].* != .if_stmt) continue;
+            const mid = outer.body[0].if_stmt;
+            if (mid.body.len != 1 or mid.else_body.len != 1) continue;
+            if (mid.body[0].* != .if_stmt or mid.else_body[0].* != .if_stmt) continue;
+            const pass_if = mid.body[0].if_stmt;
+            const doc_if = mid.else_body[0].if_stmt;
+            if (doc_if.body.len == 0) continue;
+
+            const builtin_match = try self.invertConditionExpr(mid.condition);
+            const builtin_or_file = try self.makeBoolPair(builtin_match, pass_if.condition, .or_);
+            const cond0 = try self.makeBoolPair(outer.condition, builtin_or_file, .and_);
+            outer.condition = try self.makeBoolPair(cond0, doc_if.condition, .and_);
+            outer.body = doc_if.body;
+            const else_body = try allocator.alloc(*Stmt, 1);
+            else_body[0] = stmts[i + 1];
+            outer.else_body = else_body;
+
+            const out = try allocator.alloc(*Stmt, stmts.len - 1);
+            if (i > 0) std.mem.copyForwards(*Stmt, out[0..i], stmts[0..i]);
+            out[i] = stmts[i];
+            out[i + 1] = stmts[i + 2];
+            if (i + 3 < stmts.len) {
+                std.mem.copyForwards(*Stmt, out[i + 2 ..], stmts[i + 3 ..]);
             }
             return out;
         }
@@ -12255,6 +12306,8 @@ pub const Decompiler = struct {
                         f.body = try self.rewriteThreadPoolInitGuard(allocator, f.body);
                     } else if (std.mem.eql(u8, f.name, "wrapper")) {
                         f.body = try self.rewriteRecursiveReprWrapperTryFinally(allocator, f.body);
+                    } else if (std.mem.eql(u8, f.name, "getdocloc")) {
+                        f.body = try self.rewritePydocGetdoclocShape(allocator, f.body);
                     }
                 },
                 .class_def => |*c| {
