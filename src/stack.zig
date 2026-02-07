@@ -2979,7 +2979,7 @@ pub const SimContext = struct {
 
     /// Simulate a single instruction.
     pub fn simulate(self: *SimContext, inst: Instruction) SimError!void {
-        if (self.enable_ifexp) {
+        if (self.enable_ifexp or self.findActiveCompBuilder() != null) {
             _ = try resolveIfExps(self.allocator, &self.stack, &self.pending_ifexp, inst.offset);
         }
         if (self.pending_comp_or) |pending| {
@@ -3011,7 +3011,7 @@ pub const SimContext = struct {
             },
 
             .JUMP_FORWARD => {
-                if (self.enable_ifexp) {
+                if (self.enable_ifexp or self.findActiveCompBuilder() != null) {
                     const target = inst.jumpTarget(self.version) orelse inst.arg;
                     if (try captureIfExpThen(&self.stack, &self.pending_ifexp, inst.offset, target)) return;
                 }
@@ -6225,13 +6225,9 @@ pub const SimContext = struct {
                 const jump_target = inst.jumpTarget(self.version) orelse inst.arg;
                 const active_comp_builder = self.findActiveCompBuilder();
                 const capture_comp_ifexp = blk: {
-                    if (active_comp_builder) |builder| {
-                        if (builder.kind != .dict) break :blk false;
-                        if (builder.key != null or builder.value != null) break :blk false;
+                    if (active_comp_builder) |_| {
                         if (!self.compJumpLooksLikeIfExp(inst.offset, jump_target)) break :blk false;
-                        if (self.stack.items.items.len == 0) break :blk false;
-                        const top_idx = self.stack.items.items.len - 1;
-                        break :blk self.stack.items.items[top_idx] == .expr;
+                        break :blk true;
                     }
                     break :blk false;
                 };

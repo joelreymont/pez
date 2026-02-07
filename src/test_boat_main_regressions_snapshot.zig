@@ -2060,6 +2060,15 @@ test "snapshot with tail return 3.9" {
     );
 }
 
+test "snapshot listcomp ifexp 3.9" {
+    try runSnapshot(@src(), "test/corpus/listcomp_ifexp.3.9.pyc",
+        \\[]u8
+        \\  "def listcomp_ifexp(xs):
+        \\    return [x.decode('latin1') if x is not None else x for x in xs]
+        \\"
+    );
+}
+
 test "snapshot webbrowser register preferred 3.9" {
     try runSnapshot(@src(), "test/corpus/webbrowser_register_preferred.3.9.pyc",
         \\[]u8
