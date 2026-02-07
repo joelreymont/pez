@@ -68,11 +68,8 @@ test "snapshot chained compare guard 3.9" {
     try oh.snap(@src(),
         \\[]const u8
         \\  "def f(x):
-        \\    if is_int_m(x):
-        \\        if 0 < int(x) < 99999:
-        \\            y = x
-        \\        else:
-        \\            return False
+        \\    if is_int_m(x) and 0 < int(x) < 99999:
+        \\        y = x
         \\    else:
         \\        return False
         \\    return True
