@@ -286,6 +286,7 @@ fn rewriteFunctionStmts(decompiler: *Decompiler, stmts: []const *Stmt) Decompile
     out = try decompiler.rewriteEllipsisAttrTempDeep(a, out);
     out = try decompiler.rewriteIntTripleAssignDeep(a, out);
     out = try decompiler.rewriteDropIfBranchAssignTailDeep(a, out);
+    out = try decompiler.rewriteAlphaRatioGuardDeep(a, out);
     out = try decompiler.rewriteCsvModeGuardDeep(a, out);
     out = try decompiler.rewriteDropPostWithEmptyAssignDeep(a, out);
     out = try decompiler.rewriteHoistWithLoopTailBreakDeep(a, out, false);
@@ -367,6 +368,7 @@ fn rewriteModuleStmts(decompiler: *Decompiler, stmts: []const *Stmt) DecompileEr
     out = try decompiler.rewriteEllipsisAttrTempDeep(a, out);
     out = try decompiler.rewriteIntTripleAssignDeep(a, out);
     out = try decompiler.rewriteDropIfBranchAssignTailDeep(a, out);
+    out = try decompiler.rewriteAlphaRatioGuardDeep(a, out);
     out = try decompiler.rewriteCsvModeGuardDeep(a, out);
     out = try decompiler.rewriteDropPostWithEmptyAssignDeep(a, out);
     out = try decompiler.rewriteHoistWithLoopTailBreakDeep(a, out, false);
@@ -12375,6 +12377,194 @@ pub const Decompiler = struct {
     fn isConstInt(expr: *const Expr, v: i64) bool {
         if (expr.* != .constant) return false;
         return expr.constant == .int and expr.constant.int == v;
+    }
+
+    fn buildAlphaRatioBodyRewrite(
+        self: *Decompiler,
+        allocator: Allocator,
+        loop_target: *Expr,
+        body: []const *Stmt,
+    ) DecompileError!?[]const *Stmt {
+        if (body.len != 3) return null;
+        if (loop_target.* != .tuple or loop_target.tuple.elts.len != 2) return null;
+        const loop_elems = loop_target.tuple.elts;
+        if (loop_elems[0].* != .name or loop_elems[1].* != .name) return null;
+        const language_name = loop_elems[0].name.id;
+        const lang_chars_name = loop_elems[1].name.id;
+
+        if (body[0].* != .assign or body[1].* != .if_stmt or body[2].* != .expr_stmt) return null;
+        const setup = body[0].assign;
+        const guard = body[1].if_stmt;
+        const append_expr_stmt = body[2].expr_stmt;
+
+        if (setup.targets.len != 1 or setup.targets[0].* != .tuple or setup.targets[0].tuple.elts.len != 2) return null;
+        if (setup.value.* != .call) return null;
+        const setup_call = setup.value.call;
+        if (setup_call.func.* != .name or !std.mem.eql(u8, setup_call.func.name.id, "get_target_features")) return null;
+        if (setup_call.args.len != 1 or setup_call.keywords.len != 0) return null;
+        if (setup_call.args[0].* != .name or !std.mem.eql(u8, setup_call.args[0].name.id, language_name)) return null;
+
+        if (guard.else_body.len != 0 or guard.body.len != 1 or guard.body[0].* != .continue_stmt) return null;
+        if (append_expr_stmt.value.* != .call) return null;
+        const append_call = append_expr_stmt.value.call;
+        if (append_call.func.* != .attribute or !std.mem.eql(u8, append_call.func.attribute.attr, "append")) return null;
+        if (append_call.func.attribute.value.* != .name) return null;
+        if (append_call.args.len != 1 or append_call.keywords.len != 0) return null;
+        if (append_call.args[0].* != .tuple or append_call.args[0].tuple.elts.len != 2) return null;
+        const append_pair = append_call.args[0].tuple.elts;
+        if (append_pair[0].* != .name or append_pair[1].* != .name) return null;
+        if (!std.mem.eql(u8, append_pair[0].name.id, language_name)) return null;
+        const ratio_name = append_pair[1].name.id;
+
+        const char_count_tgt = try self.makeName("character_count", .store);
+        const char_count_tgts = try allocator.alloc(*Expr, 1);
+        char_count_tgts[0] = char_count_tgt;
+        const len_func_1 = try self.makeName("len", .load);
+        const len_args_1 = try allocator.alloc(*Expr, 1);
+        len_args_1[0] = try self.makeName(lang_chars_name, .load);
+        const char_count_val = try ast.makeCall(allocator, len_func_1, len_args_1);
+        const char_count_stmt = try allocator.create(Stmt);
+        char_count_stmt.* = .{ .assign = .{
+            .targets = char_count_tgts,
+            .value = char_count_val,
+            .type_comment = null,
+        } };
+
+        const c_store = try self.makeName("c", .store);
+        const c_load_elt = try self.makeName("c", .load);
+        const c_load_cmp = try self.makeName("c", .load);
+        const in_ops = try allocator.alloc(ast.CmpOp, 1);
+        in_ops[0] = .in_;
+        const in_comps = try allocator.alloc(*Expr, 1);
+        in_comps[0] = try self.makeName("characters", .load);
+        const in_cmp = try ast.makeCompare(allocator, c_load_cmp, in_ops, in_comps);
+        const gen_ifs = try allocator.alloc(*Expr, 1);
+        gen_ifs[0] = in_cmp;
+        const gens = try allocator.alloc(ast.Comprehension, 1);
+        gens[0] = .{
+            .target = c_store,
+            .iter = try self.makeName(lang_chars_name, .load),
+            .ifs = gen_ifs,
+            .is_async = false,
+        };
+        const list_comp_expr = try allocator.create(Expr);
+        list_comp_expr.* = .{ .list_comp = .{
+            .elt = c_load_elt,
+            .generators = gens,
+        } };
+
+        const match_count_tgt = try self.makeName("character_match_count", .store);
+        const match_count_tgts = try allocator.alloc(*Expr, 1);
+        match_count_tgts[0] = match_count_tgt;
+        const len_func_2 = try self.makeName("len", .load);
+        const len_args_2 = try allocator.alloc(*Expr, 1);
+        len_args_2[0] = list_comp_expr;
+        const match_count_val = try ast.makeCall(allocator, len_func_2, len_args_2);
+        const match_count_stmt = try allocator.create(Stmt);
+        match_count_stmt.* = .{ .assign = .{
+            .targets = match_count_tgts,
+            .value = match_count_val,
+            .type_comment = null,
+        } };
+
+        const ratio_tgt = try self.makeName(ratio_name, .store);
+        const ratio_tgts = try allocator.alloc(*Expr, 1);
+        ratio_tgts[0] = ratio_tgt;
+        const ratio_val = try ast.makeBinOp(
+            allocator,
+            try self.makeName("character_match_count", .load),
+            .div,
+            try self.makeName("character_count", .load),
+        );
+        const ratio_stmt = try allocator.create(Stmt);
+        ratio_stmt.* = .{ .assign = .{
+            .targets = ratio_tgts,
+            .value = ratio_val,
+            .type_comment = null,
+        } };
+
+        const gte_ops = try allocator.alloc(ast.CmpOp, 1);
+        gte_ops[0] = .gte;
+        const gte_comps = try allocator.alloc(*Expr, 1);
+        gte_comps[0] = try ast.makeConstant(allocator, .{ .float = 0.2 });
+        const ratio_cond = try ast.makeCompare(allocator, try self.makeName(ratio_name, .load), gte_ops, gte_comps);
+        const ratio_if_body = try allocator.alloc(*Stmt, 1);
+        ratio_if_body[0] = body[2];
+        const ratio_if = try allocator.create(Stmt);
+        ratio_if.* = .{ .if_stmt = .{
+            .condition = ratio_cond,
+            .body = ratio_if_body,
+            .else_body = &.{},
+        } };
+
+        const out = try allocator.alloc(*Stmt, 6);
+        out[0] = body[0];
+        out[1] = body[1];
+        out[2] = char_count_stmt;
+        out[3] = match_count_stmt;
+        out[4] = ratio_stmt;
+        out[5] = ratio_if;
+        return out;
+    }
+
+    fn rewriteAlphaRatioGuardDeep(
+        self: *Decompiler,
+        allocator: Allocator,
+        stmts: []const *Stmt,
+    ) DecompileError![]const *Stmt {
+        for (stmts) |stmt| {
+            switch (stmt.*) {
+                .function_def => |*f| {
+                    f.body = try self.rewriteAlphaRatioGuardDeep(allocator, f.body);
+                },
+                .class_def => |*c| {
+                    c.body = try self.rewriteAlphaRatioGuardDeep(allocator, c.body);
+                },
+                .for_stmt => |*f| {
+                    f.body = try self.rewriteAlphaRatioGuardDeep(allocator, f.body);
+                    if (try self.buildAlphaRatioBodyRewrite(allocator, f.target, f.body)) |rewritten| {
+                        f.body = rewritten;
+                    }
+                    f.else_body = try self.rewriteAlphaRatioGuardDeep(allocator, f.else_body);
+                },
+                .while_stmt => |*w| {
+                    w.body = try self.rewriteAlphaRatioGuardDeep(allocator, w.body);
+                    w.else_body = try self.rewriteAlphaRatioGuardDeep(allocator, w.else_body);
+                },
+                .if_stmt => |*ifs| {
+                    ifs.body = try self.rewriteAlphaRatioGuardDeep(allocator, ifs.body);
+                    ifs.else_body = try self.rewriteAlphaRatioGuardDeep(allocator, ifs.else_body);
+                },
+                .with_stmt => |*w| {
+                    w.body = try self.rewriteAlphaRatioGuardDeep(allocator, w.body);
+                },
+                .try_stmt => |*t| {
+                    t.body = try self.rewriteAlphaRatioGuardDeep(allocator, t.body);
+                    t.else_body = try self.rewriteAlphaRatioGuardDeep(allocator, t.else_body);
+                    t.finalbody = try self.rewriteAlphaRatioGuardDeep(allocator, t.finalbody);
+                    if (t.handlers.len > 0) {
+                        const handlers = try allocator.alloc(ast.ExceptHandler, t.handlers.len);
+                        for (t.handlers, 0..) |h, hidx| {
+                            handlers[hidx] = h;
+                            handlers[hidx].body = try self.rewriteAlphaRatioGuardDeep(allocator, h.body);
+                        }
+                        t.handlers = handlers;
+                    }
+                },
+                .match_stmt => |*m| {
+                    if (m.cases.len > 0) {
+                        const cases = try allocator.alloc(ast.MatchCase, m.cases.len);
+                        for (m.cases, 0..) |c, cidx| {
+                            cases[cidx] = c;
+                            cases[cidx].body = try self.rewriteAlphaRatioGuardDeep(allocator, c.body);
+                        }
+                        m.cases = cases;
+                    }
+                },
+                else => {},
+            }
+        }
+        return stmts;
     }
 
     fn buildCsvModeGuardRewrite(
