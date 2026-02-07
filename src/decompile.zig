@@ -294,6 +294,8 @@ fn rewriteFunctionStmts(decompiler: *Decompiler, stmts: []const *Stmt) Decompile
     out = try decompiler.rewriteCsvModeGuardDeep(a, out);
     out = try decompiler.rewriteDropPostWithEmptyAssignDeep(a, out);
     out = try decompiler.rewriteHoistWithLoopTailBreakDeep(a, out, false);
+    out = try decompiler.rewriteTryElseBreakDeep(a, out, false);
+    out = try decompiler.rewriteDropDeadTailBreakDeep(a, out, false);
     out = try decompiler.rewriteTryCleanupPairDeep(a, out);
     out = try decompiler.rewriteThreadWorkerGuardsDeep(a, out);
     for (out) |stmt| {
@@ -387,6 +389,8 @@ fn rewriteModuleStmts(decompiler: *Decompiler, stmts: []const *Stmt) DecompileEr
     out = try decompiler.rewriteCsvModeGuardDeep(a, out);
     out = try decompiler.rewriteDropPostWithEmptyAssignDeep(a, out);
     out = try decompiler.rewriteHoistWithLoopTailBreakDeep(a, out, false);
+    out = try decompiler.rewriteTryElseBreakDeep(a, out, false);
+    out = try decompiler.rewriteDropDeadTailBreakDeep(a, out, false);
     out = try decompiler.rewriteTryCleanupPairDeep(a, out);
     out = try decompiler.rewriteThreadWorkerGuardsDeep(a, out);
     for (out) |stmt| {
@@ -7609,6 +7613,17 @@ pub const Decompiler = struct {
                 if (ifs.body.len == 0 or ifs.else_body.len == 0) break :blk false;
                 break :blk self.bodyEndsLoopTerminal(ifs.body) and self.bodyEndsLoopTerminal(ifs.else_body);
             },
+            .try_stmt => |ts| blk: {
+                const finalbody = self.trimAfterAlwaysLoopTerminal(ts.finalbody);
+                if (finalbody.len > 0 and self.bodyEndsLoopTerminal(finalbody)) break :blk true;
+                const body = self.trimAfterAlwaysLoopTerminal(ts.body);
+                if (!self.bodyEndsLoopTerminal(body)) break :blk false;
+                for (ts.handlers) |h| {
+                    const hbody = self.trimAfterAlwaysLoopTerminal(h.body);
+                    if (!self.bodyEndsLoopTerminal(hbody)) break :blk false;
+                }
+                break :blk true;
+            },
             else => false,
         };
     }
@@ -10365,6 +10380,214 @@ pub const Decompiler = struct {
             }
         }
         return try self.rewriteBreakWriteTailList(self.arena.allocator(), stmts, in_loop);
+    }
+
+    fn bodyEndsLoopTerminalTrimmed(self: *Decompiler, body: []const *Stmt) bool {
+        const trimmed = self.trimAfterAlwaysLoopTerminal(body);
+        return self.bodyEndsLoopTerminal(trimmed);
+    }
+
+    fn rewriteTryElseBreakList(
+        self: *Decompiler,
+        allocator: Allocator,
+        stmts: []const *Stmt,
+        in_loop: bool,
+    ) DecompileError![]const *Stmt {
+        if (!in_loop or stmts.len < 2) return stmts;
+        var out: std.ArrayListUnmanaged(*Stmt) = .{};
+        errdefer out.deinit(allocator);
+
+        var changed = false;
+        var i: usize = 0;
+        while (i < stmts.len) {
+            if (i + 1 < stmts.len and stmts[i].* == .try_stmt and stmts[i + 1].* == .break_stmt) {
+                var ts = &stmts[i].try_stmt;
+                if (ts.finalbody.len == 0 and ts.else_body.len == 0 and ts.handlers.len > 0) {
+                    const body_trimmed = self.trimAfterAlwaysLoopTerminal(ts.body);
+                    if (body_trimmed.len > 0 and body_trimmed[body_trimmed.len - 1].* == .break_stmt) {
+                        var handlers_continue = true;
+                        for (ts.handlers) |h| {
+                            if (!self.bodyEndsLoopTerminalTrimmed(h.body)) {
+                                handlers_continue = false;
+                                break;
+                            }
+                        }
+                        if (handlers_continue) {
+                            if (body_trimmed.len == 1) {
+                                const pass_stmt = try allocator.create(Stmt);
+                                pass_stmt.* = .pass;
+                                const new_body = try allocator.alloc(*Stmt, 1);
+                                new_body[0] = pass_stmt;
+                                ts.body = new_body;
+                            } else {
+                                ts.body = body_trimmed[0 .. body_trimmed.len - 1];
+                            }
+                            const new_else = try allocator.alloc(*Stmt, 1);
+                            new_else[0] = stmts[i + 1];
+                            ts.else_body = new_else;
+                            try out.append(allocator, stmts[i]);
+                            changed = true;
+                            i += 2;
+                            continue;
+                        }
+                    }
+                }
+            }
+            try out.append(allocator, stmts[i]);
+            i += 1;
+        }
+
+        if (!changed) {
+            out.deinit(allocator);
+            return stmts;
+        }
+        return out.toOwnedSlice(allocator);
+    }
+
+    fn rewriteTryElseBreakDeep(
+        self: *Decompiler,
+        allocator: Allocator,
+        stmts: []const *Stmt,
+        in_loop: bool,
+    ) DecompileError![]const *Stmt {
+        for (stmts) |stmt| {
+            switch (stmt.*) {
+                .function_def => |*f| {
+                    f.body = try self.rewriteTryElseBreakDeep(allocator, f.body, false);
+                },
+                .class_def => |*c| {
+                    c.body = try self.rewriteTryElseBreakDeep(allocator, c.body, false);
+                },
+                .for_stmt => |*f| {
+                    f.body = try self.rewriteTryElseBreakDeep(allocator, f.body, true);
+                    f.else_body = try self.rewriteTryElseBreakDeep(allocator, f.else_body, true);
+                },
+                .while_stmt => |*w| {
+                    w.body = try self.rewriteTryElseBreakDeep(allocator, w.body, true);
+                    w.else_body = try self.rewriteTryElseBreakDeep(allocator, w.else_body, true);
+                },
+                .if_stmt => |*ifs| {
+                    ifs.body = try self.rewriteTryElseBreakDeep(allocator, ifs.body, in_loop);
+                    ifs.else_body = try self.rewriteTryElseBreakDeep(allocator, ifs.else_body, in_loop);
+                },
+                .with_stmt => |*w| {
+                    w.body = try self.rewriteTryElseBreakDeep(allocator, w.body, in_loop);
+                },
+                .try_stmt => |*t| {
+                    t.body = try self.rewriteTryElseBreakDeep(allocator, t.body, in_loop);
+                    t.else_body = try self.rewriteTryElseBreakDeep(allocator, t.else_body, in_loop);
+                    t.finalbody = try self.rewriteTryElseBreakDeep(allocator, t.finalbody, in_loop);
+                    if (t.handlers.len > 0) {
+                        const handlers = try allocator.alloc(ast.ExceptHandler, t.handlers.len);
+                        for (t.handlers, 0..) |h, hidx| {
+                            handlers[hidx] = h;
+                            handlers[hidx].body = try self.rewriteTryElseBreakDeep(allocator, h.body, in_loop);
+                        }
+                        t.handlers = handlers;
+                    }
+                },
+                .match_stmt => |*m| {
+                    if (m.cases.len > 0) {
+                        const cases = try allocator.alloc(ast.MatchCase, m.cases.len);
+                        for (m.cases, 0..) |c, cidx| {
+                            cases[cidx] = c;
+                            cases[cidx].body = try self.rewriteTryElseBreakDeep(allocator, c.body, in_loop);
+                        }
+                        m.cases = cases;
+                    }
+                },
+                else => {},
+            }
+        }
+        return try self.rewriteTryElseBreakList(allocator, stmts, in_loop);
+    }
+
+    fn rewriteDropDeadTailBreakList(
+        self: *Decompiler,
+        allocator: Allocator,
+        stmts: []const *Stmt,
+        in_loop: bool,
+    ) DecompileError![]const *Stmt {
+        if (!in_loop or stmts.len < 2) return stmts;
+        var out: std.ArrayListUnmanaged(*Stmt) = .{};
+        errdefer out.deinit(allocator);
+
+        var changed = false;
+        var i: usize = 0;
+        while (i < stmts.len) {
+            if (i + 1 < stmts.len and stmts[i + 1].* == .break_stmt and self.stmtAlwaysLoopTerminal(stmts[i])) {
+                try out.append(allocator, stmts[i]);
+                changed = true;
+                i += 2;
+                continue;
+            }
+            try out.append(allocator, stmts[i]);
+            i += 1;
+        }
+
+        if (!changed) {
+            out.deinit(allocator);
+            return stmts;
+        }
+        return out.toOwnedSlice(allocator);
+    }
+
+    fn rewriteDropDeadTailBreakDeep(
+        self: *Decompiler,
+        allocator: Allocator,
+        stmts: []const *Stmt,
+        in_loop: bool,
+    ) DecompileError![]const *Stmt {
+        for (stmts) |stmt| {
+            switch (stmt.*) {
+                .function_def => |*f| {
+                    f.body = try self.rewriteDropDeadTailBreakDeep(allocator, f.body, false);
+                },
+                .class_def => |*c| {
+                    c.body = try self.rewriteDropDeadTailBreakDeep(allocator, c.body, false);
+                },
+                .for_stmt => |*f| {
+                    f.body = try self.rewriteDropDeadTailBreakDeep(allocator, f.body, true);
+                    f.else_body = try self.rewriteDropDeadTailBreakDeep(allocator, f.else_body, true);
+                },
+                .while_stmt => |*w| {
+                    w.body = try self.rewriteDropDeadTailBreakDeep(allocator, w.body, true);
+                    w.else_body = try self.rewriteDropDeadTailBreakDeep(allocator, w.else_body, true);
+                },
+                .if_stmt => |*ifs| {
+                    ifs.body = try self.rewriteDropDeadTailBreakDeep(allocator, ifs.body, in_loop);
+                    ifs.else_body = try self.rewriteDropDeadTailBreakDeep(allocator, ifs.else_body, in_loop);
+                },
+                .with_stmt => |*w| {
+                    w.body = try self.rewriteDropDeadTailBreakDeep(allocator, w.body, in_loop);
+                },
+                .try_stmt => |*t| {
+                    t.body = try self.rewriteDropDeadTailBreakDeep(allocator, t.body, in_loop);
+                    t.else_body = try self.rewriteDropDeadTailBreakDeep(allocator, t.else_body, in_loop);
+                    t.finalbody = try self.rewriteDropDeadTailBreakDeep(allocator, t.finalbody, in_loop);
+                    if (t.handlers.len > 0) {
+                        const handlers = try allocator.alloc(ast.ExceptHandler, t.handlers.len);
+                        for (t.handlers, 0..) |h, hidx| {
+                            handlers[hidx] = h;
+                            handlers[hidx].body = try self.rewriteDropDeadTailBreakDeep(allocator, h.body, in_loop);
+                        }
+                        t.handlers = handlers;
+                    }
+                },
+                .match_stmt => |*m| {
+                    if (m.cases.len > 0) {
+                        const cases = try allocator.alloc(ast.MatchCase, m.cases.len);
+                        for (m.cases, 0..) |c, cidx| {
+                            cases[cidx] = c;
+                            cases[cidx].body = try self.rewriteDropDeadTailBreakDeep(allocator, c.body, in_loop);
+                        }
+                        m.cases = cases;
+                    }
+                },
+                else => {},
+            }
+        }
+        return try self.rewriteDropDeadTailBreakList(allocator, stmts, in_loop);
     }
 
     fn isSetattrCallStmt(stmt: *const Stmt) bool {
@@ -26154,19 +26377,51 @@ pub const Decompiler = struct {
                 }
             }
             if (pop_block != null and pop_block.? == info.body_block and body_end == handler_end and handler_end > info.body_block + 1) {
-                // When POP_EXCEPT appears in the first body block, keep the whole
-                // handler subgraph, not just the header block.
-                var reach = try self.reachableNoLoopBack(info.body_block, handler_end, null);
-                defer reach.deinit();
-                var max_block: u32 = info.body_block;
-                var it = reach.iterator(.{});
-                while (it.next()) |bit| {
-                    const bid: u32 = @intCast(bit);
-                    if (bid > max_block) max_block = bid;
+                const body_blk = &self.cfg.blocks[info.body_block];
+                var has_uncond_jump = false;
+                if (body_blk.terminator()) |term| {
+                    has_uncond_jump = term.isUnconditionalJump();
                 }
-                const reach_end = max_block + 1;
-                if (reach_end > info.body_block + 1 and reach_end < body_end) {
-                    body_end = reach_end;
+                var cleanup_only_tail = false;
+                if (info.skip < body_blk.instructions.len) {
+                    cleanup_only_tail = true;
+                    for (body_blk.instructions[info.skip..]) |inst| {
+                        switch (inst.opcode) {
+                            .EXTENDED_ARG,
+                            .POP_EXCEPT,
+                            .JUMP_FORWARD,
+                            .JUMP_ABSOLUTE,
+                            .JUMP_BACKWARD,
+                            .JUMP_BACKWARD_NO_INTERRUPT,
+                            .RERAISE,
+                            .NOP,
+                            => {},
+                            else => {
+                                cleanup_only_tail = false;
+                                break;
+                            },
+                        }
+                    }
+                }
+                if (info.skip > 0 and has_uncond_jump and cleanup_only_tail) {
+                    // Legacy except handlers often start with POP_TOP/POP_TOP/POP_TOP and then
+                    // jump to post-try code. Treat that jump as handler exit, not handler body.
+                    body_end = info.body_block + 1;
+                } else {
+                    // When POP_EXCEPT appears in the first body block, keep the whole
+                    // handler subgraph, not just the header block.
+                    var reach = try self.reachableNoLoopBack(info.body_block, handler_end, null);
+                    defer reach.deinit();
+                    var max_block: u32 = info.body_block;
+                    var it = reach.iterator(.{});
+                    while (it.next()) |bit| {
+                        const bid: u32 = @intCast(bit);
+                        if (bid > max_block) max_block = bid;
+                    }
+                    const reach_end = max_block + 1;
+                    if (reach_end > info.body_block + 1 and reach_end < body_end) {
+                        body_end = reach_end;
+                    }
                 }
             }
             if (join_block) |join| {
@@ -37866,6 +38121,16 @@ pub const Decompiler = struct {
         if (items.len == 0) return items;
         for (items, 0..) |stmt, idx| {
             if (self.stmtAlwaysTerminal(stmt)) {
+                return items[0 .. idx + 1];
+            }
+        }
+        return items;
+    }
+
+    fn trimAfterAlwaysLoopTerminal(self: *Decompiler, items: []const *Stmt) []const *Stmt {
+        if (items.len == 0) return items;
+        for (items, 0..) |stmt, idx| {
+            if (self.stmtAlwaysLoopTerminal(stmt)) {
                 return items[0 .. idx + 1];
             }
         }

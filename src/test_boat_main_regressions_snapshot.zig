@@ -2069,6 +2069,27 @@ test "snapshot listcomp ifexp 3.9" {
     );
 }
 
+test "snapshot loop try dead break 3.9" {
+    try runSnapshot(@src(), "test/corpus/loop_try_dead_break.3.9.pyc",
+        \\[]u8
+        \\  "def syscmd(supported_platforms = ('win32', 'win16', 'dos')):
+        \\    import sys
+        \\    import subprocess
+        \\    if sys.platform not in supported_platforms:
+        \\        return ('', '', '')
+        \\    for cmd in ('ver', 'command /c ver', 'cmd /c ver'):
+        \\        try:
+        \\            out = subprocess.check_output(cmd, stderr=subprocess.DEVNULL, text=True, shell=True)
+        \\            break
+        \\        except (OSError, subprocess.CalledProcessError):
+        \\            continue
+        \\    else:
+        \\        return ('', '', '')
+        \\    return out
+        \\"
+    );
+}
+
 test "snapshot webbrowser register preferred 3.9" {
     try runSnapshot(@src(), "test/corpus/webbrowser_register_preferred.3.9.pyc",
         \\[]u8
