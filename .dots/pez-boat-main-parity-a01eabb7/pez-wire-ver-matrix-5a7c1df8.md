@@ -1,9 +1,11 @@
 ---
 title: Wire version-matrix parity runs
-status: open
+status: closed
 priority: 2
 issue-type: task
-created-at: "2026-02-07T09:49:04.681504+01:00"
+created-at: "\"2026-02-07T09:49:04.681504+01:00\""
+closed-at: "2026-02-07T10:07:05.102515+01:00"
+close-reason: implemented via build.zig matrix/parity steps and parity runner matrix hook
 blocks:
   - pez-expand-prop-invariants-d1dac452
 ---

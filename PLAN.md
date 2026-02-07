@@ -10,19 +10,19 @@
 ## Current Baseline (2026-02-07)
 
 - Dataset: `/Users/joel/Work/Shakhed/boat_main_extracted_3.9/PYZ-00.pyz_extracted`
-- Latest suite artifact: `/tmp/pez-boatmain-suite-20260207.json`
+- Latest suite artifact: `/tmp/pez-boatmain-suite-20260207-b.json`
 - pez decompile: `ok=329`, `error=0`
-- pez compare: `exact=206`, `close=75`, `mismatch=48`, `error=0`
+- pez compare: `exact=207`, `close=74`, `mismatch=48`, `error=0`
 - decompyle3 decompile: `ok=329`, `error=0`
 - decompyle3 compare: `exact=8`, `close=0`, `mismatch=321`, `error=0`
 
 ## Plan-Tracking Setup
 
-- [ ] Merge testing plan into PLAN [dot:pez-merge-testing-plan-dc61ae79]
-- [ ] Add PLAN checklist with dot IDs [dot:pez-add-plan-checklist-7554f7e3]
-- [ ] Sync dot tree to checklist [dot:pez-sync-dot-tree-b96bfee9]
-- [ ] Rebaseline boat_main metrics in PLAN [dot:pez-rebaseline-boat-main-4fc4b54c]
-- [ ] Create detailed mismatch implementation dots [dot:pez-create-detailed-mismatch-84522086]
+- [x] Merge testing plan into PLAN [dot:pez-merge-testing-plan-dc61ae79]
+- [x] Add PLAN checklist with dot IDs [dot:pez-add-plan-checklist-7554f7e3]
+- [x] Sync dot tree to checklist [dot:pez-sync-dot-tree-b96bfee9]
+- [x] Rebaseline boat_main metrics in PLAN [dot:pez-rebaseline-boat-main-4fc4b54c]
+- [x] Create detailed mismatch implementation dots [dot:pez-create-detailed-mismatch-84522086]
 
 ## Runtime / Tooling Standardization (uv-only)
 
@@ -33,16 +33,16 @@
 
 ## Boat_main Parity Execution
 
-- [ ] Record current boat_main baseline [dot:pez-record-curr-boat-ccb838bb]
+- [x] Record current boat_main baseline [dot:pez-record-curr-boat-ccb838bb]
 - [ ] Drain remaining boat_main mismatches [dot:pez-drain-remaining-boat-615a5db9]
 
 ### Active mismatch subtree (small-dot implementation)
 
-- [ ] Repro pycparser lex mismatch [dot:pez-repro-pycparser-lex-3890f864]
-- [ ] Locate lex first divergence [dot:pez-locate-lex-first-ffcd9e45]
-- [ ] Patch lex divergence root cause [dot:pez-patch-lex-divergence-64271ce3]
-- [ ] Add lex regression fixture+snapshot [dot:pez-add-lex-regression-af236d63]
-- [ ] Validate lex fix and update suite [dot:pez-validate-lex-fix-5db7d8d9]
+- [x] Repro pycparser lex mismatch [dot:pez-repro-pycparser-lex-3890f864]
+- [x] Locate lex first divergence [dot:pez-locate-lex-first-ffcd9e45]
+- [x] Patch lex divergence root cause [dot:pez-patch-lex-divergence-64271ce3]
+- [x] Add lex regression fixture+snapshot [dot:pez-add-lex-regression-af236d63]
+- [x] Validate lex fix and update suite [dot:pez-validate-lex-fix-5db7d8d9]
 
 ### Historical fixes already shipped
 
@@ -55,14 +55,14 @@
 
 ## Regression Hardening
 
-- [ ] Recheck listComprehensions crash regression [dot:pez-recheck-listcomprehensions-eb9cf738]
-- [ ] Recheck loops2 hang regression [dot:pez-recheck-loops2-hang-76a44e45]
+- [x] Recheck listComprehensions crash regression [dot:pez-recheck-listcomprehensions-eb9cf738]
+- [x] Recheck loops2 hang regression [dot:pez-recheck-loops2-hang-76a44e45]
 
 ## Test Hardening (merged from docs/testing-plan.md)
 
 - [ ] Expand snapshot coverage matrix [dot:pez-expand-snapshot-coverage-c98b2e59]
 - [ ] Expand property invariants [dot:pez-expand-prop-invariants-d1dac452]
-- [ ] Wire version-matrix parity runs [dot:pez-wire-ver-matrix-5a7c1df8]
+- [x] Wire version-matrix parity runs [dot:pez-wire-ver-matrix-5a7c1df8]
 
 ### Snapshot coverage targets
 
