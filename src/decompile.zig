@@ -20885,6 +20885,27 @@ pub const Decompiler = struct {
                         merge_id
                 else
                     try self.branchEnd(else_id, null);
+                if (else_id < else_end_val) {
+                    var reach = try self.reachableInRange(else_id, else_end_val, null);
+                    var consumed_before = try std.DynamicBitSet.initEmpty(self.allocator, self.cfg.blocks.len);
+                    var consumed_before_all = try std.DynamicBitSet.initEmpty(self.allocator, self.cfg.blocks.len);
+                    var bid_all: u32 = 0;
+                    while (bid_all < self.cfg.blocks.len) : (bid_all += 1) {
+                        if (self.consumed.isSet(bid_all)) {
+                            consumed_before_all.set(bid_all);
+                        }
+                    }
+                    var it = reach.iterator(.{});
+                    while (it.next()) |idx| {
+                        if (self.consumed.isSet(@intCast(idx))) {
+                            consumed_before.set(@intCast(idx));
+                        }
+                    }
+                    else_reach = reach;
+                    else_consumed = consumed_before;
+                    else_consumed_all = consumed_before_all;
+                    else_body_decompiled = true;
+                }
                 else_end = else_end_val;
                 // Save if_next - nested if processing may clear it
                 const saved_if_next_elif = self.if_next;
