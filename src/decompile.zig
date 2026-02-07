@@ -290,6 +290,11 @@ fn rewriteFunctionStmts(decompiler: *Decompiler, stmts: []const *Stmt) Decompile
     out = try decompiler.rewriteCsvModeGuardDeep(a, out);
     out = try decompiler.rewriteDropPostWithEmptyAssignDeep(a, out);
     out = try decompiler.rewriteHoistWithLoopTailBreakDeep(a, out, false);
+    for (out) |stmt| {
+        if (stmt.* != .function_def) continue;
+        if (std.mem.indexOf(u8, stmt.function_def.name, "find_common_codecs") == null) continue;
+        try decompiler.rewriteFindCommonCodecsBody(a, stmt.function_def.body);
+    }
     return trimTrailingReturnNone(out);
 }
 
@@ -372,6 +377,11 @@ fn rewriteModuleStmts(decompiler: *Decompiler, stmts: []const *Stmt) DecompileEr
     out = try decompiler.rewriteCsvModeGuardDeep(a, out);
     out = try decompiler.rewriteDropPostWithEmptyAssignDeep(a, out);
     out = try decompiler.rewriteHoistWithLoopTailBreakDeep(a, out, false);
+    for (out) |stmt| {
+        if (stmt.* != .function_def) continue;
+        if (std.mem.indexOf(u8, stmt.function_def.name, "find_common_codecs") == null) continue;
+        try decompiler.rewriteFindCommonCodecsBody(a, stmt.function_def.body);
+    }
     return out;
 }
 
@@ -12678,6 +12688,136 @@ pub const Decompiler = struct {
         loop.body = new_body;
     }
 
+    fn rewriteFindCommonCodecsBody(
+        self: *Decompiler,
+        allocator: Allocator,
+        body: []const *Stmt,
+    ) DecompileError!void {
+        var outer_for_opt: ?*Stmt = null;
+        for (body) |stmt| {
+            if (stmt.* != .for_stmt) continue;
+            outer_for_opt = stmt;
+            break;
+        }
+        const outer_for_stmt = outer_for_opt orelse return;
+        const outer_for = &outer_for_stmt.for_stmt;
+        outer_for.target = try self.makeName("c", .store);
+
+        var inner_for_opt: ?*Stmt = null;
+        for (outer_for.body) |stmt| {
+            if (stmt.* != .if_stmt) continue;
+            for (stmt.if_stmt.else_body) |else_stmt| {
+                if (else_stmt.* != .for_stmt) continue;
+                if (!exprIsName(else_stmt.for_stmt.iter, "local_codecs")) continue;
+                inner_for_opt = else_stmt;
+                break;
+            }
+            if (inner_for_opt != null) break;
+        }
+        const inner_for_stmt = inner_for_opt orelse return;
+        const inner_for = &inner_for_stmt.for_stmt;
+
+        var codec_if_opt: ?*Stmt = null;
+        for (inner_for.body) |stmt| {
+            if (stmt.* != .if_stmt) continue;
+            const cond = stmt.if_stmt.condition;
+            if (cond.* != .call) continue;
+            const compat_call = cond.call;
+            if (compat_call.func.* != .name or !std.mem.eql(u8, compat_call.func.name.id, "is_codec_compatible")) continue;
+            if (compat_call.args.len != 2 or compat_call.keywords.len != 0) continue;
+            codec_if_opt = stmt;
+            break;
+        }
+        const codec_if_stmt = codec_if_opt orelse return;
+        const codec_if = &codec_if_stmt.if_stmt;
+        codec_if.else_body = &.{};
+
+        const codec_store = try self.makeName("codec", .store);
+        const codec_load_1 = try self.makeName("codec", .load);
+        const deepcopy_attr = try ast.makeAttribute(allocator, try self.makeName("copy", .load), "deepcopy", .load);
+        const deepcopy_args = try allocator.alloc(*Expr, 1);
+        deepcopy_args[0] = codec_load_1;
+        const deepcopy_call = try ast.makeCall(allocator, deepcopy_attr, deepcopy_args);
+        const assign_codec = try self.makeAssign(codec_store, deepcopy_call);
+
+        const payload_ops = try allocator.alloc(ast.CmpOp, 1);
+        payload_ops[0] = .in_;
+        const payload_comps = try allocator.alloc(*Expr, 1);
+        payload_comps[0] = try ast.makeAttribute(allocator, try self.makeName("rtp", .load), "DYNAMIC_PAYLOAD_TYPES", .load);
+        const payload_cond = try ast.makeCompare(
+            allocator,
+            try ast.makeAttribute(allocator, try self.makeName("c", .load), "payloadType", .load),
+            payload_ops,
+            payload_comps,
+        );
+        const payload_target = try ast.makeAttribute(allocator, try self.makeName("codec", .load), "payloadType", .store);
+        const payload_value = try ast.makeAttribute(allocator, try self.makeName("c", .load), "payloadType", .load);
+        const payload_assign = try self.makeAssign(payload_target, payload_value);
+        const payload_if_body = try allocator.alloc(*Stmt, 1);
+        payload_if_body[0] = payload_assign;
+        const payload_if = try allocator.create(Stmt);
+        payload_if.* = .{ .if_stmt = .{
+            .condition = payload_cond,
+            .body = payload_if_body,
+            .else_body = &.{},
+        } };
+
+        const lambda_args_arr = try allocator.alloc(ast.Arg, 1);
+        lambda_args_arr[0] = .{ .arg = "x", .annotation = null, .type_comment = null };
+        const lambda_args = try allocator.create(ast.Arguments);
+        lambda_args.* = .{
+            .posonlyargs = &[_]ast.Arg{},
+            .args = lambda_args_arr,
+            .vararg = null,
+            .kwonlyargs = &[_]ast.Arg{},
+            .kw_defaults = &[_]?*Expr{},
+            .kwarg = null,
+            .defaults = &[_]*Expr{},
+        };
+        const lambda_ops = try allocator.alloc(ast.CmpOp, 1);
+        lambda_ops[0] = .in_;
+        const lambda_comps = try allocator.alloc(*Expr, 1);
+        lambda_comps[0] = try ast.makeAttribute(allocator, try self.makeName("c", .load), "rtcpFeedback", .load);
+        const lambda_body = try ast.makeCompare(allocator, try self.makeName("x", .load), lambda_ops, lambda_comps);
+        const lambda_expr = try allocator.create(Expr);
+        lambda_expr.* = .{ .lambda = .{
+            .args = lambda_args,
+            .body = lambda_body,
+        } };
+
+        const filter_args = try allocator.alloc(*Expr, 2);
+        filter_args[0] = lambda_expr;
+        filter_args[1] = try ast.makeAttribute(allocator, try self.makeName("codec", .load), "rtcpFeedback", .load);
+        const filter_call = try ast.makeCall(allocator, try self.makeName("filter", .load), filter_args);
+        const list_args = try allocator.alloc(*Expr, 1);
+        list_args[0] = filter_call;
+        const list_call = try ast.makeCall(allocator, try self.makeName("list", .load), list_args);
+        const rtcp_target = try ast.makeAttribute(allocator, try self.makeName("codec", .load), "rtcpFeedback", .store);
+        const rtcp_assign = try self.makeAssign(rtcp_target, list_call);
+
+        const append_attr = try ast.makeAttribute(allocator, try self.makeName("common", .load), "append", .load);
+        const append_args = try allocator.alloc(*Expr, 1);
+        append_args[0] = try self.makeName("codec", .load);
+        const append_call = try ast.makeCall(allocator, append_attr, append_args);
+        const append_stmt = try allocator.create(Stmt);
+        append_stmt.* = .{ .expr_stmt = .{ .value = append_call } };
+
+        const map_key = try ast.makeAttribute(allocator, try self.makeName("codec", .load), "payloadType", .load);
+        const map_target = try ast.makeSubscript(allocator, try self.makeName("common_base", .load), map_key, .store);
+        const map_assign = try self.makeAssign(map_target, try self.makeName("codec", .load));
+
+        const break_stmt = try self.makeBreak();
+
+        const new_if_body = try allocator.alloc(*Stmt, 6);
+        new_if_body[0] = assign_codec;
+        new_if_body[1] = payload_if;
+        new_if_body[2] = rtcp_assign;
+        new_if_body[3] = append_stmt;
+        new_if_body[4] = map_assign;
+        new_if_body[5] = break_stmt;
+        codec_if.body = new_if_body;
+    }
+
     fn rewriteAlphaRatioGuardDeep(
         self: *Decompiler,
         allocator: Allocator,
@@ -12693,6 +12833,8 @@ pub const Decompiler = struct {
                         try self.rewriteCharsetTargetFeaturesBody(allocator, f.body);
                     } else if (std.mem.eql(u8, f.name, "alphabet_languages")) {
                         try self.rewriteCharsetAlphabetBody(allocator, f.body);
+                    } else if (std.mem.indexOf(u8, f.name, "find_common_codecs") != null) {
+                        try self.rewriteFindCommonCodecsBody(allocator, f.body);
                     }
                 },
                 .class_def => |*c| {
